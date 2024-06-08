@@ -127,7 +127,7 @@ vim .env
 # ignore this if you don't know what this is
 vim obscurity/obscurity.conf
 
-docker compose -f docker-compose.yml up --build -d
+docker compose up --build --pull always -d
 ```
 
 ## ref
