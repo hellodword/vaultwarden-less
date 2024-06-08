@@ -1,0 +1,4 @@
+if ($http_bw != "...") {
+  rewrite ^(.*)$ /404 redirect;
+  return 302;
+}

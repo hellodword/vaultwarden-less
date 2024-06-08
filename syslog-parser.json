@@ -1,0 +1,6 @@
+{
+  "exclude_request_uri": [
+    "^/identity/connect/token",
+    "^/identity/accounts/prelogin"
+  ]
+}

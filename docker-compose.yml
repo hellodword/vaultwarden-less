@@ -1,0 +1,88 @@
+version: "3"
+
+services:
+  vaultwarden:
+    hostname: vaultwarden
+    logging:
+      driver: "local"
+      options:
+        max-size: "50m"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 128M
+    image: vaultwarden/server:1.30.5
+    # https://github.com/GoogleContainerTools/distroless/blob/64ac73c84c72528d574413fb246161e4d7d32248/common/variables.bzl#L18
+    user: "65532:65532"
+    restart: unless-stopped
+    volumes:
+      - ./data:/data:rw
+      # - ./log:/var/log/bitwarden:rw
+    environment:
+      WEB_VAULT_ENABLED: false
+      WEBSOCKET_ENABLED: false
+      ICON_SERVICE: "internal"
+      PUSH_ENABLED: false
+      SENDS_ALLOWED: false
+      SIGNUPS_ALLOWED: false
+      INVITATIONS_ALLOWED: false
+      EMAIL_CHANGE_ALLOWED: false
+      EMERGENCY_ACCESS_ALLOWED: false
+      DISABLE_ICON_DOWNLOAD: true
+      SHOW_PASSWORD_HINT: false
+      ICON_BLACKLIST_NON_GLOBAL_IPS: true
+      SMTP_EMBED_IMAGES: false
+      REQUIRE_DEVICE_EMAIL: false
+      DISABLE_ADMIN_TOKEN: false
+      USE_SENDMAIL: false
+
+  nginx:
+    logging:
+      driver: "local"
+      options:
+        max-size: "50m"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 128M
+    build:
+      context: .
+      dockerfile: ./docker/distroless-nginx.Dockerfile
+    ports:
+      - "127.0.0.1:8080:8080"
+    restart: unless-stopped
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./obscurity:/etc/nginx/include/obscurity:ro
+    # healthcheck:
+    #   test: ["CMD", "service", "nginx", "status"]
+    #   interval: 2s
+    #   timeout: 200s
+    #   retries: 100
+    #   start_period: 0s
+
+  syslog-parser:
+    hostname: syslog-parser
+    logging:
+      driver: "local"
+      options:
+        max-size: "50m"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 128M
+    image: ghcr.io/hellodword/vaultwarden-less-syslog-parser:master
+    # build:
+    #   context: .
+    #   dockerfile: ./docker/distroless-syslog-parser.Dockerfile
+    env_file:
+      - .env
+    restart: unless-stopped
+    volumes:
+      - ./data:/data:ro
+      - ./git-backup:/git-backup:rw
+      - ./rclone.conf:/rclone.conf:ro
+      - ./syslog-parser.json:/syslog-parser.json:ro

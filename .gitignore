@@ -1,0 +1,6 @@
+data
+log
+dist
+git-backup
+rclone.conf
+.env
