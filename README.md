@@ -4,22 +4,23 @@ Run and backup vaultwarden rootless, distroless and CVE-less.
 
 ## features
 
-- [x] protect vaultwarden with proxies
-  - [x] Nginx hardening
+- [ ] protect vaultwarden with proxies
+  - [ ] Nginx hardening
   - [x] obscurity
 - [x] trigger backup via Nginx access log
-  - [x] filtering
-  - [x] configurable
 - [ ] hardening docker images
   - [ ] service:vaultwarden
     - [ ] distroless
     - [x] nonroot
-  - [x] service:nginx
+    - [ ] healthcheck
+  - [ ] service:nginx
     - [x] distroless
     - [x] nonroot
+    - [ ] healthcheck
   - [x] service:syslog-parser
     - [x] distroless
     - [x] nonroot
+    - [ ] healthcheck
 
 ## how it works
 
@@ -40,7 +41,10 @@ You can replace them to anything, but make sure they'll be working with [distrol
 
 ## how to use
 
-<details><summary>Click to see configurations for IPv6-only VPS</summary>
+<details>
+<summary><b>
+Click this if you're running this on an IPv6-only EC2
+</b></summary>
 
 ```sh
 # enable IPv6 support of docker
@@ -105,6 +109,76 @@ Edit the `docker-compose.yml`
      hostname: syslog-parser
      logging:
        driver: "local"
+```
+
+</details>
+
+<details>
+<summary><b>
+Click this if you don't trust ghcr.io and want to build the images by yourself
+</b></summary>
+
+Edit the `docker-compose.yml`:
+
+```diff
+           memory: 128M
+-    image: ghcr.io/hellodword/vaultwarden-less-syslog-parser:master
+-    # build:
+-    #   context: .
+-    #   dockerfile: ./docker/distroless-syslog-parser.Dockerfile
++    # image: ghcr.io/hellodword/vaultwarden-less-syslog-parser:master
++    build:
++      context: .
++      dockerfile: ./docker/distroless-syslog-parser.Dockerfile
+     env_file:
+```
+
+</details>
+
+<details>
+<summary><b>
+Click this if you're rich and not using a very lowend VPS
+</b></summary>
+
+Edit the `docker-compose.yml`:
+
+```diff
+@@ -7,11 +7,6 @@ services:
+       driver: "local"
+       options:
+         max-size: "50m"
+-    deploy:
+-      resources:
+-        limits:
+-          cpus: "0.5"
+-          memory: 128M
+     image: vaultwarden/server:1.30.5
+     # https://github.com/GoogleContainerTools/distroless/blob/64ac73c84c72528d574413fb246161e4d7d32248/common/variables.bzl#L18
+     user: "65532:65532"
+@@ -42,11 +37,6 @@ services:
+       driver: "local"
+       options:
+         max-size: "50m"
+-    deploy:
+-      resources:
+-        limits:
+-          cpus: "0.5"
+-          memory: 128M
+     build:
+       context: .
+       dockerfile: ./docker/distroless-nginx.Dockerfile
+@@ -69,11 +59,6 @@ services:
+       driver: "local"
+       options:
+         max-size: "50m"
+-    deploy:
+-      resources:
+-        limits:
+-          cpus: "0.5"
+-          memory: 128M
+     image: ghcr.io/hellodword/vaultwarden-less-syslog-parser:master
+     # build:
+     #   context: .
 ```
 
 </details>
