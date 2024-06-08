@@ -1,0 +1,71 @@
+name: scan
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+jobs:
+  build-and-push-image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        image:
+          - distroless-nginx
+          - distroless-syslog-parser
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Build ${{ matrix.image }}
+        run: |
+          docker build -t ${{ matrix.image }}:${{ github.sha }} -f docker/${{ matrix.image }}.Dockerfile .
+
+      - uses: actions/cache@v4
+        name: Cache Trivy Database
+        with:
+          path: .trivy
+          key: ${{ runner.os }}-trivy
+          restore-keys: ${{ runner.os }}-trivy
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@0.20.0
+        continue-on-error: true
+        with:
+          image-ref: "${{ matrix.image }}:${{ github.sha }}"
+          scanners: vuln
+          vuln-type: "os,library"
+          exit-code: "1"
+          output: trivy.txt
+          hide-progress: true
+          cache-dir: .trivy
+
+      # https://github.com/agilee/OBP-API/blob/31aae3945c168d844af5356f693a9d108cf325db/.github/workflows/run_trivy.yml#L47-L48
+      - name: Fix .trivy permissions
+        run: sudo chown -R $(stat . -c %u:%g) .trivy
+
+      - name: Publish Trivy Output to Summary
+        run: |
+          if [[ -s trivy.txt ]]; then
+            {
+              echo "### Security Output"
+              echo "<details><summary>Click to expand</summary>"
+              echo ""
+              echo '```terraform'
+              cat trivy.txt
+              echo '```'
+              echo "</details>"
+            } >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Run docker scout cves scanner
+        uses: docker/scout-action@v1
+        continue-on-error: true
+        with:
+          command: cves
+          image: "${{ matrix.image }}:${{ github.sha }}"
+          summary: true

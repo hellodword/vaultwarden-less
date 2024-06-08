@@ -13,14 +13,17 @@ Run and backup vaultwarden rootless, distroless and CVE-less.
     - [ ] distroless
     - [x] nonroot
     - [ ] healthcheck
+    - [ ] CVE-less
   - [ ] service:nginx
     - [x] distroless
     - [x] nonroot
     - [ ] healthcheck
+    - [ ] CVE-less
   - [x] service:syslog-parser
     - [x] distroless
     - [x] nonroot
     - [ ] healthcheck
+    - [ ] CVE-less
 
 ## how it works
 
@@ -216,6 +219,12 @@ docker compose up --build --pull always -d
   - https://github.com/kyos0109/nginx-distroless/blob/4fa36b8c066303f34e490aad7b407d447ade4b7d/Dockerfile
 - Nginx hardening
   - https://github.com/trimstray/nginx-admins-handbook/blob/master/doc/RULES.md
+- CVE-less
+  - https://github.com/aquasecurity/trivy
+  - https://docs.docker.com/scout/
+  - https://www.chainguard.dev/unchained/migrating-a-node-js-application-to-chainguard-images
+  - https://www.chainguard.dev/unchained/reducing-vulnerabilities-in-backstage-with-chainguards-wolfi
+  - https://www.chainguard.dev/unchained/zero-cves-and-just-as-fast-chainguards-python-go-images
 
 [^1]: https://docs.nginx.com/nginx/admin-guide/monitoring/logging/#logging-to-syslog
 [^2]: https://news.ycombinator.com/item?id=38110286
