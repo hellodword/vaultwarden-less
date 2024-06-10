@@ -13,7 +13,7 @@ async function handleRequest(request) {
 
     request.headers.set('bw', BW_HEADER)
 
-    return fetch('http://' + BW_HOST +
+    return fetch(BW_HOST +
         url.pathname.replace(new RegExp(`^\/${BW_OBS}`), ''),
         {
             method: request.method,
