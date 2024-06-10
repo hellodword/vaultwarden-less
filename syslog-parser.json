@@ -1,6 +1,8 @@
 {
   "exclude_request_uri": [
     "^/identity/connect/token",
-    "^/identity/accounts/prelogin"
+    "^/identity/accounts/prelogin",
+    ".*/devices/.*",
+    ".*/two-factor/.*"
   ]
 }

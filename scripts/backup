@@ -1,0 +1,59 @@
+#! /usr/bin/env bash
+
+set -e
+
+DB_PATH="/data"
+DB_NAME="db.sqlite3"
+BACKUP_PATH="/git-backup"
+RCLONE_CONFIG_FILE="/rclone.conf"
+
+if [ ! -d "$BACKUP_PATH" ]; then
+  echo "dir $BACKUP_PATH not exist"
+  exit 1
+fi
+if [ ! -f "$DB_PATH/$DB_NAME" ]; then
+  echo "file $DB_PATH/$DB_NAME not exist"
+  exit 1
+fi
+if [ ! -f "$RCLONE_CONFIG_FILE" ]; then
+  echo "file $RCLONE_CONFIG_FILE not exist"
+  exit 1
+fi
+targets=( $(grep -oP '(?<=^\[)\w+_alias(?=\]$)' "$RCLONE_CONFIG_FILE" || true) )
+if [ ${#targets[*]} = 0 ]; then
+  echo "no targets in $RCLONE_CONFIG_FILE"
+  exit 1
+fi
+
+cd "$BACKUP_PATH"
+
+[ -d ".git" ] || git init
+git config user.name bitwarden-backup
+git config user.email backup@bitwarden.com
+
+sqlite3 "$DB_PATH/$DB_NAME" .dump > bitwarden.sql
+
+if [ -n "$(git status --porcelain)" ]; then 
+  git add bitwarden.sql
+  COMMIT_MSG="$(date '+%Y-%m-%d %H:%M:%S')"
+  git commit -m "$COMMIT_MSG"
+
+  failed=false
+
+  set +e
+
+  for i in ${!targets[@]}; do
+      target="${targets[$i]}"
+      echo "backup to $target"
+      if ! rclone --config "$RCLONE_CONFIG_FILE" --contimeout=3m --timeout=10m sync "$BACKUP_PATH" "$target:"; then
+        failed=true
+      else
+        echo "target $target sync successfully"
+      fi
+  done
+
+  [ "$failed" = "false" ]
+
+else
+  echo "clean repo"
+fi

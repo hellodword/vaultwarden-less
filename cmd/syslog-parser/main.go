@@ -140,39 +140,21 @@ func main() {
 func onChange(parsedLog *Log) {
 	log.Printf("%+v\n", *parsedLog)
 
-	err := backupToLocal()
+	err := backup()
 	if err != nil {
-		msg := "backupToLocal failed: " + err.Error()
+		msg := "backup failed: " + err.Error()
 		log.Println(msg)
 		notify(msg)
 		return
 	}
 
-	err = backupToRemote()
-	if err != nil {
-		msg := "backupToRemote failed: " + err.Error()
-		log.Println(msg)
-		notify(msg)
-		return
-	}
-
+	log.Println("backup succeed")
 	notify("backup succeed")
 
 }
 
-func backupToLocal() error {
-	cmd := exec.Command("/scripts/backup-to-local")
-	cmd.Stderr = os.Stderr
-	cmd.Stdout = os.Stdout
-	err := cmd.Run()
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
-func backupToRemote() error {
-	cmd := exec.Command("/scripts/backup-to-remote")
+func backup() error {
+	cmd := exec.Command("/scripts/backup")
 	cmd.Stderr = os.Stderr
 	cmd.Stdout = os.Stdout
 	err := cmd.Run()
