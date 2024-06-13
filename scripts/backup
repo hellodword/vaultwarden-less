@@ -5,7 +5,8 @@ set -e
 DB_PATH="/data"
 DB_NAME="db.sqlite3"
 BACKUP_PATH="/git-backup"
-RCLONE_CONFIG_FILE="/rclone.conf"
+RESTIC_CONFIG_FILE="/restic.json"
+RESTIC_CACHE="/restic-cache"
 
 if [ ! -d "$BACKUP_PATH" ]; then
   echo "dir $BACKUP_PATH not exist"
@@ -15,13 +16,17 @@ if [ ! -f "$DB_PATH/$DB_NAME" ]; then
   echo "file $DB_PATH/$DB_NAME not exist"
   exit 1
 fi
-if [ ! -f "$RCLONE_CONFIG_FILE" ]; then
-  echo "file $RCLONE_CONFIG_FILE not exist"
+if [ ! -d "$RESTIC_CACHE" ]; then
+  echo "dir $RESTIC_CACHE not exist"
   exit 1
 fi
-targets=( $(grep -oP '(?<=^\[)\w+_alias(?=\]$)' "$RCLONE_CONFIG_FILE" || true) )
+if [ ! -f "$RESTIC_CONFIG_FILE" ]; then
+  echo "file $RESTIC_CONFIG_FILE not exist"
+  exit 1
+fi
+targets=( $(jq -r 'keys[]' "$RESTIC_CONFIG_FILE" || true) )
 if [ ${#targets[*]} = 0 ]; then
-  echo "no targets in $RCLONE_CONFIG_FILE"
+  echo "no targets in $RESTIC_CONFIG_FILE"
   exit 1
 fi
 
@@ -45,11 +50,44 @@ if [ -n "$(git status --porcelain)" ]; then
   for i in ${!targets[@]}; do
       target="${targets[$i]}"
       echo "backup to $target"
-      if ! rclone --config "$RCLONE_CONFIG_FILE" --contimeout=3m --timeout=10m sync "$BACKUP_PATH" "$target:"; then
+      vars=( $(jq -r --arg target "$target" '.[$target] | keys[]' "$RESTIC_CONFIG_FILE" || true) )
+      if [ ${#vars[*]} = 0 ]; then
+        echo "no vars in target $target"
+        exit 1
+      fi
+
+      for j in ${!vars[@]}; do
+          var="${vars[$j]}"
+          value="$(jq -r --arg target "$target" --arg var "$var" '.[$target] | .[$var]' "$RESTIC_CONFIG_FILE")"
+          export "$var"="$value"
+      done
+      
+      if [ ! -f "$RESTIC_CACHE/$target.init" ]; then
+        if restic check --cache-dir="$RESTIC_CACHE/$target"; then
+            touch "$RESTIC_CACHE/$target.init"
+        elif restic init --cache-dir="$RESTIC_CACHE/$target"; then
+            touch "$RESTIC_CACHE/$target.init"
+        fi
+      fi
+
+      if [ ! -f "$RESTIC_CACHE/$target.init" ]; then
         failed=true
       else
-        echo "target $target sync successfully"
+        if ! restic unlock --cache-dir="$RESTIC_CACHE/$target"; then
+          failed=true
+        else
+          if ! restic backup --cache-dir="$RESTIC_CACHE/$target" "$BACKUP_PATH"; then
+            failed=true
+          else
+            echo "target $target sync successfully"
+          fi
+        fi
       fi
+
+      for j in ${!vars[@]}; do
+          var="${vars[$j]}"
+          unset "$var"
+      done
   done
 
   [ "$failed" = "false" ]

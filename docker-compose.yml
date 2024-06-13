@@ -7,11 +7,11 @@ services:
       driver: "local"
       options:
         max-size: "50m"
-    deploy:
-      resources:
-        limits:
-          cpus: "0.5"
-          memory: 128M
+    # deploy:
+    #   resources:
+    #     limits:
+    #       cpus: "0.5"
+    #       memory: 128M
     image: vaultwarden/server:1.30.5
     # https://github.com/GoogleContainerTools/distroless/blob/64ac73c84c72528d574413fb246161e4d7d32248/common/variables.bzl#L18
     user: "65532:65532"
@@ -42,11 +42,11 @@ services:
       driver: "local"
       options:
         max-size: "50m"
-    deploy:
-      resources:
-        limits:
-          cpus: "0.5"
-          memory: 128M
+    # deploy:
+    #   resources:
+    #     limits:
+    #       cpus: "0.5"
+    #       memory: 128M
     build:
       context: .
       dockerfile: ./docker/distroless-nginx.Dockerfile
@@ -69,11 +69,11 @@ services:
       driver: "local"
       options:
         max-size: "50m"
-    deploy:
-      resources:
-        limits:
-          cpus: "0.5"
-          memory: 128M
+    # deploy:
+    #   resources:
+    #     limits:
+    #       cpus: "0.7"
+    #       memory: 512M
     image: ghcr.io/hellodword/vaultwarden-less-syslog-parser:master
     # build:
     #   context: .
@@ -83,6 +83,8 @@ services:
     restart: unless-stopped
     volumes:
       - ./data:/data:ro
+      - ./scripts:/scripts:ro
       - ./git-backup:/git-backup:rw
-      - ./rclone.conf:/rclone.conf:ro
+      - ./restic-cache:/restic-cache:rw
+      - ./restic.json:/restic.json:ro
       - ./syslog-parser.json:/syslog-parser.json:ro

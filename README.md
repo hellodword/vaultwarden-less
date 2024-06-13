@@ -33,7 +33,7 @@ In `vaultwarden-less`, I created a [syslog-parser](./cmd/syslog-parser/main.go) 
 
 All the requests that change the database will trigger [scripts/backup](./scripts/backup), and report results via [notify](./scripts/notify)
 
-I use git, [rclone](https://github.com/rclone/rclone) and [bark](https://github.com/Finb/bark) in the scripts, but you can replace them to anything, and make sure they'll be working with [distroless-syslog-parser](./docker/distroless-syslog-parser.Dockerfile).
+I use git, [restic](https://github.com/restic/restic) and [bark](https://github.com/Finb/bark) in the scripts, but you can replace them to anything, and make sure they'll be working with [distroless-syslog-parser](./docker/distroless-syslog-parser.Dockerfile).
 
 > [!CAUTION]
 > Currently it's for personal usage, there's a lock in [syslog-parser](./cmd/syslog-parser/main.go), so it won't work well with too much concurrent changes.
@@ -134,65 +134,17 @@ Edit the `docker-compose.yml`:
 
 </details>
 
-<details>
-<summary><b>
-Click this if you're rich and not using a very lowend VPS
-</b></summary>
-
-Edit the `docker-compose.yml`:
-
-```diff
-@@ -7,11 +7,6 @@ services:
-       driver: "local"
-       options:
-         max-size: "50m"
--    deploy:
--      resources:
--        limits:
--          cpus: "0.5"
--          memory: 128M
-     image: vaultwarden/server:1.30.5
-     # https://github.com/GoogleContainerTools/distroless/blob/64ac73c84c72528d574413fb246161e4d7d32248/common/variables.bzl#L18
-     user: "65532:65532"
-@@ -42,11 +37,6 @@ services:
-       driver: "local"
-       options:
-         max-size: "50m"
--    deploy:
--      resources:
--        limits:
--          cpus: "0.5"
--          memory: 128M
-     build:
-       context: .
-       dockerfile: ./docker/distroless-nginx.Dockerfile
-@@ -69,11 +59,6 @@ services:
-       driver: "local"
-       options:
-         max-size: "50m"
--    deploy:
--      resources:
--        limits:
--          cpus: "0.5"
--          memory: 128M
-     image: ghcr.io/hellodword/vaultwarden-less-syslog-parser:master
-     # build:
-     #   context: .
-```
-
-</details>
-
 ```sh
 # clone repo
 git clone --depth=1 https://github.com/hellodword/vaultwarden-less && cd vaultwarden-less
 
 # prepare directories and chown for distroless nonroot
 # https://github.com/GoogleContainerTools/distroless/blob/64ac73c84c72528d574413fb246161e4d7d32248/common/variables.bzl#L18
-mkdir -p data git-backup
-sudo chown -R 65532:65532 git-backup data
+mkdir -p data git-backup restic-cache
+sudo chown -R 65532:65532 git-backup data restic-cache
 
-cp rclone.conf.template rclone.conf
-vim rclone.conf
+cp restic.json.template restic.json
+vim restic.conf
 
 cp .env.template .env
 vim .env
@@ -205,11 +157,6 @@ docker compose up --build --pull always -d
 
 ## ref
 
-- rclone alias
-  - https://github.com/rclone/rclone/issues/4862
-  - https://forum.rclone.org/t/specify-bucket-or-bucket-and-sub-directory-for-s3-in-config-file/29888/3
-- librclone
-  - https://github.com/rclone/rclone/issues/361#issuecomment-1611890274
 - distroless
   - https://github.com/TheProjectAurora/distroless-nginx/blob/cd36b3fb754dd31e20303dbe9ddd45afb7091fbf/Dockerfile
   - https://github.com/kyos0109/nginx-distroless/blob/4fa36b8c066303f34e490aad7b407d447ade4b7d/Dockerfile

@@ -2,5 +2,7 @@ data
 log
 dist
 git-backup
-rclone.conf
+rclone*.conf
 .env
+restic*.json
+restic-cache

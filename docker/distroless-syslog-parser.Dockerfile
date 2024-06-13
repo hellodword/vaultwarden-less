@@ -15,9 +15,7 @@ FROM debian:12 as base
 ARG TIME_ZONE
 
 RUN apt-get update && \
-  DEBIAN_FRONTEND=noninteractive apt-get install -y git sqlite3 unzip curl jq
-
-RUN curl -fsSL -o /tmp/rclone.sh https://rclone.org/install.sh && bash /tmp/rclone.sh
+  DEBIAN_FRONTEND=noninteractive apt-get install -y git sqlite3 unzip curl jq restic
 
 RUN mkdir -p /opt/bin /opt/etc /opt/usr/bin && \
   cp /usr/share/zoneinfo/${TIME_ZONE:-UTC} /opt/etc/localtime && \
@@ -31,8 +29,8 @@ RUN mkdir -p /opt/bin /opt/etc /opt/usr/bin && \
   ldd "$(which env)" | grep -oP '(?<==> )/lib/[^ ]+\.so' | xargs -I {} bash -xc 'cp -a --parents {}* /opt' && \
   cp -a --parents "$(which date)" /opt && \
   ldd "$(which date)" | grep -oP '(?<==> )/lib/[^ ]+\.so' | xargs -I {} bash -xc 'cp -a --parents {}* /opt' && \
-  cp -a --parents "$(which rclone)" /opt && \
-  ldd "$(which rclone)" | grep -oP '(?<==> )/lib/[^ ]+\.so' | xargs -I {} bash -xc 'cp -a --parents {}* /opt' && \
+  cp -a --parents "$(which restic)" /opt && \
+  ldd "$(which restic)" | grep -oP '(?<==> )/lib/[^ ]+\.so' | xargs -I {} bash -xc 'cp -a --parents {}* /opt' && \
   cp -a --parents "$(which grep)" /opt && \
   ldd "$(which grep)" | grep -oP '(?<==> )/lib/[^ ]+\.so' | xargs -I {} bash -xc 'cp -a --parents {}* /opt' && \
   cp -a --parents "$(which bash)" /opt && \
@@ -51,6 +49,8 @@ RUN mkdir -p /opt/bin /opt/etc /opt/usr/bin && \
   ldd "$(which cat)" | grep -oP '(?<==> )/lib/[^ ]+\.so' | xargs -I {} bash -xc 'cp -a --parents {}* /opt' && \
   cp -a --parents "$(which jq)" /opt && \
   ldd "$(which jq)" | grep -oP '(?<==> )/lib/[^ ]+\.so' | xargs -I {} bash -xc 'cp -a --parents {}* /opt' && \
+  cp -a --parents "$(which touch)" /opt && \
+  ldd "$(which touch)" | grep -oP '(?<==> )/lib/[^ ]+\.so' | xargs -I {} bash -xc 'cp -a --parents {}* /opt' && \
   true
 
 COPY scripts /opt/scripts
