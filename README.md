@@ -31,9 +31,11 @@ Bitwarden applies all changes to the vaultwarden database, so I prefer to backup
 
 In `vaultwarden-less`, I created a [syslog-parser](./cmd/syslog-parser/main.go) to receive access_log (`status`, `request_method`, `request_uri`) from Nginx[^1], cool!
 
-All the requests that change the database will trigger [scripts/backup](./scripts/backup), and report results via [notify](./scripts/notify)
+All the requests that change the database will trigger [scripts/backup](./scripts/backup), and report results via [scripts/notify](./scripts/notify)
 
 I use git, [restic](https://github.com/restic/restic) and [bark](https://github.com/Finb/bark) in the scripts, but you can replace them to anything, and make sure they'll be working with [distroless-syslog-parser](./docker/distroless-syslog-parser.Dockerfile).
+
+The [scripts/backup](./scripts/backup) receives no arguments and the [scripts/notify](./scripts/notify) receives one argument.
 
 > [!CAUTION]
 > Currently it's for personal usage, there's a lock in [syslog-parser](./cmd/syslog-parser/main.go), so it won't work well with too much concurrent changes.

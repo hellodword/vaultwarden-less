@@ -51,6 +51,10 @@ RUN mkdir -p /opt/bin /opt/etc /opt/usr/bin && \
   ldd "$(which jq)" | grep -oP '(?<==> )/lib/[^ ]+\.so' | xargs -I {} bash -xc 'cp -a --parents {}* /opt' && \
   cp -a --parents "$(which touch)" /opt && \
   ldd "$(which touch)" | grep -oP '(?<==> )/lib/[^ ]+\.so' | xargs -I {} bash -xc 'cp -a --parents {}* /opt' && \
+  cp -a --parents "$(which dirname)" /opt && \
+  ldd "$(which dirname)" | grep -oP '(?<==> )/lib/[^ ]+\.so' | xargs -I {} bash -xc 'cp -a --parents {}* /opt' && \
+  cp -a --parents "$(which pwd)" /opt && \
+  ldd "$(which pwd)" | grep -oP '(?<==> )/lib/[^ ]+\.so' | xargs -I {} bash -xc 'cp -a --parents {}* /opt' && \
   true
 
 COPY scripts /opt/scripts

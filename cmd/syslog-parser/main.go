@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -18,6 +20,18 @@ type Log struct {
 	Status        int    `json:"status"`
 	RequestMethod string `json:"request_method"`
 	RequestURI    string `json:"request_uri"`
+}
+
+func (l *Log) Format() string {
+	var uri []byte
+	for _, b := range []byte(l.RequestURI) {
+		if b == '/' || ('0' <= b && '9' <= b) || ('a' <= b && 'z' <= b) || ('A' <= b && 'Z' <= b) {
+			uri = append(uri, b)
+		} else {
+			break
+		}
+	}
+	return fmt.Sprintf("(%s)(%d)(%s)", l.RequestMethod, l.Status, string(uri))
 }
 
 type Config struct {
@@ -140,41 +154,39 @@ func main() {
 func onChange(parsedLog *Log) {
 	log.Printf("%+v\n", *parsedLog)
 
-	err := backup()
+	output, err := backup()
 	if err != nil {
-		msg := "backup failed: " + err.Error()
+		msg := fmt.Sprintf("%s failed: %s", parsedLog.Format(), err.Error())
 		log.Println(msg)
-		notify(msg)
+		notify(output + "\n" + msg)
 		return
 	}
 
-	log.Println("backup succeed")
-	notify("backup succeed")
-
+	msg := fmt.Sprintf("%s succeed", parsedLog.Format())
+	log.Println(msg)
+	notify(msg)
 }
 
-func backup() error {
+func backup() (string, error) {
 	cmd := exec.Command("/scripts/backup")
-	cmd.Stderr = os.Stderr
-	cmd.Stdout = os.Stdout
+	var output bytes.Buffer
+	cmd.Stdout = io.MultiWriter(os.Stdout, &output)
+	cmd.Stderr = io.MultiWriter(os.Stderr, &output)
 	err := cmd.Run()
 	if err != nil {
-		return err
+		return output.String(), err
 	}
-	return nil
+	return output.String(), nil
 }
 
-func notify(msg string) error {
-	cmd := exec.Command("/scripts/notify",
-		"vaultwarden-less", // group
-		"vaultwarden-less", // title
-		msg,                // desc
-	)
-	cmd.Stderr = os.Stderr
-	cmd.Stdout = os.Stdout
+func notify(msg string) (string, error) {
+	cmd := exec.Command("/scripts/notify", msg)
+	var output bytes.Buffer
+	cmd.Stdout = io.MultiWriter(os.Stdout, &output)
+	cmd.Stderr = io.MultiWriter(os.Stderr, &output)
 	err := cmd.Run()
 	if err != nil {
-		return err
+		return output.String(), err
 	}
-	return nil
+	return output.String(), nil
 }
