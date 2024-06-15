@@ -13,9 +13,13 @@ FROM debian:12 as base
 
 # https://en.wikipedia.org/wiki/List_of_tz_database_time_zones
 ARG TIME_ZONE
+ARG TARGETPLATFORM
+ARG RESTIC_VERSION="0.16.4"
 
 RUN apt-get update && \
-  DEBIAN_FRONTEND=noninteractive apt-get install -y git sqlite3 unzip curl jq restic
+  DEBIAN_FRONTEND=noninteractive apt-get install -y git sqlite3 unzip curl jq bzip2 && \
+  curl -fsSL "https://github.com/restic/restic/releases/download/v${RESTIC_VERSION}/restic_${RESTIC_VERSION}_$(echo $TARGETPLATFORM | sed 's@/@_@').bz2" | bzip2 -d -c > /usr/bin/restic && \
+  chmod +x /usr/bin/restic
 
 RUN mkdir -p /opt/bin /opt/etc /opt/usr/bin && \
   cp /usr/share/zoneinfo/${TIME_ZONE:-UTC} /opt/etc/localtime && \
