@@ -17,5 +17,13 @@
     "RESTIC_REPOSITORY": "b2:bucketname:/somepath",
     "B2_ACCOUNT_ID": "...",
     "B2_ACCOUNT_KEY": "..."
+  },
+  "cos": {
+    "RESTIC_PASSWORD": "1",
+    "RESTIC_REPOSITORY": "s3:https://cos.ap-singapore.myqcloud.com/bucketname/somepath",
+    "AWS_ACCESS_KEY_ID": "...",
+    "AWS_SECRET_ACCESS_KEY": "...",
+    "AWS_DEFAULT_REGION": "ap-singapore",
+    "S3_VIRTUAL_HOSTED_STYLE": "yes"
   }
 }

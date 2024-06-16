@@ -61,11 +61,17 @@ if [ -n "$(git status --porcelain)" ]; then
           value="$(jq -r --arg target "$target" --arg var "$var" '.[$target] | .[$var]' "$RESTIC_CONFIG_FILE")"
           export "$var"="$value"
       done
+
+      RESTIC=("restic")
+      if [ -n "$S3_VIRTUAL_HOSTED_STYLE" ]; then
+        RESTIC=("restic" "-o" "s3.bucket-lookup=dns")
+        echo "virtual hosted style selected"
+      fi
       
       if [ ! -f "$RESTIC_CACHE/$target.init" ]; then
-        if restic check --cache-dir="$RESTIC_CACHE/$target"; then
+        if "${RESTIC[@]}" check --cache-dir="$RESTIC_CACHE/$target"; then
             touch "$RESTIC_CACHE/$target.init"
-        elif restic init --cache-dir="$RESTIC_CACHE/$target"; then
+        elif "${RESTIC[@]}" init --cache-dir="$RESTIC_CACHE/$target"; then
             touch "$RESTIC_CACHE/$target.init"
         fi
       fi
@@ -73,10 +79,10 @@ if [ -n "$(git status --porcelain)" ]; then
       if [ ! -f "$RESTIC_CACHE/$target.init" ]; then
         failed=true
       else
-        if ! restic unlock --cache-dir="$RESTIC_CACHE/$target"; then
+        if ! "${RESTIC[@]}" unlock --cache-dir="$RESTIC_CACHE/$target"; then
           failed=true
         else
-          if ! restic backup --cache-dir="$RESTIC_CACHE/$target" "$BACKUP_PATH"; then
+          if ! "${RESTIC[@]}" backup --cache-dir="$RESTIC_CACHE/$target" "$BACKUP_PATH/bitwarden.sql"; then
             failed=true
           else
             echo "target $target sync successfully"
