@@ -8,14 +8,18 @@ ARG TIME_ZONE
 ENV USER=nonroot
 ENV UID=65532
 
-RUN adduser \
-    --disabled-password \
-    --gecos "" \
-    --home "/nonexistent" \
-    --shell "/sbin/nologin" \
-    --no-create-home \
-    --uid "${UID}" \
-    "${USER}"
+RUN addgroup \
+      --gid $UID \
+      $USER && \
+    adduser \
+      --disabled-password \
+      --gecos "" \
+      --home "/nonexistent" \
+      --shell "/sbin/nologin" \
+      --no-create-home \
+      --uid "${UID}" \
+      --ingroup $USER \
+      "${USER}"
 
 RUN sed -i -E 's/(listen[ ]+)80;/\18080;/' /etc/nginx/conf.d/default.conf
 

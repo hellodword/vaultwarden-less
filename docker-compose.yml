@@ -74,7 +74,7 @@ services:
     #     limits:
     #       cpus: "0.7"
     #       memory: 512M
-    image: ghcr.io/hellodword/vaultwarden-less-syslog-parser:master
+    image: ghcr.io/hellodword/vaultwarden-less-syslog-parser:latest
     # build:
     #   context: .
     #   dockerfile: ./docker/distroless-syslog-parser.Dockerfile

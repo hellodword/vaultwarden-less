@@ -123,11 +123,11 @@ Edit the `docker-compose.yml`:
 
 ```diff
            memory: 128M
--    image: ghcr.io/hellodword/vaultwarden-less-syslog-parser:master
+-    image: ghcr.io/hellodword/vaultwarden-less-syslog-parser:latest
 -    # build:
 -    #   context: .
 -    #   dockerfile: ./docker/distroless-syslog-parser.Dockerfile
-+    # image: ghcr.io/hellodword/vaultwarden-less-syslog-parser:master
++    # image: ghcr.io/hellodword/vaultwarden-less-syslog-parser:latest
 +    build:
 +      context: .
 +      dockerfile: ./docker/distroless-syslog-parser.Dockerfile
@@ -159,9 +159,7 @@ docker compose up --build --pull always -d
 
 ## ref
 
-- distroless
-  - https://github.com/TheProjectAurora/distroless-nginx/blob/cd36b3fb754dd31e20303dbe9ddd45afb7091fbf/Dockerfile
-  - https://github.com/kyos0109/nginx-distroless/blob/4fa36b8c066303f34e490aad7b407d447ade4b7d/Dockerfile
+- distroless: https://github.com/hellodword/distroless-all
 - Nginx hardening
   - https://github.com/trimstray/nginx-admins-handbook/blob/master/doc/RULES.md
 - CVE-less
