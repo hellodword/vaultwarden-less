@@ -59,6 +59,12 @@ RUN mkdir -p /opt/bin /opt/etc /opt/usr/bin && \
   ldd "$(which dirname)" | grep -oP '(?<==> )/lib/[^ ]+\.so' | xargs -I {} bash -xc 'cp -a --parents {}* /opt' && \
   cp -a --parents "$(which pwd)" /opt && \
   ldd "$(which pwd)" | grep -oP '(?<==> )/lib/[^ ]+\.so' | xargs -I {} bash -xc 'cp -a --parents {}* /opt' && \
+  cp -a --parents "$(which mkdir)" /opt && \
+  ldd "$(which mkdir)" | grep -oP '(?<==> )/lib/[^ ]+\.so' | xargs -I {} bash -xc 'cp -a --parents {}* /opt' && \
+  cp -a --parents "$(which mktemp)" /opt && \
+  ldd "$(which mktemp)" | grep -oP '(?<==> )/lib/[^ ]+\.so' | xargs -I {} bash -xc 'cp -a --parents {}* /opt' && \
+  cp -a --parents "$(which rm)" /opt && \
+  ldd "$(which rm)" | grep -oP '(?<==> )/lib/[^ ]+\.so' | xargs -I {} bash -xc 'cp -a --parents {}* /opt' && \
   true
 
 COPY scripts /opt/scripts
@@ -68,5 +74,7 @@ FROM gcr.io/distroless/base-debian12:nonroot
 COPY --from=base /opt /
 COPY --from=builder /usr/local/bin/trigger /usr/local/bin/trigger
 COPY trigger.json /
+
+ENV HOME=/home/nonroot
 
 CMD ["/usr/local/bin/trigger", "-config", "/trigger.json"]

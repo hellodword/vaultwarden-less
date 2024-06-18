@@ -20,7 +20,7 @@ Run and backup vaultwarden rootless, distroless and CVE-less.
     - [ ] healthcheck
     - [ ] CVE-less
   - [x] service:trigger
-    - [x] distroless
+    - [x] ~~distroless~~ (maybe)
     - [x] nonroot
     - [ ] healthcheck
     - [ ] CVE-less
@@ -108,6 +108,28 @@ Edit the `docker-compose.yml`
      hostname: trigger
      logging:
        driver: "local"
+```
+
+</details>
+
+<details>
+<summary><b>
+Click this if you don't trust ghcr.io and want to build the images by yourself
+</b></summary>
+
+Edit the `docker-compose.yml`:
+
+```diff
+           memory: 128M
+-    image: ghcr.io/hellodword/vaultwarden-less-trigger:latest
+-    # build:
+-    #   context: .
+-    #   dockerfile: ./docker/distroless-trigger.Dockerfile
++    # image: ghcr.io/hellodword/vaultwarden-less-trigger:latest
++    build:
++      context: .
++      dockerfile: ./docker/distroless-trigger.Dockerfile
+     env_file:
 ```
 
 </details>
