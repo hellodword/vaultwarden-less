@@ -20,7 +20,7 @@ jobs:
       matrix:
         image:
           - distroless-nginx
-          - distroless-syslog-parser
+          - distroless-trigger
 
     steps:
       - name: Checkout Repository

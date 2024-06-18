@@ -7,7 +7,7 @@ COPY go.mod go.sum ./
 RUN go mod download && go mod verify
 
 COPY cmd ./cmd
-RUN go build -x -v -trimpath -ldflags "-s -w" -buildvcs=false -o /usr/local/bin/syslog-parser ./cmd/syslog-parser
+RUN go build -x -v -trimpath -ldflags "-s -w" -buildvcs=false -o /usr/local/bin/trigger ./cmd/trigger
 
 FROM debian:12 as base
 
@@ -66,7 +66,7 @@ COPY scripts /opt/scripts
 FROM gcr.io/distroless/base-debian12:nonroot
 
 COPY --from=base /opt /
-COPY --from=builder /usr/local/bin/syslog-parser /usr/local/bin/syslog-parser
-COPY syslog-parser.json /
+COPY --from=builder /usr/local/bin/trigger /usr/local/bin/trigger
+COPY trigger.json /
 
-CMD ["/usr/local/bin/syslog-parser", "-config", "/syslog-parser.json"]
+CMD ["/usr/local/bin/trigger", "-config", "/trigger.json"]

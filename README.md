@@ -19,7 +19,7 @@ Run and backup vaultwarden rootless, distroless and CVE-less.
     - [x] nonroot
     - [ ] healthcheck
     - [ ] CVE-less
-  - [x] service:syslog-parser
+  - [x] service:trigger
     - [x] distroless
     - [x] nonroot
     - [ ] healthcheck
@@ -29,16 +29,14 @@ Run and backup vaultwarden rootless, distroless and CVE-less.
 
 Bitwarden applies all changes to the vaultwarden database, so I prefer to backup on each change. I used `inotifywatch`, it works, but not graceful, and sometimes buggy.
 
-In `vaultwarden-less`, I created a [syslog-parser](./cmd/syslog-parser/main.go) to receive access_log (`status`, `request_method`, `request_uri`) from Nginx[^1], cool!
+In `vaultwarden-less`, I created a [trigger](./cmd/trigger/main.go) as a reverse proxy between Nginx and vaultwarden. So all the requests that change the database will trigger [scripts/backup](./scripts/backup), and report results via [scripts/notify](./scripts/notify)
 
-All the requests that change the database will trigger [scripts/backup](./scripts/backup), and report results via [scripts/notify](./scripts/notify)
-
-I use git, [restic](https://github.com/restic/restic) and [bark](https://github.com/Finb/bark) in the scripts, but you can replace them to anything, and make sure they'll be working with [distroless-syslog-parser](./docker/distroless-syslog-parser.Dockerfile).
+I use git, [restic](https://github.com/restic/restic) and [bark](https://github.com/Finb/bark) in the scripts, but you can replace them to anything, and make sure they'll be working with [distroless-trigger](./docker/distroless-trigger.Dockerfile).
 
 The [scripts/backup](./scripts/backup) receives no arguments and the [scripts/notify](./scripts/notify) receives one argument.
 
 > [!CAUTION]
-> Currently it's for personal usage, there's a lock in [syslog-parser](./cmd/syslog-parser/main.go), so it won't work well with too much concurrent changes.
+> Currently it's for personal usage, there's a lock in [trigger](./cmd/trigger/main.go), so it won't work well with too much concurrent changes.
 
 ## how to use
 
@@ -102,36 +100,14 @@ Edit the `docker-compose.yml`
        driver: "local"
        options:
 
-   syslog-parser:
+   trigger:
 +     networks:
 +       - wan
 +     sysctls:
 +       - net.ipv6.conf.all.disable_ipv6=0
-     hostname: syslog-parser
+     hostname: trigger
      logging:
        driver: "local"
-```
-
-</details>
-
-<details>
-<summary><b>
-Click this if you don't trust ghcr.io and want to build the images by yourself
-</b></summary>
-
-Edit the `docker-compose.yml`:
-
-```diff
-           memory: 128M
--    image: ghcr.io/hellodword/vaultwarden-less-syslog-parser:latest
--    # build:
--    #   context: .
--    #   dockerfile: ./docker/distroless-syslog-parser.Dockerfile
-+    # image: ghcr.io/hellodword/vaultwarden-less-syslog-parser:latest
-+    build:
-+      context: .
-+      dockerfile: ./docker/distroless-syslog-parser.Dockerfile
-     env_file:
 ```
 
 </details>
@@ -168,6 +144,5 @@ docker compose up --build --pull always -d
   - https://www.chainguard.dev/unchained/migrating-a-node-js-application-to-chainguard-images
   - https://www.chainguard.dev/unchained/reducing-vulnerabilities-in-backstage-with-chainguards-wolfi
   - https://www.chainguard.dev/unchained/zero-cves-and-just-as-fast-chainguards-python-go-images
-
-[^1]: https://docs.nginx.com/nginx/admin-guide/monitoring/logging/#logging-to-syslog
-[^2]: https://news.ycombinator.com/item?id=38110286
+- httputil.ReverseProxy
+  - https://blog.joshsoftware.com/2021/05/25/simple-and-powerful-reverseproxy-in-go/

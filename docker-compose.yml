@@ -63,8 +63,8 @@ services:
     #   retries: 100
     #   start_period: 0s
 
-  syslog-parser:
-    hostname: syslog-parser
+  trigger:
+    hostname: trigger
     logging:
       driver: "local"
       options:
@@ -74,10 +74,10 @@ services:
     #     limits:
     #       cpus: "0.7"
     #       memory: 512M
-    image: ghcr.io/hellodword/vaultwarden-less-syslog-parser:latest
+    image: ghcr.io/hellodword/vaultwarden-less-trigger:latest
     # build:
     #   context: .
-    #   dockerfile: ./docker/distroless-syslog-parser.Dockerfile
+    #   dockerfile: ./docker/distroless-trigger.Dockerfile
     env_file:
       - .env
     restart: unless-stopped
@@ -87,4 +87,4 @@ services:
       - ./git-backup:/git-backup:rw
       - ./restic-cache:/restic-cache:rw
       - ./restic.json:/restic.json:ro
-      - ./syslog-parser.json:/syslog-parser.json:ro
+      - ./trigger.json:/trigger.json:ro

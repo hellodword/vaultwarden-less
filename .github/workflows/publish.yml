@@ -8,7 +8,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository_owner }}/vaultwarden-less-syslog-parser
+  IMAGE_NAME: ${{ github.repository_owner }}/vaultwarden-less-trigger
 
 jobs:
   build-and-push-image:
@@ -51,4 +51,4 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          file: docker/distroless-syslog-parser.Dockerfile
+          file: docker/distroless-trigger.Dockerfile

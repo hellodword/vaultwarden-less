@@ -1,0 +1,11 @@
+{
+  "addr": ":8080",
+  "upstream": "http://vaultwarden",
+  "exclude_path": [
+    "^/identity/connect/token",
+    "^/identity/accounts/prelogin",
+    ".*/devices/.*",
+    ".*/two-factor/.*"
+  ],
+  "include_method": ["POST", "PUT", "DELETE"]
+}
