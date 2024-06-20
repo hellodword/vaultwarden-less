@@ -113,7 +113,7 @@ for i in ${!targets[@]}; do
   last_check="$(cat "$CACHE_DIR/$target.last_check" 2>/dev/null || echo "0")"
   current_time="$(date +%s)"
   check_opt=()
-  if [ $((current_time - last_check)) -ge 86400 ]; then
+  if [[ "$(jq -r --arg target "$target" '.[$target] | has("STRICT_CHECK")' "$CONFIG_FILE")" = "true" && $((current_time - last_check)) -ge 86400 ]]; then
     check_opt+=("--no-cache")
     echo "++++++++++++ fully check selected"
     echo "$current_time" > "$CACHE_DIR/$target.last_check"
