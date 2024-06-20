@@ -4,10 +4,7 @@ Run and backup vaultwarden rootless, distroless and CVE-less.
 
 ## features
 
-- [x] protect vaultwarden with proxies
-  - [x] Nginx hardening
-  - [x] obscurity
-- [x] trigger backup via Nginx access log
+- [x] trigger backup on change
 - [ ] hardening docker images
   - [ ] service:vaultwarden
     - [ ] distroless
@@ -19,23 +16,15 @@ Run and backup vaultwarden rootless, distroless and CVE-less.
     - [x] nonroot
     - [x] healthcheck
     - [ ] CVE-less (hard, becase I use prebuilt restic in it, I can compile it with the latest Go version, but the dependencies are always vulnerable)
-  - [x] service:nginx
-    - [x] distroless
-    - [x] nonroot
-    - [x] CVE-less
 
 ## how it works
 
-Bitwarden applies all changes to the vaultwarden database, so it's possible to backup on each change. I used `inotifywatch`, it works, but not graceful, and sometimes buggy.
+Bitwarden applies all changes to the vaultwarden database, making it possible to backup on each change. I used `inotifywatch`, it works, but it's not graceful and can be buggy at times.
 
-In `vaultwarden-less`, I created a [trigger](./cmd/trigger/main.go) as a reverse proxy between Nginx and vaultwarden. So all the requests that change the database will trigger [scripts/backup](./scripts/backup), and report results via [scripts/notify](./scripts/notify)
-
-I use git, [restic](https://github.com/restic/restic) and [bark](https://github.com/Finb/bark) in the scripts, but you can replace them to anything, and make sure they'll be working with [distroless-trigger](./docker/distroless-trigger.Dockerfile).
-
-The [scripts/backup](./scripts/backup) receives no arguments, it should be secure (DoS not considered). But the [scripts/notify](./scripts/notify) receives one argument as message, I format the URIs in the source code, **but still should be careful**.
+In `vaultwarden-less`, I created a [trigger](./cmd/trigger/main.go) that acts as a reverse proxy before vaultwarden. This way, all requests that change the database trigger the [scripts/backup](./scripts/backup), and report results via the [scripts/notify](./scripts/notify)
 
 > [!CAUTION]
-> Currently it's for personal usage, there's a lock in [trigger](./cmd/trigger/main.go), so it won't work well with too much concurrent changes.
+> Currently, this setup is for personal usage. There is a lock in the [trigger](./cmd/trigger/main.go), so it doesn't handle too many concurrent changes well.
 
 ## how to use
 
@@ -89,24 +78,6 @@ Edit the `docker-compose.yml`
      logging:
        driver: "local"
 
-
-   nginx:
-+     networks:
-+       - wan
-+     sysctls:
-+       - net.ipv6.conf.all.disable_ipv6=1
-     logging:
-       driver: "local"
-       options:
-
-   trigger:
-+     networks:
-+       - wan
-+     sysctls:
-+       - net.ipv6.conf.all.disable_ipv6=0
-     hostname: trigger
-     logging:
-       driver: "local"
 ```
 
 </details>
@@ -133,36 +104,53 @@ Edit the `docker-compose.yml`:
 
 </details>
 
-<details>
-<summary><b>
-Click if you want to customize the vaultwarden features
-</b></summary>
+---
 
-See https://github.com/dani-garcia/vaultwarden/blob/main/.env.template
-
-And modify the [.env.vaultwarden](./.env.vaultwarden)
-
-</details>
+1. clone repo
 
 ```sh
-# clone repo
-git clone --depth=1 https://github.com/hellodword/vaultwarden-less && cd vaultwarden-less
+git clone --depth=1 https://github.com/hellodword/vaultwarden-less
 
-# prepare directories and chown for distroless nonroot
-# https://github.com/GoogleContainerTools/distroless/blob/64ac73c84c72528d574413fb246161e4d7d32248/common/variables.bzl#L18
+cd vaultwarden-less
+```
+
+2. prepare directories and chown for nonroot distroless container
+
+```sh
 mkdir -p data git-backup restic-cache
 sudo chown -R 65532:65532 git-backup data restic-cache
+```
 
-cp restic.json.template restic.json
-vim restic.conf
+3. replace the [scripts/backup](./scripts/backup) and [scripts/notify](./scripts/notify) with your own scripts or executables
 
-cp .env.template .env
-vim .env
+I use git, [restic](https://github.com/restic/restic) and [bark](https://github.com/Finb/bark) in my scripts, but you can replace them to anything, and make sure they'll be working with [distroless-trigger](./docker/distroless-trigger.Dockerfile).
 
-vim trigger.json
+The [scripts/backup](./scripts/backup) receives no arguments and should be secure (DoS not considered). The [scripts/notify](./scripts/notify) receives one argument, which is the notification message, although I format the URIs in the source code, **but you should still be cautious**.
 
-# ignore this if you don't know what this is
-vim obscurity/obscurity.conf
+4. customize the vaultwarden features
+
+> > See https://github.com/dani-garcia/vaultwarden/blob/main/.env.template
+
+```sh
+vim .env.vaultwarden
+```
+
+5. customize the trigger configuration
+
+> > edit the `exclude_path`, see the regexp syntax https://pkg.go.dev/regexp/syntax
+
+```sh
+vim config/trigger.json
+```
+
+6. expose the trigger (`127.0.0.1:8080`) to the world
+
+I'm using Nginx and Cloudflare, but you can use any tools and services you prefer.
+
+7. start
+
+```sh
+docker compose down -t 360
 
 docker compose up --build --pull always -d
 ```
@@ -170,8 +158,6 @@ docker compose up --build --pull always -d
 ## ref
 
 - distroless: https://github.com/hellodword/distroless-all
-- Nginx hardening
-  - https://github.com/trimstray/nginx-admins-handbook/blob/master/doc/RULES.md
 - CVE-less
   - https://github.com/aquasecurity/trivy
   - https://docs.docker.com/scout/

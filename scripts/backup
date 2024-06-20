@@ -5,7 +5,7 @@ set -e
 DB_PATH="/data"
 DB_NAME="db.sqlite3"
 BACKUP_PATH="/git-backup"
-CONFIG_FILE="/restic.json"
+CONFIG_FILE="/config/restic.json"
 CACHE_DIR="/restic-cache"
 INIT_DIR="$HOME/restic-init"
 

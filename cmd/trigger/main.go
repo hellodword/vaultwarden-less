@@ -17,52 +17,43 @@ import (
 	"os/signal"
 	"regexp"
 	"slices"
+	"strings"
 	"sync"
 	"syscall"
+	"time"
 )
 
-func NewProxy(upstream string) (*httputil.ReverseProxy, error) {
-	u, err := url.Parse(upstream)
-	if err != nil {
-		return nil, err
-	}
-
-	if u.String() == "" {
-		return nil, fmt.Errorf("invalid upstream %s", upstream)
-	}
-
-	return httputil.NewSingleHostReverseProxy(u), nil
-}
-
-func ProxyRequestHandler(proxy *httputil.ReverseProxy) func(http.ResponseWriter, *http.Request) {
-	return func(w http.ResponseWriter, r *http.Request) {
-		proxy.ServeHTTP(w, r)
-	}
-}
-
 type Config struct {
-	Upstream string `json:"upstream"`
-	Addr     string `json:"addr"`
-	// https://pkg.go.dev/regexp
-	ExcludePath   []string `json:"exclude_path"`
-	IncludeMethod []string `json:"include_method"`
+	Upstream            string   `json:"upstream"`
+	Addr                string   `json:"addr"`
+	ExcludePath         []string `json:"exclude_path"`
+	IncludeMethod       []string `json:"include_method"`
+	Script              Script   `json:"script"`
+	VerboseNotification bool     `json:"verbose_notification"`
+}
+
+type Script struct {
+	Backup string `json:"backup"`
+	Notify string `json:"notify"`
 }
 
 func loadConfig(configFile string) (*Config, error) {
 	b, err := os.ReadFile(configFile)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to read config file: %w", err)
 	}
 
 	var c Config
 	err = json.Unmarshal(b, &c)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to unmarshal config: %w", err)
 	}
 
-	// verify
+	// Verify patterns
 	for _, pattern := range c.ExcludePath {
-		regexp.MustCompile(pattern).MatchString("/")
+		if _, err := regexp.Compile(pattern); err != nil {
+			return nil, fmt.Errorf("invalid exclude_path pattern %s: %w", pattern, err)
+		}
 	}
 
 	return &c, nil
@@ -74,78 +65,65 @@ func main() {
 
 	config, err := loadConfig(*configFile)
 	if err != nil {
-		panic(err)
+		log.Fatalf("failed to load config: %v", err)
 	}
 
-	log.Printf("config %+v\n", config)
-
-	proxy, err := NewProxy(config.Upstream)
-	if err != nil {
-		panic(err)
-	}
+	log.Printf("loaded config: %+v\n", config)
 
 	var wgConsumer, wgProducer sync.WaitGroup
 	var taskCh = make(chan string)
 	var quitCh = make(chan struct{})
 
-	wgConsumer.Add(1)
-	go func() {
-		defer wgConsumer.Done()
-		for task := range taskCh {
-			onChange(task)
-		}
-	}()
+	upstream, err := url.Parse(config.Upstream)
+	if err != nil || upstream.String() == "" {
+		log.Fatalf("invalid upstream URL: %v", err)
+	}
 
-	proxy.ModifyResponse = func(response *http.Response) error {
+	proxy := httputil.NewSingleHostReverseProxy(upstream)
+	proxy.ModifyResponse = func(response *http.Response) (_ error) {
 		// nil r.Request? i dont care
 		method, path, status := response.Request.Method, response.Request.URL.Path, response.StatusCode
 
 		// exclude failed requests
 		if status < http.StatusOK || status >= http.StatusMultipleChoices {
-			return nil
+			return
 		}
 
-		// only POST PUT DELETE will modify database
-		if !slices.Contains(config.IncludeMethod, method) {
-			return nil
+		if !slices.Contains(config.IncludeMethod, method) || isExcludedPath(config.ExcludePath, path) {
+			return
 		}
 
-		// exclude changes
-		var excluded = false
-		for _, pattern := range config.ExcludePath {
-			if regexp.MustCompile(pattern).MatchString(path) {
-				excluded = true
-				break
-			}
-		}
-		if excluded {
-			return nil
-		}
+		task := formatRequest(method, path, status)
 
-		formatted := formatRequest(method, path, status)
-
-		// TODO concurrent
 		wgProducer.Add(1)
 		go func() {
 			defer wgProducer.Done()
-			log.Println("adding", formatted)
-			defer log.Println("added", formatted)
-
-			taskCh <- formatted
+			log.Println("queueing task:", task)
+			defer log.Println("queued task", task)
+			taskCh <- task
 		}()
 
-		return nil
+		return
 	}
 
-	http.HandleFunc("/", ProxyRequestHandler(proxy))
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { proxy.ServeHTTP(w, r) })
 	server := &http.Server{Addr: config.Addr, Handler: nil}
+
 	go func() {
 		log.Println("listening on", config.Addr)
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Println("server err", err)
+			log.Printf("server error: %v\n", err)
 		}
 
 		close(quitCh)
+	}()
+
+	wgConsumer.Add(1)
+	go func() {
+		defer wgConsumer.Done()
+		for task := range taskCh {
+			handleTask(task, config)
+		}
 	}()
 
 	notifier := make(chan os.Signal, 1)
@@ -159,10 +137,11 @@ func main() {
 		break
 	}
 
-	// by default, docker compose will forcefully kill the container after 10 seconds, so notify when shutting down
+	// by default, docker compose will forcefully kill the container after 10 seconds,
+	// if there is no task in the queue, this notification won't be successfully executed,
 	// a better way is `docker compose stop/down -t 300`
-	go notify("shutting down")
-	server.Shutdown(context.Background())
+	go execute(config.Script.Notify, "shutting down")
+	shutdownServer(server)
 
 	// make sure all the tasks been handled
 	wgProducer.Wait()
@@ -170,55 +149,63 @@ func main() {
 	wgConsumer.Wait()
 }
 
-func formatRequest(method, path string, status int) string {
-	var uri []byte
-	for _, b := range []byte(path) {
-		if b == '/' || ('0' <= b && '9' <= b) || ('a' <= b && 'z' <= b) || ('A' <= b && 'Z' <= b) {
-			uri = append(uri, b)
-		} else {
-			break
+func isExcludedPath(patterns []string, path string) bool {
+	for _, pattern := range patterns {
+		if regexp.MustCompile(pattern).MatchString(path) {
+			return true
 		}
 	}
-	return fmt.Sprintf("(%s)(%d)(%s)", method, status, string(uri))
+	return false
 }
 
-func onChange(formatted string) {
-	log.Println("handling task", formatted)
-	defer log.Println("handled task", formatted)
+func formatRequest(method, path string, status int) string {
+	safePath := strings.Map(func(b rune) rune {
+		if b == '/' || ('0' <= b && b <= '9') || ('a' <= b && b <= 'z') || ('A' <= b && b <= 'Z') {
+			return b
+		}
+		return '-'
+	}, path)
+	return fmt.Sprintf("(%s)(%d)(%s)", method, status, safePath)
+}
 
-	output, err := backup()
+func handleTask(task string, config *Config) {
+	log.Println("handling task", task)
+	defer log.Println("handled task", task)
+
+	output, err := execute(config.Script.Backup)
 	if err != nil {
-		msg := fmt.Sprintf("%s failed: %s", formatted, err.Error())
+		msg := fmt.Sprintf("%s failed: %s", task, err.Error())
 		log.Println(msg)
-		notify(output + "\n" + msg)
+		if config.VerboseNotification {
+			msg = output + "\n" + msg
+		}
+		execute(config.Script.Notify, msg)
 		return
 	}
 
-	msg := fmt.Sprintf("%s succeed", formatted)
+	msg := fmt.Sprintf("%s succeed", task)
 	log.Println(msg)
-	notify(msg)
+	execute(config.Script.Notify, msg)
 }
 
-func backup() (string, error) {
-	cmd := exec.Command("/scripts/backup")
+func execute(name string, arg ...string) (string, error) {
+	cmd := exec.Command(name, arg...)
 	var output bytes.Buffer
 	cmd.Stdout = io.MultiWriter(os.Stdout, &output)
 	cmd.Stderr = io.MultiWriter(os.Stderr, &output)
 	err := cmd.Run()
 	if err != nil {
-		return output.String(), err
+		return "", fmt.Errorf("command execution failed: %w", err)
 	}
 	return output.String(), nil
 }
 
-func notify(msg string) (string, error) {
-	cmd := exec.Command("/scripts/notify", msg)
-	var output bytes.Buffer
-	cmd.Stdout = io.MultiWriter(os.Stdout, &output)
-	cmd.Stderr = io.MultiWriter(os.Stderr, &output)
-	err := cmd.Run()
-	if err != nil {
-		return output.String(), err
+func shutdownServer(server *http.Server) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := server.Shutdown(ctx); err != nil {
+		log.Println("server shutdown error:", err)
+	} else {
+		log.Println("server gracefully stopped")
 	}
-	return output.String(), nil
 }

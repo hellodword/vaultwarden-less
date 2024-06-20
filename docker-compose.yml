@@ -42,14 +42,15 @@ services:
     #   dockerfile: ./docker/distroless-trigger.Dockerfile
     env_file:
       - .env
+    ports:
+      - "127.0.0.1:8080:8080"
     restart: unless-stopped
     volumes:
       - ./data:/data:ro
       - ./scripts:/scripts:ro
       - ./git-backup:/git-backup:rw
       - ./restic-cache:/restic-cache:rw
-      - ./restic.json:/restic.json:ro
-      - ./trigger.json:/trigger.json:ro
+      - ./config:/config:ro
     healthcheck:
       test:
         [
@@ -61,21 +62,3 @@ services:
       interval: 2s
       timeout: 1s
       retries: 10
-
-  nginx:
-    depends_on:
-      trigger:
-        condition: service_healthy
-    logging:
-      driver: "local"
-      options:
-        max-size: "50m"
-    build:
-      context: .
-      dockerfile: ./docker/distroless-nginx.Dockerfile
-    ports:
-      - "127.0.0.1:8080:8080"
-    restart: unless-stopped
-    volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./obscurity:/etc/nginx/include/obscurity:ro

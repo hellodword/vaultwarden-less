@@ -7,5 +7,10 @@
     ".*/devices/.*",
     ".*/two-factor/.*"
   ],
-  "include_method": ["POST", "PUT", "DELETE"]
+  "include_method": ["POST", "PUT", "DELETE"],
+  "script": {
+    "backup": "/scripts/backup",
+    "notify": "/scripts/notify"
+  },
+  "verbose_notification": true
 }
