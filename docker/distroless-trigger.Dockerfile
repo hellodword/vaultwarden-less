@@ -9,17 +9,24 @@ RUN go mod download && go mod verify
 COPY cmd ./cmd
 RUN go build -x -v -trimpath -ldflags "-s -w" -buildvcs=false -o /usr/local/bin/trigger ./cmd/trigger
 
+FROM golang:bookworm as restic-builder
+
+ARG RESTIC_VERSION="0.16.4"
+
+WORKDIR /usr/src/app
+
+ENV CGO_ENABLED=0
+RUN git clone --depth=1 -b "v$RESTIC_VERSION" https://github.com/restic/restic restic && \
+  cd restic && \
+  go build -x -v -trimpath -ldflags "-s -w" -buildvcs=false -o /usr/local/bin/restic ./cmd/restic
+
 FROM debian:12 as base
 
 # https://en.wikipedia.org/wiki/List_of_tz_database_time_zones
 ARG TIME_ZONE
-ARG TARGETPLATFORM
-ARG RESTIC_VERSION="0.16.4"
 
 RUN apt-get update && \
-  DEBIAN_FRONTEND=noninteractive apt-get install -y git sqlite3 unzip curl jq bzip2 && \
-  curl -fsSL "https://github.com/restic/restic/releases/download/v${RESTIC_VERSION}/restic_${RESTIC_VERSION}_$(echo $TARGETPLATFORM | sed 's@/@_@').bz2" | bzip2 -d -c > /usr/bin/restic && \
-  chmod +x /usr/bin/restic
+  DEBIAN_FRONTEND=noninteractive apt-get install -y git sqlite3 curl jq
 
 RUN mkdir -p /opt/bin /opt/etc /opt/usr/bin && \
   cp /usr/share/zoneinfo/${TIME_ZONE:-UTC} /opt/etc/localtime && \
@@ -33,8 +40,6 @@ RUN mkdir -p /opt/bin /opt/etc /opt/usr/bin && \
   ldd "$(which env)" | grep -oP '(?<==> )/lib/[^ ]+\.so' | xargs -I {} bash -xc 'cp -a --parents {}* /opt' && \
   cp -a --parents "$(which date)" /opt && \
   ldd "$(which date)" | grep -oP '(?<==> )/lib/[^ ]+\.so' | xargs -I {} bash -xc 'cp -a --parents {}* /opt' && \
-  cp -a --parents "$(which restic)" /opt && \
-  ldd "$(which restic)" | grep -oP '(?<==> )/lib/[^ ]+\.so' | xargs -I {} bash -xc 'cp -a --parents {}* /opt' && \
   cp -a --parents "$(which grep)" /opt && \
   ldd "$(which grep)" | grep -oP '(?<==> )/lib/[^ ]+\.so' | xargs -I {} bash -xc 'cp -a --parents {}* /opt' && \
   cp -a --parents "$(which bash)" /opt && \
@@ -72,6 +77,7 @@ COPY scripts /opt/scripts
 FROM gcr.io/distroless/base-debian12:nonroot
 
 COPY --from=base /opt /
+COPY --from=restic-builder /usr/local/bin/restic /usr/local/bin/restic
 COPY --from=builder /usr/local/bin/trigger /usr/local/bin/trigger
 COPY trigger.json /
 

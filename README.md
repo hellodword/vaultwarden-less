@@ -4,36 +4,35 @@ Run and backup vaultwarden rootless, distroless and CVE-less.
 
 ## features
 
-- [ ] protect vaultwarden with proxies
-  - [ ] Nginx hardening
+- [x] protect vaultwarden with proxies
+  - [x] Nginx hardening
   - [x] obscurity
 - [x] trigger backup via Nginx access log
 - [ ] hardening docker images
   - [ ] service:vaultwarden
     - [ ] distroless
     - [x] nonroot
-    - [ ] healthcheck
-    - [ ] CVE-less
-  - [ ] service:nginx
-    - [x] distroless
-    - [x] nonroot
-    - [ ] healthcheck
+    - [x] healthcheck
     - [ ] CVE-less
   - [x] service:trigger
-    - [x] ~~distroless~~ (maybe)
+    - [x] ~~distroless~~ (maybe, because I use bash scripts in it, but I distroless it for fun)
     - [x] nonroot
-    - [ ] healthcheck
-    - [ ] CVE-less
+    - [x] healthcheck
+    - [ ] CVE-less (hard, becase I use prebuilt restic in it, I can compile it with the latest Go version, but the dependencies are always vulnerable)
+  - [x] service:nginx
+    - [x] distroless
+    - [x] nonroot
+    - [x] CVE-less
 
 ## how it works
 
-Bitwarden applies all changes to the vaultwarden database, so I prefer to backup on each change. I used `inotifywatch`, it works, but not graceful, and sometimes buggy.
+Bitwarden applies all changes to the vaultwarden database, so it's possible to backup on each change. I used `inotifywatch`, it works, but not graceful, and sometimes buggy.
 
 In `vaultwarden-less`, I created a [trigger](./cmd/trigger/main.go) as a reverse proxy between Nginx and vaultwarden. So all the requests that change the database will trigger [scripts/backup](./scripts/backup), and report results via [scripts/notify](./scripts/notify)
 
 I use git, [restic](https://github.com/restic/restic) and [bark](https://github.com/Finb/bark) in the scripts, but you can replace them to anything, and make sure they'll be working with [distroless-trigger](./docker/distroless-trigger.Dockerfile).
 
-The [scripts/backup](./scripts/backup) receives no arguments and the [scripts/notify](./scripts/notify) receives one argument.
+The [scripts/backup](./scripts/backup) receives no arguments, it should be secure (DoS not considered). But the [scripts/notify](./scripts/notify) receives one argument as message, I format the URIs in the source code, **but still should be careful**.
 
 > [!CAUTION]
 > Currently it's for personal usage, there's a lock in [trigger](./cmd/trigger/main.go), so it won't work well with too much concurrent changes.
@@ -42,7 +41,7 @@ The [scripts/backup](./scripts/backup) receives no arguments and the [scripts/no
 
 <details>
 <summary><b>
-Click this if you're running this on an IPv6-only EC2
+Click if you're running this on an IPv6-only EC2
 </b></summary>
 
 ```sh
@@ -114,7 +113,7 @@ Edit the `docker-compose.yml`
 
 <details>
 <summary><b>
-Click this if you don't trust ghcr.io and want to build the images by yourself
+Click if you don't trust ghcr.io and want to build the images by yourself
 </b></summary>
 
 Edit the `docker-compose.yml`:
@@ -134,6 +133,17 @@ Edit the `docker-compose.yml`:
 
 </details>
 
+<details>
+<summary><b>
+Click if you want to customize the vaultwarden features
+</b></summary>
+
+See https://github.com/dani-garcia/vaultwarden/blob/main/.env.template
+
+And modify the [.env.vaultwarden](./.env.vaultwarden)
+
+</details>
+
 ```sh
 # clone repo
 git clone --depth=1 https://github.com/hellodword/vaultwarden-less && cd vaultwarden-less
@@ -148,6 +158,8 @@ vim restic.conf
 
 cp .env.template .env
 vim .env
+
+vim trigger.json
 
 # ignore this if you don't know what this is
 vim obscurity/obscurity.conf

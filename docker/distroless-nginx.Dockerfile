@@ -34,8 +34,8 @@ RUN mkdir -p /opt/bin /opt/etc /opt/usr/bin /opt/var/cache/nginx && \
     cp -a --parents /etc/nginx /opt && \
     cp -a --parents "$(which nginx)" /opt && \
     ldd "$(which nginx)" | grep -oP '(?<==> )/lib/[^ ]+\.so' | xargs -I {} bash -xc 'cp -a --parents {}* /opt' && \
-    cp -a --parents "$(which nginx-debug)" /opt && \
-    ldd "$(which nginx-debug)" | grep -oP '(?<==> )/lib/[^ ]+\.so' | xargs -I {} bash -xc 'cp -a --parents {}* /opt' && \
+    # cp -a --parents "$(which nginx-debug)" /opt && \
+    # ldd "$(which nginx-debug)" | grep -oP '(?<==> )/lib/[^ ]+\.so' | xargs -I {} bash -xc 'cp -a --parents {}* /opt' && \
     true
 
 RUN chown -R nonroot:nonroot /opt/var/cache /opt/var/run

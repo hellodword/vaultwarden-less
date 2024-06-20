@@ -7,73 +7,35 @@ services:
       driver: "local"
       options:
         max-size: "50m"
-    # deploy:
-    #   resources:
-    #     limits:
-    #       cpus: "0.5"
-    #       memory: 128M
     image: vaultwarden/server:1.30.5
     # https://github.com/GoogleContainerTools/distroless/blob/64ac73c84c72528d574413fb246161e4d7d32248/common/variables.bzl#L18
     user: "65532:65532"
     restart: unless-stopped
     volumes:
       - ./data:/data:rw
-      # - ./log:/var/log/bitwarden:rw
-    environment:
-      WEB_VAULT_ENABLED: false
-      WEBSOCKET_ENABLED: false
-      ICON_SERVICE: "internal"
-      PUSH_ENABLED: false
-      SENDS_ALLOWED: false
-      SIGNUPS_ALLOWED: false
-      INVITATIONS_ALLOWED: false
-      EMAIL_CHANGE_ALLOWED: false
-      EMERGENCY_ACCESS_ALLOWED: false
-      DISABLE_ICON_DOWNLOAD: true
-      SHOW_PASSWORD_HINT: false
-      ICON_BLACKLIST_NON_GLOBAL_IPS: true
-      SMTP_EMBED_IMAGES: false
-      REQUIRE_DEVICE_EMAIL: false
-      DISABLE_ADMIN_TOKEN: false
-      USE_SENDMAIL: false
-
-  nginx:
-    logging:
-      driver: "local"
-      options:
-        max-size: "50m"
-    # deploy:
-    #   resources:
-    #     limits:
-    #       cpus: "0.5"
-    #       memory: 128M
-    build:
-      context: .
-      dockerfile: ./docker/distroless-nginx.Dockerfile
-    ports:
-      - "127.0.0.1:8080:8080"
-    restart: unless-stopped
-    volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./obscurity:/etc/nginx/include/obscurity:ro
-    # healthcheck:
-    #   test: ["CMD", "service", "nginx", "status"]
-    #   interval: 2s
-    #   timeout: 200s
-    #   retries: 100
-    #   start_period: 0s
+    env_file:
+      - .env.vaultwarden
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "bash",
+          "-c",
+          "[ -f /tmp/.healthy ] || (/healthcheck.sh && touch /tmp/.healthy)",
+        ]
+      interval: 2s
+      timeout: 1s
+      retries: 10
 
   trigger:
+    depends_on:
+      vaultwarden:
+        condition: service_healthy
     hostname: trigger
     logging:
       driver: "local"
       options:
         max-size: "50m"
-    # deploy:
-    #   resources:
-    #     limits:
-    #       cpus: "0.7"
-    #       memory: 512M
     image: ghcr.io/hellodword/vaultwarden-less-trigger:latest
     # build:
     #   context: .
@@ -88,3 +50,32 @@ services:
       - ./restic-cache:/restic-cache:rw
       - ./restic.json:/restic.json:ro
       - ./trigger.json:/trigger.json:ro
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "bash",
+          "-c",
+          "[ -f /tmp/.healthy ] || (curl --fail --silent --show-error http://127.0.0.1:8080/alive && touch /tmp/.healthy)",
+        ]
+      interval: 2s
+      timeout: 1s
+      retries: 10
+
+  nginx:
+    depends_on:
+      trigger:
+        condition: service_healthy
+    logging:
+      driver: "local"
+      options:
+        max-size: "50m"
+    build:
+      context: .
+      dockerfile: ./docker/distroless-nginx.Dockerfile
+    ports:
+      - "127.0.0.1:8080:8080"
+    restart: unless-stopped
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./obscurity:/etc/nginx/include/obscurity:ro

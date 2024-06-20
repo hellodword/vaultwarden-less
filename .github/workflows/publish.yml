@@ -10,6 +10,10 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository_owner }}/vaultwarden-less-trigger
 
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
 jobs:
   build-and-push-image:
     runs-on: ubuntu-latest

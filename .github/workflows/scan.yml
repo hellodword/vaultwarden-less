@@ -11,6 +11,10 @@ env:
   # see https://github.com/docker/scout-action/issues/8#issuecomment-1641723691
   REGISTRY: docker.io
 
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
 jobs:
   build-and-push-image:
     runs-on: ubuntu-latest
@@ -34,8 +38,8 @@ jobs:
         name: Cache Trivy Database
         with:
           path: .trivy
-          key: ${{ runner.os }}-trivy
-          restore-keys: ${{ runner.os }}-trivy
+          key: trivy-${{ runner.os }}-${{ matrix.image }}
+          restore-keys: trivy-${{ runner.os }}-${{ matrix.image }}
 
       - name: Run Trivy vulnerability scanner
         uses: aquasecurity/trivy-action@0.20.0
