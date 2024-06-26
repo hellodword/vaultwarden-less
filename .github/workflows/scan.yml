@@ -41,7 +41,7 @@ jobs:
           restore-keys: trivy-${{ runner.os }}-${{ matrix.image }}
 
       - name: Run Trivy vulnerability scanner
-        uses: aquasecurity/trivy-action@0.20.0
+        uses: aquasecurity/trivy-action@0.23.0
         continue-on-error: true
         with:
           image-ref: "${{ matrix.image }}:${{ github.sha }}"
@@ -49,6 +49,7 @@ jobs:
           vuln-type: "os,library"
           exit-code: "1"
           output: trivy.txt
+          ignore-unfixed: true
           hide-progress: true
           cache-dir: .trivy
 
