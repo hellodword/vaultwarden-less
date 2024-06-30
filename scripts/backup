@@ -39,7 +39,12 @@ cd "$BACKUP_PATH"
 [ -d ".git" ] || git init
 git config user.name bitwarden-backup
 git config user.email backup@bitwarden.com
-sqlite3 "$DB_PATH/$DB_NAME" .dump > bitwarden.sql
+
+# https://github.com/jjlin/vaultwarden-backup/blob/eccd7eff1bc23832bbe989c3ed881a47511fd8f7/backup.sh#L28-L40
+busy_timeout=30000 # in milliseconds
+sqlite3 -cmd ".timeout ${busy_timeout}" \
+           "file:${DB_PATH}/${DB_NAME}?mode=ro" \
+           ".dump" > bitwarden.sql
 if [ -z "$(git status --porcelain)" ]; then
   echo "++++++++++++ clean repo"
   exit 0
