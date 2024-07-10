@@ -16,7 +16,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build-and-push-image:
+  scan:
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -29,9 +29,14 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
+      - name: Read .env
+        id: read-env
+        run: |
+          cat .env.template | grep VERSION >> $GITHUB_OUTPUT
+
       - name: Build ${{ matrix.image }}
         run: |
-          docker build -t ${{ matrix.image }}:${{ github.sha }} -f docker/${{ matrix.image }}.Dockerfile .
+          docker build --build-arg "RESTIC_VERSION=${{ steps.read-env.outputs.RESTIC_VERSION }}" -t ${{ matrix.image }}:${{ github.sha }} -f docker/${{ matrix.image }}.Dockerfile .
 
       - uses: actions/cache@v4
         name: Cache Trivy Database

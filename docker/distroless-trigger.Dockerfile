@@ -1,4 +1,4 @@
-FROM golang:bookworm as builder
+FROM golang:bookworm AS builder
 
 WORKDIR /usr/src/app
 
@@ -9,9 +9,9 @@ RUN go mod download && go mod verify
 COPY cmd ./cmd
 RUN go build -x -v -trimpath -ldflags "-s -w" -buildvcs=false -o /usr/local/bin/trigger ./cmd/trigger
 
-FROM golang:bookworm as restic-builder
+FROM golang:bookworm AS restic-builder
 
-ARG RESTIC_VERSION="0.16.4"
+ARG RESTIC_VERSION
 
 WORKDIR /usr/src/app
 
@@ -20,7 +20,7 @@ RUN git clone --depth=1 -b "v$RESTIC_VERSION" https://github.com/restic/restic r
   cd restic && \
   go build -x -v -trimpath -ldflags "-s -w" -buildvcs=false -o /usr/local/bin/restic ./cmd/restic
 
-FROM debian:12 as base
+FROM debian:12 AS base
 
 # https://en.wikipedia.org/wiki/List_of_tz_database_time_zones
 ARG TIME_ZONE

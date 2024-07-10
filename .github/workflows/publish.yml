@@ -25,6 +25,11 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Read .env
+        id: read-env
+        run: |
+          cat .env.template | grep VERSION >> $GITHUB_OUTPUT
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
@@ -56,3 +61,4 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           file: docker/distroless-trigger.Dockerfile
+          build-args: RESTIC_VERSION=${{ steps.read-env.outputs.RESTIC_VERSION }}

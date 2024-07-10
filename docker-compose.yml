@@ -7,7 +7,7 @@ services:
       driver: "local"
       options:
         max-size: "50m"
-    image: vaultwarden/server:1.31.0
+    image: "vaultwarden/server:${VAULTWARDEN_SERVER_VERSION}"
     # https://github.com/GoogleContainerTools/distroless/blob/64ac73c84c72528d574413fb246161e4d7d32248/common/variables.bzl#L18
     user: "65532:65532"
     restart: unless-stopped
@@ -40,10 +40,12 @@ services:
     # build:
     #   context: .
     #   dockerfile: ./docker/distroless-trigger.Dockerfile
+    #   args:
+    #     - RESTIC_VERSION=${RESTIC_VERSION}
     env_file:
       - .env
     ports:
-      - "127.0.0.1:8080:8080"
+      - "${LISTEN_HOST}:8080"
     restart: unless-stopped
     volumes:
       - ./data:/data:ro
