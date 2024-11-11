@@ -60,7 +60,7 @@ jobs:
 
       # https://github.com/agilee/OBP-API/blob/31aae3945c168d844af5356f693a9d108cf325db/.github/workflows/run_trivy.yml#L47-L48
       - name: Fix .trivy permissions
-        run: sudo chown -R $(stat . -c %u:%g) .trivy
+        run: sudo chown -R $(stat . -c %u:%g) .trivy || true
 
       - name: Publish Trivy Output to Summary
         run: |
