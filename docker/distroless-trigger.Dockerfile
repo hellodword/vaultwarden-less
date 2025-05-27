@@ -11,7 +11,7 @@ RUN go build -x -v -trimpath -ldflags "-s -w" -buildvcs=false -o /usr/local/bin/
 
 FROM golang:bookworm AS restic-builder
 
-ARG RESTIC_VERSION="0.17.3"
+ARG RESTIC_VERSION="0.18.0"
 
 WORKDIR /usr/src/app
 
