@@ -7,7 +7,7 @@ services:
       driver: "local"
       options:
         max-size: "50m"
-    image: "vaultwarden/server:1.35.0"
+    image: "vaultwarden/server:1.35.1"
     # https://github.com/GoogleContainerTools/distroless/blob/64ac73c84c72528d574413fb246161e4d7d32248/common/variables.bzl#L18
     user: "65532:65532"
     restart: unless-stopped
