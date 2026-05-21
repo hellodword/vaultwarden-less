@@ -3,21 +3,14 @@
 > [!CAUTION]
 > Security through obscurity[^1] is not recommended at all.
 
-I use HTTPS + [cloudflare workers](../obscurity/cloudflare-workers-obscurity.js) + Nginx [obscurity.conf](../obscurity/obscurity.conf.template) to hide the path.
+I use HTTPS, Cloudflare, and Nginx to hide the public entry path.
 
-```
-location / {
-    include /etc/nginx/include/obscurity.conf;
-
-    # https://serverfault.com/a/587432
-    proxy_max_temp_file_size 0;
-
-    # ... security hardening
-
-    proxy_redirect off;
-    proxy_pass http://127.0.0.1:8080;
-    proxy_http_version 1.1;
-}
-```
+1. Run vaultwarden-less on a local address, for example `127.0.0.1:8080`.
+2. Use a long random string as the secret path segment.
+3. In Cloudflare, create a proxied DNS record for `bar.foo.com` that points to the server, and force HTTPS.
+4. On the server firewall, allow access to Nginx only from Cloudflare IP ranges[^2].
+5. In Nginx, proxy `https://bar.foo.com/<secret>/*` to `http://127.0.0.1:8080/*`.
 
 [^1]: https://en.wikipedia.org/wiki/Security_through_obscurity
+
+[^2]: https://www.cloudflare.com/ips/
