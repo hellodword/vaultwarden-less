@@ -6,3 +6,8 @@ rclone*.conf
 .env
 restic*.json
 restic-cache
+AGENTS.md
+tmp
+.agents
+.devcontainer
+.vscode
