@@ -1,0 +1,65 @@
+#!/bin/sh
+
+set -eu
+
+project_dir=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$project_dir"
+
+umask 077
+
+if [ ! -e .env ]; then
+  env_temp=$(mktemp ./.env.new.XXXXXX)
+  trap 'rm -f -- "$env_temp"' EXIT HUP INT TERM
+  {
+    printf 'PUID=%s\n' "$(id -u)"
+    printf 'PGID=%s\n' "$(id -g)"
+    printf 'LISTEN_HOST=127.0.0.1\n'
+    printf 'DOMAIN=\n'
+  } > "$env_temp"
+  chmod 0600 "$env_temp"
+  if ! mv -n -- "$env_temp" .env || [ -e "$env_temp" ]; then
+    printf '%s\n' 'refused to overwrite existing .env' >&2
+    exit 1
+  fi
+  trap - EXIT HUP INT TERM
+fi
+
+for directory in data state staging cache restore repositories secrets; do
+  if [ -L "$directory" ]; then
+    printf 'refused symlink directory: %s\n' "$directory" >&2
+    exit 1
+  fi
+  mkdir -p -- "$directory"
+  chmod 0700 "$directory"
+done
+
+for secret in \
+  primary_repository \
+  primary_restic_password \
+  primary_backup_username \
+  primary_backup_password \
+  primary_maintenance_username \
+  primary_maintenance_password
+do
+  path="secrets/$secret"
+  if [ -L "$path" ]; then
+    printf 'refused non-regular secret path: %s\n' "$path" >&2
+    exit 1
+  elif [ ! -e "$path" ]; then
+    secret_temp=$(mktemp "./secrets/.$secret.new.XXXXXX")
+    trap 'rm -f -- "$secret_temp"' EXIT HUP INT TERM
+    chmod 0600 "$secret_temp"
+    if ! mv -n -- "$secret_temp" "$path" || [ -e "$secret_temp" ]; then
+      printf 'refused to overwrite existing secret path: %s\n' "$path" >&2
+      exit 1
+    fi
+    trap - EXIT HUP INT TERM
+  elif [ ! -f "$path" ]; then
+    printf 'refused non-regular secret path: %s\n' "$path" >&2
+    exit 1
+  fi
+  chmod 0600 "$path"
+done
+
+printf '%s\n' 'initialized private directories without overwriting existing files'
+printf '%s\n' 'set DOMAIN in .env and populate every 0600 file under secrets/'

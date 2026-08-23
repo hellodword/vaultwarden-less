@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "listen_address": "0.0.0.0:8080",
+  "upstream_url": "http://vaultwarden:80",
+  "events_url": "http://backup:9090/v1/events",
+  "trusted_proxy_cidrs": [
+    "127.0.0.1/32",
+    "172.16.0.0/12",
+    "::1/128",
+    "fc00::/7"
+  ],
+  "max_request_bytes": 629145600,
+  "read_header_timeout": "10s",
+  "read_timeout": "30m",
+  "write_timeout": "30m",
+  "idle_timeout": "2m",
+  "upstream_response_header_timeout": "5m",
+  "event_timeout": "2s",
+  "shutdown_timeout": "2m"
+}

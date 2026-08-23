@@ -1,0 +1,11 @@
+**
+!go.mod
+!go.sum
+!cmd/
+!cmd/**
+!internal/
+!internal/**
+!docker/
+!docker/*.Dockerfile
+!LICENSE
+!THIRD_PARTY_LICENSES.md

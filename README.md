@@ -1,168 +1,126 @@
-# vaultwarden-less
+# vaultwarden-less 1.0
 
-Run and backup vaultwarden rootless, distroless and CVE-less.
+`vaultwarden-less` is a small, recovery-first deployment for general
+self-hosted Vaultwarden users. Version 1.0 separates the public reverse proxy
+from the private backup worker so that the public process has neither `/data`
+nor Restic or notification credentials.
 
-## features
+This is a new v1 contract. It does not read the old `trigger.json`, SQL/Git
+backup history, backup scripts, or CLI. Upgrading the repository does not
+delete those files, existing Vaultwarden data, or old Restic snapshots.
 
-- [x] trigger backup on change
-- [ ] hardening docker images
-  - [ ] service:vaultwarden
-    - [ ] distroless
-    - [x] nonroot
-    - [x] healthcheck
-    - [ ] CVE-less
-  - [x] service:trigger
-    - [x] ~~distroless~~ (maybe, because I use bash scripts in it, but I distroless it for fun)
-    - [x] nonroot
-    - [x] healthcheck
-    - [ ] CVE-less (hard, becase I use prebuilt restic in it, I can compile it with the latest Go version, but the dependencies are always vulnerable)
+## Supported scope
 
-## how it works
+- Vaultwarden `1.37.2`, SQLite, and files stored locally under `/data`.
+- Local attachments, file Sends, `rsa_key*`, `/data/config.json`, and custom
+  templates. Vaultwarden PostgreSQL/MySQL and Vaultwarden S3/MinIO attachment
+  or Send storage are not supported.
+- Restic `0.19.1` native local, REST, S3/MinIO/COS, B2, Azure, GCS, and Swift
+  backends. SFTP and rclone are intentionally absent from the image.
+- `linux/amd64` project images, starting at tag `1.0.0`. Other architectures
+  are outside the current support and release-validation scope.
 
-Bitwarden applies all changes to the vaultwarden database, making it possible to backup on each change. I used `inotifywatch`, it works, but it's not graceful and can be buggy at times.
+The image references use version tags rather than immutable digests. That is
+an accepted availability and supply-chain risk; read [the threat
+model](docs/architecture.md) before deployment.
 
-In `vaultwarden-less`, I created a [trigger](./cmd/trigger/main.go) that acts as a reverse proxy before vaultwarden. This way, all requests that change the database trigger the [scripts/backup](./scripts/backup), and report results via the [scripts/notify](./scripts/notify)
+The tracked Vaultwarden environment fixes `DATA_FOLDER`, `DATABASE_URL`, and
+every recoverable asset folder to local `/data` paths. Do not override them with
+database servers or `s3://` storage; those deployments are outside this
+recovery contract.
 
-> [!CAUTION]
-> Currently, this setup is for personal usage. There is a lock in the [trigger](./cmd/trigger/main.go), so it doesn't handle too many concurrent changes well.
+## Services
 
-## how to use
+| Service | Public reachability | Data and credentials |
+| --- | --- | --- |
+| `vaultwarden` | only through `proxy` | read/write `/data`; no backup credentials |
+| `proxy` | `127.0.0.1:8080` by default | no data, state, cache, or secrets |
+| `backup` | private event network plus outbound network | read-only `/data`; private state, staging, cache, optional local repositories, and secrets |
 
-<details>
-<summary><b>
-Click if you're running this on an IPv6-only EC2
-</b></summary>
+Maintenance and restore are one-shot Compose profiles. Maintenance never
+mounts `/data`; restore writes only beneath `./restore`.
 
-```sh
-# enable IPv6 support of docker
-# https://docs.docker.com/config/daemon/ipv6/
-sudo vim /etc/docker/daemon.json
-# {
-#   "ipv6": true,
-#   "fixed-cidr-v6": "2001:db8:1::/64",
-#   "experimental": true,
-#   "ip6tables": true
-# }
-sudo systemctl restart docker
+## Start a new deployment
 
-# enable GitHub/ghcr.io IPv6 proxy (shame on you GitHub!)
-# https://danwin1210.de/github-ipv6-proxy.php
-vim /etc/hosts
-# 2a01:4f8:c010:d56::2 github.com
-# 2a01:4f8:c010:d56::3 api.github.com
-# 2a01:4f8:c010:d56::4 codeload.github.com
-# 2a01:4f8:c010:d56::5 objects.githubusercontent.com
-# 2a01:4f8:c010:d56::6 ghcr.io
-# 2a01:4f8:c010:d56::7 pkg.github.com npm.pkg.github.com maven.pkg.github.com nuget.pkg.github.com rubygems.pkg.github.com
-```
+1. Initialize private paths. The script records the current host UID/GID and
+   never overwrites an existing file:
 
-Edit the `docker-compose.yml`
+   ```sh
+   scripts/init
+   ```
 
-```diff
-+ networks:
-+   wan:
-+     enable_ipv6: true
-+     driver: bridge
-+     ipam:
-+       config:
-+         - subnet: 192.168.234.0/24
-+         - subnet: fd5f:c26e:7746:f664::/64
+2. Set the externally visible HTTPS `DOMAIN` in `.env`. Populate every
+   required file under `secrets/`, keep it mode `0600`, and adjust
+   [backup.json](config/backup.json) for the selected repository. Store the
+   repository address, Restic password, and backend credentials in those
+   files—not in JSON or command arguments.
 
+3. Validate configuration and mounted secrets:
 
-   vaultwarden:
-+     networks:
-+       - wan
-+     sysctls:
-+       - net.ipv6.conf.all.disable_ipv6=1
-     hostname: vaultwarden
-     logging:
-       driver: "local"
+   ```sh
+   docker compose --profile maintenance run --rm maintenance \
+     config --check-secrets --config /config/backup.json
+   ```
 
-```
+4. Explicitly initialize a new repository once. The long-running worker never
+   runs `init`, `unlock`, `forget`, `prune`, or `check`:
 
-</details>
+   ```sh
+   docker compose --profile maintenance run --rm maintenance \
+     repo init --target primary --config /config/backup.json
+   ```
 
-<details>
-<summary><b>
-Click if you don't trust ghcr.io and want to build the images by yourself
-</b></summary>
+5. Start the three long-running services:
 
-Edit the `docker-compose.yml`:
+   ```sh
+   docker compose up --build -d
+   ```
 
-```diff
-           memory: 128M
--    image: ghcr.io/hellodword/vaultwarden-less-trigger:latest
--    # build:
--    #   context: .
--    #   dockerfile: ./docker/distroless-trigger.Dockerfile
-+    # image: ghcr.io/hellodword/vaultwarden-less-trigger:latest
-+    build:
-+      context: .
-+      dockerfile: ./docker/distroless-trigger.Dockerfile
-     env_file:
-```
+6. Point a local Nginx or Caddy listener at `http://127.0.0.1:8080`. The front
+   proxy must overwrite `X-Real-IP` and `X-Forwarded-Proto`; configure its
+   actual source CIDR in [proxy.json](config/proxy.json).
 
-</details>
+For the one-time first-account flow, routine checks, and failure semantics,
+read [operations](docs/operations.md). Registration must be returned to
+`false` immediately after the first account is created.
 
----
+## Recovery and maintenance
 
-1. clone repo
+The worker creates a new binary SQLite database with the SQLite Online Backup
+API, validates it, then derives the file set from that snapshot database. A
+versioned deterministic `manifest.json` binds every copied file to its size and
+SHA-256. Missing referenced files are retried twice at 30-second intervals;
+the third attempt becomes a separately tagged `incomplete` recovery point and
+alerts immediately after any target accepts it.
 
-```sh
-git clone --depth=1 https://github.com/hellodword/vaultwarden-less
+- [Configuration](docs/configuration.md)
+- [Architecture and threat model](docs/architecture.md)
+- [1.0.0 security validation record](docs/security-validation.md)
+- [HTTP and JSON contracts](docs/api.md)
+- [Backup format](docs/backup-format.md)
+- [Routine operations](docs/operations.md)
+- [Repository maintenance](docs/maintenance.md)
+- [Isolated restore and cutover](docs/restore.md)
+- [Upgrade policy](docs/upgrade.md)
 
-cd vaultwarden-less
-```
+`restore` defaults to the newest `complete` v1 snapshot, verifies Restic,
+manifest hashes, SQLite, and database file references, and publishes an
+isolated prepared directory atomically. It never writes the online `/data`.
 
-2. prepare directories and chown for nonroot distroless container
+## Development validation
+
+The required local checks are:
 
 ```sh
-mkdir -p data git-backup restic-cache
-sudo chown -R 65532:65532 git-backup data restic-cache
+go test ./...
+go test -race ./...
+go vet ./...
+govulncheck ./...
+shellcheck scripts/init
+docker compose --env-file .env.template config --quiet
 ```
 
-3. replace the [scripts/backup](./scripts/backup) and [scripts/notify](./scripts/notify) with your own scripts or executables
-
-I use git, [restic](https://github.com/restic/restic) and [bark](https://github.com/Finb/bark) in my scripts, but you can replace them to anything, and make sure they'll be working with [distroless-trigger](./docker/distroless-trigger.Dockerfile).
-
-The [scripts/backup](./scripts/backup) receives no arguments and should be secure (DoS not considered). The [scripts/notify](./scripts/notify) receives one argument, which is the notification message, although I format the URIs in the source code, **but you should still be cautious**.
-
-4. customize the vaultwarden features
-
-> > See https://github.com/dani-garcia/vaultwarden/blob/main/.env.template
-
-```sh
-vim .env.vaultwarden
-```
-
-5. customize the trigger configuration
-
-> > edit the `exclude_path`, see the regexp syntax https://pkg.go.dev/regexp/syntax
-
-```sh
-vim config/trigger.json
-```
-
-6. expose the trigger (`127.0.0.1:8080`) to the world
-
-I'm using Nginx and Cloudflare, but you can use any tools and services you prefer.
-
-7. start
-
-```sh
-docker compose down -t 360
-
-docker compose up --build --pull always -d
-```
-
-## ref
-
-- distroless: https://github.com/hellodword/distroless-all
-- CVE-less
-  - https://github.com/aquasecurity/trivy
-  - https://docs.docker.com/scout/
-  - https://www.chainguard.dev/unchained/migrating-a-node-js-application-to-chainguard-images
-  - https://www.chainguard.dev/unchained/reducing-vulnerabilities-in-backstage-with-chainguards-wolfi
-  - https://www.chainguard.dev/unchained/zero-cves-and-just-as-fast-chainguards-python-go-images
-- httputil.ReverseProxy
-  - https://blog.joshsoftware.com/2021/05/25/simple-and-powerful-reverseproxy-in-go/
+Image builds use Go `1.26.7`, `go-sqlite3 v1.14.50`, Cobra `v1.10.2`, and copy
+the Restic binary from `ghcr.io/restic/restic:0.19.1`. Scanner findings must be
+attributed to reachable code, base-image packages, or accepted residual risk;
+this project makes no “zero CVE” promise.
