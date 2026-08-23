@@ -24,6 +24,10 @@ The image references use version tags rather than immutable digests. That is
 an accepted availability and supply-chain risk; read [the threat
 model](docs/architecture.md) before deployment.
 
+Project images are published only from `v<SemVer>` Git tags. For example,
+`v1.0.0` publishes the exact `1.0.0` tag for both project images. A push to
+`master` does not publish an image, and no `latest` tag is emitted.
+
 The tracked Vaultwarden environment fixes `DATA_FOLDER`, `DATABASE_URL`, and
 every recoverable asset folder to local `/data` paths. Do not override them with
 database servers or `s3://` storage; those deployments are outside this
@@ -95,7 +99,6 @@ alerts immediately after any target accepts it.
 
 - [Configuration](docs/configuration.md)
 - [Architecture and threat model](docs/architecture.md)
-- [1.0.0 security validation record](docs/security-validation.md)
 - [HTTP and JSON contracts](docs/api.md)
 - [Backup format](docs/backup-format.md)
 - [Routine operations](docs/operations.md)
