@@ -1,129 +1,148 @@
 # vaultwarden-less 1.0
 
-`vaultwarden-less` is a small, recovery-first deployment for general
-self-hosted Vaultwarden users. Version 1.0 separates the public reverse proxy
-from the private backup worker so that the public process has neither `/data`
-nor Restic or notification credentials.
+`vaultwarden-less` is a recovery-first Vaultwarden deployment for a single
+self-hosted server. The public proxy can only forward HTTP and coalesce change
+events. The resident backup worker alone receives read-only `/data` and the
+backup backend role; backup-side one-shot services use a separate maintenance
+role and never mount online data.
 
-This is a new v1 contract. It does not read the old `trigger.json`, SQL/Git
-backup history, backup scripts, or CLI. Upgrading the repository does not
-delete those files, existing Vaultwarden data, or old Restic snapshots.
+This is a clean v1 contract. It does not read the old `trigger.json`, SQL/Git
+backup scripts, JSON configuration, or old CLI. It also never deletes those
+files, an existing `git-backup`, live Vaultwarden data, or old Restic snapshots.
 
 ## Supported scope
 
-- Vaultwarden `1.37.2`, SQLite, and files stored locally under `/data`.
-- Local attachments, file Sends, `rsa_key*`, `/data/config.json`, and custom
-  templates. Vaultwarden PostgreSQL/MySQL and Vaultwarden S3/MinIO attachment
-  or Send storage are not supported.
-- Restic `0.19.1` native local, REST, S3/MinIO/COS, B2, Azure, GCS, and Swift
-  backends. SFTP and rclone are intentionally absent from the image.
-- `linux/amd64` project images, starting at tag `1.0.0`. Other architectures
-  are outside the current support and release-validation scope.
+- Vaultwarden `1.37.2`, SQLite, and attachments, file Sends, RSA files,
+  `config.json`, and templates stored locally below `/data`.
+- Restic `0.19.1` with an S3-compatible repository (Amazon S3, MinIO, or COS)
+  or Restic's native Backblaze B2 backend.
+- Enterprise WeChat text notifications and Bark notifications sent directly
+  to production APNs.
+- `linux/amd64` only. Project images start at `1.0.0`, never use `latest`, and
+  are deliberately version-tagged rather than digest-pinned.
 
-The image references use version tags rather than immutable digests. That is
-an accepted availability and supply-chain risk; read [the threat
-model](docs/architecture.md) before deployment.
+PostgreSQL/MySQL, Vaultwarden-managed S3 attachment/Send storage, local and
+REST Restic repositories, Azure, GCS, Swift, SFTP, rclone, custom CAs, session
+credentials, and generic webhooks are outside v1.
 
-Project images are published only from `v<SemVer>` Git tags. For example,
-`v1.0.0` publishes the exact `1.0.0` tag for both project images. A push to
-`master` does not publish an image, and no `latest` tag is emitted.
-
-The tracked Vaultwarden environment fixes `DATA_FOLDER`, `DATABASE_URL`, and
-every recoverable asset folder to local `/data` paths. Do not override them with
-database servers or `s3://` storage; those deployments are outside this
-recovery contract.
+Vaultwarden end-to-end encryption does not protect deployment configuration,
+Restic/notification credentials, availability, or rollback. Read the
+[architecture and threat model](docs/architecture.md) before deployment.
 
 ## Services
 
-| Service | Public reachability | Data and credentials |
+| Service | Reachability | Mounts and authority |
 | --- | --- | --- |
-| `vaultwarden` | only through `proxy` | read/write `/data`; no backup credentials |
-| `proxy` | `127.0.0.1:8080` by default | no data, state, cache, or secrets |
-| `backup` | private event network plus outbound network | read-only `/data`; private state, staging, cache, optional local repositories, and secrets |
+| `vaultwarden` | internal; reached through `proxy` | read/write `/data`; no backup credentials |
+| `proxy` | host `127.0.0.1:8080` by default | no configuration, data, state, cache, or credentials |
+| `backup` | private event network plus outbound network | read-only `/data`; backup role; state/staging/cache |
+| `maintenance` | one-shot profile, outbound only | private main config, common password, maintenance role, and cache; no `/data` |
+| `restore` | one-shot profile, outbound only | private main config, common password, maintenance role, cache, and `./restore`; no online `/data` |
 
-Maintenance and restore are one-shot Compose profiles. Maintenance never
-mounts `/data`; restore writes only beneath `./restore`.
+## Prepare a deployment
 
-## Start a new deployment
+There is no initialization shell script or duplicated preflight subsystem.
+Compose refuses to create missing bind sources, and each process validates the
+exact file or directory when it consumes it. It never creates a host mount root
+or changes its permissions.
 
-1. Initialize private paths. The script records the current host UID/GID and
-   never overwrites an existing file:
+1. Create `.env` from [.env.template](.env.template), and create
+   `.env.vaultwarden` from
+   [.env.vaultwarden.template](.env.vaultwarden.template). Do not overwrite an
+   existing file. Set `PUID`/`PGID` to the intended non-root host owner, set the
+   externally visible HTTPS `DOMAIN`, and make both files `0600`.
 
-   ```sh
-   scripts/init
+2. Create these host directories as real, non-symlink directories owned by
+   `PUID:PGID` and mode `0700`:
+
+   ```text
+   data/  state/  staging/  cache/  restore/
+   credentials/common/
+   credentials/backup/
+   credentials/maintenance/
    ```
 
-2. Set the externally visible HTTPS `DOMAIN` in `.env`. Populate every
-   required file under `secrets/`, keep it mode `0600`, and adjust
-   [backup.json](config/backup.json) for the selected repository. Store the
-   repository address, Restic password, and backend credentials in those
-   files—not in JSON or command arguments.
+3. Create `config/backup.yaml` from
+   [config/backup.template.yaml](config/backup.template.yaml), without
+   overwriting any existing file, and make it `0600`. Zero targets is valid and
+   useful for validating a fresh Vaultwarden instance, but it creates no
+   backups.
 
-3. Validate configuration and mounted secrets:
+4. Create the credential files described in
+   [configuration](docs/configuration.md). Each must be a real, non-symlink
+   `0400` or `0600` file. The three credential directories remain `0700`.
+
+5. Validate the main YAML and each role independently:
+
+   ```sh
+   docker compose run --rm --no-deps backup \
+     config --config /config/backup.yaml
+   docker compose run --rm --no-deps backup \
+     config --check-credentials backup --config /config/backup.yaml
+   docker compose --profile maintenance run --rm --no-deps maintenance \
+     config --check-credentials maintenance --config /config/backup.yaml
+   ```
+
+   Output is a secret-free v1 JSON summary. Missing paths and unsafe modes are
+   reported against fixed container paths; use the host/container mapping in
+   [configuration](docs/configuration.md) to correct the corresponding bind
+   source.
+
+6. For each confirmed new, empty repository, initialize it exactly once with
+   the maintenance role. The worker never initializes or cleans a repository:
 
    ```sh
    docker compose --profile maintenance run --rm maintenance \
-     config --check-secrets --config /config/backup.json
+     repo init --target primary --config /config/backup.yaml
    ```
 
-4. Explicitly initialize a new repository once. The long-running worker never
-   runs `init`, `unlock`, `forget`, `prune`, or `check`:
-
-   ```sh
-   docker compose --profile maintenance run --rm maintenance \
-     repo init --target primary --config /config/backup.json
-   ```
-
-5. Start the three long-running services:
+7. Start the deployment and point local Nginx or Caddy at the loopback port:
 
    ```sh
    docker compose up --build -d
    ```
 
-6. Point a local Nginx or Caddy listener at `http://127.0.0.1:8080`. The front
-   proxy must overwrite `X-Real-IP` and `X-Forwarded-Proto`; configure its
-   actual source CIDR in [proxy.json](config/proxy.json).
+   The front proxy must overwrite `X-Real-IP` and `X-Forwarded-Proto`.
 
-For the one-time first-account flow, routine checks, and failure semantics,
-read [operations](docs/operations.md). Registration must be returned to
-`false` immediately after the first account is created.
+Before migrating an existing instance, first exercise registration, login,
+sync, a synthetic attachment, backup, and isolated restore on a separate fresh
+instance. The parallel-validation and registration procedure is in
+[routine operations](docs/operations.md); recovery and manual cutover are in
+[restore](docs/restore.md).
 
-## Recovery and maintenance
+## Recovery behavior
 
-The worker creates a new binary SQLite database with the SQLite Online Backup
-API, validates it, then derives the file set from that snapshot database. A
-versioned deterministic `manifest.json` binds every copied file to its size and
-SHA-256. Missing referenced files are retried twice at 30-second intervals;
-the third attempt becomes a separately tagged `incomplete` recovery point and
-alerts immediately after any target accepts it.
+The worker uses SQLite's Online Backup API to create a new binary database,
+checks it, and derives attachment/Send paths from that fixed database. A
+deterministic `manifest.json` records the status, schema, sorted paths, sizes,
+SHA-256 values, missing entries, and content ID. Missing referenced files are
+retried twice at 30-second intervals; the third set is uploaded as separately
+tagged `incomplete` data and alerts immediately after a target accepts it.
 
-- [Configuration](docs/configuration.md)
+`restore` defaults to the newest complete v1 point, verifies Restic output,
+manifest hashes, SQLite, and referenced files, and atomically publishes an
+isolated prepared directory. It never writes online `/data`.
+
+- [Configuration and credentials](docs/configuration.md)
 - [Architecture and threat model](docs/architecture.md)
-- [HTTP and JSON contracts](docs/api.md)
+- [HTTP, JSON, and CLI contracts](docs/api.md)
 - [Backup format](docs/backup-format.md)
 - [Routine operations](docs/operations.md)
 - [Repository maintenance](docs/maintenance.md)
 - [Isolated restore and cutover](docs/restore.md)
 - [Upgrade policy](docs/upgrade.md)
 
-`restore` defaults to the newest `complete` v1 snapshot, verifies Restic,
-manifest hashes, SQLite, and database file references, and publishes an
-isolated prepared directory atomically. It never writes the online `/data`.
-
 ## Development validation
-
-The required local checks are:
 
 ```sh
 go test ./...
 go test -race ./...
 go vet ./...
 govulncheck ./...
-shellcheck scripts/init
-docker compose --env-file .env.template config --quiet
+docker compose --profile maintenance --profile restore config --quiet
 ```
 
-Image builds use Go `1.26.7`, `go-sqlite3 v1.14.50`, Cobra `v1.10.2`, and copy
-the Restic binary from `ghcr.io/restic/restic:0.19.1`. Scanner findings must be
-attributed to reachable code, base-image packages, or accepted residual risk;
-this project makes no “zero CVE” promise.
+Builds pin Go `1.26.7`, `go-sqlite3 v1.14.50`, Cobra `v1.10.2`,
+goccy/go-yaml `v1.19.2`, and Restic `0.19.1`. Scanner findings must be
+attributed to reachable code, image contents, or accepted residual risk; the
+project makes no “zero CVE” promise.

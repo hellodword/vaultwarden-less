@@ -3,9 +3,11 @@ package restore_test
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -25,6 +27,12 @@ func TestResticRoundTrip(t *testing.T) {
 	resticBinary := os.Getenv("RESTIC_BINARY")
 	if resticBinary == "" {
 		t.Fatal("RESTIC_BINARY is required for the Restic integration test")
+	}
+	repository := os.Getenv("RESTIC_TEST_REPOSITORY")
+	accessKey := os.Getenv("RESTIC_TEST_AWS_ACCESS_KEY_ID")
+	secretKey := os.Getenv("RESTIC_TEST_AWS_SECRET_ACCESS_KEY")
+	if !strings.HasPrefix(repository, "s3:") || accessKey == "" || secretKey == "" {
+		t.Fatal("RESTIC_TEST_REPOSITORY and synthetic S3 credentials are required")
 	}
 
 	root := t.TempDir()
@@ -49,15 +57,22 @@ func TestResticRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	repositoryPath := filepath.Join(root, "repository")
-	repositoryFile := writeSecret(t, root, "repository-file", repositoryPath)
-	passwordFile := writeSecret(t, root, "password-file", "synthetic-restic-password")
-	maintenance := config.Credentials{PasswordFile: passwordFile}
-	target := config.Target{
-		Name: "roundtrip", Backend: "local", RepositoryFile: repositoryFile,
-		BackupCredentials: maintenance, MaintenanceCredentials: &maintenance,
+	credentialsDir := filepath.Join(root, "credentials")
+	if err := os.Mkdir(credentialsDir, 0o700); err != nil {
+		t.Fatal(err)
 	}
-	runner := restic.Runner{Binary: resticBinary, CacheDir: cacheDir, StagingDir: stagingDir}
+	passwordFile := writeSecret(t, credentialsDir, "password-file", "synthetic-restic-password")
+	target := config.Target{
+		Name: "roundtrip", Repository: repository,
+		ResticOptions: map[string]string{"s3.bucket-lookup": "path"},
+	}
+	credentials := &config.RoleCredentials{SchemaVersion: 1, Targets: map[string]map[string]string{
+		"roundtrip": {"AWS_ACCESS_KEY_ID": accessKey, "AWS_SECRET_ACCESS_KEY": secretKey},
+	}}
+	runner := restic.Runner{
+		Binary: resticBinary, CacheDir: cacheDir, StagingDir: stagingDir,
+		PasswordFile: passwordFile, Credentials: credentials,
+	}
 	if err := runner.VerifyVersion(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -68,14 +83,30 @@ func TestResticRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	incompleteManifest, err := snapshot.NewManifest(snapshot.Incomplete, built.Manifest.DatabaseMigration, built.Manifest.Files, []snapshot.Missing{{
-		Path:   "data/attachments/33333333-3333-3333-3333-333333333333/cccccccccccccccccccc",
+	missingPath := "data/attachments/11111111-1111-1111-1111-111111111111/" + strings.Repeat("a", 20)
+	incompleteFiles := slices.DeleteFunc(append([]snapshot.File(nil), built.Manifest.Files...), func(file snapshot.File) bool {
+		return file.Path == missingPath
+	})
+	if err := os.Remove(filepath.Join(stagingDir, "current", filepath.FromSlash(missingPath))); err != nil {
+		t.Fatal(err)
+	}
+	incompleteManifest, err := snapshot.NewManifest(snapshot.Incomplete, built.Manifest.DatabaseMigration, incompleteFiles, []snapshot.Missing{{
+		Path:   missingPath,
 		Reason: "not_found",
 	}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := runner.Backup(ctx, target, incompleteManifest); err != nil {
+	manifestData, err := json.MarshalIndent(incompleteManifest, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestData = append(manifestData, '\n')
+	if err := os.WriteFile(filepath.Join(stagingDir, "current", "manifest.json"), manifestData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	incompleteBackup, err := runner.Backup(ctx, target, incompleteManifest)
+	if err != nil {
 		t.Fatal(err)
 	}
 	if err := runner.Check(ctx, target, ""); err != nil {
@@ -89,7 +120,11 @@ func TestResticRoundTrip(t *testing.T) {
 		t.Fatalf("dry-run retention report count = %d", len(pruneReports))
 	}
 
-	output := filepath.Join(root, "prepared")
+	restoreRoot := filepath.Join(root, "restore")
+	if err := os.Mkdir(restoreRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	output := filepath.Join(restoreRoot, "prepared")
 	cfg := &config.Backup{DataDir: dataDir}
 	restored, err := restoretool.Run(ctx, cfg, runner, restoretool.Request{Target: target, Output: output})
 	if err != nil {
@@ -104,6 +139,19 @@ func TestResticRoundTrip(t *testing.T) {
 	}
 	if verified.ContentID != built.Manifest.ContentID {
 		t.Fatalf("verified content ID = %s, want %s", verified.ContentID, built.Manifest.ContentID)
+	}
+	incompleteOutput := filepath.Join(restoreRoot, "incomplete")
+	incompleteRestored, err := restoretool.Run(ctx, cfg, runner, restoretool.Request{
+		Target: target, SnapshotID: incompleteBackup.SnapshotID, AllowIncomplete: true, Output: incompleteOutput,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if incompleteRestored.Manifest.Status != snapshot.Incomplete || len(incompleteRestored.Manifest.Missing) != 1 {
+		t.Fatalf("incomplete restore = %#v", incompleteRestored.Manifest)
+	}
+	if _, err := snapshot.Verify(ctx, incompleteOutput, true); err != nil {
+		t.Fatal(err)
 	}
 }
 

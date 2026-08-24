@@ -15,8 +15,8 @@ type Lock struct {
 }
 
 func AcquireLock(dir string) (*Lock, error) {
-	if err := safefs.EnsurePrivateDirectory(dir); err != nil {
-		return nil, fmt.Errorf("create lock directory: %w", err)
+	if err := safefs.ValidatePrivateDirectory(dir); err != nil {
+		return nil, fmt.Errorf("validate lock directory: %w", err)
 	}
 	path := filepath.Join(dir, "worker.lock")
 	fd, err := syscall.Open(path, syscall.O_CREAT|syscall.O_RDWR|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0o600)

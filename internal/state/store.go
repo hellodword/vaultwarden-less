@@ -24,8 +24,8 @@ type Store struct {
 }
 
 func Open(dir string, targetNames []string) (*Store, error) {
-	if err := safefs.EnsurePrivateDirectory(dir); err != nil {
-		return nil, fmt.Errorf("create state directory: %w", err)
+	if err := safefs.ValidatePrivateDirectory(dir); err != nil {
+		return nil, fmt.Errorf("validate state directory: %w", err)
 	}
 	store := &Store{dir: dir, path: filepath.Join(dir, "state.json")}
 	data, err := readStateFile(store.path)
@@ -80,6 +80,9 @@ func Open(dir string, targetNames []string) (*Store, error) {
 }
 
 func Read(dir string) (State, error) {
+	if err := safefs.ValidatePrivateDirectory(dir); err != nil {
+		return State{}, fmt.Errorf("validate state directory: %w", err)
+	}
 	path := filepath.Join(dir, "state.json")
 	data, err := readStateFile(path)
 	if err != nil {

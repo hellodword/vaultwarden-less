@@ -44,41 +44,44 @@ func NewCoordinator(cfg *config.Backup, store *state.Store, resticRunner backupR
 }
 
 func (c *Coordinator) MarkDirty(now time.Time) error {
+	if len(c.cfg.Targets) == 0 {
+		return nil
+	}
 	c.dirtyMu.Lock()
 	defer c.dirtyMu.Unlock()
-	current := c.store.Snapshot()
-	if current.Dirty {
-		if current.BackupInProgress && current.DirtyGeneration != current.RunningGeneration {
-			c.signal()
-			return nil
-		}
-		if !current.BackupInProgress {
-			err := c.store.Update(func(next *state.State) error {
-				next.LastDirtyAt = state.FormatTime(now)
-				return nil
-			})
-			if err == nil {
-				c.signal()
-			}
-			return err
-		}
-	}
+	formatted := state.FormatTime(now)
 	err := c.store.Update(func(next *state.State) error {
+		if next.Dirty {
+			if next.BackupInProgress && next.DirtyGeneration != next.RunningGeneration {
+				return errDirtyAlreadyQueued
+			}
+			if !next.BackupInProgress {
+				next.LastDirtyAt = formatted
+				return nil
+			}
+		}
 		next.DirtyGeneration++
 		next.Dirty = true
-		next.LastDirtyAt = state.FormatTime(now)
+		next.LastDirtyAt = formatted
 		if next.FirstDirtyAt == "" {
-			next.FirstDirtyAt = state.FormatTime(now)
+			next.FirstDirtyAt = formatted
 		}
 		return nil
 	})
-	if err == nil {
+	if err == nil || errors.Is(err, errDirtyAlreadyQueued) {
 		c.signal()
+		return nil
 	}
 	return err
 }
 
+var errDirtyAlreadyQueued = errors.New("dirty generation already queued")
+
 func (c *Coordinator) Run(ctx context.Context) error {
+	if len(c.cfg.Targets) == 0 {
+		<-ctx.Done()
+		return nil
+	}
 	if err := c.Reconcile(ctx); err != nil {
 		return err
 	}
@@ -129,6 +132,9 @@ func (c *Coordinator) Run(ctx context.Context) error {
 }
 
 func (c *Coordinator) Sample(ctx context.Context) error {
+	if len(c.cfg.Targets) == 0 {
+		return nil
+	}
 	return c.sample(ctx, false)
 }
 
@@ -186,6 +192,9 @@ func (c *Coordinator) sample(ctx context.Context, preemptibleUploads bool) (resu
 }
 
 func (c *Coordinator) CatchUp(ctx context.Context) error {
+	if len(c.cfg.Targets) == 0 {
+		return nil
+	}
 	return c.catchUp(ctx, false)
 }
 
@@ -524,7 +533,7 @@ func (c *Coordinator) cleanupIfCaughtUp() error {
 }
 
 func (c *Coordinator) Reconcile(ctx context.Context) error {
-	if err := safefs.EnsurePrivateDirectory(c.cfg.StagingDir); err != nil {
+	if err := safefs.ValidatePrivateDirectory(c.cfg.StagingDir); err != nil {
 		return err
 	}
 	currentPath := filepath.Join(c.cfg.StagingDir, "current")

@@ -6,7 +6,6 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/x509"
-	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"io"
@@ -14,7 +13,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -29,7 +27,7 @@ func recoveryEvent(id string) Event {
 }
 
 func TestQueueBoundsSuccessesAndCoalescesTargetState(t *testing.T) {
-	dir := t.TempDir()
+	dir := privateNotificationDir(t)
 	store, err := OpenQueueStore(dir, []string{"ops"})
 	if err != nil {
 		t.Fatal(err)
@@ -86,7 +84,7 @@ func TestQueueBoundsSuccessesAndCoalescesTargetState(t *testing.T) {
 
 func TestSuccessMergeCountIsIndependentPerNotifier(t *testing.T) {
 	t.Parallel()
-	store, err := OpenQueueStore(t.TempDir(), []string{"full", "room"})
+	store, err := OpenQueueStore(privateNotificationDir(t), []string{"full", "room"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,7 +110,7 @@ func TestSuccessMergeCountIsIndependentPerNotifier(t *testing.T) {
 
 func TestIncompleteRecoveryUsesReplaceablePriorityState(t *testing.T) {
 	t.Parallel()
-	store, err := OpenQueueStore(t.TempDir(), []string{"ops"})
+	store, err := OpenQueueStore(privateNotificationDir(t), []string{"ops"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,7 +132,7 @@ func TestIncompleteRecoveryUsesReplaceablePriorityState(t *testing.T) {
 
 func TestCompleteRecoveryAtomicallySupersedesPendingIncompleteState(t *testing.T) {
 	t.Parallel()
-	store, err := OpenQueueStore(t.TempDir(), []string{"ops"})
+	store, err := OpenQueueStore(privateNotificationDir(t), []string{"ops"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,7 +152,7 @@ func TestCompleteRecoveryAtomicallySupersedesPendingIncompleteState(t *testing.T
 
 func TestNotificationStateReconcilesRemovedNotifiers(t *testing.T) {
 	t.Parallel()
-	dir := t.TempDir()
+	dir := privateNotificationDir(t)
 	store, err := OpenQueueStore(dir, []string{"removed"})
 	if err != nil {
 		t.Fatal(err)
@@ -174,54 +172,20 @@ func TestNotificationStateReconcilesRemovedNotifiers(t *testing.T) {
 	}
 }
 
-func TestManagerDefersBrokenNotifierSecretsWithoutBlockingBackupSetup(t *testing.T) {
+func TestManagerDefersBrokenNotifierMaterialWithoutBlockingBackupSetup(t *testing.T) {
 	t.Parallel()
-	manager, err := NewManager(t.TempDir(), []config.Notifier{{
-		Name: "automation", Type: "webhook", Timeout: config.Duration{Duration: time.Second},
-		URL: "https://example.test/hook", HeadersFromFiles: map[string]string{"Authorization": "/missing/secret"},
+	manager, err := NewManager(privateNotificationDir(t), []config.Notifier{{
+		Name: "bark", Type: "bark", Timeout: config.Duration{Duration: time.Second},
+		DeviceToken: "invalid", AuthKey: "invalid", KeyID: "KEY123", TeamID: "TEAM123", Topic: "me.fin.bark",
 	}}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
-		t.Fatalf("notification secret blocked manager setup: %v", err)
+		t.Fatalf("notification material blocked manager setup: %v", err)
 	}
 	if err := manager.EnqueueSuccess(recoveryEvent("deferred-secret")); err != nil {
 		t.Fatalf("notification event was not persisted: %v", err)
 	}
 	if err := manager.senders[0].Send(context.Background(), recoveryEvent("deferred-secret")); err == nil {
-		t.Fatal("broken deferred notifier secret was accepted")
-	}
-}
-
-func TestWebhookUsesVersionedJSONAndRefusesRedirects(t *testing.T) {
-	var redirected atomic.Int64
-	destination := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		redirected.Add(1)
-		w.WriteHeader(http.StatusNoContent)
-	}))
-	defer destination.Close()
-	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/ok" {
-			var event Event
-			if err := json.NewDecoder(r.Body).Decode(&event); err != nil || event.SchemaVersion != 1 {
-				t.Errorf("invalid webhook payload: %#v, %v", event, err)
-			}
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-		http.Redirect(w, r, destination.URL, http.StatusTemporaryRedirect)
-	}))
-	defer origin.Close()
-	client := origin.Client()
-	client.CheckRedirect = func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }
-	sender := &webhookSender{name: "ops", url: origin.URL + "/ok", headers: http.Header{}, client: client}
-	if err := sender.Send(context.Background(), recoveryEvent("one")); err != nil {
-		t.Fatal(err)
-	}
-	sender.url = origin.URL + "/redirect"
-	if err := sender.Send(context.Background(), recoveryEvent("two")); err == nil {
-		t.Fatal("redirect was accepted")
-	}
-	if redirected.Load() != 0 {
-		t.Fatal("redirect destination was contacted")
+		t.Fatal("broken deferred notifier material was accepted")
 	}
 }
 
@@ -255,6 +219,28 @@ func TestWechatChecksHTTPAndErrcode(t *testing.T) {
 	}
 }
 
+func TestNotificationHTTPClientRefusesRedirects(t *testing.T) {
+	t.Parallel()
+	var redirected atomic.Int64
+	destination := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		redirected.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer destination.Close()
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, destination.URL, http.StatusTemporaryRedirect)
+	}))
+	defer origin.Close()
+	response, err := strictClient(time.Second).Get(origin.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusTemporaryRedirect || redirected.Load() != 0 {
+		t.Fatalf("redirect status/contacts = %d/%d", response.StatusCode, redirected.Load())
+	}
+}
+
 type gatedSender struct {
 	name    string
 	started chan<- string
@@ -276,7 +262,7 @@ func (s *gatedSender) Send(ctx context.Context, _ Event) error {
 func TestNotifierDeliveryRunsIndependentlyPerNotifier(t *testing.T) {
 	t.Parallel()
 	names := []string{"first", "second"}
-	store, err := OpenQueueStore(t.TempDir(), names)
+	store, err := OpenQueueStore(privateNotificationDir(t), names)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -347,7 +333,6 @@ func TestBarkUsesHTTP2JWTAndChecksAPNsReason(t *testing.T) {
 	server.EnableHTTP2 = true
 	server.StartTLS()
 	defer server.Close()
-	dir := t.TempDir()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatal(err)
@@ -356,22 +341,16 @@ func TestBarkUsesHTTP2JWTAndChecksAPNsReason(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	keyPath := filepath.Join(dir, "apns-key")
-	tokenPath := filepath.Join(dir, "device-token")
-	if err := os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: encoded}), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(tokenPath, []byte(strings.Repeat("a", 64)), 0o600); err != nil {
-		t.Fatal(err)
-	}
 	senderRaw, err := newBarkSender(config.Notifier{
-		Name: "bark", Type: "bark", Timeout: config.Duration{Duration: time.Second}, Endpoint: server.URL,
-		DeviceTokenFile: tokenPath, AuthKeyFile: keyPath, KeyID: "KEY123", TeamID: "TEAM123", Topic: "me.fin.bark",
+		Name: "bark", Type: "bark", Timeout: config.Duration{Duration: time.Second},
+		DeviceToken: strings.Repeat("a", 64), AuthKey: string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: encoded})),
+		KeyID: "KEY123", TeamID: "TEAM123", Topic: "me.fin.bark",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	sender := senderRaw.(*barkSender)
+	sender.endpoint = server.URL
 	sender.client = server.Client()
 	sender.client.CheckRedirect = func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }
 	if err := sender.Send(context.Background(), recoveryEvent("bark-ok")); err != nil {
@@ -391,4 +370,13 @@ func TestBarkUsesHTTP2JWTAndChecksAPNsReason(t *testing.T) {
 	if err := sender.Send(context.Background(), recoveryEvent("bark-fail")); err == nil || !strings.Contains(err.Error(), "Unregistered") {
 		t.Fatalf("APNs failure was not checked: %v", err)
 	}
+}
+
+func privateNotificationDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return dir
 }

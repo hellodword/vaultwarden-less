@@ -2,118 +2,122 @@ package config
 
 import (
 	"bytes"
-	"encoding/json"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
-	"net"
-	"net/netip"
 	"net/url"
-	"os"
 	"path/filepath"
 	"regexp"
 	"slices"
-	"strconv"
 	"strings"
 	"time"
 
+	"github.com/goccy/go-yaml"
+	"github.com/hellodword/vaultwarden-less/internal/safefs"
+	"github.com/hellodword/vaultwarden-less/internal/securefile"
 	"github.com/hellodword/vaultwarden-less/internal/version"
 )
 
-const maxConfigBytes = 1 << 20
+const (
+	MaxConfigBytes = 1 << 20
 
-var namePattern = regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`)
+	DefaultBackupConfigPath = "/config/backup.yaml"
+	RoleCredentialsPath     = "/run/credentials/role/credentials.yaml"
+	ResticPasswordPath      = "/run/credentials/common/restic-password"
 
-type Proxy struct {
-	SchemaVersion                 int      `json:"schema_version"`
-	ListenAddress                 string   `json:"listen_address"`
-	UpstreamURL                   string   `json:"upstream_url"`
-	EventsURL                     string   `json:"events_url"`
-	TrustedProxyCIDRs             []string `json:"trusted_proxy_cidrs"`
-	MaxRequestBytes               int64    `json:"max_request_bytes"`
-	ReadHeaderTimeout             Duration `json:"read_header_timeout"`
-	ReadTimeout                   Duration `json:"read_timeout"`
-	WriteTimeout                  Duration `json:"write_timeout"`
-	IdleTimeout                   Duration `json:"idle_timeout"`
-	UpstreamResponseHeaderTimeout Duration `json:"upstream_response_header_timeout"`
-	EventTimeout                  Duration `json:"event_timeout"`
-	ShutdownTimeout               Duration `json:"shutdown_timeout"`
+	ListenAddress = "0.0.0.0:9090"
+	DataDir       = "/data"
+	StateDir      = "/state"
+	StagingDir    = "/staging"
+	CacheDir      = "/cache"
+	ResticBinary  = "/usr/local/bin/restic"
+)
 
-	Upstream *url.URL       `json:"-"`
-	Events   *url.URL       `json:"-"`
-	Trusted  []netip.Prefix `json:"-"`
-}
+var (
+	namePattern     = regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`)
+	yamlPosition    = regexp.MustCompile(`\[([0-9]+):([0-9]+)\]`)
+	allowedS3Option = map[string]struct{}{
+		"s3.bucket-lookup":   {},
+		"s3.region":          {},
+		"s3.list-objects-v1": {},
+	}
+	regionPattern   = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
+	b2BucketPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9.-]{0,254}$`)
+	b2PrefixPattern = regexp.MustCompile(`^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$`)
+)
 
+// Backup is the complete human-authored v1 configuration. Runtime paths,
+// scheduler timing and event-server limits are fixed product behavior and are
+// populated after decoding rather than exposed as YAML fields.
 type Backup struct {
-	SchemaVersion      int        `json:"schema_version"`
-	ListenAddress      string     `json:"listen_address"`
-	DataDir            string     `json:"data_dir"`
-	StateDir           string     `json:"state_dir"`
-	StagingDir         string     `json:"staging_dir"`
-	CacheDir           string     `json:"cache_dir"`
-	ResticBinary       string     `json:"restic_binary"`
-	Debounce           Duration   `json:"debounce"`
-	MaxWait            Duration   `json:"max_wait"`
-	MinInterval        Duration   `json:"min_interval"`
-	SampleInterval     Duration   `json:"sample_interval"`
-	MissingRetry       Duration   `json:"missing_retry"`
-	TargetTimeout      Duration   `json:"target_timeout"`
-	MaintenanceTimeout Duration   `json:"maintenance_timeout"`
-	ShutdownTimeout    Duration   `json:"shutdown_timeout"`
-	EventMaxBytes      int64      `json:"event_max_bytes"`
-	EventRatePerSecond float64    `json:"event_rate_per_second"`
-	EventBurst         int        `json:"event_burst"`
-	Targets            []Target   `json:"targets"`
-	Notifiers          []Notifier `json:"notifiers"`
+	SchemaVersion      int        `yaml:"schema_version"`
+	TargetTimeout      Duration   `yaml:"target_timeout"`
+	MaintenanceTimeout Duration   `yaml:"maintenance_timeout"`
+	Targets            []Target   `yaml:"targets,omitempty"`
+	Notifiers          []Notifier `yaml:"notifiers,omitempty"`
+
+	ListenAddress      string   `yaml:"-"`
+	DataDir            string   `yaml:"-"`
+	StateDir           string   `yaml:"-"`
+	StagingDir         string   `yaml:"-"`
+	CacheDir           string   `yaml:"-"`
+	ResticBinary       string   `yaml:"-"`
+	Debounce           Duration `yaml:"-"`
+	MaxWait            Duration `yaml:"-"`
+	MinInterval        Duration `yaml:"-"`
+	SampleInterval     Duration `yaml:"-"`
+	MissingRetry       Duration `yaml:"-"`
+	ShutdownTimeout    Duration `yaml:"-"`
+	EventMaxBytes      int64    `yaml:"-"`
+	EventRatePerSecond float64  `yaml:"-"`
+	EventBurst         int      `yaml:"-"`
 }
 
 type Target struct {
-	Name                   string            `json:"name"`
-	Backend                string            `json:"backend"`
-	RepositoryFile         string            `json:"repository_file"`
-	CACertificateFile      string            `json:"ca_certificate_file,omitempty"`
-	Options                map[string]string `json:"options,omitempty"`
-	BackupCredentials      Credentials       `json:"backup_credentials"`
-	MaintenanceCredentials *Credentials      `json:"maintenance_credentials,omitempty"`
-}
-
-type Credentials struct {
-	PasswordFile     string            `json:"password_file"`
-	EnvironmentFiles map[string]string `json:"environment_files,omitempty"`
-	EnvironmentPaths map[string]string `json:"environment_paths,omitempty"`
+	Name          string            `yaml:"name"`
+	Repository    string            `yaml:"repository"`
+	ResticOptions map[string]string `yaml:"restic_options,omitempty"`
 }
 
 type Notifier struct {
-	Name             string            `json:"name"`
-	Type             string            `json:"type"`
-	Timeout          Duration          `json:"timeout"`
-	URL              string            `json:"url,omitempty"`
-	URLFile          string            `json:"url_file,omitempty"`
-	HeadersFromFiles map[string]string `json:"headers_from_files,omitempty"`
-	Endpoint         string            `json:"endpoint,omitempty"`
-	DeviceTokenFile  string            `json:"device_token_file,omitempty"`
-	AuthKeyFile      string            `json:"auth_key_file,omitempty"`
-	KeyID            string            `json:"key_id,omitempty"`
-	TeamID           string            `json:"team_id,omitempty"`
-	Topic            string            `json:"topic,omitempty"`
-	Sound            string            `json:"sound,omitempty"`
+	Name    string   `yaml:"name"`
+	Type    string   `yaml:"type"`
+	Timeout Duration `yaml:"timeout"`
+
+	WebhookURL string `yaml:"webhook_url,omitempty"`
+
+	DeviceToken string `yaml:"device_token,omitempty"`
+	AuthKey     string `yaml:"auth_key,omitempty"`
+	KeyID       string `yaml:"key_id,omitempty"`
+	TeamID      string `yaml:"team_id,omitempty"`
+	Topic       string `yaml:"topic,omitempty"`
+	Sound       string `yaml:"sound,omitempty"`
 }
 
-func LoadProxy(path string) (*Proxy, error) {
-	var cfg Proxy
-	if err := decodeFile(path, &cfg); err != nil {
-		return nil, err
-	}
-	if err := cfg.Validate(); err != nil {
-		return nil, fmt.Errorf("validate proxy config: %w", err)
-	}
-	return &cfg, nil
+// RoleCredentials is intentionally permissive about unknown targets and
+// fields. Only the configured target and the keys required by its repository
+// form are consumed.
+type RoleCredentials struct {
+	SchemaVersion int                          `yaml:"schema_version"`
+	Targets       map[string]map[string]string `yaml:"targets"`
 }
 
 func LoadBackup(path string) (*Backup, error) {
-	var cfg Backup
-	if err := decodeFile(path, &cfg); err != nil {
-		return nil, err
+	data, err := securefile.ReadBytes(path, MaxConfigBytes)
+	if err != nil {
+		return nil, fmt.Errorf("read backup config: %w", err)
+	}
+	return DecodeBackup(data)
+}
+
+func DecodeBackup(data []byte) (*Backup, error) {
+	if len(data) > MaxConfigBytes {
+		return nil, fmt.Errorf("backup config exceeds %d bytes", MaxConfigBytes)
+	}
+	cfg := defaultBackup()
+	if err := decodeOneYAML(data, &cfg, true); err != nil {
+		return nil, fmt.Errorf("decode backup config: %w", safeYAMLError(err))
 	}
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("validate backup config: %w", err)
@@ -121,176 +125,94 @@ func LoadBackup(path string) (*Backup, error) {
 	return &cfg, nil
 }
 
-func decodeFile(path string, dst any) error {
-	info, err := os.Lstat(path)
+func LoadRoleCredentials(path string, cfg *Backup) (*RoleCredentials, error) {
+	if err := safefs.ValidatePrivateDirectory(filepath.Dir(path)); err != nil {
+		return nil, fmt.Errorf("validate role credentials directory: %w", err)
+	}
+	data, err := securefile.ReadBytes(path, MaxConfigBytes)
 	if err != nil {
-		return fmt.Errorf("inspect config: %w", err)
+		return nil, fmt.Errorf("read role credentials: %w", err)
 	}
-	if !info.Mode().IsRegular() || info.Size() > maxConfigBytes {
-		return fmt.Errorf("config must be a regular file no larger than %d bytes", maxConfigBytes)
+	var credentials RoleCredentials
+	if err := decodeOneYAML(data, &credentials, false); err != nil {
+		return nil, fmt.Errorf("decode role credentials: %w", safeYAMLError(err))
 	}
-	f, err := os.Open(path)
-	if err != nil {
-		return fmt.Errorf("open config: %w", err)
+	if credentials.SchemaVersion != version.SchemaVersion {
+		return nil, fmt.Errorf("role credentials schema_version must be %d", version.SchemaVersion)
 	}
-	defer f.Close()
-	dec := json.NewDecoder(io.LimitReader(f, maxConfigBytes+1))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(dst); err != nil {
-		return fmt.Errorf("decode config: %w", err)
+	if credentials.Targets == nil {
+		return nil, fmt.Errorf("role credentials targets must be a mapping")
 	}
-	var extra any
-	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
-		if err == nil {
-			return fmt.Errorf("decode config: multiple JSON values")
+	for _, target := range cfg.Targets {
+		if _, err := credentials.Environment(target); err != nil {
+			return nil, fmt.Errorf("target %s credentials: %w", target.Name, err)
 		}
-		return fmt.Errorf("decode config trailer: %w", err)
 	}
-	return nil
+	return &credentials, nil
 }
 
-func DecodeProxy(data []byte) (*Proxy, error) {
-	var cfg Proxy
-	if err := decodeBytes(data, &cfg); err != nil {
-		return nil, err
+func decodeOneYAML(data []byte, destination any, strict bool) error {
+	options := []yaml.DecodeOption{}
+	if strict {
+		options = append(options, yaml.DisallowUnknownField())
 	}
-	if err := cfg.Validate(); err != nil {
-		return nil, err
-	}
-	return &cfg, nil
-}
-
-func DecodeBackup(data []byte) (*Backup, error) {
-	var cfg Backup
-	if err := decodeBytes(data, &cfg); err != nil {
-		return nil, err
-	}
-	if err := cfg.Validate(); err != nil {
-		return nil, err
-	}
-	return &cfg, nil
-}
-
-func decodeBytes(data []byte, dst any) error {
-	if len(data) > maxConfigBytes {
-		return fmt.Errorf("config exceeds %d bytes", maxConfigBytes)
-	}
-	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(dst); err != nil {
+	decoder := yaml.NewDecoder(bytes.NewReader(data), options...)
+	if err := decoder.Decode(destination); err != nil {
 		return err
 	}
 	var extra any
-	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
-		return fmt.Errorf("multiple JSON values")
+	err := decoder.Decode(&extra)
+	if errors.Is(err, io.EOF) {
+		return nil
 	}
-	return nil
+	if err == nil {
+		return fmt.Errorf("multiple YAML documents")
+	}
+	return err
 }
 
-func (c *Proxy) Validate() error {
-	if c.SchemaVersion != version.SchemaVersion {
-		return fmt.Errorf("schema_version must be %d", version.SchemaVersion)
+func safeYAMLError(err error) error {
+	text := err.Error()
+	category := "invalid YAML"
+	switch {
+	case strings.Contains(text, "unknown field"):
+		category = "unknown field"
+	case strings.Contains(text, "duplicate key"):
+		category = "duplicate key"
+	case strings.Contains(text, "cannot unmarshal"), strings.Contains(text, "cannot convert"), strings.Contains(text, "type"):
+		category = "invalid value type"
+	case strings.Contains(text, "multiple YAML documents"):
+		category = "multiple YAML documents"
 	}
-	if err := validListen(c.ListenAddress); err != nil {
-		return fmt.Errorf("listen_address: %w", err)
+	if position := yamlPosition.FindStringSubmatch(text); len(position) == 3 {
+		return fmt.Errorf("%s at line %s column %s", category, position[1], position[2])
 	}
-	upstream, err := parseHTTPURL(c.UpstreamURL, false)
-	if err != nil {
-		return fmt.Errorf("upstream_url: %w", err)
+	return errors.New(category)
+}
+
+func defaultBackup() Backup {
+	return Backup{
+		ListenAddress:      ListenAddress,
+		DataDir:            DataDir,
+		StateDir:           StateDir,
+		StagingDir:         StagingDir,
+		CacheDir:           CacheDir,
+		ResticBinary:       ResticBinary,
+		Debounce:           Duration{Duration: 30 * time.Second},
+		MaxWait:            Duration{Duration: 2 * time.Minute},
+		MinInterval:        Duration{Duration: 5 * time.Minute},
+		SampleInterval:     Duration{Duration: 15 * time.Minute},
+		MissingRetry:       Duration{Duration: 30 * time.Second},
+		ShutdownTimeout:    Duration{Duration: 2 * time.Minute},
+		EventMaxBytes:      1024,
+		EventRatePerSecond: 10,
+		EventBurst:         20,
 	}
-	if upstream.Path != "" && upstream.Path != "/" || upstream.RawQuery != "" {
-		return fmt.Errorf("upstream_url must not contain a path or query")
-	}
-	events, err := parseHTTPURL(c.EventsURL, false)
-	if err != nil {
-		return fmt.Errorf("events_url: %w", err)
-	}
-	if events.Path != "/v1/events" || events.RawQuery != "" {
-		return fmt.Errorf("events_url path must be /v1/events")
-	}
-	if len(c.TrustedProxyCIDRs) == 0 {
-		return fmt.Errorf("trusted_proxy_cidrs must not be empty")
-	}
-	trusted := make([]netip.Prefix, 0, len(c.TrustedProxyCIDRs))
-	for _, raw := range c.TrustedProxyCIDRs {
-		prefix, err := netip.ParsePrefix(raw)
-		if err != nil || prefix.String() != raw || prefix.Masked() != prefix {
-			return fmt.Errorf("trusted_proxy_cidrs contains invalid canonical CIDR %q", raw)
-		}
-		trusted = append(trusted, prefix)
-	}
-	if c.MaxRequestBytes != 600<<20 {
-		return fmt.Errorf("max_request_bytes must be 629145600")
-	}
-	durations := []struct {
-		name string
-		got  time.Duration
-		want time.Duration
-	}{
-		{"read_header_timeout", c.ReadHeaderTimeout.Duration, 10 * time.Second},
-		{"read_timeout", c.ReadTimeout.Duration, 30 * time.Minute},
-		{"write_timeout", c.WriteTimeout.Duration, 30 * time.Minute},
-		{"idle_timeout", c.IdleTimeout.Duration, 2 * time.Minute},
-		{"upstream_response_header_timeout", c.UpstreamResponseHeaderTimeout.Duration, 5 * time.Minute},
-		{"shutdown_timeout", c.ShutdownTimeout.Duration, 2 * time.Minute},
-	}
-	for _, item := range durations {
-		if item.got != item.want {
-			return fmt.Errorf("%s must be %s", item.name, item.want)
-		}
-	}
-	if c.EventTimeout.Duration < time.Second || c.EventTimeout.Duration > 10*time.Second {
-		return fmt.Errorf("event_timeout must be between 1s and 10s")
-	}
-	c.Upstream, c.Events, c.Trusted = upstream, events, trusted
-	return nil
 }
 
 func (c *Backup) Validate() error {
 	if c.SchemaVersion != version.SchemaVersion {
 		return fmt.Errorf("schema_version must be %d", version.SchemaVersion)
-	}
-	if err := validListen(c.ListenAddress); err != nil {
-		return fmt.Errorf("listen_address: %w", err)
-	}
-	paths := []struct {
-		name string
-		path string
-	}{
-		{"data_dir", c.DataDir}, {"state_dir", c.StateDir}, {"staging_dir", c.StagingDir}, {"cache_dir", c.CacheDir}, {"restic_binary", c.ResticBinary},
-	}
-	for _, item := range paths {
-		if err := cleanAbsolutePath(item.path); err != nil {
-			return fmt.Errorf("%s: %w", item.name, err)
-		}
-	}
-	for _, other := range []struct {
-		name string
-		path string
-	}{{"state_dir", c.StateDir}, {"staging_dir", c.StagingDir}, {"cache_dir", c.CacheDir}} {
-		if pathsOverlap(c.DataDir, other.path) {
-			return fmt.Errorf("data_dir and %s must not overlap", other.name)
-		}
-	}
-	if pathsOverlap(c.StateDir, c.StagingDir) || pathsOverlap(c.StateDir, c.CacheDir) || pathsOverlap(c.StagingDir, c.CacheDir) {
-		return fmt.Errorf("state_dir, staging_dir, and cache_dir must not overlap")
-	}
-	wants := []struct {
-		name string
-		got  time.Duration
-		want time.Duration
-	}{
-		{"debounce", c.Debounce.Duration, 30 * time.Second},
-		{"max_wait", c.MaxWait.Duration, 2 * time.Minute},
-		{"min_interval", c.MinInterval.Duration, 5 * time.Minute},
-		{"sample_interval", c.SampleInterval.Duration, 15 * time.Minute},
-		{"missing_retry", c.MissingRetry.Duration, 30 * time.Second},
-		{"shutdown_timeout", c.ShutdownTimeout.Duration, 2 * time.Minute},
-	}
-	for _, item := range wants {
-		if item.got != item.want {
-			return fmt.Errorf("%s must be %s", item.name, item.want)
-		}
 	}
 	if c.TargetTimeout.Duration < time.Minute || c.TargetTimeout.Duration > 2*time.Hour {
 		return fmt.Errorf("target_timeout must be between 1m and 2h")
@@ -298,142 +220,136 @@ func (c *Backup) Validate() error {
 	if c.MaintenanceTimeout.Duration < time.Minute || c.MaintenanceTimeout.Duration > 24*time.Hour {
 		return fmt.Errorf("maintenance_timeout must be between 1m and 24h")
 	}
-	if c.EventMaxBytes < 16 || c.EventMaxBytes > 4096 {
-		return fmt.Errorf("event_max_bytes must be between 16 and 4096")
-	}
-	if c.EventRatePerSecond <= 0 || c.EventRatePerSecond > 1000 || c.EventBurst < 1 || c.EventBurst > 10000 {
-		return fmt.Errorf("event rate or burst is outside supported bounds")
-	}
-	if len(c.Targets) == 0 {
-		return fmt.Errorf("targets must not be empty")
-	}
 	if len(c.Targets) > 32 {
 		return fmt.Errorf("targets must not contain more than 32 entries")
 	}
-	targetNames := map[string]struct{}{}
-	for i := range c.Targets {
-		if err := c.Targets[i].validate(); err != nil {
-			return fmt.Errorf("targets[%d]: %w", i, err)
-		}
-		if _, exists := targetNames[c.Targets[i].Name]; exists {
-			return fmt.Errorf("duplicate target name %q", c.Targets[i].Name)
-		}
-		targetNames[c.Targets[i].Name] = struct{}{}
+	if c.Targets == nil {
+		c.Targets = []Target{}
 	}
-	notifierNames := map[string]struct{}{}
+	targetNames := map[string]struct{}{}
+	for index := range c.Targets {
+		if err := c.Targets[index].Validate(); err != nil {
+			return fmt.Errorf("targets[%d]: %w", index, err)
+		}
+		if _, exists := targetNames[c.Targets[index].Name]; exists {
+			return fmt.Errorf("duplicate target name %q", c.Targets[index].Name)
+		}
+		targetNames[c.Targets[index].Name] = struct{}{}
+	}
 	if len(c.Notifiers) > 16 {
 		return fmt.Errorf("notifiers must not contain more than 16 entries")
 	}
-	for i := range c.Notifiers {
-		if err := c.Notifiers[i].validate(); err != nil {
-			return fmt.Errorf("notifiers[%d]: %w", i, err)
+	if c.Notifiers == nil {
+		c.Notifiers = []Notifier{}
+	}
+	notifierNames := map[string]struct{}{}
+	for index := range c.Notifiers {
+		if err := c.Notifiers[index].validate(); err != nil {
+			return fmt.Errorf("notifiers[%d]: %w", index, err)
 		}
-		if _, exists := notifierNames[c.Notifiers[i].Name]; exists {
-			return fmt.Errorf("duplicate notifier name %q", c.Notifiers[i].Name)
+		if _, exists := notifierNames[c.Notifiers[index].Name]; exists {
+			return fmt.Errorf("duplicate notifier name %q", c.Notifiers[index].Name)
 		}
-		notifierNames[c.Notifiers[i].Name] = struct{}{}
+		notifierNames[c.Notifiers[index].Name] = struct{}{}
 	}
 	return nil
 }
 
-func (t *Target) validate() error {
+func (t Target) Backend() string {
+	switch {
+	case strings.HasPrefix(t.Repository, "s3:"):
+		return "s3"
+	case strings.HasPrefix(t.Repository, "b2:"):
+		return "b2"
+	default:
+		return ""
+	}
+}
+
+func (t Target) Validate() error {
 	if !namePattern.MatchString(t.Name) {
 		return fmt.Errorf("invalid name %q", t.Name)
 	}
-	if !slices.Contains([]string{"local", "rest", "s3", "b2", "azure", "gcs", "swift"}, t.Backend) {
-		return fmt.Errorf("unsupported backend %q", t.Backend)
+	if !validRepository(t.Repository) {
+		return fmt.Errorf("repository must be a supported s3: or b2: locator without embedded credentials")
 	}
-	if err := cleanAbsolutePath(t.RepositoryFile); err != nil {
-		return fmt.Errorf("repository_file: %w", err)
+	if t.Backend() != "s3" && len(t.ResticOptions) != 0 {
+		return fmt.Errorf("restic_options are supported only for s3 repositories")
 	}
-	if t.CACertificateFile != "" {
-		if err := cleanAbsolutePath(t.CACertificateFile); err != nil {
-			return fmt.Errorf("ca_certificate_file: %w", err)
+	for name := range t.ResticOptions {
+		if _, allowed := allowedS3Option[name]; !allowed {
+			return fmt.Errorf("unsupported Restic option %q", name)
 		}
-	}
-	if err := t.validateOptions(); err != nil {
-		return err
-	}
-	if err := t.BackupCredentials.validate(); err != nil {
-		return fmt.Errorf("backup_credentials: %w", err)
-	}
-	if t.MaintenanceCredentials != nil {
-		if err := t.MaintenanceCredentials.validate(); err != nil {
-			return fmt.Errorf("maintenance_credentials: %w", err)
-		}
-	}
-	return nil
-}
-
-var allowedValueEnvironment = map[string]struct{}{
-	"AWS_ACCESS_KEY_ID": {}, "AWS_SECRET_ACCESS_KEY": {}, "AWS_SESSION_TOKEN": {}, "AWS_DEFAULT_REGION": {},
-	"B2_ACCOUNT_ID": {}, "B2_ACCOUNT_KEY": {},
-	"AZURE_ACCOUNT_NAME": {}, "AZURE_ACCOUNT_KEY": {}, "AZURE_ACCOUNT_SAS": {}, "AZURE_ENDPOINT_SUFFIX": {},
-	"GOOGLE_PROJECT_ID":    {},
-	"RESTIC_REST_USERNAME": {}, "RESTIC_REST_PASSWORD": {},
-	"ST_AUTH": {}, "ST_USER": {}, "ST_KEY": {},
-	"OS_AUTH_URL": {}, "OS_REGION_NAME": {}, "OS_USERNAME": {}, "OS_USER_ID": {}, "OS_PASSWORD": {},
-	"OS_TENANT_ID": {}, "OS_TENANT_NAME": {}, "OS_USER_DOMAIN_NAME": {}, "OS_USER_DOMAIN_ID": {},
-	"OS_PROJECT_NAME": {}, "OS_PROJECT_DOMAIN_NAME": {}, "OS_PROJECT_DOMAIN_ID": {}, "OS_TRUST_ID": {},
-	"OS_APPLICATION_CREDENTIAL_ID": {}, "OS_APPLICATION_CREDENTIAL_NAME": {}, "OS_APPLICATION_CREDENTIAL_SECRET": {},
-	"OS_STORAGE_URL": {}, "OS_AUTH_TOKEN": {}, "SWIFT_DEFAULT_CONTAINER_POLICY": {},
-}
-
-var allowedPathEnvironment = map[string]struct{}{
-	"GOOGLE_APPLICATION_CREDENTIALS": {},
-}
-
-func (c Credentials) validate() error {
-	if err := cleanAbsolutePath(c.PasswordFile); err != nil {
-		return fmt.Errorf("password_file: %w", err)
-	}
-	seen := map[string]struct{}{}
-	for name, path := range c.EnvironmentFiles {
-		if _, ok := allowedValueEnvironment[name]; !ok {
-			return fmt.Errorf("environment_files contains unsupported variable %q", name)
-		}
-		if err := cleanAbsolutePath(path); err != nil {
-			return fmt.Errorf("environment_files[%s]: %w", name, err)
-		}
-		seen[name] = struct{}{}
-	}
-	for name, path := range c.EnvironmentPaths {
-		if _, ok := allowedPathEnvironment[name]; !ok {
-			return fmt.Errorf("environment_paths contains unsupported variable %q", name)
-		}
-		if _, duplicate := seen[name]; duplicate {
-			return fmt.Errorf("environment variable %q is configured twice", name)
-		}
-		if err := cleanAbsolutePath(path); err != nil {
-			return fmt.Errorf("environment_paths[%s]: %w", name, err)
-		}
-	}
-	return nil
-}
-
-func (t Target) validateOptions() error {
-	for name, value := range t.Options {
-		if t.Backend != "s3" {
-			return fmt.Errorf("options are not supported for backend %q", t.Backend)
+		value := t.ResticOptions[name]
+		if value == "" || len(value) > 256 || strings.ContainsAny(value, "\r\n\x00") {
+			return fmt.Errorf("Restic option %q has an invalid value", name)
 		}
 		switch name {
 		case "s3.bucket-lookup":
 			if !slices.Contains([]string{"auto", "dns", "path"}, value) {
-				return fmt.Errorf("options[%s] must be auto, dns, or path", name)
-			}
-		case "s3.region":
-			if len(value) < 1 || len(value) > 63 || !regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`).MatchString(value) {
-				return fmt.Errorf("options[%s] is invalid", name)
+				return fmt.Errorf("Restic option %q has an invalid value", name)
 			}
 		case "s3.list-objects-v1":
 			if value != "true" && value != "false" {
-				return fmt.Errorf("options[%s] must be true or false", name)
+				return fmt.Errorf("Restic option %q has an invalid value", name)
 			}
-		default:
-			return fmt.Errorf("unsupported Restic option %q", name)
+		case "s3.region":
+			if !regionPattern.MatchString(value) {
+				return fmt.Errorf("Restic option %q has an invalid value", name)
+			}
 		}
 	}
 	return nil
+}
+
+func validRepository(repository string) bool {
+	if repository == "" || len(repository) > 4096 || strings.ContainsAny(repository, "\r\n\x00") {
+		return false
+	}
+	if strings.HasPrefix(repository, "b2:") {
+		bucket, prefix, ok := strings.Cut(strings.TrimPrefix(repository, "b2:"), ":")
+		if !ok || !b2BucketPattern.MatchString(bucket) || !b2PrefixPattern.MatchString(prefix) {
+			return false
+		}
+		for _, component := range strings.Split(prefix, "/") {
+			if component == "" || component == "." || component == ".." {
+				return false
+			}
+		}
+		return true
+	}
+	if !strings.HasPrefix(repository, "s3:") {
+		return false
+	}
+	parsed, err := url.Parse(strings.TrimPrefix(repository, "s3:"))
+	return err == nil && parsed.IsAbs() && parsed.Host != "" && parsed.User == nil && parsed.RawQuery == "" && parsed.Fragment == "" &&
+		strings.Trim(parsed.EscapedPath(), "/") != "" &&
+		slices.Contains([]string{"http", "https"}, parsed.Scheme)
+}
+
+func (c RoleCredentials) Environment(target Target) (map[string]string, error) {
+	values, exists := c.Targets[target.Name]
+	if !exists {
+		return nil, fmt.Errorf("target entry is missing")
+	}
+	var names []string
+	switch target.Backend() {
+	case "s3":
+		names = []string{"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"}
+	case "b2":
+		names = []string{"B2_ACCOUNT_ID", "B2_ACCOUNT_KEY"}
+	default:
+		return nil, fmt.Errorf("repository backend is unsupported")
+	}
+	environment := make(map[string]string, len(names))
+	for _, name := range names {
+		value, exists := values[name]
+		if !exists || value == "" || len(value) > 64<<10 || strings.ContainsAny(value, "\r\n\x00") {
+			return nil, fmt.Errorf("required key %s is missing or invalid", name)
+		}
+		environment[name] = value
+	}
+	return environment, nil
 }
 
 func (n *Notifier) validate() error {
@@ -444,55 +360,33 @@ func (n *Notifier) validate() error {
 		return fmt.Errorf("timeout must be between 1s and 1m")
 	}
 	switch n.Type {
-	case "webhook":
-		if n.URL == "" || n.URLFile != "" || n.Endpoint != "" || n.DeviceTokenFile != "" || n.AuthKeyFile != "" || n.KeyID != "" || n.TeamID != "" || n.Topic != "" || n.Sound != "" {
-			return fmt.Errorf("webhook fields are invalid for this notifier type")
-		}
-		parsed, err := parseHTTPURL(n.URL, true)
-		if err != nil || parsed.RawQuery != "" {
-			return fmt.Errorf("url must be an HTTPS URL without query credentials")
-		}
-		canonicalHeaders := make(map[string]struct{}, len(n.HeadersFromFiles))
-		for header, path := range n.HeadersFromFiles {
-			if !validSecretHeader(header) {
-				return fmt.Errorf("unsupported secret header %q", header)
-			}
-			canonical := strings.ToLower(header)
-			if _, duplicate := canonicalHeaders[canonical]; duplicate {
-				return fmt.Errorf("duplicate secret header %q", header)
-			}
-			canonicalHeaders[canonical] = struct{}{}
-			if err := cleanAbsolutePath(path); err != nil {
-				return fmt.Errorf("headers_from_files[%s]: %w", header, err)
-			}
-		}
 	case "wechat":
-		if n.URL != "" || n.URLFile == "" || len(n.HeadersFromFiles) != 0 || n.Endpoint != "" || n.DeviceTokenFile != "" || n.AuthKeyFile != "" || n.KeyID != "" || n.TeamID != "" || n.Topic != "" || n.Sound != "" {
-			return fmt.Errorf("wechat fields are invalid for this notifier type")
+		if n.WebhookURL == "" || n.DeviceToken != "" || n.AuthKey != "" || n.KeyID != "" || n.TeamID != "" || n.Topic != "" || n.Sound != "" {
+			return fmt.Errorf("fields are invalid for WeChat")
 		}
-		if err := cleanAbsolutePath(n.URLFile); err != nil {
-			return fmt.Errorf("url_file: %w", err)
+		parsed, err := parseHTTPSURL(n.WebhookURL)
+		if err != nil || parsed.Path == "" {
+			return fmt.Errorf("webhook_url must be an HTTPS URL without user info or fragment")
 		}
 	case "bark":
-		if n.URL != "" || n.URLFile != "" || len(n.HeadersFromFiles) != 0 || n.Endpoint == "" || n.DeviceTokenFile == "" || n.AuthKeyFile == "" || n.KeyID == "" || n.TeamID == "" || n.Topic == "" {
-			return fmt.Errorf("bark fields are incomplete or invalid")
+		if n.WebhookURL != "" || n.DeviceToken == "" || n.AuthKey == "" || n.KeyID == "" || n.TeamID == "" || n.Topic == "" {
+			return fmt.Errorf("Bark fields are incomplete or invalid")
 		}
-		endpoint, err := parseHTTPURL(n.Endpoint, true)
-		if err != nil || endpoint.Path != "" && endpoint.Path != "/" || endpoint.RawQuery != "" || endpoint.Port() != "" ||
-			!slices.Contains([]string{"api.push.apple.com", "api.sandbox.push.apple.com"}, endpoint.Hostname()) {
-			return fmt.Errorf("endpoint must be an official APNs HTTPS origin")
+		if len(n.DeviceToken) != 64 || strings.ToLower(n.DeviceToken) != n.DeviceToken {
+			return fmt.Errorf("device_token must be 64 lowercase hexadecimal characters")
 		}
-		for label, path := range map[string]string{"device_token_file": n.DeviceTokenFile, "auth_key_file": n.AuthKeyFile} {
-			if err := cleanAbsolutePath(path); err != nil {
-				return fmt.Errorf("%s: %w", label, err)
-			}
+		if _, err := hex.DecodeString(n.DeviceToken); err != nil {
+			return fmt.Errorf("device_token must be 64 lowercase hexadecimal characters")
+		}
+		if len(n.AuthKey) > 16<<10 || strings.IndexByte(n.AuthKey, 0) >= 0 {
+			return fmt.Errorf("auth_key is invalid")
 		}
 		for label, value := range map[string]string{"key_id": n.KeyID, "team_id": n.TeamID, "topic": n.Topic} {
-			if len(value) < 2 || len(value) > 255 || strings.ContainsAny(value, "\r\n") {
+			if len(value) < 2 || len(value) > 255 || strings.ContainsAny(value, "\r\n\x00") {
 				return fmt.Errorf("%s is invalid", label)
 			}
 		}
-		if len(n.Sound) > 255 || strings.ContainsAny(n.Sound, "\r\n") {
+		if len(n.Sound) > 255 || strings.ContainsAny(n.Sound, "\r\n\x00") {
 			return fmt.Errorf("sound is invalid")
 		}
 	default:
@@ -501,57 +395,13 @@ func (n *Notifier) validate() error {
 	return nil
 }
 
-func validListen(value string) error {
-	host, port, err := net.SplitHostPort(value)
-	if err != nil || port == "" {
-		return fmt.Errorf("must be host:port")
-	}
-	if host != "" {
-		if _, err := netip.ParseAddr(host); err != nil {
-			return fmt.Errorf("host must be an IP address")
-		}
-	}
-	numericPort, err := strconv.Atoi(port)
-	if err != nil || numericPort < 1 || numericPort > 65535 {
-		return fmt.Errorf("port must be between 1 and 65535")
-	}
-	return nil
-}
-
-func parseHTTPURL(raw string, httpsOnly bool) (*url.URL, error) {
+func parseHTTPSURL(raw string) (*url.URL, error) {
 	if len(raw) < 1 || len(raw) > 4096 || strings.ContainsAny(raw, "\r\n\x00") {
-		return nil, fmt.Errorf("URL length or characters are invalid")
+		return nil, fmt.Errorf("URL is invalid")
 	}
 	parsed, err := url.Parse(raw)
-	if err != nil || !parsed.IsAbs() || parsed.Host == "" || parsed.User != nil || parsed.Fragment != "" {
-		return nil, fmt.Errorf("must be an absolute URL without user info or fragment")
-	}
-	if httpsOnly && parsed.Scheme != "https" {
-		return nil, fmt.Errorf("scheme must be https")
-	}
-	if !httpsOnly && parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return nil, fmt.Errorf("scheme must be http or https")
+	if err != nil || !parsed.IsAbs() || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.Fragment != "" {
+		return nil, fmt.Errorf("URL is invalid")
 	}
 	return parsed, nil
-}
-
-func cleanAbsolutePath(path string) error {
-	if path == "" || path == string(filepath.Separator) || !filepath.IsAbs(path) || filepath.Clean(path) != path || strings.IndexByte(path, 0) >= 0 {
-		return fmt.Errorf("must be a clean absolute non-root path")
-	}
-	return nil
-}
-
-func pathsOverlap(left, right string) bool {
-	rel, err := filepath.Rel(left, right)
-	if err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return true
-	}
-	rel, err = filepath.Rel(right, left)
-	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
-}
-
-func validSecretHeader(name string) bool {
-	canonical := strings.ToLower(name)
-	return canonical == "authorization" || canonical == "x-api-key" || strings.HasPrefix(canonical, "x-vaultwarden-less-")
 }

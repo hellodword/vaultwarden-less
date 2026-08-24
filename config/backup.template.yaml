@@ -1,0 +1,41 @@
+# Copy this file to config/backup.yaml, keep it private (0400 or 0600), and
+# uncomment only the integrations you use. An empty target list is supported.
+schema_version: 1
+target_timeout: 30m
+maintenance_timeout: 12h
+targets: []
+notifiers: []
+
+# S3-compatible target (Amazon S3, MinIO, or COS):
+# targets:
+#   - name: primary
+#     repository: s3:https://objects.example.test/bucket/vaultwarden
+#     restic_options:
+#       s3.bucket-lookup: path
+#       s3.region: ap-singapore
+#
+# Native Backblaze B2 target:
+#   - name: cold-copy
+#     repository: b2:bucket-name:vaultwarden
+#
+# Enterprise WeChat notifier. The real URL is a secret, so backup.yaml must
+# remain private.
+# notifiers:
+#   - name: operations
+#     type: wechat
+#     timeout: 10s
+#     webhook_url: https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=REPLACE_ME
+#
+# Bark through APNs. Paste the complete PKCS#8 APNs private key under auth_key.
+#   - name: phone
+#     type: bark
+#     timeout: 10s
+#     device_token: REPLACE_WITH_64_LOWERCASE_HEX_CHARACTERS
+#     auth_key: |
+#       -----BEGIN PRIVATE KEY-----
+#       REPLACE_ME
+#       -----END PRIVATE KEY-----
+#     key_id: REPLACE_ME
+#     team_id: REPLACE_ME
+#     topic: me.fin.bark
+#     sound: "1107"

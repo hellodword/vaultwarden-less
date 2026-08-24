@@ -9,51 +9,68 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/netip"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/hellodword/vaultwarden-less/internal/config"
 )
 
-const HealthPath = "/.vaultwarden-less/healthz"
+const (
+	HealthPath    = "/.vaultwarden-less/healthz"
+	ListenAddress = "0.0.0.0:8080"
+	UpstreamURL   = "http://vaultwarden:80"
+	EventsURL     = "http://backup:9090/v1/events"
+
+	MaxRequestBytes               = int64(600 << 20)
+	ReadHeaderTimeout             = 10 * time.Second
+	ReadTimeout                   = 30 * time.Minute
+	WriteTimeout                  = 30 * time.Minute
+	IdleTimeout                   = 2 * time.Minute
+	UpstreamResponseHeaderTimeout = 5 * time.Minute
+	EventTimeout                  = 2 * time.Second
+	ShutdownTimeout               = 2 * time.Minute
+)
 
 type DirtyMarker interface {
 	MarkDirty()
 }
 
 type Server struct {
-	cfg    *config.Proxy
-	marker DirtyMarker
-	log    *slog.Logger
-	proxy  *httputil.ReverseProxy
-	http   *http.Server
+	upstream *url.URL
+	marker   DirtyMarker
+	log      *slog.Logger
+	proxy    *httputil.ReverseProxy
+	http     *http.Server
 }
 
-func NewServer(cfg *config.Proxy, marker DirtyMarker, log *slog.Logger) *Server {
+func NewServer(marker DirtyMarker, log *slog.Logger) *Server {
+	return newServer(mustURL(UpstreamURL), marker, log)
+}
+
+func newServer(upstream *url.URL, marker DirtyMarker, log *slog.Logger) *Server {
 	transport := &http.Transport{
 		Proxy:                 nil,
 		DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          100,
 		MaxIdleConnsPerHost:   32,
-		IdleConnTimeout:       cfg.IdleTimeout.Duration,
+		IdleConnTimeout:       IdleTimeout,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: time.Second,
-		ResponseHeaderTimeout: cfg.UpstreamResponseHeaderTimeout.Duration,
+		ResponseHeaderTimeout: UpstreamResponseHeaderTimeout,
 	}
 	rp := &httputil.ReverseProxy{Transport: transport}
-	s := &Server{cfg: cfg, marker: marker, log: log, proxy: rp}
+	s := &Server{upstream: upstream, marker: marker, log: log, proxy: rp}
 	rp.Rewrite = s.rewrite
 	rp.ModifyResponse = s.modifyResponse
 	rp.ErrorHandler = s.proxyError
 	s.http = &http.Server{
-		Addr:              cfg.ListenAddress,
+		Addr:              ListenAddress,
 		Handler:           s,
-		ReadHeaderTimeout: cfg.ReadHeaderTimeout.Duration,
-		ReadTimeout:       cfg.ReadTimeout.Duration,
-		WriteTimeout:      cfg.WriteTimeout.Duration,
-		IdleTimeout:       cfg.IdleTimeout.Duration,
+		ReadHeaderTimeout: ReadHeaderTimeout,
+		ReadTimeout:       ReadTimeout,
+		WriteTimeout:      WriteTimeout,
+		IdleTimeout:       IdleTimeout,
 		MaxHeaderBytes:    1 << 20,
 	}
 	return s
@@ -80,11 +97,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_forwarded_header", "Invalid forwarding header")
 		return
 	}
-	if r.ContentLength > s.cfg.MaxRequestBytes {
+	if r.ContentLength > MaxRequestBytes {
 		writeError(w, http.StatusRequestEntityTooLarge, "request_too_large", "Request body exceeds 600 MiB")
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, s.cfg.MaxRequestBytes)
+	r.Body = http.MaxBytesReader(w, r.Body, MaxRequestBytes)
 	s.proxy.ServeHTTP(w, r)
 }
 
@@ -103,7 +120,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 func (s *Server) rewrite(pr *httputil.ProxyRequest) {
 	clientIP, proto, _ := s.forwardedValues(pr.In)
 	removeForwardingHeaders(pr.Out.Header)
-	pr.SetURL(s.cfg.Upstream)
+	pr.SetURL(s.upstream)
 	pr.Out.Host = pr.In.Host
 	pr.Out.Header.Set("X-Real-IP", clientIP.String())
 	pr.Out.Header.Set("X-Forwarded-For", clientIP.String())
@@ -150,7 +167,7 @@ func (s *Server) forwardedValues(r *http.Request) (netip.Addr, string, error) {
 			return netip.Addr{}, "", fmt.Errorf("invalid X-Real-IP")
 		}
 		parsed, err := netip.ParseAddr(raw)
-		if err != nil {
+		if err != nil || parsed.Zone() != "" {
 			return netip.Addr{}, "", fmt.Errorf("invalid X-Real-IP")
 		}
 		client = parsed.Unmap()
@@ -165,12 +182,15 @@ func (s *Server) forwardedValues(r *http.Request) (netip.Addr, string, error) {
 }
 
 func (s *Server) trusts(addr netip.Addr) bool {
-	for _, prefix := range s.cfg.Trusted {
-		if prefix.Contains(addr) {
-			return true
-		}
+	return addr.IsLoopback() || addr.IsPrivate()
+}
+
+func mustURL(raw string) *url.URL {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		panic(err)
 	}
-	return false
+	return parsed
 }
 
 func remoteIP(remote string) (netip.Addr, error) {
@@ -179,7 +199,7 @@ func remoteIP(remote string) (netip.Addr, error) {
 		return netip.Addr{}, fmt.Errorf("invalid peer address")
 	}
 	addr, err := netip.ParseAddr(host)
-	if err != nil {
+	if err != nil || addr.Zone() != "" {
 		return netip.Addr{}, fmt.Errorf("invalid peer address")
 	}
 	return addr.Unmap(), nil
@@ -251,6 +271,9 @@ func validHost(hostport string) bool {
 		}
 	}
 	if addr, err := netip.ParseAddr(host); err == nil {
+		if addr.Zone() != "" {
+			return false
+		}
 		return addr.IsValid() && (bracketedIPv6 && addr.Is6() || !bracketedIPv6 && addr.Is4())
 	}
 	if len(host) > 253 || strings.HasPrefix(host, ".") || strings.HasSuffix(host, ".") {

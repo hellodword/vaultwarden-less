@@ -11,6 +11,8 @@ import (
 	"slices"
 	"strings"
 	"syscall"
+
+	"github.com/hellodword/vaultwarden-less/internal/safefs"
 )
 
 const spaceReserve = int64(64 << 20)
@@ -40,8 +42,8 @@ func (b Builder) Build(ctx context.Context, allowIncomplete bool) (_ Result, err
 	if err := validateOwnedDirectory(b.DataDir); err != nil {
 		return Result{}, fmt.Errorf("validate data directory: %w", err)
 	}
-	if err := mkdirAllSecure(b.StagingDir); err != nil {
-		return Result{}, fmt.Errorf("prepare staging directory: %w", err)
+	if err := safefs.ValidatePrivateDirectory(b.StagingDir); err != nil {
+		return Result{}, fmt.Errorf("validate staging directory: %w", err)
 	}
 	buildDir, err := os.MkdirTemp(b.StagingDir, ".build-")
 	if err != nil {
@@ -247,7 +249,8 @@ func validateOwnedDirectory(path string) error {
 	if err != nil {
 		return err
 	}
-	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o700 {
+	stat, ownerKnown := info.Sys().(*syscall.Stat_t)
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || !ownerKnown || stat.Uid != uint32(os.Geteuid()) || info.Mode().Perm() != 0o700 {
 		return fmt.Errorf("path is not a real 0700 directory")
 	}
 	return nil

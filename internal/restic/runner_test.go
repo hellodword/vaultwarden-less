@@ -37,21 +37,20 @@ fi
 		t.Fatal(err)
 	}
 	t.Setenv("ARG_LOG", logPath)
-	secret := func(name, value string) string {
-		path := filepath.Join(root, name)
-		if err := os.WriteFile(path, []byte(value+"\n"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		return path
+	secretsDir := filepath.Join(root, "secrets")
+	if err := os.Mkdir(secretsDir, 0o700); err != nil {
+		t.Fatal(err)
 	}
-	repository := secret("repository", filepath.Join(root, "repository-data"))
-	password := secret("password", "synthetic-password")
-	backend := secret("backend", "synthetic-backend-value")
+	password := filepath.Join(secretsDir, "password")
+	if err := os.WriteFile(password, []byte("synthetic-password\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	target := config.Target{
-		Name: "primary", Backend: "local", RepositoryFile: repository,
-		BackupCredentials:      config.Credentials{PasswordFile: password, EnvironmentFiles: map[string]string{"AWS_ACCESS_KEY_ID": backend}},
-		MaintenanceCredentials: &config.Credentials{PasswordFile: password},
+		Name: "primary", Repository: "s3:https://objects.example.test/bucket/repository",
 	}
+	credentials := &config.RoleCredentials{SchemaVersion: 1, Targets: map[string]map[string]string{
+		"primary": {"AWS_ACCESS_KEY_ID": "synthetic-access", "AWS_SECRET_ACCESS_KEY": "synthetic-backend-value"},
+	}}
 	staging := filepath.Join(root, "staging")
 	for _, path := range []string{filepath.Join(staging, "current", "data"), filepath.Join(root, "cache")} {
 		if err := os.MkdirAll(path, 0o700); err != nil {
@@ -61,7 +60,10 @@ fi
 	if err := os.WriteFile(filepath.Join(staging, "current", "manifest.json"), []byte("{}"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	return Runner{Binary: script, CacheDir: filepath.Join(root, "cache"), StagingDir: staging}, target, logPath
+	return Runner{
+		Binary: script, CacheDir: filepath.Join(root, "cache"), StagingDir: staging,
+		PasswordFile: password, Credentials: credentials,
+	}, target, logPath
 }
 
 func TestBackupRunsOnlyBackupWithSecretFileEnvironment(t *testing.T) {
@@ -118,7 +120,7 @@ func TestPruneIsDryRunAndStrictlyFilteredByDefault(t *testing.T) {
 		}
 	}
 	if len(allLines) != 4 || len(lines) != 2 {
-		t.Fatalf("prune preflight/command count = %d/%d (%q)", len(allLines), len(lines), allLines)
+		t.Fatalf("prune inspection/command count = %d/%d (%q)", len(allLines), len(lines), allLines)
 	}
 	for i, line := range lines {
 		for _, required := range []string{
@@ -155,7 +157,7 @@ func TestSnapshotsUsesConjunctiveStatusTagFilter(t *testing.T) {
 
 func TestCredentialPermissionFailureIsGeneric(t *testing.T) {
 	runner, target, _ := fakeRunner(t)
-	if err := os.Chmod(target.BackupCredentials.PasswordFile, 0o644); err != nil {
+	if err := os.Chmod(runner.PasswordFile, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	manifest, err := testManifest()
@@ -163,18 +165,24 @@ func TestCredentialPermissionFailureIsGeneric(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err = runner.Backup(context.Background(), target, manifest)
-	if err == nil || strings.Contains(err.Error(), target.BackupCredentials.PasswordFile) {
+	if err == nil || strings.Contains(err.Error(), runner.PasswordFile) {
 		t.Fatalf("error was absent or exposed path: %v", err)
+	}
+}
+
+func TestPasswordFileRejectsAdditionalLines(t *testing.T) {
+	runner, target, _ := fakeRunner(t)
+	if err := os.WriteFile(runner.PasswordFile, []byte("first\nsecond\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.ValidateTarget(target); err == nil {
+		t.Fatal("multi-line Restic password was accepted")
 	}
 }
 
 func TestS3OptionsArePassedAsStructuredGlobalArguments(t *testing.T) {
 	runner, target, logPath := fakeRunner(t)
-	target.Backend = "s3"
-	target.Options = map[string]string{"s3.region": "ap-singapore", "s3.bucket-lookup": "dns"}
-	if err := os.WriteFile(target.RepositoryFile, []byte("s3:https://cos.example.test/bucket/repository\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	target.ResticOptions = map[string]string{"s3.region": "ap-singapore", "s3.bucket-lookup": "dns"}
 	manifest, err := testManifest()
 	if err != nil {
 		t.Fatal(err)
@@ -196,22 +204,6 @@ func testManifest() (snapshot.Manifest, error) {
 	return snapshot.NewManifest(snapshot.Complete, version.VaultwardenSchema, []snapshot.File{{
 		Path: "data/db.sqlite3", Size: 0, SHA256: strings.Repeat("0", 64),
 	}}, nil)
-}
-
-func TestRepositoryBackendValidation(t *testing.T) {
-	t.Parallel()
-	for _, test := range []struct {
-		backend, repository string
-		want                bool
-	}{
-		{"local", "/srv/restic", true}, {"rest", "rest:https://example.test/repo", true},
-		{"s3", "s3:http://minio.test/bucket/path", true}, {"gcs", "gs:bucket:/path", true},
-		{"local", "relative", false}, {"rest", "sftp:user@example.test:/repo", false}, {"s3", "rclone:remote:path", false},
-	} {
-		if got := validRepository(test.backend, test.repository); got != test.want {
-			t.Errorf("validRepository(%q, %q) = %v, want %v", test.backend, test.repository, got, test.want)
-		}
-	}
 }
 
 func TestSamePathsRequiresExactSet(t *testing.T) {

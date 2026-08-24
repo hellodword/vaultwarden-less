@@ -102,6 +102,7 @@ func TestBuilderCreatesCompleteWhitelistedRecoverySetDuringWALWrites(t *testing.
 	dataDir, db := syntheticData(t, true)
 	defer db.Close()
 	stagingDir := filepath.Join(t.TempDir(), "staging")
+	mustSnapshotRoot(t, stagingDir)
 	builder := Builder{DataDir: dataDir, StagingDir: stagingDir}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -158,7 +159,7 @@ func TestBuilderCreatesCompleteWhitelistedRecoverySetDuringWALWrites(t *testing.
 func TestBuilderRetriesMissingReferencesThenAllowsIncomplete(t *testing.T) {
 	dataDir, db := syntheticData(t, false)
 	defer db.Close()
-	builder := Builder{DataDir: dataDir, StagingDir: filepath.Join(t.TempDir(), "staging")}
+	builder := Builder{DataDir: dataDir, StagingDir: mustSnapshotRoot(t, filepath.Join(t.TempDir(), "staging"))}
 	if _, err := builder.Build(context.Background(), false); err == nil {
 		t.Fatal("missing references produced a complete result")
 	} else {
@@ -190,7 +191,7 @@ func TestBuilderRejectsTemplateSymlink(t *testing.T) {
 	if err := os.Symlink(filepath.Join(dataDir, "config.json"), link); err != nil {
 		t.Fatal(err)
 	}
-	builder := Builder{DataDir: dataDir, StagingDir: filepath.Join(t.TempDir(), "staging")}
+	builder := Builder{DataDir: dataDir, StagingDir: mustSnapshotRoot(t, filepath.Join(t.TempDir(), "staging"))}
 	if _, err := builder.Build(context.Background(), false); err == nil {
 		t.Fatal("template symlink was accepted")
 	}
@@ -199,7 +200,7 @@ func TestBuilderRejectsTemplateSymlink(t *testing.T) {
 func TestVerifyRejectsUnreferencedDatabaseManagedFile(t *testing.T) {
 	dataDir, db := syntheticData(t, true)
 	defer db.Close()
-	builder := Builder{DataDir: dataDir, StagingDir: filepath.Join(t.TempDir(), "staging")}
+	builder := Builder{DataDir: dataDir, StagingDir: mustSnapshotRoot(t, filepath.Join(t.TempDir(), "staging"))}
 	result, err := builder.Build(context.Background(), false)
 	if err != nil {
 		t.Fatal(err)
@@ -227,7 +228,7 @@ func TestVerifyRejectsUnreferencedDatabaseManagedFile(t *testing.T) {
 func TestVerifyRejectsUnreferencedMissingDatabaseManagedFile(t *testing.T) {
 	dataDir, db := syntheticData(t, true)
 	defer db.Close()
-	builder := Builder{DataDir: dataDir, StagingDir: filepath.Join(t.TempDir(), "staging")}
+	builder := Builder{DataDir: dataDir, StagingDir: mustSnapshotRoot(t, filepath.Join(t.TempDir(), "staging"))}
 	result, err := builder.Build(context.Background(), false)
 	if err != nil {
 		t.Fatal(err)
@@ -259,6 +260,14 @@ func writeTestManifest(t *testing.T, root string, manifest Manifest) {
 	if err := os.WriteFile(filepath.Join(root, "manifest.json"), data, 0o600); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func mustSnapshotRoot(t *testing.T, path string) string {
+	t.Helper()
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }
 
 func TestManifestContentIDIsDeterministic(t *testing.T) {

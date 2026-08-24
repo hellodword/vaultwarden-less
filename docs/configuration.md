@@ -1,206 +1,250 @@
-# Configuration
+# Configuration and credentials
 
-Both configuration files are strict JSON with `"schema_version": 1`.
-Unknown fields, multiple/trailing top-level JSON values, unsupported URLs or backends,
-unclean paths, invalid names, and out-of-contract durations stop startup. There
-are no environment-variable overrides for these JSON contracts.
+The proxy has no configuration file. The worker has one strict private YAML
+file and one fixed role-credential YAML file. There are no environment-variable
+overrides for either contract.
 
-Configuration JSON must never contain passwords, tokens, private keys,
-repository credentials, or authenticated URLs. Secret values are loaded from
-regular, non-symlink files with permissions exactly `0600`. A secret file path
-is configuration; its contents are not.
+## Fixed container paths
 
-## proxy.json
+Hard-coded paths are container paths, not arbitrary host paths. Compose owns
+the mapping:
 
-The tracked [proxy.json](../config/proxy.json) is the complete schema.
+| Host source | Container path | Consumer | Access |
+| --- | --- | --- | --- |
+| `./data` | `/data` | Vaultwarden / backup | read-write / read-only |
+| `./state` | `/state` | backup | read-write |
+| `./staging` | `/staging` | backup | read-write |
+| `./cache` | `/cache` | backup, maintenance, restore | read-write |
+| `./restore` | `/restore` | restore | read-write |
+| `./config/backup.yaml` | `/config/backup.yaml` | backup, maintenance, restore | read-only |
+| `./credentials/common` | `/run/credentials/common` | all Restic roles | read-only |
+| role-specific directory | `/run/credentials/role` | one role only | read-only |
+
+The backup service maps `./credentials/backup`; maintenance and restore map
+`./credentials/maintenance`. The proxy has none of these mounts. Compose sets
+`create_host_path: false`, so a misspelled or absent host source fails instead
+of becoming a root-owned directory.
+
+`data`, `state`, `staging`, `cache`, `restore`, and all credential directories
+must already be real non-symlink directories owned by the configured non-root
+identity and mode `0700`. The worker does create private children and state
+files inside its writable roots; it does not create or chmod the roots.
+
+## Proxy constants
+
+The proxy binary fixes these values:
+
+| Behavior | Value |
+| --- | --- |
+| listen | `0.0.0.0:8080` in the container; host loopback publication by Compose |
+| Vaultwarden upstream | `http://vaultwarden:80` |
+| event endpoint | `http://backup:9090/v1/events` |
+| request body | 600 MiB maximum |
+| read header | 10 seconds |
+| read/write | 30 minutes |
+| idle | 2 minutes |
+| upstream response header | 5 minutes |
+| event delivery | 2 seconds |
+| graceful shutdown | 2 minutes |
+
+The only trusted forwarding peers are loopback/private source addresses, which
+are safe here because the published port defaults to host loopback and the
+Compose networks are internal. The local Nginx/Caddy hop must overwrite
+`X-Real-IP` with one IP and `X-Forwarded-Proto` with exactly `http` or `https`.
+The proxy deletes and rebuilds every `Forwarded` and `X-Forwarded-*` field.
+
+## backup.yaml
+
+[backup.template.yaml](../config/backup.template.yaml) is a non-secret
+starting point. The real ignored `config/backup.yaml` is private because
+repository topology, WeChat URLs, Bark tokens, and an APNs private key may be
+present.
+
+Unknown fields, duplicate keys, multiple YAML documents, invalid types,
+unsupported repositories, invalid names, and out-of-range durations stop the
+command. Parser errors report a category and position without echoing YAML
+values.
+
+The complete human-authored top level is:
 
 | Field | Contract |
 | --- | --- |
-| `listen_address` | numeric IP plus port; Compose publishes it on host loopback |
-| `upstream_url` | HTTP(S) origin with no credentials, query, or non-root path |
-| `events_url` | HTTP(S) URL whose path is exactly `/v1/events` |
-| `trusted_proxy_cidrs` | canonical CIDRs allowed to supply `X-Real-IP` and `X-Forwarded-Proto` |
-| `max_request_bytes` | fixed at `629145600` (600 MiB) |
-| `read_header_timeout` | fixed at `10s` |
-| `read_timeout`, `write_timeout` | fixed at `30m` |
-| `idle_timeout` | fixed at `2m` |
-| `upstream_response_header_timeout` | fixed at `5m` |
-| `event_timeout` | `1s` through `10s`; the example uses `2s` |
-| `shutdown_timeout` | fixed at `2m` |
+| `schema_version` | exactly `1` |
+| `target_timeout` | `1m` through `2h` |
+| `maintenance_timeout` | `1m` through `24h` |
+| `targets` | optional list, at most 32; omitted/empty means no backup |
+| `notifiers` | optional list, at most 16 |
 
-Narrow `trusted_proxy_cidrs` to the actual local front-proxy source addresses.
-For untrusted peers, forwarding headers are ignored. For trusted peers, an
-invalid or repeated `X-Real-IP`/`X-Forwarded-Proto` is rejected. All inbound
-`Forwarded`, `X-Real-IP`, and `X-Forwarded-*` fields are deleted and rebuilt.
+Scheduling and runtime paths are deliberately not configuration. v1 fixes a
+30-second debounce, 2-minute maximum continuous wait, 5-minute minimum
+snapshot interval, 15-minute sampling interval, 30-second missing-file retry,
+and 2-minute shutdown timeout. The event server listens at `0.0.0.0:9090`,
+limits bodies to 1024 bytes, and uses a 10-per-second, burst-20 limiter.
 
-## backup.json
+The companion ignored `.env.vaultwarden` must retain the local SQLite and
+`/data` asset paths from [.env.vaultwarden.template](../.env.vaultwarden.template).
+Do not override them with PostgreSQL, MySQL, or Vaultwarden object storage.
 
-The tracked [backup.json](../config/backup.json) shows an append-only REST
-backup identity and a separate maintenance identity.
+## Targets
 
-The companion `.env.vaultwarden` explicitly pins `DATA_FOLDER=/data`, a
-`sqlite:///data/db.sqlite3` database URL, and local attachment, Send, RSA,
-template, icon-cache, and temporary paths. PostgreSQL/MySQL and Vaultwarden S3
-storage must not override those values in a supported deployment.
+An S3-compatible target:
 
-### Service and schedule
-
-`data_dir`, `state_dir`, `staging_dir`, and `cache_dir` must be clean absolute,
-pairwise non-overlapping paths. The source `data_dir` and every worker-owned
-directory must be a real `0700` directory. None of the writable worker
-directories may overlap `data_dir`. `restic_binary` is also an absolute path.
-
-The v1 schedule is visible but deliberately fixed:
-
-| Field | v1 value |
-| --- | --- |
-| `debounce` | `30s` |
-| `max_wait` | `2m` |
-| `min_interval` | `5m` |
-| `sample_interval` | `15m` |
-| `missing_retry` | `30s` |
-| `shutdown_timeout` | `2m` |
-
-`target_timeout` may be `1m` through `2h`; `maintenance_timeout` may be `1m`
-through `24h`. The internal event body limit must be 16–4096 bytes. Rate and
-burst values are bounded, and at most 32 targets and 16 notifiers are allowed.
-
-### Restic targets
-
-Each target has a unique lowercase name, explicit backend, repository file,
-backup credentials, and optional maintenance credentials. The repository file
-itself is `0600`, because authenticated repository URLs and local topology can
-be sensitive. A CA file, when configured, is also read from a `0600` file.
-
-| `backend` | Repository-file prefix/form |
-| --- | --- |
-| `local` | clean absolute path |
-| `rest` | `rest:https://...` or intentionally private `rest:http://...` |
-| `s3` | `s3:https://...` or `s3:http://...` for MinIO/COS-compatible endpoints |
-| `b2` | `b2:...` |
-| `azure` | `azure:...` |
-| `gcs` | `gs:...` |
-| `swift` | `swift:...` |
-
-For a local target, use a path below `/repositories` (for example,
-`/repositories/primary`). Compose mounts the private host `./repositories`
-directory into backup, maintenance, and restore containers. A local repository
-is useful as an additional fast recovery copy but does not protect against loss
-of that host or filesystem.
-
-An optional `options` object is deliberately narrow. For `s3` targets it may
-contain `s3.bucket-lookup` (`auto`, `dns`, or `path`), `s3.region`, and
-`s3.list-objects-v1` (`true` or `false`). For example, COS and other providers
-that require virtual-hosted bucket addressing can use:
-
-```json
-"options": {
-  "s3.bucket-lookup": "dns",
-  "s3.region": "ap-singapore"
-}
+```yaml
+targets:
+  - name: primary
+    repository: s3:https://objects.example.test/bucket/vaultwarden
+    restic_options:
+      s3.bucket-lookup: path
+      s3.region: ap-singapore
 ```
 
-Options for command-backed SFTP/rclone or arbitrary Restic flags are never
-accepted.
+A native B2 target:
 
-`sftp:` and `rclone:` repositories are rejected because neither external tool
-is included in the image.
-
-`password_file` supplies Restic's repository password. `environment_files`
-maps an approved environment name to a file whose contents become the value.
-Approved names are:
-
-- AWS: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`,
-  `AWS_DEFAULT_REGION`;
-- B2: `B2_ACCOUNT_ID`, `B2_ACCOUNT_KEY`;
-- Azure: `AZURE_ACCOUNT_NAME`, `AZURE_ACCOUNT_KEY`, `AZURE_ACCOUNT_SAS`,
-  `AZURE_ENDPOINT_SUFFIX`;
-- GCS: `GOOGLE_PROJECT_ID`;
-- REST: `RESTIC_REST_USERNAME`, `RESTIC_REST_PASSWORD`;
-- Swift/OpenStack: `OS_AUTH_URL`, `OS_USERNAME`, `OS_PASSWORD`,
-  `OS_REGION_NAME`, Keystone v1 `ST_AUTH`/`ST_USER`/`ST_KEY`, v2 tenant fields,
-  v3 user/domain/project fields, trust/application-credential fields, token
-  fields, and `SWIFT_DEFAULT_CONTAINER_POLICY` documented by Restic 0.19.1.
-
-`environment_paths` currently accepts only
-`GOOGLE_APPLICATION_CREDENTIALS`; Restic receives the mounted `0600` JSON file
-path rather than its contents. The worker scrubs inherited Restic and backend
-credential variables before constructing each target-specific process.
-
-The long-running worker uses only `backup_credentials` and invokes only
-`restic backup`. `repo` and `restore` require `maintenance_credentials`. Give
-the backup identity only append/create permissions where the backend supports
-that distinction; reserve delete, unlock, full read/check, and repository
-administration for the maintenance identity.
-
-### Notifiers
-
-Notifiers operate in parallel. Their failures are persisted and retried but do
-not change a backup result.
-
-Generic webhook (HTTPS, no redirects; header values come from secret files):
-
-```json
-{
-  "name": "automation",
-  "type": "webhook",
-  "timeout": "10s",
-  "url": "https://hooks.example.com/vaultwarden-less",
-  "headers_from_files": {
-    "Authorization": "/run/secrets/webhook_authorization"
-  }
-}
+```yaml
+targets:
+  - name: cold-copy
+    repository: b2:bucket-name:vaultwarden
 ```
 
-Enterprise WeChat (the whole authenticated URL is secret):
+Target names are unique lowercase ASCII names. An S3 URL may use HTTPS or,
+for an explicitly private MinIO/COS endpoint, HTTP; user info, query, fragment,
+control characters, and embedded credentials are rejected. Only
+`s3.bucket-lookup`, `s3.region`, and `s3.list-objects-v1` are accepted as
+structured Restic options. B2 uses Restic's native `b2:` locator.
 
-```json
-{
-  "name": "wechat",
-  "type": "wechat",
-  "timeout": "10s",
-  "url_file": "/run/secrets/wechat_url"
-}
+Native B2 requires an explicit non-empty bucket and repository prefix in the
+form `b2:bucket-name:path/to/repository`. Restic 0.19.1 itself recommends B2's
+S3-compatible API over its native B2 library when that is available; v1 keeps
+native B2 as a supported explicit option.
+
+Local, REST, Azure, GCS, Swift, SFTP, rclone, and every other locator are
+rejected. There is no custom-CA field, anonymous mode, session token, or
+arbitrary Restic flag. The process also removes inherited Restic and cloud
+credential variables before constructing the target-specific environment.
+
+## Exact credentials layout
+
+No credential template is tracked. Create only the real ignored files you
+need:
+
+```text
+credentials/
+├── common/
+│   └── restic-password
+├── backup/
+│   └── credentials.yaml
+└── maintenance/
+    └── credentials.yaml
 ```
 
-Bark through APNs HTTP/2:
+- `common/restic-password`: the repository encryption password as raw text.
+  All configured targets currently share this one Restic password. Store an
+  independent offline recovery copy; neither Vaultwarden nor the repository
+  backend can reconstruct it.
+- `backup/credentials.yaml`: backend credentials exposed only to the
+  long-running append-only backup worker.
+- `maintenance/credentials.yaml`: independently issued higher-authority
+  credentials for init/check/unlock/prune/snapshot listing/restore.
 
-```json
-{
-  "name": "bark",
-  "type": "bark",
-  "timeout": "10s",
-  "endpoint": "https://api.push.apple.com",
-  "device_token_file": "/run/secrets/bark_device_token",
-  "auth_key_file": "/run/secrets/bark_apns_auth_key",
-  "key_id": "KEY_ID",
-  "team_id": "TEAM_ID",
-  "topic": "me.fin.bark",
-  "sound": "1107"
-}
+Every file must be regular, non-symlink, owner-readable, inaccessible to group
+and other users (`0400` or `0600`), and bounded in size. Credential directories
+must be `0700`. The role files have this shape:
+
+```yaml
+schema_version: 1
+targets:
+  primary:
+    AWS_ACCESS_KEY_ID: REPLACE_ME
+    AWS_SECRET_ACCESS_KEY: REPLACE_ME
+  cold-copy:
+    B2_ACCOUNT_ID: REPLACE_ME
+    B2_ACCOUNT_KEY: REPLACE_ME
 ```
 
-The endpoint is restricted to `https://api.push.apple.com` or
-`https://api.sandbox.push.apple.com`; redirects and custom APNs origins are not
-accepted.
+Only the configured target and its two required keys are consumed. Unknown
+target entries and unknown keys are ignored intentionally, so operators may
+roll credentials or share a superset across staged configuration changes.
+For a configured S3 target both AWS keys are mandatory; for native B2 both B2
+keys are mandatory. Empty values fail. `AWS_SESSION_TOKEN`, profiles, region
+environment variables, and every other backend variable are ignored.
 
-No APNs private key is bundled or accepted in JSON. `auth_key_file` must hold a
-PKCS#8 P-256 key. APNs HTTP status and `reason`, WeChat HTTP status and
-`errcode == 0`, and generic webhook 2xx status are all required for delivery.
+The backup backend identity should have only append/create authority where the
+provider supports it. Maintenance needs the read/list/delete/administrative
+authority required by the explicit command. The common Restic password alone
+does not grant backend access.
 
-## Secret-free validation
+When `targets` is empty, no Restic password or backend key is consumed, but the
+backup role `credentials.yaml` must still be a valid private document; use:
 
-Validate syntax alone:
+```yaml
+schema_version: 1
+targets: {}
+```
+
+## Notifiers
+
+Notifier failures never alter a backup result. They have independent persisted
+queues and run concurrently.
+
+Enterprise WeChat uses its required `msgtype=text` shape:
+
+```yaml
+notifiers:
+  - name: operations
+    type: wechat
+    timeout: 10s
+    webhook_url: https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=REPLACE_ME
+```
+
+Bark sends directly to `https://api.push.apple.com` over HTTP/2:
+
+```yaml
+notifiers:
+  - name: phone
+    type: bark
+    timeout: 10s
+    device_token: REPLACE_WITH_64_LOWERCASE_HEX_CHARACTERS
+    auth_key: |
+      -----BEGIN PRIVATE KEY-----
+      REPLACE_ME
+      -----END PRIVATE KEY-----
+    key_id: REPLACE_ME
+    team_id: REPLACE_ME
+    topic: me.fin.bark
+    sound: "1107"
+```
+
+The APNs key must be a PKCS#8 P-256 key. The production APNs origin cannot be
+overridden. Redirects are forbidden and responses are bounded. APNs requires
+HTTP/2, status `200`, and a valid error `reason` on failure; WeChat requires
+both HTTP 2xx and `errcode == 0`. Generic webhooks are not part of v1.
+
+## Validation without preflight
+
+Validate syntax and print only names/types/backend kinds:
 
 ```sh
-docker compose --profile maintenance run --rm maintenance \
-  config --config /config/backup.json
+docker compose run --rm --no-deps backup \
+  config --config /config/backup.yaml
 ```
 
-Also inspect every mounted secret's type, permissions, non-empty contents, and
-backend consistency without printing it:
+Validate the role actually mounted into a service, the common password, and
+(for the backup role) notifier material:
 
 ```sh
-docker compose --profile maintenance run --rm maintenance \
-  config --check-secrets --config /config/backup.json
+docker compose run --rm --no-deps backup \
+  config --check-credentials backup --config /config/backup.yaml
+docker compose --profile maintenance run --rm --no-deps maintenance \
+  config --check-credentials maintenance --config /config/backup.yaml
 ```
+
+The `backup`/`maintenance` label is checked for valid CLI use and recorded in
+the secret-free JSON result; authority comes from which host role directory
+Compose mounts at `/run/credentials/role`.
+
+This design keeps filesystem preparation in the deployment system rather than
+maintaining a second host-layout model in application code. Failures stay at
+the consuming boundary: Compose reports absent bind sources; YAML loading
+reports private-file/type/schema errors; state/staging/cache report the fixed
+container path and required private directory; Restic validation reports a
+stable target error without logging credentials or the repository URL.

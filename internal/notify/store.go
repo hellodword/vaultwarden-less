@@ -43,8 +43,8 @@ type QueueStore struct {
 }
 
 func OpenQueueStore(dir string, notifierNames []string) (*QueueStore, error) {
-	if err := safefs.EnsurePrivateDirectory(dir); err != nil {
-		return nil, fmt.Errorf("create notification state directory: %w", err)
+	if err := safefs.ValidatePrivateDirectory(dir); err != nil {
+		return nil, fmt.Errorf("validate notification state directory: %w", err)
 	}
 	store := &QueueStore{
 		dir:  dir,

@@ -14,7 +14,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/hellodword/vaultwarden-less/internal/config"
 	proxyserver "github.com/hellodword/vaultwarden-less/internal/proxy"
 )
 
@@ -28,7 +27,6 @@ func main() {
 func run(args []string) int {
 	flags := flag.NewFlagSet("vaultwarden-less-proxy", flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
-	configPath := flags.String("config", "/config/proxy.json", "path to proxy.json")
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
@@ -39,21 +37,16 @@ func run(args []string) int {
 		fmt.Fprintln(os.Stderr, "unexpected positional argument")
 		return 2
 	}
-	cfg, err := config.LoadProxy(*configPath)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "proxy configuration is invalid:", err)
-		return 1
-	}
 	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	events := proxyserver.NewEventSender(cfg.Events, cfg.EventTimeout.Duration, log)
+	events := proxyserver.NewEventSender(log)
 	var eventWG sync.WaitGroup
 	events.Run(ctx, &eventWG)
-	server := proxyserver.NewServer(cfg, events, log)
+	server := proxyserver.NewServer(events, log)
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- server.ListenAndServe() }()
-	log.Info("proxy started", "listen_address", cfg.ListenAddress)
+	log.Info("proxy started", "listen_address", proxyserver.ListenAddress)
 
 	select {
 	case <-ctx.Done():
@@ -63,7 +56,7 @@ func run(args []string) int {
 			return 1
 		}
 	}
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout.Duration)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), proxyserver.ShutdownTimeout)
 	defer cancel()
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		log.Error("proxy shutdown did not complete", "error_code", "shutdown_timeout")

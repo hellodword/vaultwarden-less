@@ -17,4 +17,3 @@ COPY LICENSE THIRD_PARTY_LICENSES.md /licenses/
 WORKDIR /
 USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/vaultwarden-less-proxy"]
-CMD ["--config", "/config/proxy.json"]

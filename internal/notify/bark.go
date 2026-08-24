@@ -22,8 +22,9 @@ import (
 	"time"
 
 	"github.com/hellodword/vaultwarden-less/internal/config"
-	"github.com/hellodword/vaultwarden-less/internal/securefile"
 )
+
+const apnsProductionEndpoint = "https://api.push.apple.com"
 
 type barkSender struct {
 	name        string
@@ -41,20 +42,19 @@ type barkSender struct {
 }
 
 func newBarkSender(cfg config.Notifier) (Sender, error) {
-	deviceToken, err := securefile.Read(cfg.DeviceTokenFile)
-	if err != nil || len(deviceToken) != 64 {
-		return nil, fmt.Errorf("Bark device token file is invalid")
+	deviceToken := cfg.DeviceToken
+	if len(deviceToken) != 64 {
+		return nil, fmt.Errorf("Bark device token is invalid")
 	}
 	if _, err := hex.DecodeString(deviceToken); err != nil || strings.ToLower(deviceToken) != deviceToken {
 		return nil, fmt.Errorf("Bark device token is invalid")
 	}
-	keyPEM, err := securefile.Read(cfg.AuthKeyFile)
-	if err != nil {
-		return nil, fmt.Errorf("Bark APNs key file is invalid")
+	block, remainder := pem.Decode([]byte(cfg.AuthKey))
+	if block == nil || block.Type != "PRIVATE KEY" || len(block.Headers) != 0 {
+		return nil, fmt.Errorf("Bark APNs key is not PEM")
 	}
-	block, _ := pem.Decode([]byte(keyPEM))
-	if block == nil {
-		return nil, fmt.Errorf("Bark APNs key file is not PEM")
+	if strings.TrimSpace(string(remainder)) != "" {
+		return nil, fmt.Errorf("Bark APNs key contains trailing data")
 	}
 	parsed, err := x509.ParsePKCS8PrivateKey(block.Bytes)
 	if err != nil {
@@ -69,7 +69,7 @@ func newBarkSender(cfg config.Notifier) (Sender, error) {
 		sound = "1107"
 	}
 	return &barkSender{
-		name: cfg.Name, endpoint: strings.TrimSuffix(cfg.Endpoint, "/"), deviceToken: deviceToken,
+		name: cfg.Name, endpoint: apnsProductionEndpoint, deviceToken: deviceToken,
 		keyID: cfg.KeyID, teamID: cfg.TeamID, topic: cfg.Topic, sound: sound, key: key,
 		client: strictClient(cfg.Timeout.Duration),
 	}, nil

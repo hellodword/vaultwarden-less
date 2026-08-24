@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-func TestReadRequiresRegular0600File(t *testing.T) {
+func TestReadRequiresPrivateOwnerReadableFile(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "secret")
@@ -22,6 +22,12 @@ func TestReadRequiresRegular0600File(t *testing.T) {
 	}
 	if _, err := Read(path); err == nil {
 		t.Fatal("accepted group-readable secret")
+	}
+	if err := os.Chmod(path, 0o400); err != nil {
+		t.Fatal(err)
+	}
+	if value, err := Read(path); err != nil || value != "value" {
+		t.Fatalf("accepted owner-read-only file = %q, %v", value, err)
 	}
 }
 

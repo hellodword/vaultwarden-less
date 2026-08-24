@@ -10,6 +10,7 @@ import (
 func TestStorePersistsAtomic0600State(t *testing.T) {
 	t.Parallel()
 	dir := filepath.Join(t.TempDir(), "state")
+	mustPrivateDirectory(t, dir)
 	store, err := Open(dir, []string{"primary"})
 	if err != nil {
 		t.Fatal(err)
@@ -38,11 +39,21 @@ func TestStorePersistsAtomic0600State(t *testing.T) {
 	if !reloaded.Dirty || reloaded.FirstDirtyAt != "2026-08-23T12:34:56.789Z" {
 		t.Fatalf("reloaded state = %#v", reloaded)
 	}
+	if err := os.Chmod(dir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Read(dir); err == nil {
+		t.Fatal("status read accepted a group-accessible state directory")
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestWorkerLockIsExclusive(t *testing.T) {
 	t.Parallel()
 	dir := filepath.Join(t.TempDir(), "state")
+	mustPrivateDirectory(t, dir)
 	first, err := AcquireLock(dir)
 	if err != nil {
 		t.Fatal(err)
@@ -89,6 +100,7 @@ func TestTimestampRequiresMillisecondsUTC(t *testing.T) {
 func TestOpenRecoversInterruptedBackupAsDirty(t *testing.T) {
 	t.Parallel()
 	dir := filepath.Join(t.TempDir(), "state")
+	mustPrivateDirectory(t, dir)
 	store, err := Open(dir, []string{"primary"})
 	if err != nil {
 		t.Fatal(err)
@@ -113,6 +125,7 @@ func TestOpenRecoversInterruptedBackupAsDirty(t *testing.T) {
 func TestOpenReconcilesTargetsToCurrentConfiguration(t *testing.T) {
 	t.Parallel()
 	dir := filepath.Join(t.TempDir(), "state")
+	mustPrivateDirectory(t, dir)
 	if _, err := Open(dir, []string{"removed"}); err != nil {
 		t.Fatal(err)
 	}
@@ -126,5 +139,12 @@ func TestOpenReconcilesTargetsToCurrentConfiguration(t *testing.T) {
 	}
 	if target, exists := targets["current"]; !exists || target.State != "unknown" {
 		t.Fatalf("current target was not initialized: %#v", targets)
+	}
+}
+
+func mustPrivateDirectory(t *testing.T, path string) {
+	t.Helper()
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatal(err)
 	}
 }

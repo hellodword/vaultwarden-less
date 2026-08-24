@@ -5,7 +5,27 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 )
+
+// ValidatePrivateDirectory validates an existing mount root without creating
+// it or changing its permissions. Owner write permission is optional; group
+// and other users must have no access.
+func ValidatePrivateDirectory(path string) error {
+	if path == "" || path == string(filepath.Separator) || !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return fmt.Errorf("private directory path must be clean, absolute, and non-root")
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	permissions := info.Mode().Perm()
+	stat, ownerKnown := info.Sys().(*syscall.Stat_t)
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || !ownerKnown || stat.Uid != uint32(os.Geteuid()) || permissions&0o100 == 0 || permissions&0o077 != 0 {
+		return fmt.Errorf("path must be a real directory owned by effective UID %d, owner-traversable, and inaccessible to group and other users", os.Geteuid())
+	}
+	return nil
+}
 
 // EnsurePrivateDirectory creates an absolute directory and then rejects any
 // symlink or non-directory in its path before setting the leaf to 0700.

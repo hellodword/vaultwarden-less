@@ -11,6 +11,7 @@ import (
 
 	"github.com/hellodword/vaultwarden-less/internal/config"
 	"github.com/hellodword/vaultwarden-less/internal/restic"
+	"github.com/hellodword/vaultwarden-less/internal/safefs"
 	"github.com/hellodword/vaultwarden-less/internal/snapshot"
 	"github.com/hellodword/vaultwarden-less/internal/version"
 )
@@ -147,6 +148,9 @@ func validateOutput(dataDir, output string) error {
 	parent := filepath.Dir(output)
 	if err := realDirectoryChain(parent); err != nil {
 		return fmt.Errorf("restore output parent: %w", err)
+	}
+	if err := safefs.ValidatePrivateDirectory(parent); err != nil {
+		return fmt.Errorf("restore output parent must be an existing private directory: %w", err)
 	}
 	_, err := emptyOutputState(output)
 	return err

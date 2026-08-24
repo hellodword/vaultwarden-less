@@ -56,7 +56,7 @@ func New(stdout, stderr io.Writer) *cobra.Command {
 	}
 	root.SetOut(stdout)
 	root.SetErr(stderr)
-	root.PersistentFlags().StringVar(&configPath, "config", "/config/backup.json", "path to backup.json")
+	root.PersistentFlags().StringVar(&configPath, "config", config.DefaultBackupConfigPath, "path to backup.yaml")
 	root.SetFlagErrorFunc(func(_ *cobra.Command, err error) error { return &UsageError{Err: err} })
 	root.AddCommand(
 		serveCommand(&configPath), runCommand(&configPath), statusCommand(&configPath),
@@ -80,7 +80,10 @@ func serveCommand(configPath *string) *cobra.Command {
 			}
 			defer lock.Close()
 			log := slog.New(slog.NewJSONHandler(cmd.ErrOrStderr(), nil))
-			runner := newRunner(cfg)
+			runner, err := newRunner(cfg)
+			if err != nil {
+				return err
+			}
 			if err := runner.VerifyVersion(cmd.Context()); err != nil {
 				return err
 			}
@@ -158,7 +161,10 @@ func runCommand(configPath *string) *cobra.Command {
 			}
 			defer lock.Close()
 			log := slog.New(slog.NewJSONHandler(cmd.ErrOrStderr(), nil))
-			runner := newRunner(cfg)
+			runner, err := newRunner(cfg)
+			if err != nil {
+				return err
+			}
 			if err := runner.VerifyVersion(cmd.Context()); err != nil {
 				return err
 			}
@@ -174,11 +180,14 @@ func runCommand(configPath *string) *cobra.Command {
 			ctx, cancel := context.WithCancel(cmd.Context())
 			notifiers.Start(ctx)
 			coordinator := worker.NewCoordinator(cfg, store, runner, notifiers, log)
-			if err := coordinator.Reconcile(ctx); err == nil {
-				err = coordinator.MarkDirty(time.Now())
-			}
-			if err == nil {
-				err = coordinator.Sample(ctx)
+			if len(cfg.Targets) != 0 {
+				err = coordinator.Reconcile(ctx)
+				if err == nil {
+					err = coordinator.MarkDirty(time.Now())
+				}
+				if err == nil {
+					err = coordinator.Sample(ctx)
+				}
 			}
 			cancel()
 			notifiers.Wait()
@@ -208,7 +217,7 @@ func statusCommand(configPath *string) *cobra.Command {
 }
 
 func configCommand(configPath *string) *cobra.Command {
-	var checkSecrets bool
+	var checkCredentials string
 	command := &cobra.Command{
 		Use: "config", Short: "Validate configuration and print a secret-free v1 summary", Args: usageNoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -216,26 +225,28 @@ func configCommand(configPath *string) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			runner := newRunner(cfg)
-			if checkSecrets {
+			if checkCredentials != "" && checkCredentials != "backup" && checkCredentials != "maintenance" {
+				return &UsageError{Err: fmt.Errorf("--check-credentials must be backup or maintenance")}
+			}
+			if checkCredentials != "" {
+				runner, err := newRunner(cfg)
+				if err != nil {
+					return err
+				}
 				for _, target := range cfg.Targets {
-					if err := runner.ValidateTarget(target, false); err != nil {
-						return fmt.Errorf("target %s backup secrets: %w", target.Name, err)
-					}
-					if target.MaintenanceCredentials != nil {
-						if err := runner.ValidateTarget(target, true); err != nil {
-							return fmt.Errorf("target %s maintenance secrets: %w", target.Name, err)
-						}
+					if err := runner.ValidateTarget(target); err != nil {
+						return fmt.Errorf("target %s %s credentials: %w", target.Name, checkCredentials, err)
 					}
 				}
-				if err := notify.ValidateConfigs(cfg.Notifiers); err != nil {
-					return err
+				if checkCredentials == "backup" {
+					if err := notify.ValidateConfigs(cfg.Notifiers); err != nil {
+						return err
+					}
 				}
 			}
 			type targetSummary struct {
-				Name        string `json:"name"`
-				Backend     string `json:"backend"`
-				Maintenance bool   `json:"maintenance_credentials"`
+				Name    string `json:"name"`
+				Backend string `json:"backend"`
 			}
 			type notifierSummary struct {
 				Name string `json:"name"`
@@ -246,16 +257,16 @@ func configCommand(configPath *string) *cobra.Command {
 				ProductVersion     string            `json:"product_version"`
 				VaultwardenVersion string            `json:"vaultwarden_version"`
 				ResticVersion      string            `json:"restic_version"`
-				SecretsChecked     bool              `json:"secrets_checked"`
+				CredentialsChecked string            `json:"credentials_checked,omitempty"`
 				Targets            []targetSummary   `json:"targets"`
 				Notifiers          []notifierSummary `json:"notifiers"`
 			}{
 				SchemaVersion: version.SchemaVersion, ProductVersion: version.Product,
-				VaultwardenVersion: version.Vaultwarden, ResticVersion: version.Restic, SecretsChecked: checkSecrets,
+				VaultwardenVersion: version.Vaultwarden, ResticVersion: version.Restic, CredentialsChecked: checkCredentials,
 				Targets: make([]targetSummary, 0, len(cfg.Targets)), Notifiers: make([]notifierSummary, 0, len(cfg.Notifiers)),
 			}
 			for _, target := range cfg.Targets {
-				summary.Targets = append(summary.Targets, targetSummary{target.Name, target.Backend, target.MaintenanceCredentials != nil})
+				summary.Targets = append(summary.Targets, targetSummary{target.Name, target.Backend()})
 			}
 			for _, notifier := range cfg.Notifiers {
 				summary.Notifiers = append(summary.Notifiers, notifierSummary{notifier.Name, notifier.Type})
@@ -263,7 +274,7 @@ func configCommand(configPath *string) *cobra.Command {
 			return writeJSON(cmd.OutOrStdout(), summary)
 		},
 	}
-	command.Flags().BoolVar(&checkSecrets, "check-secrets", false, "validate mounted 0600 secret files without printing values")
+	command.Flags().StringVar(&checkCredentials, "check-credentials", "", "validate the mounted backup or maintenance role credentials")
 	return command
 }
 
@@ -286,7 +297,10 @@ func repoCommand(configPath *string) *cobra.Command {
 			if err != nil {
 				return &UsageError{Err: err}
 			}
-			runner := newRunner(cfg)
+			runner, err := newRunner(cfg)
+			if err != nil {
+				return err
+			}
 			if err := runner.VerifyVersion(cmd.Context()); err != nil {
 				return err
 			}
@@ -375,7 +389,10 @@ func restoreCommand(configPath *string) *cobra.Command {
 			if err != nil {
 				return &UsageError{Err: err}
 			}
-			runner := newRunner(cfg)
+			runner, err := newRunner(cfg)
+			if err != nil {
+				return err
+			}
 			if err := runner.VerifyVersion(cmd.Context()); err != nil {
 				return err
 			}
@@ -418,8 +435,21 @@ func healthcheckCommand() *cobra.Command {
 	return command
 }
 
-func newRunner(cfg *config.Backup) restic.Runner {
-	return restic.Runner{Binary: cfg.ResticBinary, CacheDir: cfg.CacheDir, StagingDir: cfg.StagingDir}
+func newRunner(cfg *config.Backup) (restic.Runner, error) {
+	credentials, err := config.LoadRoleCredentials(config.RoleCredentialsPath, cfg)
+	if err != nil {
+		return restic.Runner{}, err
+	}
+	runner := restic.Runner{
+		Binary: cfg.ResticBinary, CacheDir: cfg.CacheDir, StagingDir: cfg.StagingDir,
+		PasswordFile: config.ResticPasswordPath, Credentials: credentials,
+	}
+	for _, target := range cfg.Targets {
+		if err := runner.ValidateTarget(target); err != nil {
+			return restic.Runner{}, fmt.Errorf("target %s credentials: %w", target.Name, err)
+		}
+	}
+	return runner, nil
 }
 func targetNames(cfg *config.Backup) []string {
 	names := make([]string, 0, len(cfg.Targets))

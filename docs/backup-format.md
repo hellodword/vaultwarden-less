@@ -56,7 +56,7 @@ guidance](https://github.com/dani-garcia/vaultwarden/wiki/Backing-up-your-vault)
 Everything else is excluded, including live `db.sqlite3-wal` and
 `db.sqlite3-shm`, icon cache, temporary uploads, built-in/old backups, unknown
 directories, MinIO content, `.env`, Compose/project configuration, TLS files,
-proxy and worker JSON, worker state/cache, Restic credentials, and notification
+proxy/worker configuration, worker state/cache, Restic credentials, and notification
 credentials.
 
 The included `/data/config.json` is a Vaultwarden data asset. It is not a
@@ -115,8 +115,7 @@ Worker backups use stable metadata:
 - host: `vaultwarden-less-v1`;
 - tags: `vaultwarden-less-v1`, `complete` or `incomplete`, and
   `content-id=<64 lowercase hex>`;
-- paths: `<staging_dir>/current/data` and
-  `<staging_dir>/current/manifest.json`.
+- paths: `/staging/current/data` and `/staging/current/manifest.json`.
 
 Maintenance filters all three dimensions before retention is evaluated. It
 does not select old SQL/Git snapshots, snapshots for another application, or

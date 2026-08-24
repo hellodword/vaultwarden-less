@@ -3,6 +3,7 @@ package worker
 import (
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -59,11 +60,18 @@ func TestBackoffIsBoundedAndJitteredWithinContract(t *testing.T) {
 
 func TestMarkDirtyRefreshesDebounceButCoalescesDuringBackup(t *testing.T) {
 	t.Parallel()
-	store, err := state.Open(filepath.Join(t.TempDir(), "state"), nil)
+	dir := filepath.Join(t.TempDir(), "state")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	store, err := state.Open(dir, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	coordinator := &Coordinator{store: store, wake: make(chan struct{}, 1)}
+	coordinator := &Coordinator{
+		cfg:   &config.Backup{Targets: []config.Target{{Name: "primary"}}},
+		store: store, wake: make(chan struct{}, 1),
+	}
 	base := time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC)
 	if err := coordinator.MarkDirty(base); err != nil {
 		t.Fatal(err)

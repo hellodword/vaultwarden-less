@@ -11,8 +11,8 @@ The project starts at `1.0.0` and follows SemVer:
   persisted-format contract.
 
 The v1 recovery-point reader is long-lived. A future writer may add v2 but must
-continue restoring v1. Stable status and generic webhook JSON remain at
-`schema_version: 1` until a separately documented version is introduced.
+continue restoring v1. Stable status JSON remains at `schema_version: 1` until
+a separately documented version is introduced.
 
 The pre-1.0 `trigger.json`, SQL/Git backup scripts, and CLI are not v1 inputs.
 They are not automatically deleted or converted. Old remote snapshots remain
@@ -21,8 +21,8 @@ outside v1 maintenance filters.
 ## Configuration and state migration
 
 Configuration migration reads an old file and writes a new path. It never
-overwrites the operator's only configuration in place and never places secret
-values in JSON.
+overwrites the operator's only configuration in place. The private YAML and
+credential files remain outside recovery points.
 
 Worker and notification state are versioned and atomically replaced. A state
 version that cannot be validated or migrated is preserved unchanged and stops
@@ -68,7 +68,8 @@ command. It is never automatic.
 
 ## Go, SQLite, dependencies, and images
 
-Production builds use Go `1.26.7`, `go-sqlite3 v1.14.50`, and Cobra `v1.10.2`.
+Production builds use Go `1.26.7`, `go-sqlite3 v1.14.50`, Cobra `v1.10.2`,
+and goccy/go-yaml `v1.19.2`.
 For every update:
 
 - verify the official release/tag and module checksum;

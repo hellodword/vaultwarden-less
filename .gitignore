@@ -5,6 +5,8 @@
 /restore/
 /repositories/
 /secrets/
+/credentials/
+/config/backup.yaml
 /log/
 /dist/
 /git-backup/
@@ -12,6 +14,7 @@
 /tmp/
 
 .env
+.env.vaultwarden
 restic*.json
 rclone*.conf
 

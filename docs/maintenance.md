@@ -2,7 +2,7 @@
 
 The long-running worker intentionally runs only `restic backup`. Repository
 creation, checking, unlocking, retention, pruning, and restoration are explicit
-operator commands using `maintenance_credentials`.
+operator commands using the separately mounted maintenance role.
 
 Stop or schedule around normal backup activity before commands that need an
 exclusive repository lock. Never expose maintenance credentials to the proxy,
@@ -13,7 +13,7 @@ Vaultwarden, or the long-running append-only backup identity.
 ```sh
 docker compose --profile maintenance run --rm maintenance \
   repo snapshots --target primary --status all \
-  --config /config/backup.json
+  --config /config/backup.yaml
 ```
 
 `--status` is `all`, `complete`, or `incomplete`. Results are filtered by v1
@@ -25,7 +25,7 @@ Only for a confirmed new, empty repository:
 
 ```sh
 docker compose --profile maintenance run --rm maintenance \
-  repo init --target primary --config /config/backup.json
+  repo init --target primary --config /config/backup.yaml
 ```
 
 The worker never interprets “repository not found” as permission to initialize
@@ -38,7 +38,7 @@ Daily structure and index check:
 
 ```sh
 docker compose --profile maintenance run --rm maintenance \
-  repo check --target primary --config /config/backup.json
+  repo check --target primary --config /config/backup.yaml
 ```
 
 Once a month, rotate through one twelfth of repository data. Use `1/12` in
@@ -48,7 +48,7 @@ of calendar month:
 ```sh
 docker compose --profile maintenance run --rm maintenance \
   repo check --target primary --read-data-subset 1/12 \
-  --config /config/backup.json
+  --config /config/backup.yaml
 ```
 
 Restic documents the distinction between repository structure checks and
@@ -62,7 +62,7 @@ the repository lock:
 
 ```sh
 docker compose --profile maintenance run --rm maintenance \
-  repo unlock --target primary --config /config/backup.json
+  repo unlock --target primary --config /config/backup.yaml
 ```
 
 An ordinary network timeout is not proof of a stale lock.
@@ -92,7 +92,7 @@ Review the default dry-run every week:
 
 ```sh
 docker compose --profile maintenance run --rm maintenance \
-  repo prune --target primary --config /config/backup.json
+  repo prune --target primary --config /config/backup.yaml
 ```
 
 The JSON output contains Restic's dry-run documents for both integrity groups.
@@ -100,7 +100,7 @@ Only after reviewing them and confirming a current isolated restore, apply:
 
 ```sh
 docker compose --profile maintenance run --rm maintenance \
-  repo prune --target primary --apply --config /config/backup.json
+  repo prune --target primary --apply --config /config/backup.yaml
 ```
 
 `--apply` is the only path in this CLI that turns the retention dry-run into

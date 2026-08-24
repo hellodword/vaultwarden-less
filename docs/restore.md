@@ -18,8 +18,8 @@ inside Restic snapshots:
 
 - repository address and backend type;
 - Restic repository password;
-- backend recovery/maintenance credentials and any private CA;
-- `backup.json`, `proxy.json`, `.env.vaultwarden`, Compose/front-proxy/TLS
+- maintenance backend credentials;
+- `backup.yaml`, `.env.vaultwarden`, Compose/front-proxy/TLS
   configuration, and the intended `DOMAIN`;
 - project, Vaultwarden, and Restic versions;
 - host UID/GID and filesystem ownership expectations;
@@ -36,7 +36,7 @@ Ensure `./restore` is mode `0700` and `./restore/prepared` is absent or empty:
 ```sh
 docker compose --profile restore run --rm restore \
   restore --target primary --output /restore/prepared \
-  --config /config/backup.json
+  --config /config/backup.yaml
 ```
 
 Without `--snapshot`, only v1 snapshots tagged `complete` are considered and
@@ -48,7 +48,7 @@ To select an exact full 64-character snapshot ID:
 ```sh
 docker compose --profile restore run --rm restore \
   restore --target primary --snapshot SNAPSHOT_ID \
-  --output /restore/prepared --config /config/backup.json
+  --output /restore/prepared --config /config/backup.yaml
 ```
 
 An exact incomplete point is rejected unless the operator also supplies

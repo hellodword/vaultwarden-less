@@ -1,22 +1,15 @@
-# v1 HTTP and JSON contracts
+# v1 HTTP, JSON, and CLI contracts
 
-All machine instants are UTC RFC 3339 with exactly millisecond precision, for
-example `2026-08-23T12:34:56.789Z`. Structured errors use:
-
-```json
-{"error":{"code":"stable_code","message":"Safe message"}}
-```
-
-Errors and logs never include repository URLs, passwords, tokens, secret-file
-contents, command environments, or raw Restic output.
+Machine instants are UTC RFC 3339 with exactly millisecond precision, for
+example `2026-08-23T12:34:56.789Z`. Logs and errors do not include repository
+URLs, passwords, tokens, YAML values, command environments, or raw Restic
+output.
 
 ## Internal event endpoint
 
-`POST /v1/events` exists only on the Compose `events` network. There is no
-identity assertion in the payload and no per-request queue; the endpoint
-rate-limits a small body and marks the worker state dirty idempotently.
-
-Request:
+`POST /v1/events` exists only on the Compose `events` network. The request has
+no identity claim and no per-request queue; a rate-limited bounded request
+merely marks persisted state dirty idempotently.
 
 ```http
 Content-Type: application/json
@@ -24,26 +17,25 @@ Content-Type: application/json
 {"schema_version":1}
 ```
 
-Success is `204 No Content`. Unknown fields, multiple JSON values, wrong
-versions, non-JSON media types, and oversized bodies are rejected. Relevant
-errors include `invalid_event`, `event_too_large`, `unsupported_media_type`,
-`rate_limited`, and `state_unavailable`.
+Success is `204 No Content`. Unknown fields, multiple values, wrong versions,
+wrong media types, and oversized bodies fail. Relevant safe codes include
+`invalid_event`, `event_too_large`, `unsupported_media_type`, `rate_limited`,
+and `state_unavailable`.
 
 ## Health endpoints
 
-Both project binaries reserve `GET`/`HEAD
-/.vaultwarden-less/healthz` and return `204 No Content` when their local HTTP
-process is serving. The checks execute a real request every time; they are not
-latched in `/tmp`.
+Both binaries answer `GET`/`HEAD /.vaultwarden-less/healthz` with `204` while
+their local HTTP process is serving. Each container check performs a real
+request; no result is latched in `/tmp`.
 
-Repository failures do not make this process health endpoint fail. They appear
-in status and notifications so that container restarts do not hide a remote
-outage.
+Repository failure is status, not process health. Restarting a worker cannot
+repair backend credentials, capacity, or an outage and would hide its persisted
+retry schedule.
 
 ## Status JSON
 
-`vaultwarden-less-backup status` prints only JSON on stdout. Diagnostics use
-stderr. Example:
+`vaultwarden-less-backup status` writes stable v1 JSON to stdout and
+diagnostics to stderr:
 
 ```json
 {
@@ -61,10 +53,7 @@ stderr. Example:
     {
       "name": "primary",
       "state": "degraded",
-      "content_id": "sha256:abcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd",
-      "snapshot_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "last_attempt_at": "2026-08-23T12:30:00.000Z",
-      "last_success_at": "2026-08-23T12:15:00.000Z",
       "next_retry_at": "2026-08-23T12:31:05.000Z",
       "consecutive_failures": 1,
       "error_code": "backup_failed"
@@ -73,55 +62,63 @@ stderr. Example:
 }
 ```
 
-Optional timestamp, snapshot, pending, and error fields are absent when no
-value exists. Target order is lexical by configured name. Target state is one
-of `unknown`, `catching_up`, `healthy`, or `degraded`.
+Optional timestamps, IDs, pending points, and errors are absent when empty.
+Targets are sorted by configured name; state is `unknown`, `catching_up`,
+`healthy`, or `degraded`. With zero targets, `targets` is an empty array and no
+sampling/upload is performed.
 
-## Generic webhook JSON
+## Notification protocols
 
-The generic webhook receives versioned JSON with `Content-Type:
-application/json`. Redirects are not followed. A recovery-point event is:
+Enterprise WeChat receives JSON containing `msgtype: "text"` and
+`text.content`. Bark receives the equivalent logical message as an APNs alert.
+There is no public generic-webhook JSON contract.
 
-```json
-{
-  "schema_version": 1,
-  "id": "recovery:sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-  "type": "recovery_point_available",
-  "occurred_at": "2026-08-23T12:30:00.000Z",
-  "recovery_point": {
-    "content_id": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-    "status": "complete"
-  },
-  "targets": [
-    {"name":"primary","state":"healthy"},
-    {"name":"secondary","state":"degraded","error_code":"backup_failed"}
-  ],
-  "merged_successes": 3
-}
-```
+Ordinary successes are bounded to 100 persisted items per notifier; overflow
+is folded into a merge count. Each target fault/recovery and source-integrity
+fault is a replaceable state item retained until delivered or superseded.
 
-`merged_successes` is omitted unless bounded-queue overflow was folded into
-this delivery. Target changes use `type` `target_degraded` or
-`target_recovered` and a single `target` object instead of `recovery_point`
-and `targets`.
-
-Enterprise WeChat deliberately uses its required `msgtype=text` shape rather
-than this generic envelope. Bark translates the same logical event into an
-APNs alert.
-
-## CLI exit and stream contract
-
-The public command tree is:
+## CLI
 
 ```text
 vaultwarden-less-backup serve
 vaultwarden-less-backup run
 vaultwarden-less-backup status
-vaultwarden-less-backup config [--check-secrets]
+vaultwarden-less-backup config [--check-credentials backup|maintenance]
 vaultwarden-less-backup repo snapshots|init|check|unlock|prune
 vaultwarden-less-backup restore
 ```
 
-Primary structured results go to stdout. Logs and human diagnostics go to
-stderr. Exit `0` means success, `2` means a usage/input error, and `1` means a
-runtime, data, repository, or environment failure.
+Every public command accepts `--config`; its default is
+`/config/backup.yaml`. Primary structured results use stdout. Logs and human
+diagnostics use stderr. Exit `0` is success, `2` is command/argument usage
+failure, and `1` is configuration, filesystem, data, process, or repository
+failure.
+
+`config` validates strict main YAML and emits a secret-free summary:
+
+```json
+{
+  "schema_version": 1,
+  "product_version": "1.0.0",
+  "vaultwarden_version": "1.37.2",
+  "restic_version": "0.19.1",
+  "credentials_checked": "backup",
+  "targets": [{"name":"primary","backend":"s3"}],
+  "notifiers": [{"name":"operations","type":"wechat"}]
+}
+```
+
+The credential check reads only the role mounted at the fixed
+`/run/credentials/role/credentials.yaml` and the fixed common password. It
+does not contact or initialize a repository.
+
+`repo snapshots` accepts `--status all|complete|incomplete`. `repo prune` is a
+Restic dry-run unless `--apply` is explicit. `repo check` accepts an optional
+`--read-data-subset n/12`. Every repo command requires an exact configured
+`--target`.
+
+`restore` requires `--target` and an absolute `--output`. It selects the newest
+complete point by default. `--snapshot` must be the full 64-character
+lowercase ID; an incomplete point additionally requires
+`--allow-incomplete`. Output must be absent or an empty safe directory and can
+never be online `/data`.

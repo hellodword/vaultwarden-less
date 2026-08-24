@@ -9,6 +9,7 @@ also preserve the license files supplied by each base image.
 | Go | 1.26.7 | BSD-3-Clause | <https://go.dev/LICENSE> |
 | Cobra | 1.10.2 | Apache-2.0 | <https://github.com/spf13/cobra> |
 | pflag | 1.0.9 | BSD-3-Clause | <https://github.com/spf13/pflag> |
+| goccy/go-yaml | 1.19.2 | MIT | <https://github.com/goccy/go-yaml> |
 | go-sqlite3 | 1.14.50 | MIT | <https://github.com/mattn/go-sqlite3> |
 | SQLite amalgamation included by go-sqlite3 | bundled upstream version | Public domain | <https://sqlite.org/copyright.html> |
 | Restic | 0.19.1 | BSD-2-Clause | <https://github.com/restic/restic> |

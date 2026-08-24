@@ -34,6 +34,71 @@ type blockingTargetRunner struct {
 	canceled chan struct{}
 }
 
+func TestZeroTargetsNeverSamples(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	coordinator := NewCoordinator(&config.Backup{}, nil, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err := coordinator.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := coordinator.Sample(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := coordinator.CatchUp(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := coordinator.MarkDirty(time.Now()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDirtyEventsDuringBackupQueueExactlyOneFurtherGeneration(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "state")
+	if err := os.Mkdir(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	store, err := state.Open(stateDir, []string{"primary"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	coordinator := NewCoordinator(
+		&config.Backup{Targets: []config.Target{{Name: "primary"}}},
+		store, nil, nil, slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+	first := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
+	if err := coordinator.MarkDirty(first); err != nil {
+		t.Fatal(err)
+	}
+	if err := coordinator.beginWork(store.Snapshot().DirtyGeneration); err != nil {
+		t.Fatal(err)
+	}
+	second := first.Add(time.Second)
+	if err := coordinator.MarkDirty(second); err != nil {
+		t.Fatal(err)
+	}
+	if err := coordinator.MarkDirty(second.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	during := store.Snapshot()
+	if during.DirtyGeneration != 2 || during.LastDirtyAt != state.FormatTime(second) {
+		t.Fatalf("events during backup were not coalesced: %#v", during)
+	}
+	if err := coordinator.endWork(); err != nil {
+		t.Fatal(err)
+	}
+	fourth := second.Add(2 * time.Second)
+	if err := coordinator.MarkDirty(fourth); err != nil {
+		t.Fatal(err)
+	}
+	after := store.Snapshot()
+	if after.DirtyGeneration != 2 || after.LastDirtyAt != state.FormatTime(fourth) {
+		t.Fatalf("post-backup debounce timestamp was not updated: %#v", after)
+	}
+}
+
 func (r *blockingTargetRunner) Backup(ctx context.Context, _ config.Target, _ snapshot.Manifest) (restic.BackupResult, error) {
 	close(r.started)
 	<-ctx.Done()
@@ -73,6 +138,7 @@ func TestPartialTargetFailureDoesNotBlockHealthyTargetAndCatchUpUsesLatest(t *te
 		TargetTimeout: config.Duration{Duration: time.Second},
 		Targets:       []config.Target{{Name: "primary"}, {Name: "secondary"}},
 	}
+	prepareCoordinatorRoots(t, cfg)
 	store, err := state.Open(cfg.StateDir, []string{"primary", "secondary"})
 	if err != nil {
 		t.Fatal(err)
@@ -130,6 +196,7 @@ func TestScheduledSamplePreemptsSlowTargetWithoutMarkingFailure(t *testing.T) {
 		MissingRetry: config.Duration{Duration: time.Millisecond}, TargetTimeout: config.Duration{Duration: 5 * time.Second},
 		SampleInterval: config.Duration{Duration: 50 * time.Millisecond}, Targets: []config.Target{{Name: "slow"}},
 	}
+	prepareCoordinatorRoots(t, cfg)
 	store, err := state.Open(cfg.StateDir, []string{"slow"})
 	if err != nil {
 		t.Fatal(err)
@@ -173,6 +240,7 @@ func TestUnavailableNotificationPersistenceDoesNotChangeBackupResult(t *testing.
 		MissingRetry: config.Duration{Duration: time.Millisecond}, TargetTimeout: config.Duration{Duration: time.Second},
 		Targets: []config.Target{{Name: "primary"}},
 	}
+	prepareCoordinatorRoots(t, cfg)
 	store, err := state.Open(cfg.StateDir, []string{"primary"})
 	if err != nil {
 		t.Fatal(err)
@@ -218,4 +286,13 @@ func createCoordinatorData(t *testing.T, root string) string {
 		t.Fatal(err)
 	}
 	return dataDir
+}
+
+func prepareCoordinatorRoots(t *testing.T, cfg *config.Backup) {
+	t.Helper()
+	for _, path := range []string{cfg.StateDir, cfg.StagingDir, cfg.CacheDir} {
+		if err := os.Mkdir(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
 }

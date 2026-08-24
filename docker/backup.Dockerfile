@@ -20,4 +20,4 @@ COPY LICENSE THIRD_PARTY_LICENSES.md /licenses/
 WORKDIR /
 USER 65532:65532
 ENTRYPOINT ["/usr/local/bin/vaultwarden-less-backup"]
-CMD ["serve", "--config", "/config/backup.json"]
+CMD ["serve", "--config", "/config/backup.yaml"]

@@ -11,55 +11,86 @@ import (
 
 const maxSecretBytes = 64 << 10
 
-// Read reads a small, regular, non-symlink file whose permissions are exactly
-// 0600. A single trailing line ending is removed; other whitespace is data.
-func Read(path string) (string, error) {
+// ReadBytes reads a bounded, regular, non-symlink private file. Owner write
+// permission is optional, but group and other users must have no access.
+func ReadBytes(path string, limit int64) ([]byte, error) {
 	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
-		return "", fmt.Errorf("secret path must be a clean absolute path")
+		return nil, fmt.Errorf("private file path must be clean and absolute")
 	}
 	info, err := os.Lstat(path)
 	if err != nil {
-		return "", fmt.Errorf("inspect secret file: %w", err)
+		return nil, fmt.Errorf("inspect private file: %w", err)
 	}
 	if !info.Mode().IsRegular() {
-		return "", fmt.Errorf("secret path is not a regular file")
+		return nil, fmt.Errorf("private path is not a regular file")
 	}
-	if info.Mode().Perm() != 0o600 {
-		return "", fmt.Errorf("secret file permissions must be 0600, got %04o", info.Mode().Perm())
+	if !privateReadableMode(info) {
+		return nil, fmt.Errorf("private file must be owned by effective UID %d, owner-readable, and inaccessible to group and other users", os.Geteuid())
+	}
+	if limit < 1 || info.Size() > limit {
+		return nil, fmt.Errorf("private file exceeds %d bytes", limit)
 	}
 	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
 	if err != nil {
-		return "", fmt.Errorf("open secret file: %w", err)
+		return nil, fmt.Errorf("open private file: %w", err)
 	}
 	f := os.NewFile(uintptr(fd), path)
 	if f == nil {
 		_ = syscall.Close(fd)
-		return "", fmt.Errorf("open secret file handle")
+		return nil, fmt.Errorf("open private file handle")
 	}
 	defer f.Close()
 	opened, err := f.Stat()
-	if err != nil || !opened.Mode().IsRegular() || opened.Mode().Perm() != 0o600 || !os.SameFile(info, opened) {
-		return "", fmt.Errorf("secret file changed while opening")
+	if err != nil || !opened.Mode().IsRegular() || !privateReadableMode(opened) || !sameFileVersion(info, opened) {
+		return nil, fmt.Errorf("private file changed while opening")
 	}
 
-	data := make([]byte, maxSecretBytes+1)
+	data := make([]byte, limit+1)
 	n, err := io.ReadFull(f, data)
 	if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
-		return "", fmt.Errorf("read secret file: %w", err)
+		return nil, fmt.Errorf("read private file: %w", err)
 	}
-	if n > maxSecretBytes {
-		return "", fmt.Errorf("secret file exceeds %d bytes", maxSecretBytes)
+	if int64(n) > limit {
+		return nil, fmt.Errorf("private file exceeds %d bytes", limit)
 	}
-	value := strings.TrimSuffix(strings.TrimSuffix(string(data[:n]), "\n"), "\r")
-	if value == "" {
-		return "", fmt.Errorf("secret file is empty")
-	}
-	if strings.IndexByte(value, 0) >= 0 {
-		return "", fmt.Errorf("secret file contains a NUL byte")
+	if int64(n) != opened.Size() {
+		return nil, fmt.Errorf("private file changed while reading")
 	}
 	latest, err := os.Lstat(path)
-	if err != nil || !latest.Mode().IsRegular() || !os.SameFile(opened, latest) {
-		return "", fmt.Errorf("secret file changed while reading")
+	if err != nil || !latest.Mode().IsRegular() || !privateReadableMode(latest) || !sameFileVersion(opened, latest) {
+		return nil, fmt.Errorf("private file changed while reading")
+	}
+	return data[:n], nil
+}
+
+// Read returns a small non-empty private text file. A single trailing line
+// ending is removed; other whitespace is data.
+func Read(path string) (string, error) {
+	data, err := ReadBytes(path, maxSecretBytes)
+	if err != nil {
+		return "", err
+	}
+	value := strings.TrimSuffix(strings.TrimSuffix(string(data), "\n"), "\r")
+	if value == "" {
+		return "", fmt.Errorf("private file is empty")
+	}
+	if strings.IndexByte(value, 0) >= 0 {
+		return "", fmt.Errorf("private file contains a NUL byte")
 	}
 	return value, nil
+}
+
+func privateReadableMode(info os.FileInfo) bool {
+	permissions := info.Mode().Perm()
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	return ok && stat.Uid == uint32(os.Geteuid()) && permissions&0o400 != 0 && permissions&0o077 == 0
+}
+
+func sameFileVersion(left, right os.FileInfo) bool {
+	if left == nil || right == nil || !os.SameFile(left, right) || left.Size() != right.Size() || left.ModTime() != right.ModTime() {
+		return false
+	}
+	leftStat, leftOK := left.Sys().(*syscall.Stat_t)
+	rightStat, rightOK := right.Sys().(*syscall.Stat_t)
+	return leftOK && rightOK && leftStat.Ctim == rightStat.Ctim
 }

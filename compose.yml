@@ -18,13 +18,17 @@ services:
     <<: *service-defaults
     image: vaultwarden/server:1.37.2
     hostname: vaultwarden
-    user: "${PUID:?run scripts/init and set PUID}:${PGID:?run scripts/init and set PGID}"
+    user: "${PUID:?set PUID in .env to the non-root owner UID}:${PGID:?set PGID in .env to the non-root owner GID}"
     env_file:
       - .env.vaultwarden
     environment:
       DOMAIN: "${DOMAIN:?set DOMAIN in .env}"
     volumes:
-      - ./data:/data:rw
+      - type: bind
+        source: ./data
+        target: /data
+        bind:
+          create_host_path: false
     networks:
       - app
     stop_grace_period: 2m
@@ -42,18 +46,15 @@ services:
       context: .
       dockerfile: docker/proxy.Dockerfile
     hostname: proxy
-    user: "${PUID:?run scripts/init and set PUID}:${PGID:?run scripts/init and set PGID}"
+    user: "${PUID:?set PUID in .env to the non-root owner UID}:${PGID:?set PGID in .env to the non-root owner GID}"
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
     depends_on:
       vaultwarden:
         condition: service_healthy
-    command: ["--config", "/config/proxy.json"]
     ports:
-      - "${LISTEN_HOST:-127.0.0.1}:8080:8080"
-    volumes:
-      - ./config/proxy.json:/config/proxy.json:ro
+      - "${LISTEN_HOST:-127.0.0.1}:${LISTEN_PORT:-8080}:8080"
     networks:
       - app
       - events
@@ -71,22 +72,54 @@ services:
       context: .
       dockerfile: docker/backup.Dockerfile
     hostname: backup
-    user: "${PUID:?run scripts/init and set PUID}:${PGID:?run scripts/init and set PGID}"
+    user: "${PUID:?set PUID in .env to the non-root owner UID}:${PGID:?set PGID in .env to the non-root owner GID}"
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
     depends_on:
       vaultwarden:
         condition: service_healthy
-    command: ["serve", "--config", "/config/backup.json"]
+    command: ["serve", "--config", "/config/backup.yaml"]
     volumes:
-      - ./data:/data:ro
-      - ./state:/state:rw
-      - ./staging:/staging:rw
-      - ./cache:/cache:rw
-      - ./repositories:/repositories:rw
-      - ./secrets:/run/secrets:ro
-      - ./config/backup.json:/config/backup.json:ro
+      - type: bind
+        source: ./data
+        target: /data
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./state
+        target: /state
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./staging
+        target: /staging
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./cache
+        target: /cache
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./config/backup.yaml
+        target: /config/backup.yaml
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./credentials/common
+        target: /run/credentials/common
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./credentials/backup
+        target: /run/credentials/role
+        read_only: true
+        bind:
+          create_host_path: false
     networks:
       - events
       - outbound
@@ -101,7 +134,7 @@ services:
     platform: linux/amd64
     image: ghcr.io/hellodword/vaultwarden-less-backup:1.0.0
     profiles: ["maintenance"]
-    user: "${PUID:?run scripts/init and set PUID}:${PGID:?run scripts/init and set PGID}"
+    user: "${PUID:?set PUID in .env to the non-root owner UID}:${PGID:?set PGID in .env to the non-root owner GID}"
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
@@ -110,12 +143,31 @@ services:
     cap_drop:
       - ALL
     entrypoint: ["/usr/local/bin/vaultwarden-less-backup"]
-    command: ["repo", "snapshots", "--target", "primary", "--config", "/config/backup.json"]
+    command: ["repo", "snapshots", "--target", "primary", "--config", "/config/backup.yaml"]
     volumes:
-      - ./cache:/cache:rw
-      - ./repositories:/repositories:rw
-      - ./secrets:/run/secrets:ro
-      - ./config/backup.json:/config/backup.json:ro
+      - type: bind
+        source: ./cache
+        target: /cache
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./config/backup.yaml
+        target: /config/backup.yaml
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./credentials/common
+        target: /run/credentials/common
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./credentials/maintenance
+        target: /run/credentials/role
+        read_only: true
+        bind:
+          create_host_path: false
     networks:
       - outbound
     stop_grace_period: 2m10s
@@ -124,7 +176,7 @@ services:
     platform: linux/amd64
     image: ghcr.io/hellodword/vaultwarden-less-backup:1.0.0
     profiles: ["restore"]
-    user: "${PUID:?run scripts/init and set PUID}:${PGID:?run scripts/init and set PGID}"
+    user: "${PUID:?set PUID in .env to the non-root owner UID}:${PGID:?set PGID in .env to the non-root owner GID}"
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
@@ -133,13 +185,36 @@ services:
     cap_drop:
       - ALL
     entrypoint: ["/usr/local/bin/vaultwarden-less-backup"]
-    command: ["restore", "--target", "primary", "--output", "/restore/prepared", "--config", "/config/backup.json"]
+    command: ["restore", "--target", "primary", "--output", "/restore/prepared", "--config", "/config/backup.yaml"]
     volumes:
-      - ./restore:/restore:rw
-      - ./cache:/cache:rw
-      - ./repositories:/repositories:rw
-      - ./secrets:/run/secrets:ro
-      - ./config/backup.json:/config/backup.json:ro
+      - type: bind
+        source: ./restore
+        target: /restore
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./cache
+        target: /cache
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./config/backup.yaml
+        target: /config/backup.yaml
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./credentials/common
+        target: /run/credentials/common
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./credentials/maintenance
+        target: /run/credentials/role
+        read_only: true
+        bind:
+          create_host_path: false
     networks:
       - outbound
     stop_grace_period: 2m10s

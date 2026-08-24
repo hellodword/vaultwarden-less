@@ -29,9 +29,11 @@ import (
 const maxCommandOutput = 16 << 20
 
 type Runner struct {
-	Binary     string
-	CacheDir   string
-	StagingDir string
+	Binary       string
+	CacheDir     string
+	StagingDir   string
+	PasswordFile string
+	Credentials  *config.RoleCredentials
 }
 
 type OperationError struct {
@@ -57,8 +59,8 @@ type PruneResult struct {
 	Documents []json.RawMessage `json:"documents"`
 }
 
-func (r Runner) ValidateTarget(target config.Target, maintenance bool) error {
-	_, _, err := r.environment(target, maintenance)
+func (r Runner) ValidateTarget(target config.Target) error {
+	_, _, err := r.environment(target)
 	return err
 }
 
@@ -79,7 +81,7 @@ func (r Runner) Backup(ctx context.Context, target config.Target, manifest snaps
 	if err := manifest.Validate(); err != nil {
 		return BackupResult{}, &OperationError{Code: "invalid_manifest"}
 	}
-	env, globals, err := r.environment(target, false)
+	env, globals, err := r.environment(target)
 	if err != nil {
 		return BackupResult{}, err
 	}
@@ -273,10 +275,7 @@ func decodeJSONStream(data []byte) ([]json.RawMessage, error) {
 }
 
 func (r Runner) maintenance(ctx context.Context, target config.Target, command []string) ([]byte, error) {
-	if target.MaintenanceCredentials == nil {
-		return nil, &OperationError{Code: "maintenance_credentials_missing"}
-	}
-	env, globals, err := r.environment(target, true)
+	env, globals, err := r.environment(target)
 	if err != nil {
 		return nil, err
 	}
@@ -287,72 +286,51 @@ func (r Runner) maintenance(ctx context.Context, target config.Target, command [
 	return stdout, nil
 }
 
-func (r Runner) environment(target config.Target, maintenance bool) ([]string, []string, error) {
-	credentials := target.BackupCredentials
-	if maintenance {
-		if target.MaintenanceCredentials == nil {
-			return nil, nil, &OperationError{Code: "maintenance_credentials_missing"}
-		}
-		credentials = *target.MaintenanceCredentials
-	}
-	repository, err := securefile.Read(target.RepositoryFile)
-	if err != nil {
-		return nil, nil, &OperationError{Code: "repository_file_invalid"}
-	}
-	if !validRepository(target.Backend, repository) {
+func (r Runner) environment(target config.Target) ([]string, []string, error) {
+	if err := target.Validate(); err != nil {
 		return nil, nil, &OperationError{Code: "repository_backend_mismatch"}
 	}
-	if _, err := securefile.Read(credentials.PasswordFile); err != nil {
+	if r.Credentials == nil {
+		return nil, nil, &OperationError{Code: "role_credentials_missing"}
+	}
+	credentialEnvironment, err := r.Credentials.Environment(target)
+	if err != nil {
+		return nil, nil, &OperationError{Code: "backend_credentials_invalid"}
+	}
+	if err := safefs.ValidatePrivateDirectory(filepath.Dir(r.PasswordFile)); err != nil {
+		return nil, nil, &OperationError{Code: "password_directory_invalid"}
+	}
+	password, err := securefile.Read(r.PasswordFile)
+	if err != nil || strings.ContainsAny(password, "\r\n") {
 		return nil, nil, &OperationError{Code: "password_file_invalid"}
 	}
 	env := scrubEnvironment(os.Environ())
 	env = append(env,
-		"RESTIC_REPOSITORY_FILE="+target.RepositoryFile,
-		"RESTIC_PASSWORD_FILE="+credentials.PasswordFile,
+		"RESTIC_REPOSITORY="+target.Repository,
+		"RESTIC_PASSWORD_FILE="+r.PasswordFile,
 	)
-	names := make([]string, 0, len(credentials.EnvironmentFiles))
-	for name := range credentials.EnvironmentFiles {
+	names := make([]string, 0, len(credentialEnvironment))
+	for name := range credentialEnvironment {
 		names = append(names, name)
 	}
 	sort.Strings(names)
 	for _, name := range names {
-		value, err := securefile.Read(credentials.EnvironmentFiles[name])
-		if err != nil {
-			return nil, nil, &OperationError{Code: "backend_credential_file_invalid"}
-		}
-		env = append(env, name+"="+value)
-	}
-	names = names[:0]
-	for name := range credentials.EnvironmentPaths {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	for _, name := range names {
-		if _, err := securefile.Read(credentials.EnvironmentPaths[name]); err != nil {
-			return nil, nil, &OperationError{Code: "backend_credential_file_invalid"}
-		}
-		env = append(env, name+"="+credentials.EnvironmentPaths[name])
+		env = append(env, name+"="+credentialEnvironment[name])
 	}
 	globals := []string{}
-	if target.CACertificateFile != "" {
-		if _, err := securefile.Read(target.CACertificateFile); err != nil {
-			return nil, nil, &OperationError{Code: "ca_file_invalid"}
-		}
-		globals = append(globals, "--cacert", target.CACertificateFile)
-	}
-	optionNames := make([]string, 0, len(target.Options))
-	for name := range target.Options {
+	optionNames := make([]string, 0, len(target.ResticOptions))
+	for name := range target.ResticOptions {
 		optionNames = append(optionNames, name)
 	}
 	sort.Strings(optionNames)
 	for _, name := range optionNames {
-		globals = append(globals, "-o", name+"="+target.Options[name])
+		globals = append(globals, "-o", name+"="+target.ResticOptions[name])
 	}
 	return env, globals, nil
 }
 
 func (r Runner) targetCache(name string) (string, error) {
-	if err := safefs.EnsurePrivateDirectory(r.CacheDir); err != nil {
+	if err := safefs.ValidatePrivateDirectory(r.CacheDir); err != nil {
 		return "", &OperationError{Code: "cache_path_invalid"}
 	}
 	path := filepath.Join(r.CacheDir, name)
@@ -475,30 +453,6 @@ func classifyRunError(ctx context.Context, err error, fallback string) string {
 		return fallback
 	}
 	return "restic_process_failed"
-}
-
-func validRepository(backend, repository string) bool {
-	if repository == "" || len(repository) > 4096 || strings.ContainsAny(repository, "\r\n\x00") {
-		return false
-	}
-	switch backend {
-	case "local":
-		return repository != string(filepath.Separator) && filepath.IsAbs(repository) && filepath.Clean(repository) == repository
-	case "rest":
-		return strings.HasPrefix(repository, "rest:https://") || strings.HasPrefix(repository, "rest:http://")
-	case "s3":
-		return strings.HasPrefix(repository, "s3:https://") || strings.HasPrefix(repository, "s3:http://")
-	case "b2":
-		return strings.HasPrefix(repository, "b2:")
-	case "azure":
-		return strings.HasPrefix(repository, "azure:")
-	case "gcs":
-		return strings.HasPrefix(repository, "gs:")
-	case "swift":
-		return strings.HasPrefix(repository, "swift:")
-	default:
-		return false
-	}
 }
 
 func scrubEnvironment(input []string) []string {

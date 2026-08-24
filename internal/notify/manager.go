@@ -97,8 +97,6 @@ func (s *lazySender) Send(ctx context.Context, event Event) error {
 
 func senderForConfig(cfg config.Notifier) (Sender, error) {
 	switch cfg.Type {
-	case "webhook":
-		return newWebhookSender(cfg)
 	case "wechat":
 		return newWechatSender(cfg)
 	case "bark":

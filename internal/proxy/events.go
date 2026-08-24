@@ -23,7 +23,11 @@ type EventSender struct {
 	signal chan struct{}
 }
 
-func NewEventSender(target *url.URL, timeout time.Duration, log *slog.Logger) *EventSender {
+func NewEventSender(log *slog.Logger) *EventSender {
+	return newEventSender(mustURL(EventsURL), EventTimeout, log)
+}
+
+func newEventSender(target *url.URL, timeout time.Duration, log *slog.Logger) *EventSender {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.Proxy = nil
 	return &EventSender{
