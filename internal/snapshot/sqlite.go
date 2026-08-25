@@ -3,14 +3,12 @@ package snapshot
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
 	"time"
 
-	"github.com/hellodword/vaultwarden-less/internal/version"
 	"github.com/mattn/go-sqlite3"
 )
 
@@ -42,14 +40,14 @@ func onlineBackup(ctx context.Context, sourcePath, destinationPath string) error
 	if err != nil {
 		return fmt.Errorf("open source database: %w", err)
 	}
-	defer source.Close()
+	defer func() { _ = source.Close() }()
 	source.SetMaxOpenConns(4)
 	source.SetMaxIdleConns(4)
 	destination, err := sql.Open("sqlite3", sqliteURI(destinationPath, "rw"))
 	if err != nil {
 		return fmt.Errorf("open destination database: %w", err)
 	}
-	defer destination.Close()
+	defer func() { _ = destination.Close() }()
 	destination.SetMaxOpenConns(1)
 	destination.SetMaxIdleConns(1)
 
@@ -67,12 +65,12 @@ func onlineBackup(ctx context.Context, sourcePath, destinationPath string) error
 	if err != nil {
 		return fmt.Errorf("reserve source connection: %w", err)
 	}
-	defer sourceConn.Close()
+	defer func() { _ = sourceConn.Close() }()
 	destinationConn, err := destination.Conn(ctx)
 	if err != nil {
 		return fmt.Errorf("reserve destination connection: %w", err)
 	}
-	defer destinationConn.Close()
+	defer func() { _ = destinationConn.Close() }()
 
 	err = sourceConn.Raw(func(rawSource any) error {
 		src, ok := rawSource.(*sqlite3.SQLiteConn)
@@ -173,7 +171,7 @@ func validateDatabase(ctx context.Context, path string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("open snapshot database: %w", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 
@@ -185,13 +183,13 @@ func validateDatabase(ctx context.Context, path string) (string, error) {
 	for rows.Next() {
 		var result string
 		if err := rows.Scan(&result); err != nil {
-			rows.Close()
+			_ = rows.Close()
 			return "", fmt.Errorf("read integrity_check: %w", err)
 		}
 		results = append(results, result)
 	}
 	if err := rows.Err(); err != nil {
-		rows.Close()
+		_ = rows.Close()
 		return "", fmt.Errorf("iterate integrity_check: %w", err)
 	}
 	if err := rows.Close(); err != nil {
@@ -206,43 +204,44 @@ func validateDatabase(ctx context.Context, path string) (string, error) {
 		return "", fmt.Errorf("run foreign_key_check: %w", err)
 	}
 	if rows.Next() {
-		rows.Close()
+		_ = rows.Close()
 		return "", fmt.Errorf("foreign_key_check failed")
 	}
 	if err := rows.Err(); err != nil {
-		rows.Close()
+		_ = rows.Close()
 		return "", fmt.Errorf("iterate foreign_key_check: %w", err)
 	}
 	if err := rows.Close(); err != nil {
 		return "", fmt.Errorf("close foreign_key_check: %w", err)
 	}
 
-	required := map[string][]string{
-		"attachments":                {"id", "cipher_uuid", "file_size"},
-		"ciphers":                    {"uuid"},
-		"sends":                      {"uuid", "atype", "data"},
-		"users":                      {"uuid"},
-		"__diesel_schema_migrations": {"version"},
+	required := []struct {
+		table   string
+		columns []string
+	}{
+		{table: "attachments", columns: []string{"cipher_uuid", "id", "file_size"}},
+		{table: "__diesel_schema_migrations", columns: []string{"version"}},
 	}
-	for table, columns := range required {
+	for _, requirement := range required {
+		table := requirement.table
 		var count int
 		if err := db.QueryRowContext(ctx, "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?", table).Scan(&count); err != nil || count != 1 {
 			return "", fmt.Errorf("required table %s is missing", table)
 		}
-		for _, column := range columns {
+		for _, column := range requirement.columns {
 			if err := db.QueryRowContext(ctx, "SELECT count(*) FROM pragma_table_info(?) WHERE name = ?", table, column).Scan(&count); err != nil || count != 1 {
 				return "", fmt.Errorf("required column %s.%s is missing", table, column)
 			}
 		}
 	}
-	var migration string
+	var migration sql.NullString
 	if err := db.QueryRowContext(ctx, "SELECT max(version) FROM __diesel_schema_migrations").Scan(&migration); err != nil {
 		return "", fmt.Errorf("read database migration: %w", err)
 	}
-	if migration != version.VaultwardenSchema {
-		return "", fmt.Errorf("unsupported database migration %q", migration)
+	if !migration.Valid || !validMigration(migration.String) {
+		return "", fmt.Errorf("unsupported database migration")
 	}
-	return migration, nil
+	return migration.String, nil
 }
 
 func referencedFiles(ctx context.Context, path string) ([]referencedFile, error) {
@@ -250,7 +249,7 @@ func referencedFiles(ctx context.Context, path string) ([]referencedFile, error)
 	if err != nil {
 		return nil, err
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 
@@ -263,49 +262,21 @@ func referencedFiles(ctx context.Context, path string) ([]referencedFile, error)
 		var cipherID, attachmentID string
 		var size int64
 		if err := rows.Scan(&cipherID, &attachmentID, &size); err != nil {
-			rows.Close()
+			_ = rows.Close()
 			return nil, fmt.Errorf("read attachment reference: %w", err)
 		}
 		if !validUUID(cipherID) || !validOpaqueID(attachmentID) || size < 0 {
-			rows.Close()
+			_ = rows.Close()
 			return nil, fmt.Errorf("database contains an unsafe attachment reference")
 		}
 		refs = append(refs, referencedFile{Path: "data/attachments/" + cipherID + "/" + attachmentID, ExpectedSize: size})
 	}
 	if err := rows.Err(); err != nil {
-		rows.Close()
+		_ = rows.Close()
 		return nil, fmt.Errorf("iterate attachment references: %w", err)
 	}
 	if err := rows.Close(); err != nil {
 		return nil, fmt.Errorf("close attachment references: %w", err)
-	}
-
-	rows, err = db.QueryContext(ctx, "SELECT uuid, data FROM sends WHERE atype = 1 ORDER BY uuid")
-	if err != nil {
-		return nil, fmt.Errorf("query send references: %w", err)
-	}
-	for rows.Next() {
-		var sendID, raw string
-		if err := rows.Scan(&sendID, &raw); err != nil {
-			rows.Close()
-			return nil, fmt.Errorf("read send reference: %w", err)
-		}
-		var data struct {
-			ID   string `json:"id"`
-			Size int64  `json:"size"`
-		}
-		if err := json.Unmarshal([]byte(raw), &data); err != nil || !validUUID(sendID) || !validOpaqueID(data.ID) || data.Size < 0 {
-			rows.Close()
-			return nil, fmt.Errorf("database contains an unsafe file-send reference")
-		}
-		refs = append(refs, referencedFile{Path: "data/sends/" + sendID + "/" + data.ID, ExpectedSize: data.Size})
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return nil, fmt.Errorf("iterate send references: %w", err)
-	}
-	if err := rows.Close(); err != nil {
-		return nil, fmt.Errorf("close send references: %w", err)
 	}
 	return refs, nil
 }

@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+
+	"github.com/hellodword/vaultwarden-less/internal/safefs"
 )
 
 type changedFileError struct{ reason string }
@@ -25,7 +27,7 @@ func copyStableFile(ctx context.Context, dataDir, destinationRoot string, ref re
 		}
 		return File{}, fmt.Errorf("open contained source file: %w", err)
 	}
-	defer source.Close()
+	defer func() { _ = source.Close() }()
 	before, err := source.Stat()
 	if err != nil || !before.Mode().IsRegular() {
 		return File{}, fmt.Errorf("inspect source file")
@@ -47,7 +49,7 @@ func copyStableFile(ctx context.Context, dataDir, destinationRoot string, ref re
 	}
 	keep := false
 	defer func() {
-		destination.Close()
+		_ = destination.Close()
 		if !keep {
 			_ = os.Remove(destinationPath)
 		}
@@ -64,7 +66,7 @@ func copyStableFile(ctx context.Context, dataDir, destinationRoot string, ref re
 		return File{}, fmt.Errorf("secure destination file: %w", err)
 	}
 	after, err := source.Stat()
-	if err != nil || !sameFileVersion(before, after) || written != before.Size() {
+	if err != nil || !safefs.SameFileVersion(before, after) || written != before.Size() {
 		return File{}, changedFileError{reason: "changed_during_copy"}
 	}
 	latest, err := openSourceFile(dataDir, ref.Path)
@@ -76,7 +78,7 @@ func copyStableFile(ctx context.Context, dataDir, destinationRoot string, ref re
 	}
 	latestInfo, statErr := latest.Stat()
 	closeErr := latest.Close()
-	if statErr != nil || closeErr != nil || !sameFileVersion(before, latestInfo) {
+	if statErr != nil || closeErr != nil || !safefs.SameFileVersion(before, latestInfo) {
 		return File{}, changedFileError{reason: "changed_during_copy"}
 	}
 	if ref.ExpectedSize >= 0 && written != ref.ExpectedSize {
@@ -128,16 +130,6 @@ func openSourceFile(dataDir, relative string) (*os.File, error) {
 	return file, nil
 }
 
-func sameFileVersion(left, right os.FileInfo) bool {
-	if left == nil || right == nil || !left.Mode().IsRegular() || !right.Mode().IsRegular() ||
-		!os.SameFile(left, right) || left.Size() != right.Size() || left.ModTime() != right.ModTime() {
-		return false
-	}
-	leftStat, leftOK := left.Sys().(*syscall.Stat_t)
-	rightStat, rightOK := right.Sys().(*syscall.Stat_t)
-	return leftOK && rightOK && leftStat.Ctim == rightStat.Ctim
-}
-
 func copyWithContext(ctx context.Context, destination io.Writer, source io.Reader) (int64, error) {
 	buffer := make([]byte, 256<<10)
 	var total int64
@@ -177,7 +169,7 @@ func hashRegularFile(path string) (File, error) {
 	if err != nil {
 		return File{}, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	hash := sha256.New()
 	size, err := io.Copy(hash, f)
 	if err != nil {

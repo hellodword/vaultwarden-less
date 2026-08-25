@@ -147,11 +147,11 @@ func (b Builder) Build(ctx context.Context, allowIncomplete bool) (_ Result, err
 		return Result{}, fmt.Errorf("create manifest: %w", err)
 	}
 	if _, err := manifestFile.Write(manifestBytes); err != nil {
-		manifestFile.Close()
+		_ = manifestFile.Close()
 		return Result{}, fmt.Errorf("write manifest: %w", err)
 	}
 	if err := manifestFile.Sync(); err != nil {
-		manifestFile.Close()
+		_ = manifestFile.Close()
 		return Result{}, fmt.Errorf("sync manifest: %w", err)
 	}
 	if err := manifestFile.Close(); err != nil {
@@ -176,13 +176,13 @@ func (b Builder) optionalFiles() ([]referencedFile, int64, error) {
 	var total int64
 	for _, entry := range entries {
 		name := entry.Name()
-		if name != "config.json" && !strings.HasPrefix(name, "rsa_key") {
+		if name != "rsa_key.pem" && name != "rsa_key.pub.pem" {
 			continue
 		}
-		if strings.Contains(name, "/") || name == "rsa_key" && entry.IsDir() {
+		if strings.Contains(name, "/") {
 			return nil, 0, fmt.Errorf("invalid whitelisted data entry")
 		}
-		info, err := entry.Info()
+		info, err := os.Lstat(filepath.Join(b.DataDir, name))
 		if err != nil {
 			return nil, 0, fmt.Errorf("inspect whitelisted data entry: %w", err)
 		}
@@ -194,49 +194,6 @@ func (b Builder) optionalFiles() ([]referencedFile, int64, error) {
 		if err != nil {
 			return nil, 0, fmt.Errorf("optional file size overflow")
 		}
-	}
-	templatesRoot := filepath.Join(b.DataDir, "templates")
-	info, err := os.Lstat(templatesRoot)
-	if err == nil {
-		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-			return nil, 0, fmt.Errorf("templates is not a real directory")
-		}
-		err = filepath.WalkDir(templatesRoot, func(path string, entry os.DirEntry, walkErr error) error {
-			if walkErr != nil {
-				return walkErr
-			}
-			if path == templatesRoot {
-				return nil
-			}
-			entryInfo, err := os.Lstat(path)
-			if err != nil {
-				return err
-			}
-			if entryInfo.Mode()&os.ModeSymlink != 0 {
-				return fmt.Errorf("templates contains a symlink")
-			}
-			if entryInfo.IsDir() {
-				return nil
-			}
-			if !entryInfo.Mode().IsRegular() {
-				return fmt.Errorf("templates contains a special file")
-			}
-			relative, err := filepath.Rel(b.DataDir, path)
-			if err != nil {
-				return err
-			}
-			refs = append(refs, referencedFile{Path: "data/" + filepath.ToSlash(relative), ExpectedSize: entryInfo.Size()})
-			total, err = checkedSizeSum(total, entryInfo.Size())
-			if err != nil {
-				return fmt.Errorf("optional file size overflow")
-			}
-			return nil
-		})
-		if err != nil {
-			return nil, 0, fmt.Errorf("walk templates whitelist: %w", err)
-		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return nil, 0, fmt.Errorf("inspect templates whitelist: %w", err)
 	}
 	return refs, total, nil
 }
@@ -344,6 +301,6 @@ func syncDirectory(path string) error {
 	if err != nil {
 		return err
 	}
-	defer dir.Close()
+	defer func() { _ = dir.Close() }()
 	return dir.Sync()
 }

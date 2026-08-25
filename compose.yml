@@ -1,8 +1,10 @@
 name: vaultwarden-less
 
+x-product-image: &product-image ghcr.io/hellodword/vaultwarden-less:${PRODUCT_VERSION:-dev}
 x-service-defaults: &service-defaults
   platform: linux/amd64
   restart: unless-stopped
+  user: "65532:65532"
   logging:
     driver: local
     options:
@@ -16,13 +18,11 @@ x-service-defaults: &service-defaults
 services:
   vaultwarden:
     <<: *service-defaults
-    image: vaultwarden/server:1.37.2
+    image: vaultwarden/server:1.37.2@sha256:5d326778c22f063d093d6b0c9c766a28249561632266776f2c93132ab0ad3a80
     hostname: vaultwarden
-    user: "${PUID:?set PUID in .env to the non-root owner UID}:${PGID:?set PGID in .env to the non-root owner GID}"
     env_file:
-      - .env.vaultwarden
-    environment:
-      DOMAIN: "${DOMAIN:?set DOMAIN in .env}"
+      - path: ${VAULTWARDEN_ENV_FILE:-.env.vaultwarden}
+        required: true
     volumes:
       - type: bind
         source: ./data
@@ -41,12 +41,14 @@ services:
 
   proxy:
     <<: *service-defaults
-    image: ghcr.io/hellodword/vaultwarden-less-proxy:1.0.0
+    image: *product-image
     build:
       context: .
-      dockerfile: docker/proxy.Dockerfile
+      dockerfile: docker/Dockerfile
+      args:
+        PRODUCT_VERSION: "${PRODUCT_VERSION:-dev}"
     hostname: proxy
-    user: "${PUID:?set PUID in .env to the non-root owner UID}:${PGID:?set PGID in .env to the non-root owner GID}"
+    entrypoint: ["/usr/local/bin/vaultwarden-less-proxy"]
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
@@ -54,10 +56,11 @@ services:
       vaultwarden:
         condition: service_healthy
     ports:
-      - "${LISTEN_HOST:-127.0.0.1}:${LISTEN_PORT:-8080}:8080"
+      - "127.0.0.1:${LISTEN_PORT:-8080}:8080"
     networks:
       - app
       - events
+      - proxy-ingress
     stop_grace_period: 2m10s
     healthcheck:
       test: ["CMD", "/usr/local/bin/vaultwarden-less-proxy", "healthcheck"]
@@ -67,19 +70,11 @@ services:
 
   backup:
     <<: *service-defaults
-    image: ghcr.io/hellodword/vaultwarden-less-backup:1.0.0
-    build:
-      context: .
-      dockerfile: docker/backup.Dockerfile
+    image: *product-image
     hostname: backup
-    user: "${PUID:?set PUID in .env to the non-root owner UID}:${PGID:?set PGID in .env to the non-root owner GID}"
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
-    depends_on:
-      vaultwarden:
-        condition: service_healthy
-    command: ["serve", "--config", "/config/backup.yaml"]
     volumes:
       - type: bind
         source: ./data
@@ -120,9 +115,10 @@ services:
         read_only: true
         bind:
           create_host_path: false
+    command: ["serve", "--config", "/config/backup.yaml"]
     networks:
       - events
-      - outbound
+      - backup-outbound
     stop_grace_period: 2m10s
     healthcheck:
       test: ["CMD", "/usr/local/bin/vaultwarden-less-backup", "healthcheck"]
@@ -131,18 +127,13 @@ services:
       retries: 6
 
   maintenance:
-    platform: linux/amd64
-    image: ghcr.io/hellodword/vaultwarden-less-backup:1.0.0
+    <<: *service-defaults
+    image: *product-image
     profiles: ["maintenance"]
-    user: "${PUID:?set PUID in .env to the non-root owner UID}:${PGID:?set PGID in .env to the non-root owner GID}"
+    entrypoint: ["/usr/local/bin/vaultwarden-less-backup"]
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
-    entrypoint: ["/usr/local/bin/vaultwarden-less-backup"]
     command: ["repo", "snapshots", "--target", "primary", "--config", "/config/backup.yaml"]
     volumes:
       - type: bind
@@ -169,22 +160,17 @@ services:
         bind:
           create_host_path: false
     networks:
-      - outbound
+      - maintenance-outbound
     stop_grace_period: 2m10s
 
   restore:
-    platform: linux/amd64
-    image: ghcr.io/hellodword/vaultwarden-less-backup:1.0.0
+    <<: *service-defaults
+    image: *product-image
     profiles: ["restore"]
-    user: "${PUID:?set PUID in .env to the non-root owner UID}:${PGID:?set PGID in .env to the non-root owner GID}"
+    entrypoint: ["/usr/local/bin/vaultwarden-less-backup"]
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
-    entrypoint: ["/usr/local/bin/vaultwarden-less-backup"]
     command: ["restore", "--target", "primary", "--output", "/restore/prepared", "--config", "/config/backup.yaml"]
     volumes:
       - type: bind
@@ -216,7 +202,7 @@ services:
         bind:
           create_host_path: false
     networks:
-      - outbound
+      - maintenance-outbound
     stop_grace_period: 2m10s
 
 networks:
@@ -224,4 +210,8 @@ networks:
     internal: true
   events:
     internal: true
-  outbound: {}
+  proxy-ingress:
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: "false"
+  backup-outbound: {}
+  maintenance-outbound: {}

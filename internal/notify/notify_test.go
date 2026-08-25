@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -39,7 +40,7 @@ func TestQueueBoundsSuccessesAndCoalescesTargetState(t *testing.T) {
 		}
 	}
 	queue := store.state.Notifiers["ops"]
-	if len(queue.Items) != 100 || queue.Items[len(queue.Items)-1].Event.MergedSuccesses != 1 || queue.Items[len(queue.Items)-1].Event.ID != "recovery-xxxxW" {
+	if len(queue.Items) != 1 || queue.Availability != "unavailable" || queue.Items[0].Event.MergedSuccesses != 100 || queue.Items[0].Event.ID != "recovery-xxxxW" {
 		t.Fatalf("queue length/merged = %d/%d", len(queue.Items), queue.Items[len(queue.Items)-1].Event.MergedSuccesses)
 	}
 	if err := store.Ack("ops", queue.Items[0].Event.ID); err != nil {
@@ -50,7 +51,7 @@ func TestQueueBoundsSuccessesAndCoalescesTargetState(t *testing.T) {
 		t.Fatal(err)
 	}
 	queue = store.state.Notifiers["ops"]
-	if queue.Items[len(queue.Items)-2].Event.MergedSuccesses != 1 || queue.Items[len(queue.Items)-1].Event.MergedSuccesses != 0 {
+	if len(queue.Items) != 1 || queue.Items[0].Event.MergedSuccesses != 0 || queue.Items[0].Event.ID != "new-success" || queue.Availability != "available" {
 		t.Fatalf("merged success was not retained for delivery: %#v", queue)
 	}
 	degraded := NewTargetEvent("degraded", "target_degraded", "2026-08-23T12:00:00.000Z", TargetStatus{Name: "primary", State: "degraded", ErrorCode: "backup_failed"})
@@ -100,7 +101,7 @@ func TestSuccessMergeCountIsIndependentPerNotifier(t *testing.T) {
 	}
 	full := store.state.Notifiers["full"].Items
 	room := store.state.Notifiers["room"].Items
-	if full[len(full)-1].Event.MergedSuccesses != 1 {
+	if len(full) != 1 || full[0].Event.MergedSuccesses != 100 {
 		t.Fatalf("full queue merged count = %d", full[len(full)-1].Event.MergedSuccesses)
 	}
 	if len(room) != 1 || room[0].Event.ID != latest.ID || room[0].Event.MergedSuccesses != 0 {
@@ -125,12 +126,12 @@ func TestIncompleteRecoveryUsesReplaceablePriorityState(t *testing.T) {
 		t.Fatal(err)
 	}
 	queue := store.state.Notifiers["ops"]
-	if len(queue.Items) != maxSuccessItems+1 || queue.Items[0].Event.ID != "incomplete" {
+	if len(queue.Items) != maxSuccessItems+1 || queue.Items[0].Event.ID != "incomplete" || queue.Items[len(queue.Items)-1].Event.MergedSuccesses != 0 {
 		t.Fatalf("incomplete recovery was not retained with priority: %#v", queue.Items[:1])
 	}
 }
 
-func TestCompleteRecoveryAtomicallySupersedesPendingIncompleteState(t *testing.T) {
+func TestCompleteRecoveryRetainsPendingIncompleteState(t *testing.T) {
 	t.Parallel()
 	store, err := OpenQueueStore(privateNotificationDir(t), []string{"ops"})
 	if err != nil {
@@ -141,12 +142,12 @@ func TestCompleteRecoveryAtomicallySupersedesPendingIncompleteState(t *testing.T
 		t.Fatal(err)
 	}
 	complete := recoveryEvent("complete")
-	if err := store.EnqueueSuccessReplacingState([]string{"ops"}, complete, "source-integrity"); err != nil {
+	if err := store.EnqueueAll([]string{"ops"}, complete, "success", complete.ID); err != nil {
 		t.Fatal(err)
 	}
 	queue := store.state.Notifiers["ops"]
-	if len(queue.Items) != 1 || queue.Items[0].Kind != "success" || queue.Items[0].Event.ID != "complete" {
-		t.Fatalf("complete recovery did not supersede incomplete state: %#v", queue.Items)
+	if len(queue.Items) != 2 || queue.Items[0].Kind != "state" || queue.Items[0].Event.ID != "incomplete" || queue.Items[1].Kind != "success" || queue.Items[1].Event.ID != "complete" {
+		t.Fatalf("complete recovery did not retain state transition: %#v", queue.Items)
 	}
 }
 
@@ -169,6 +170,31 @@ func TestNotificationStateReconcilesRemovedNotifiers(t *testing.T) {
 	}
 	if queue, exists := reopened.state.Notifiers["current"]; !exists || len(queue.Items) != 0 {
 		t.Fatalf("current notifier queue was not initialized: %#v", reopened.state.Notifiers)
+	}
+}
+
+func TestNotificationStateRebuildsSafeInvalidFile(t *testing.T) {
+	t.Parallel()
+	dir := privateNotificationDir(t)
+	path := filepath.Join(dir, "notifications.json")
+	if err := os.WriteFile(path, []byte("{\"schema_version\":1,\"unknown\":true}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := OpenQueueStore(dir, []string{"ops"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !store.Rebuilt() || store.state.Notifiers["ops"].Items == nil {
+		t.Fatalf("invalid notification state was not rebuilt: %#v", store.state)
+	}
+	if err := os.WriteFile(path, []byte("keep\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenQueueStore(dir, []string{"ops"}); err == nil {
+		t.Fatal("insecure notification state was rebuilt")
 	}
 }
 
@@ -235,7 +261,7 @@ func TestNotificationHTTPClientRefusesRedirects(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	if response.StatusCode != http.StatusTemporaryRedirect || redirected.Load() != 0 {
 		t.Fatalf("redirect status/contacts = %d/%d", response.StatusCode, redirected.Load())
 	}

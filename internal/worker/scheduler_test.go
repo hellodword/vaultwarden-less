@@ -46,14 +46,33 @@ func TestSchedulerDebounceMaxWaitMinimumAndPeriodicSample(t *testing.T) {
 	if got, want := nextSnapshotAt(current, cfg, base), base.Add(15*time.Minute); !got.Equal(want) {
 		t.Fatalf("periodic sample = %s, want %s", got, want)
 	}
+	current.Source = state.Source{State: "degraded", NextRetryAt: state.FormatTime(base.Add(time.Minute))}
+	if got, want := nextSnapshotAt(current, cfg, base), base.Add(time.Minute); !got.Equal(want) {
+		t.Fatalf("source retry = %s, want %s", got, want)
+	}
+	current.Source.NextRetryAt = state.FormatTime(base.Add(-time.Second))
+	if got, want := nextSnapshotAt(current, cfg, base), base; !got.Equal(want) {
+		t.Fatalf("overdue source retry = %s, want %s", got, want)
+	}
 }
 
-func TestBackoffIsBoundedAndJitteredWithinContract(t *testing.T) {
+func TestTargetBackoffIsBoundedAndJitteredWithinContract(t *testing.T) {
 	t.Parallel()
+	coordinator := &Coordinator{randomInt: func(max int64) (int64, error) { return max - 1, nil }}
 	for failures := 1; failures <= 20; failures++ {
-		delay := backoff(failures)
+		delay := coordinator.targetBackoff(failures)
 		if delay < time.Minute || delay > 15*time.Minute {
 			t.Fatalf("failures %d delay %s outside contract", failures, delay)
+		}
+	}
+}
+
+func TestSourceBackoffUsesFixedSchedule(t *testing.T) {
+	t.Parallel()
+	want := map[int]time.Duration{1: time.Minute, 5: 15 * time.Minute, 8: 6 * time.Hour, 20: 6 * time.Hour}
+	for failures, expected := range want {
+		if got := sourceBackoff(failures); got != expected {
+			t.Fatalf("failures %d backoff = %s, want %s", failures, got, expected)
 		}
 	}
 }

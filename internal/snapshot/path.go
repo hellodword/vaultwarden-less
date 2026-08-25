@@ -16,10 +16,7 @@ var (
 
 func validUUID(value string) bool { return uuidPattern.MatchString(value) }
 
-// Vaultwarden currently generates lowercase hexadecimal attachment and Send
-// file IDs, but its durable model treats both as opaque safe path components.
-// Preserve older valid local data without accepting separators, Unicode, or a
-// component too large for the supported local-filesystem contract.
+// Attachment IDs are opaque path-safe components in the v1 path contract.
 func validOpaqueID(value string) bool {
 	return len(value) >= 1 && len(value) <= 255 && opaqueIDPattern.MatchString(value)
 }
@@ -31,10 +28,11 @@ func validManifestPath(path string) bool {
 	if path == "manifest.json" || path == "data/db.sqlite3" {
 		return true
 	}
-	if strings.HasPrefix(path, "data/attachments/") || strings.HasPrefix(path, "data/sends/") || strings.HasPrefix(path, "data/templates/") || path == "data/config.json" {
+	parts := strings.Split(path, "/")
+	if len(parts) == 4 && parts[0] == "data" && parts[1] == "attachments" && validUUID(parts[2]) && validOpaqueID(parts[3]) {
 		return true
 	}
-	return strings.HasPrefix(path, "data/rsa_key") && !strings.Contains(strings.TrimPrefix(path, "data/"), "/")
+	return path == "data/rsa_key.pem" || path == "data/rsa_key.pub.pem"
 }
 
 func secureJoin(base, relative string) (string, error) {

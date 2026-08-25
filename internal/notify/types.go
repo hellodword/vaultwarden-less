@@ -82,6 +82,14 @@ func (e Event) Validate() error {
 			e.Type == "target_recovered" && (e.Target.State != "healthy" || e.Target.ErrorCode != "") {
 			return fmt.Errorf("target event type and state disagree")
 		}
+	case "source_degraded", "source_recovered":
+		if e.Target == nil || e.RecoveryPoint != nil || len(e.Targets) != 0 || e.MergedSuccesses != 0 || e.Target.Name != "source" {
+			return fmt.Errorf("invalid source-state notification")
+		}
+		if e.Type == "source_degraded" && (e.Target.State != "degraded" || e.Target.ErrorCode == "") ||
+			e.Type == "source_recovered" && (e.Target.State != "healthy" || e.Target.ErrorCode != "") {
+			return fmt.Errorf("source event type and state disagree")
+		}
 	default:
 		return fmt.Errorf("invalid notification type")
 	}
@@ -128,9 +136,22 @@ func (e Event) Message() string {
 		return fmt.Sprintf("Vaultwarden backup target %s is degraded (%s)", e.Target.Name, e.Target.ErrorCode)
 	case "target_recovered":
 		return fmt.Sprintf("Vaultwarden backup target %s has caught up", e.Target.Name)
+	case "source_degraded":
+		return fmt.Sprintf("Vaultwarden source is degraded (%s)", e.Target.ErrorCode)
+	case "source_recovered":
+		return "Vaultwarden backup source has recovered"
 	default:
 		return "Vaultwarden backup status changed"
 	}
+}
+
+func NewSourceEvent(id, eventType, occurredAt, errorCode string) Event {
+	state := "degraded"
+	if eventType == "source_recovered" {
+		state = "healthy"
+		errorCode = ""
+	}
+	return NewTargetEvent(id, eventType, occurredAt, TargetStatus{Name: "source", State: state, ErrorCode: errorCode})
 }
 
 func shortID(id string) string {

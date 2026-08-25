@@ -45,9 +45,6 @@ func TestZeroTargetsNeverSamples(t *testing.T) {
 	if err := coordinator.Sample(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if err := coordinator.CatchUp(context.Background()); err != nil {
-		t.Fatal(err)
-	}
 	if err := coordinator.MarkDirty(time.Now()); err != nil {
 		t.Fatal(err)
 	}
@@ -101,9 +98,15 @@ func TestDirtyEventsDuringBackupQueueExactlyOneFurtherGeneration(t *testing.T) {
 
 func (r *blockingTargetRunner) Backup(ctx context.Context, _ config.Target, _ snapshot.Manifest) (restic.BackupResult, error) {
 	close(r.started)
-	<-ctx.Done()
-	close(r.canceled)
-	return restic.BackupResult{}, &restic.OperationError{Code: "operation_cancelled"}
+	timer := time.NewTimer(100 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return restic.BackupResult{SnapshotID: strings.Repeat("a", 64)}, nil
+	case <-ctx.Done():
+		close(r.canceled)
+		return restic.BackupResult{}, &restic.OperationError{Code: "operation_cancelled"}
+	}
 }
 
 func (r *partialTargetRunner) Backup(_ context.Context, target config.Target, _ snapshot.Manifest) (restic.BackupResult, error) {
@@ -159,7 +162,7 @@ func TestPartialTargetFailureDoesNotBlockHealthyTargetAndCatchUpUsesLatest(t *te
 	if current.Current == nil || current.Targets["primary"].State != "healthy" || current.Targets["secondary"].State != "degraded" {
 		t.Fatalf("partial failure state = %#v", current)
 	}
-	if current.Targets["primary"].ContentID != current.Current.ContentID || current.Targets["secondary"].ContentID == current.Current.ContentID {
+	if current.Targets["primary"].LastRecoveryPoint == nil || current.Targets["primary"].LastRecoveryPoint.ContentID != current.Current.ContentID || current.Targets["secondary"].LastRecoveryPoint != nil {
 		t.Fatalf("target progress was not isolated: %#v", current.Targets)
 	}
 
@@ -172,11 +175,11 @@ func TestPartialTargetFailureDoesNotBlockHealthyTargetAndCatchUpUsesLatest(t *te
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := coordinator.CatchUp(context.Background()); err != nil {
+	if err := coordinator.catchUp(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	current = store.Snapshot()
-	if current.Current != nil || current.Targets["secondary"].State != "healthy" || current.Targets["secondary"].ContentID == "" {
+	if current.Current != nil || current.Targets["secondary"].State != "healthy" || current.Targets["secondary"].LastRecoveryPoint == nil {
 		t.Fatalf("catch-up state = %#v", current)
 	}
 	if runner.callCount("primary") != 1 || runner.callCount("secondary") != 2 {
@@ -187,7 +190,7 @@ func TestPartialTargetFailureDoesNotBlockHealthyTargetAndCatchUpUsesLatest(t *te
 	}
 }
 
-func TestScheduledSamplePreemptsSlowTargetWithoutMarkingFailure(t *testing.T) {
+func TestScheduledSampleDoesNotCancelInFlightTarget(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
 	cfg := &config.Backup{
@@ -209,7 +212,7 @@ func TestScheduledSamplePreemptsSlowTargetWithoutMarkingFailure(t *testing.T) {
 	coordinator := NewCoordinator(cfg, store, runner, notifiers, slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	startedAt := time.Now()
-	if err := coordinator.sample(context.Background(), true); err != nil {
+	if err := coordinator.sample(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if time.Since(startedAt) > time.Second {
@@ -222,12 +225,12 @@ func TestScheduledSamplePreemptsSlowTargetWithoutMarkingFailure(t *testing.T) {
 	}
 	select {
 	case <-runner.canceled:
+		t.Fatal("in-flight target was canceled by a new schedule")
 	default:
-		t.Fatal("slow target was not canceled when sampling became due")
 	}
 	current := store.Snapshot()
-	if current.Current == nil || current.Targets["slow"].State == "degraded" || current.Targets["slow"].ConsecutiveFailures != 0 {
-		t.Fatalf("scheduled preemption was recorded as a remote failure: %#v", current)
+	if current.Targets["slow"].State != "healthy" || current.Targets["slow"].ConsecutiveFailures != 0 {
+		t.Fatalf("in-flight target was recorded as a remote failure: %#v", current)
 	}
 }
 
@@ -254,7 +257,7 @@ func TestUnavailableNotificationPersistenceDoesNotChangeBackupResult(t *testing.
 		t.Fatal(err)
 	}
 	current := store.Snapshot()
-	if current.Targets["primary"].State != "healthy" || current.Targets["primary"].ContentID == "" {
+	if current.Targets["primary"].State != "healthy" || current.Targets["primary"].LastRecoveryPoint == nil {
 		t.Fatalf("notification persistence changed backup state: %#v", current)
 	}
 }
@@ -269,11 +272,10 @@ func createCoordinatorData(t *testing.T, root string) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer database.Close()
+	defer func() { _ = database.Close() }()
 	statements := []string{
 		`CREATE TABLE attachments (id TEXT PRIMARY KEY, cipher_uuid TEXT NOT NULL, file_size INTEGER NOT NULL)`,
 		`CREATE TABLE ciphers (uuid TEXT PRIMARY KEY)`,
-		`CREATE TABLE sends (uuid TEXT PRIMARY KEY, atype INTEGER NOT NULL, data TEXT NOT NULL)`,
 		`CREATE TABLE users (uuid TEXT PRIMARY KEY)`,
 		`CREATE TABLE __diesel_schema_migrations (version TEXT PRIMARY KEY)`,
 	}

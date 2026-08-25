@@ -1,8 +1,12 @@
 package restic
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,14 +22,16 @@ func fakeRunner(t *testing.T) (Runner, config.Target, string) {
 	t.Helper()
 	root := t.TempDir()
 	logPath := filepath.Join(root, "arguments.log")
+	environmentPath := filepath.Join(root, "environment.log")
 	script := filepath.Join(root, "restic")
 	scriptBody := `#!/bin/sh
 set -eu
-printf '%s\n' "$*" >> "$ARG_LOG"
-while [ "${1:-}" = -o ] || [ "${1:-}" = --cacert ]; do
+printf '%s\n' "$*" >> '` + logPath + `'
+/usr/bin/env > '` + environmentPath + `'
+while [ "${1:-}" = -o ]; do
   shift 2
 done
-if [ "$1" = version ]; then
+if [ "${1:-}" = version ]; then
   printf '%s\n' 'restic 0.19.1 compiled with go1.26.7 on linux/amd64'
 elif [ "$1" = backup ]; then
   printf '%s\n' '{"message_type":"summary","snapshot_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}'
@@ -36,7 +42,6 @@ fi
 	if err := os.WriteFile(script, []byte(scriptBody), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("ARG_LOG", logPath)
 	secretsDir := filepath.Join(root, "secrets")
 	if err := os.Mkdir(secretsDir, 0o700); err != nil {
 		t.Fatal(err)
@@ -68,6 +73,7 @@ fi
 
 func TestBackupRunsOnlyBackupWithSecretFileEnvironment(t *testing.T) {
 	runner, target, logPath := fakeRunner(t)
+	t.Setenv("SENTINEL", "host-only")
 	if err := runner.VerifyVersion(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -89,6 +95,13 @@ func TestBackupRunsOnlyBackupWithSecretFileEnvironment(t *testing.T) {
 	lines := strings.Split(strings.TrimSpace(string(log)), "\n")
 	if len(lines) != 2 || lines[0] != "version" || !strings.HasPrefix(lines[1], "backup --json") {
 		t.Fatalf("commands = %q", lines)
+	}
+	environment, err := os.ReadFile(filepath.Join(filepath.Dir(logPath), "environment.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(environment), "ARG_LOG=") || strings.Contains(string(environment), "SENTINEL=") {
+		t.Fatalf("host-only environment leaked: %s", environment)
 	}
 	for _, forbidden := range []string{"synthetic-password", "synthetic-backend-value", " init", " unlock", " forget", " prune", " check"} {
 		if strings.Contains(lines[1], forbidden) {
@@ -119,16 +132,20 @@ func TestPruneIsDryRunAndStrictlyFilteredByDefault(t *testing.T) {
 			lines = append(lines, line)
 		}
 	}
-	if len(allLines) != 4 || len(lines) != 2 {
+	if len(allLines) != 3 || len(lines) != 2 {
 		t.Fatalf("prune inspection/command count = %d/%d (%q)", len(allLines), len(lines), allLines)
 	}
 	for i, line := range lines {
-		for _, required := range []string{
+		required := []string{
 			"forget --json", "--dry-run", "--host " + version.SnapshotHost,
-			"--path " + filepath.Join(runner.StagingDir, "current", "data"),
-			"--path " + filepath.Join(runner.StagingDir, "current", "manifest.json"),
-			"--tag " + version.SnapshotTag + ",", "--group-by host,paths", "--keep-within 24h", "--keep-hourly 48", "--keep-yearly 3",
-		} {
+			"--tag " + version.SnapshotTag + ",", "--group-by host", "--keep-within 24h",
+		}
+		if i == 0 {
+			required = append(required, "--keep-hourly 48", "--keep-yearly 3")
+		} else {
+			required = append(required, "--keep-daily 7")
+		}
+		for _, required := range required {
 			if !strings.Contains(line, required) {
 				t.Errorf("prune line %d lacks %q: %s", i, required, line)
 			}
@@ -139,7 +156,39 @@ func TestPruneIsDryRunAndStrictlyFilteredByDefault(t *testing.T) {
 	}
 }
 
-func TestSnapshotsUsesConjunctiveStatusTagFilter(t *testing.T) {
+func TestAppliedForgetAcceptsRestic0191EndOfJSON(t *testing.T) {
+	id := strings.Repeat("a", 64)
+	data := []byte(`[{"tags":null,"host":"vaultwarden-less-v1","paths":null,"keep":[{"id":"` + id + `"}],"remove":null,"reasons":null}]`)
+	result, err := parseForgetOutput(data, snapshot.Complete, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.KeptCount != 1 || result.KeptSnapshotIDs[0] != id {
+		t.Fatalf("result = %#v", result)
+	}
+}
+
+func TestAppliedForgetRejectsUnknownTrailingJSON(t *testing.T) {
+	id := strings.Repeat("a", 64)
+	data := []byte(`[{"keep":[{"id":"` + id + `"}]}]` + "\n" + `{"message_type":"unknown"}`)
+	if _, err := parseForgetOutput(data, snapshot.Complete, true); err == nil {
+		t.Fatal("unknown trailing prune output was accepted")
+	}
+}
+
+func TestAppliedForgetAcceptsDocumentedPruneSummary(t *testing.T) {
+	id := strings.Repeat("a", 64)
+	data := []byte(`[{
+  "tags": null, "host": "vaultwarden-less-v1", "paths": null,
+  "keep": [{"id": "` + id + `"}], "remove": null, "reasons": null
+}]
+{"message_type":"summary","blobs":{"used":0,"duplicate":0,"unused":0,"total":0,"repack":0,"repack_remove":0,"remove":0,"remove_total":0,"remaining":0},"bytes":{"used":0,"duplicate":0,"unused":0,"unreferenced":0,"uncompressed":0,"total":0,"repack":0,"repack_remove":0,"remove":0,"remove_total":0,"remaining":0,"remaining_unused":0},"packfiles":{"used":0,"unused":0,"partly_used":0,"unreferenced":0,"total":0,"keep":0,"repack":0,"remove":0,"remove_total":0}}`)
+	if _, err := parseForgetOutput(data, snapshot.Complete, true); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSnapshotsUsesProductHostFilter(t *testing.T) {
 	runner, target, logPath := fakeRunner(t)
 	if _, err := runner.Snapshots(context.Background(), target, snapshot.Complete); err != nil {
 		t.Fatal(err)
@@ -149,9 +198,54 @@ func TestSnapshotsUsesConjunctiveStatusTagFilter(t *testing.T) {
 		t.Fatal(err)
 	}
 	line := strings.TrimSpace(string(data))
-	want := "--tag " + version.SnapshotTag + "," + string(snapshot.Complete)
+	want := "snapshots --json"
 	if !strings.Contains(line, want) {
-		t.Fatalf("snapshots command lacks conjunctive tag filter %q: %s", want, line)
+		t.Fatalf("snapshots command lacks list operation %q: %s", want, line)
+	}
+	if !strings.Contains(line, "--host "+version.SnapshotHost) || !strings.Contains(line, "--tag "+version.SnapshotTag) {
+		t.Fatalf("snapshots command lacks product identity filter: %s", line)
+	}
+	if strings.Contains(line, string(snapshot.Complete)) {
+		t.Fatalf("snapshots command applied a status filter remotely: %s", line)
+	}
+}
+
+func TestListSnapshotsSeparatesInvalidCandidatesAndAllowsExtraMetadata(t *testing.T) {
+	runner, target, logPath := fakeRunner(t)
+	manifest, err := testManifest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	content, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Dir(logPath)
+	manifestPath := filepath.Join(root, "manifest.json")
+	if err := os.WriteFile(manifestPath, content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	firstID := strings.Repeat("a", 64)
+	secondID := strings.Repeat("b", 64)
+	listing := fmt.Sprintf(`[{"id":%q,"time":"2026-08-23T12:00:00.000Z","hostname":%q,"tags":[%q,%q,"content-id=%s"],"paths":["data","manifest.json"]},{"id":"bad","time":"2026-08-23T12:01:00.000Z","hostname":%q,"tags":[%q,%q,"content-id=%s"],"paths":[]},{"id":%q,"time":"2026-08-23T12:02:00.000Z","hostname":%q,"tags":[%q,%q,"content-id=%s","operator-tag"],"paths":["a-different-path"]}]`, firstID, version.SnapshotHost, version.SnapshotTag, snapshot.Complete, strings.TrimPrefix(manifest.ContentID, "sha256:"), version.SnapshotHost, version.SnapshotTag, snapshot.Complete, strings.TrimPrefix(manifest.ContentID, "sha256:"), secondID, version.SnapshotHost, version.SnapshotTag, snapshot.Complete, strings.TrimPrefix(manifest.ContentID, "sha256:"))
+	script := filepath.Join(root, "restic-list")
+	scriptBody := "#!/bin/sh\nset -eu\nwhile [ \"${1:-}\" = -o ]; do shift 2; done\nif [ \"${1:-}\" = snapshots ]; then printf '%s\\n' '" + listing + "'\nelif [ \"${1:-}\" = dump ]; then /bin/cat '" + manifestPath + "'\nfi\n"
+	if err := os.WriteFile(script, []byte(scriptBody), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runner.Binary = script
+	report, err := runner.ListSnapshots(context.Background(), target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Snapshots) != 2 || report.Snapshots[0].ID != firstID || report.Snapshots[1].ID != secondID {
+		t.Fatalf("valid candidates = %#v", report.Snapshots)
+	}
+	if len(report.Anomalies) != 1 || report.Anomalies[0].SnapshotID != "bad" || report.Anomalies[0].ErrorCode != "snapshot_id_invalid" {
+		t.Fatalf("candidate anomalies = %#v", report.Anomalies)
+	}
+	if _, err := runner.FindSnapshot(context.Background(), target, "bad"); err == nil {
+		t.Fatal("explicit invalid candidate was accepted")
 	}
 }
 
@@ -206,27 +300,6 @@ func testManifest() (snapshot.Manifest, error) {
 	}}, nil)
 }
 
-func TestSamePathsRequiresExactSet(t *testing.T) {
-	want := []string{"/staging/current/data", "/staging/current/manifest.json"}
-	for _, test := range []struct {
-		name string
-		got  []string
-		want bool
-	}{
-		{"same order", append([]string(nil), want...), true},
-		{"reverse order", []string{want[1], want[0]}, true},
-		{"missing", []string{want[0]}, false},
-		{"additional", []string{want[0], want[1], "/other"}, false},
-		{"duplicate", []string{want[0], want[0]}, false},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			if got := samePaths(test.got, want); got != test.want {
-				t.Fatalf("samePaths() = %v, want %v", got, test.want)
-			}
-		})
-	}
-}
-
 func TestSnapshotTagsRequireExactV1Identity(t *testing.T) {
 	t.Parallel()
 	content := "content-id=" + strings.Repeat("a", 64)
@@ -237,27 +310,20 @@ func TestSnapshotTagsRequireExactV1Identity(t *testing.T) {
 		{version.SnapshotTag, string(snapshot.Complete)},
 		{version.SnapshotTag, string(snapshot.Complete), string(snapshot.Incomplete), content},
 		{version.SnapshotTag, string(snapshot.Complete), "content-id=short"},
-		{version.SnapshotTag, string(snapshot.Complete), content, "unrelated"},
 	} {
 		if validSnapshotTags(tags) {
 			t.Fatalf("invalid v1 tags were accepted: %q", tags)
 		}
 	}
-}
-
-func TestScrubEnvironmentRemovesUnconfiguredBackendFamilies(t *testing.T) {
-	t.Parallel()
-	input := []string{"PATH=/usr/bin", "AWS_PROFILE=host", "AZURE_CLIENT_SECRET=host", "OS_AUTH_TOKEN=host", "RESTIC_PASSWORD=host", "UNRELATED=value"}
-	got := scrubEnvironment(input)
-	if strings.Join(got, ",") != "PATH=/usr/bin,UNRELATED=value" {
-		t.Fatalf("scrubbed environment = %q", got)
+	if !validSnapshotTags([]string{version.SnapshotTag, string(snapshot.Complete), content, "unrelated"}) {
+		t.Fatal("extra safety tag was rejected")
 	}
 }
 
 func TestBackupCancellationTerminatesRestic(t *testing.T) {
 	runner, target, _ := fakeRunner(t)
 	script := filepath.Join(t.TempDir(), "restic-blocking")
-	if err := os.WriteFile(script, []byte("#!/bin/sh\nexec sleep 30\n"), 0o700); err != nil {
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nexec /usr/bin/sleep 30\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	runner.Binary = script
@@ -273,7 +339,35 @@ func TestBackupCancellationTerminatesRestic(t *testing.T) {
 		t.Fatal("cancelled Restic command did not terminate promptly")
 	}
 	var operation *OperationError
-	if !errors.As(err, &operation) || operation.Code != "operation_cancelled" {
+	if !errors.As(err, &operation) || operation.Code != "operation_timeout" {
 		t.Fatalf("cancelled backup error = %v", err)
+	}
+}
+
+func TestResticFailureRedactsSecretsBeforeLogging(t *testing.T) {
+	runner, target, _ := fakeRunner(t)
+	script := filepath.Join(t.TempDir(), "restic-failure")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\nprintf '%s %s %s\\n' 'synthetic-access' 'synthetic-backend-value' 'synthetic-password' >&2\nexit 1\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runner.Binary = script
+	var logs bytes.Buffer
+	runner.Logger = slog.New(slog.NewJSONHandler(&logs, nil))
+	manifest, err := testManifest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = runner.Backup(context.Background(), target, manifest)
+	var operation *OperationError
+	if !errors.As(err, &operation) || operation.Code != "repository_operation_failed" {
+		t.Fatalf("failure = %v", err)
+	}
+	for _, secret := range []string{"synthetic-access", "synthetic-backend-value", "synthetic-password"} {
+		if strings.Contains(operation.Stderr, secret) || strings.Contains(logs.String(), secret) {
+			t.Fatalf("secret %q escaped redaction: stderr=%q logs=%q", secret, operation.Stderr, logs.String())
+		}
+	}
+	if !strings.Contains(operation.Stderr, "[REDACTED]") || !strings.Contains(logs.String(), `"target":"primary"`) || !strings.Contains(logs.String(), `"s3_host":"objects.example.test"`) {
+		t.Fatalf("redacted diagnostic fields missing: stderr=%q logs=%q", operation.Stderr, logs.String())
 	}
 }

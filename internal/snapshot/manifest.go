@@ -107,10 +107,10 @@ func (m Manifest) CalculateContentID() (string, error) {
 }
 
 func (m Manifest) Validate() error {
-	if m.SchemaVersion != version.ManifestVersion || m.VaultwardenVersion != version.Vaultwarden {
+	if m.SchemaVersion != version.ManifestVersion || !validSemVer(m.VaultwardenVersion) {
 		return fmt.Errorf("unsupported manifest or Vaultwarden version")
 	}
-	if m.DatabaseMigration != version.VaultwardenSchema {
+	if !validMigration(m.DatabaseMigration) {
 		return fmt.Errorf("unsupported Vaultwarden database migration")
 	}
 	if m.Status != Complete && m.Status != Incomplete {
@@ -165,4 +165,80 @@ func validHash(value string) bool {
 
 func validMissingReason(value string) bool {
 	return value == "not_found" || value == "size_mismatch" || value == "changed_during_copy"
+}
+
+func validSemVer(value string) bool {
+	if len(value) == 0 || len(value) > 128 {
+		return false
+	}
+	coreAndBuild := strings.SplitN(value, "+", 2)
+	if coreAndBuild[0] == "" {
+		return false
+	}
+	coreAndPre := strings.SplitN(coreAndBuild[0], "-", 2)
+	if len(coreAndPre) > 2 || !validSemVerCore(coreAndPre[0]) {
+		return false
+	}
+	if len(coreAndPre) == 2 && !validSemVerIdentifiers(coreAndPre[1], true) {
+		return false
+	}
+	if len(coreAndBuild) == 2 && !validSemVerIdentifiers(coreAndBuild[1], false) {
+		return false
+	}
+	return true
+}
+
+func validSemVerCore(value string) bool {
+	parts := strings.Split(value, ".")
+	if len(parts) != 3 {
+		return false
+	}
+	for _, part := range parts {
+		if part == "" || len(part) > 1 && part[0] == '0' {
+			return false
+		}
+		for _, char := range part {
+			if char < '0' || char > '9' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func validSemVerIdentifiers(value string, prerelease bool) bool {
+	identifiers := strings.Split(value, ".")
+	if len(identifiers) == 0 {
+		return false
+	}
+	for _, identifier := range identifiers {
+		if identifier == "" {
+			return false
+		}
+		allDigits := true
+		for _, char := range identifier {
+			if (char < '0' || char > '9') && (char < 'A' || char > 'Z') && (char < 'a' || char > 'z') && char != '-' {
+				return false
+			}
+			if char < '0' || char > '9' {
+				allDigits = false
+			}
+		}
+		if prerelease && allDigits && len(identifier) > 1 && identifier[0] == '0' {
+			return false
+		}
+	}
+	return true
+}
+
+func validMigration(value string) bool {
+	if len(value) != 14 {
+		return false
+	}
+	for _, char := range value {
+		if char < '0' || char > '9' {
+			return false
+		}
+	}
+	return true
 }

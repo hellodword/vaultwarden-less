@@ -9,7 +9,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"regexp"
-	"slices"
+	"sort"
 	"strings"
 	"time"
 
@@ -36,16 +36,14 @@ const (
 
 var (
 	namePattern     = regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`)
-	yamlPosition    = regexp.MustCompile(`\[([0-9]+):([0-9]+)\]`)
 	allowedS3Option = map[string]struct{}{
-		"s3.bucket-lookup":   {},
-		"s3.region":          {},
-		"s3.list-objects-v1": {},
+		"s3.bucket-lookup": {},
+		"s3.region":        {},
 	}
-	regionPattern   = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
-	b2BucketPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9.-]{0,254}$`)
-	b2PrefixPattern = regexp.MustCompile(`^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$`)
+	regionPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 )
+
+var errUnknownYAMLField = errors.New("unknown YAML field")
 
 // Backup is the complete human-authored v1 configuration. Runtime paths,
 // scheduler timing and event-server limits are fixed product behavior and are
@@ -78,6 +76,13 @@ type Target struct {
 	Name          string            `yaml:"name"`
 	Repository    string            `yaml:"repository"`
 	ResticOptions map[string]string `yaml:"restic_options,omitempty"`
+}
+
+func (t Target) Warnings() []string {
+	if strings.HasPrefix(t.Repository, "s3:http://") {
+		return []string{"plaintext_s3_endpoint"}
+	}
+	return []string{}
 }
 
 type Notifier struct {
@@ -117,7 +122,10 @@ func DecodeBackup(data []byte) (*Backup, error) {
 	}
 	cfg := defaultBackup()
 	if err := decodeOneYAML(data, &cfg, true); err != nil {
-		return nil, fmt.Errorf("decode backup config: %w", safeYAMLError(err))
+		if errors.Is(err, errUnknownYAMLField) {
+			return nil, fmt.Errorf("decode backup config: unknown field")
+		}
+		return nil, fmt.Errorf("decode backup config: invalid YAML")
 	}
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("validate backup config: %w", err)
@@ -135,7 +143,7 @@ func LoadRoleCredentials(path string, cfg *Backup) (*RoleCredentials, error) {
 	}
 	var credentials RoleCredentials
 	if err := decodeOneYAML(data, &credentials, false); err != nil {
-		return nil, fmt.Errorf("decode role credentials: %w", safeYAMLError(err))
+		return nil, fmt.Errorf("decode role credentials: invalid YAML")
 	}
 	if credentials.SchemaVersion != version.SchemaVersion {
 		return nil, fmt.Errorf("role credentials schema_version must be %d", version.SchemaVersion)
@@ -158,6 +166,9 @@ func decodeOneYAML(data []byte, destination any, strict bool) error {
 	}
 	decoder := yaml.NewDecoder(bytes.NewReader(data), options...)
 	if err := decoder.Decode(destination); err != nil {
+		if strict && strings.Contains(strings.ToLower(err.Error()), "unknown field") {
+			return errUnknownYAMLField
+		}
 		return err
 	}
 	var extra any
@@ -169,25 +180,6 @@ func decodeOneYAML(data []byte, destination any, strict bool) error {
 		return fmt.Errorf("multiple YAML documents")
 	}
 	return err
-}
-
-func safeYAMLError(err error) error {
-	text := err.Error()
-	category := "invalid YAML"
-	switch {
-	case strings.Contains(text, "unknown field"):
-		category = "unknown field"
-	case strings.Contains(text, "duplicate key"):
-		category = "duplicate key"
-	case strings.Contains(text, "cannot unmarshal"), strings.Contains(text, "cannot convert"), strings.Contains(text, "type"):
-		category = "invalid value type"
-	case strings.Contains(text, "multiple YAML documents"):
-		category = "multiple YAML documents"
-	}
-	if position := yamlPosition.FindStringSubmatch(text); len(position) == 3 {
-		return fmt.Errorf("%s at line %s column %s", category, position[1], position[2])
-	}
-	return errors.New(category)
 }
 
 func defaultBackup() Backup {
@@ -226,15 +218,20 @@ func (c *Backup) Validate() error {
 	if c.Targets == nil {
 		c.Targets = []Target{}
 	}
-	targetNames := map[string]struct{}{}
+	for index := 1; index < len(c.Targets); index++ {
+		if c.Targets[index-1].Name >= c.Targets[index].Name {
+			return fmt.Errorf("targets must be sorted by name")
+		}
+	}
 	for index := range c.Targets {
-		if err := c.Targets[index].Validate(); err != nil {
+		if err := c.Targets[index].validateFields(); err != nil {
 			return fmt.Errorf("targets[%d]: %w", index, err)
 		}
-		if _, exists := targetNames[c.Targets[index].Name]; exists {
-			return fmt.Errorf("duplicate target name %q", c.Targets[index].Name)
+	}
+	for index := range c.Targets {
+		if err := c.Targets[index].validateOptions(); err != nil {
+			return fmt.Errorf("targets[%d].restic_options: %w", index, err)
 		}
-		targetNames[c.Targets[index].Name] = struct{}{}
 	}
 	if len(c.Notifiers) > 16 {
 		return fmt.Errorf("notifiers must not contain more than 16 entries")
@@ -242,60 +239,65 @@ func (c *Backup) Validate() error {
 	if c.Notifiers == nil {
 		c.Notifiers = []Notifier{}
 	}
-	notifierNames := map[string]struct{}{}
+	for index := 1; index < len(c.Notifiers); index++ {
+		if c.Notifiers[index-1].Name >= c.Notifiers[index].Name {
+			return fmt.Errorf("notifiers must be sorted by name")
+		}
+	}
 	for index := range c.Notifiers {
 		if err := c.Notifiers[index].validate(); err != nil {
 			return fmt.Errorf("notifiers[%d]: %w", index, err)
 		}
-		if _, exists := notifierNames[c.Notifiers[index].Name]; exists {
-			return fmt.Errorf("duplicate notifier name %q", c.Notifiers[index].Name)
-		}
-		notifierNames[c.Notifiers[index].Name] = struct{}{}
 	}
 	return nil
 }
 
 func (t Target) Backend() string {
-	switch {
-	case strings.HasPrefix(t.Repository, "s3:"):
+	if strings.HasPrefix(t.Repository, "s3:") {
 		return "s3"
-	case strings.HasPrefix(t.Repository, "b2:"):
-		return "b2"
-	default:
-		return ""
 	}
+	return ""
 }
 
 func (t Target) Validate() error {
+	if err := t.validateFields(); err != nil {
+		return err
+	}
+	return t.validateOptions()
+}
+
+func (t Target) validateFields() error {
 	if !namePattern.MatchString(t.Name) {
 		return fmt.Errorf("invalid name %q", t.Name)
 	}
 	if !validRepository(t.Repository) {
-		return fmt.Errorf("repository must be a supported s3: or b2: locator without embedded credentials")
+		return fmt.Errorf("repository must be an s3:http[s]:// locator without embedded credentials")
 	}
-	if t.Backend() != "s3" && len(t.ResticOptions) != 0 {
-		return fmt.Errorf("restic_options are supported only for s3 repositories")
-	}
+	return nil
+}
+
+func (t Target) validateOptions() error {
+	optionNames := make([]string, 0, len(t.ResticOptions))
 	for name := range t.ResticOptions {
+		optionNames = append(optionNames, name)
+	}
+	sort.Strings(optionNames)
+	for _, name := range optionNames {
 		if _, allowed := allowedS3Option[name]; !allowed {
 			return fmt.Errorf("unsupported Restic option %q", name)
 		}
 		value := t.ResticOptions[name]
 		if value == "" || len(value) > 256 || strings.ContainsAny(value, "\r\n\x00") {
-			return fmt.Errorf("Restic option %q has an invalid value", name)
+			return fmt.Errorf("restic option %q has an invalid value", name)
 		}
 		switch name {
 		case "s3.bucket-lookup":
-			if !slices.Contains([]string{"auto", "dns", "path"}, value) {
-				return fmt.Errorf("Restic option %q has an invalid value", name)
-			}
-		case "s3.list-objects-v1":
-			if value != "true" && value != "false" {
-				return fmt.Errorf("Restic option %q has an invalid value", name)
+			if value != "auto" && value != "dns" && value != "path" {
+				return fmt.Errorf("restic option %q has an invalid value", name)
 			}
 		case "s3.region":
 			if !regionPattern.MatchString(value) {
-				return fmt.Errorf("Restic option %q has an invalid value", name)
+				return fmt.Errorf("restic option %q has an invalid value", name)
 			}
 		}
 	}
@@ -306,25 +308,24 @@ func validRepository(repository string) bool {
 	if repository == "" || len(repository) > 4096 || strings.ContainsAny(repository, "\r\n\x00") {
 		return false
 	}
-	if strings.HasPrefix(repository, "b2:") {
-		bucket, prefix, ok := strings.Cut(strings.TrimPrefix(repository, "b2:"), ":")
-		if !ok || !b2BucketPattern.MatchString(bucket) || !b2PrefixPattern.MatchString(prefix) {
-			return false
-		}
-		for _, component := range strings.Split(prefix, "/") {
-			if component == "" || component == "." || component == ".." {
-				return false
-			}
-		}
-		return true
-	}
 	if !strings.HasPrefix(repository, "s3:") {
 		return false
 	}
 	parsed, err := url.Parse(strings.TrimPrefix(repository, "s3:"))
-	return err == nil && parsed.IsAbs() && parsed.Host != "" && parsed.User == nil && parsed.RawQuery == "" && parsed.Fragment == "" &&
-		strings.Trim(parsed.EscapedPath(), "/") != "" &&
-		slices.Contains([]string{"http", "https"}, parsed.Scheme)
+	if err != nil || !parsed.IsAbs() || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" ||
+		(parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Opaque != "" {
+		return false
+	}
+	path := parsed.Path
+	if path == "" || !strings.HasPrefix(path, "/") {
+		return false
+	}
+	for _, component := range strings.Split(strings.TrimPrefix(path, "/"), "/") {
+		if component == "" || component == "." || component == ".." || strings.ContainsAny(component, "\r\n\x00") {
+			return false
+		}
+	}
+	return true
 }
 
 func (c RoleCredentials) Environment(target Target) (map[string]string, error) {
@@ -336,8 +337,6 @@ func (c RoleCredentials) Environment(target Target) (map[string]string, error) {
 	switch target.Backend() {
 	case "s3":
 		names = []string{"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"}
-	case "b2":
-		names = []string{"B2_ACCOUNT_ID", "B2_ACCOUNT_KEY"}
 	default:
 		return nil, fmt.Errorf("repository backend is unsupported")
 	}
@@ -370,7 +369,7 @@ func (n *Notifier) validate() error {
 		}
 	case "bark":
 		if n.WebhookURL != "" || n.DeviceToken == "" || n.AuthKey == "" || n.KeyID == "" || n.TeamID == "" || n.Topic == "" {
-			return fmt.Errorf("Bark fields are incomplete or invalid")
+			return fmt.Errorf("bark fields are incomplete or invalid")
 		}
 		if len(n.DeviceToken) != 64 || strings.ToLower(n.DeviceToken) != n.DeviceToken {
 			return fmt.Errorf("device_token must be 64 lowercase hexadecimal characters")
@@ -381,9 +380,12 @@ func (n *Notifier) validate() error {
 		if len(n.AuthKey) > 16<<10 || strings.IndexByte(n.AuthKey, 0) >= 0 {
 			return fmt.Errorf("auth_key is invalid")
 		}
-		for label, value := range map[string]string{"key_id": n.KeyID, "team_id": n.TeamID, "topic": n.Topic} {
-			if len(value) < 2 || len(value) > 255 || strings.ContainsAny(value, "\r\n\x00") {
-				return fmt.Errorf("%s is invalid", label)
+		for _, field := range []struct {
+			name  string
+			value string
+		}{{"key_id", n.KeyID}, {"team_id", n.TeamID}, {"topic", n.Topic}} {
+			if len(field.value) < 2 || len(field.value) > 255 || strings.ContainsAny(field.value, "\r\n\x00") {
+				return fmt.Errorf("%s is invalid", field.name)
 			}
 		}
 		if len(n.Sound) > 255 || strings.ContainsAny(n.Sound, "\r\n\x00") {

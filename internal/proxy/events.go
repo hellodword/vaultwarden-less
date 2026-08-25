@@ -78,7 +78,7 @@ func (s *EventSender) send(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("send event: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 	if resp.StatusCode != http.StatusNoContent {
 		return fmt.Errorf("event endpoint returned status %d", resp.StatusCode)

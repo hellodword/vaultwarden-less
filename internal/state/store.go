@@ -8,7 +8,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"sort"
 	"sync"
 
 	"github.com/hellodword/vaultwarden-less/internal/safefs"
@@ -17,17 +16,35 @@ import (
 const maxStateBytes = 8 << 20
 
 type Store struct {
-	mu    sync.Mutex
-	dir   string
-	path  string
-	state State
+	mu      sync.Mutex
+	dir     string
+	path    string
+	state   State
+	fileOps safefs.FileOps
+	rebuilt bool
 }
 
+// PersistError reports whether a failed state write crossed the rename
+// publication boundary. Callers that have already published a related
+// filesystem change must not roll it back when this is
+// PublishedUnconfirmed.
+type PersistError struct {
+	PublishState safefs.PublishState
+	Err          error
+}
+
+func (e *PersistError) Error() string { return e.Err.Error() }
+func (e *PersistError) Unwrap() error { return e.Err }
+
 func Open(dir string, targetNames []string) (*Store, error) {
+	return OpenWithFileOps(dir, targetNames, safefs.FileOps{})
+}
+
+func OpenWithFileOps(dir string, targetNames []string, fileOps safefs.FileOps) (*Store, error) {
 	if err := safefs.ValidatePrivateDirectory(dir); err != nil {
 		return nil, fmt.Errorf("validate state directory: %w", err)
 	}
-	store := &Store{dir: dir, path: filepath.Join(dir, "state.json")}
+	store := &Store{dir: dir, path: filepath.Join(dir, "state.json"), fileOps: fileOps}
 	data, err := readStateFile(store.path)
 	if errors.Is(err, os.ErrNotExist) {
 		store.state = New(targetNames)
@@ -37,35 +54,21 @@ func Open(dir string, targetNames []string) (*Store, error) {
 		return store, nil
 	}
 	if err != nil {
+		// Unsafe files are never overwritten. A malformed but safe regular
+		// file is handled below and can be rebuilt in place.
 		return nil, err
 	}
-	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&store.state); err != nil {
-		return nil, fmt.Errorf("decode state: %w", err)
-	}
-	var extra any
-	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
-		return nil, fmt.Errorf("state contains multiple JSON values")
-	}
-	if err := store.state.Validate(); err != nil {
-		return nil, fmt.Errorf("validate state without overwriting it: %w", err)
-	}
-	changed := false
-	configured := make(map[string]struct{}, len(targetNames))
-	for _, name := range targetNames {
-		configured[name] = struct{}{}
-		if _, exists := store.state.Targets[name]; !exists {
-			store.state.Targets[name] = Target{Name: name, State: "unknown"}
-			changed = true
+	parsed, parseErr := parseState(data)
+	if parseErr != nil {
+		store.state = New(targetNames)
+		store.rebuilt = true
+		if err := store.saveLocked(); err != nil {
+			return nil, fmt.Errorf("rebuild runtime state: %w", err)
 		}
+		return store, nil
 	}
-	for name := range store.state.Targets {
-		if _, exists := configured[name]; !exists {
-			delete(store.state.Targets, name)
-			changed = true
-		}
-	}
+	store.state = parsed
+	changed := reconcile(&store.state, targetNames)
 	if store.state.BackupInProgress {
 		store.state.BackupInProgress = false
 		store.state.Dirty = true
@@ -79,15 +82,9 @@ func Open(dir string, targetNames []string) (*Store, error) {
 	return store, nil
 }
 
-func Read(dir string) (State, error) {
-	if err := safefs.ValidatePrivateDirectory(dir); err != nil {
-		return State{}, fmt.Errorf("validate state directory: %w", err)
-	}
-	path := filepath.Join(dir, "state.json")
-	data, err := readStateFile(path)
-	if err != nil {
-		return State{}, err
-	}
+func (s *Store) Rebuilt() bool { return s.rebuilt }
+
+func parseState(data []byte) (State, error) {
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
 	var current State
@@ -96,12 +93,45 @@ func Read(dir string) (State, error) {
 	}
 	var extra any
 	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
-		return State{}, fmt.Errorf("state contains multiple JSON values")
+		if err == nil {
+			return State{}, fmt.Errorf("state contains multiple JSON values")
+		}
+		return State{}, fmt.Errorf("state contains trailing data")
 	}
 	if err := current.Validate(); err != nil {
 		return State{}, err
 	}
 	return current, nil
+}
+
+func reconcile(current *State, targetNames []string) bool {
+	changed := false
+	configured := make(map[string]struct{}, len(targetNames))
+	for _, name := range targetNames {
+		configured[name] = struct{}{}
+		if _, exists := current.Targets[name]; !exists {
+			current.Targets[name] = Target{Name: name, State: "unknown"}
+			changed = true
+		}
+	}
+	for name := range current.Targets {
+		if _, exists := configured[name]; !exists {
+			delete(current.Targets, name)
+			changed = true
+		}
+	}
+	return changed
+}
+
+func Read(dir string) (State, error) {
+	if err := safefs.ValidatePrivateDirectory(dir); err != nil {
+		return State{}, fmt.Errorf("validate state directory: %w", err)
+	}
+	data, err := readStateFile(filepath.Join(dir, "state.json"))
+	if err != nil {
+		return State{}, err
+	}
+	return parseState(data)
 }
 
 func (s *Store) Snapshot() State {
@@ -122,56 +152,35 @@ func (s *Store) Update(update func(*State) error) error {
 	}
 	previous := s.state
 	s.state = next
-	if err := s.saveLocked(); err != nil {
+	result, err := s.saveLockedResult()
+	if err != nil && result == safefs.Unpublished {
+		// The old value is still the durable value before publication.
 		s.state = previous
-		return err
+	}
+	if err != nil {
+		// A published_unconfirmed rename is authoritative in memory even
+		// though callers must surface the fsync uncertainty.
+		return &PersistError{PublishState: result, Err: err}
 	}
 	return nil
 }
 
 func (s *Store) saveLocked() error {
+	_, err := s.saveLockedResult()
+	return err
+}
+
+func (s *Store) saveLockedResult() (safefs.PublishState, error) {
 	data, err := json.MarshalIndent(s.state, "", "  ")
 	if err != nil {
-		return fmt.Errorf("encode state: %w", err)
+		return safefs.Unpublished, fmt.Errorf("encode state: %w", err)
 	}
 	data = append(data, '\n')
-	temp, err := os.CreateTemp(s.dir, ".state-")
+	result, err := safefs.AtomicReplace(s.path, data, s.fileOps)
 	if err != nil {
-		return fmt.Errorf("create state transaction: %w", err)
+		return result, fmt.Errorf("persist state: %w", err)
 	}
-	tempPath := temp.Name()
-	keep := false
-	defer func() {
-		temp.Close()
-		if !keep {
-			_ = os.Remove(tempPath)
-		}
-	}()
-	if err := temp.Chmod(0o600); err != nil {
-		return fmt.Errorf("secure state transaction: %w", err)
-	}
-	if _, err := temp.Write(data); err != nil {
-		return fmt.Errorf("write state transaction: %w", err)
-	}
-	if err := temp.Sync(); err != nil {
-		return fmt.Errorf("sync state transaction: %w", err)
-	}
-	if err := temp.Close(); err != nil {
-		return fmt.Errorf("close state transaction: %w", err)
-	}
-	if err := os.Rename(tempPath, s.path); err != nil {
-		return fmt.Errorf("commit state transaction: %w", err)
-	}
-	keep = true
-	dir, err := os.Open(s.dir)
-	if err != nil {
-		return fmt.Errorf("open state directory for sync: %w", err)
-	}
-	defer dir.Close()
-	if err := dir.Sync(); err != nil {
-		return fmt.Errorf("sync state directory: %w", err)
-	}
-	return nil
+	return result, nil
 }
 
 func readStateFile(path string) ([]byte, error) {
@@ -186,38 +195,13 @@ func readStateFile(path string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
-	return io.ReadAll(io.LimitReader(f, maxStateBytes+1))
-}
-
-type Status struct {
-	SchemaVersion    int            `json:"schema_version"`
-	Dirty            bool           `json:"dirty"`
-	BackupInProgress bool           `json:"backup_in_progress"`
-	LastSampleAt     string         `json:"last_sample_at,omitempty"`
-	LastSnapshotAt   string         `json:"last_snapshot_at,omitempty"`
-	LastContentID    string         `json:"last_content_id,omitempty"`
-	Pending          *RecoveryPoint `json:"pending_recovery_point,omitempty"`
-	Targets          []Target       `json:"targets"`
-}
-
-func (s State) PublicStatus(configuredTargets []string) Status {
-	names := append([]string(nil), configuredTargets...)
-	sort.Strings(names)
-	targets := make([]Target, 0, len(names))
-	for _, name := range names {
-		if target, exists := s.Targets[name]; exists {
-			targets = append(targets, target)
-		}
+	defer func() { _ = f.Close() }()
+	data, err := io.ReadAll(io.LimitReader(f, maxStateBytes+1))
+	if err != nil {
+		return nil, err
 	}
-	return Status{
-		SchemaVersion:    1,
-		Dirty:            s.Dirty,
-		BackupInProgress: s.BackupInProgress,
-		LastSampleAt:     s.LastSampleAt,
-		LastSnapshotAt:   s.LastSnapshotAt,
-		LastContentID:    s.LastContentID,
-		Pending:          s.Current,
-		Targets:          targets,
+	if int64(len(data)) > maxStateBytes {
+		return nil, fmt.Errorf("state file exceeds %d bytes", maxStateBytes)
 	}
+	return data, nil
 }

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	proxyserver "github.com/hellodword/vaultwarden-less/internal/proxy"
+	"github.com/hellodword/vaultwarden-less/internal/version"
 )
 
 func main() {
@@ -25,6 +26,10 @@ func main() {
 }
 
 func run(args []string) int {
+	if len(args) == 1 && args[0] == "--version" {
+		fmt.Printf("vaultwarden-less-proxy version %s\n", version.Product)
+		return 0
+	}
 	flags := flag.NewFlagSet("vaultwarden-less-proxy", flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
 	if err := flags.Parse(args); err != nil {
@@ -87,7 +92,7 @@ func healthcheck(args []string) int {
 	if err != nil {
 		return 1
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 	if resp.StatusCode != http.StatusNoContent {
 		return 1

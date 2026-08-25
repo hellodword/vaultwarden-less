@@ -3,8 +3,6 @@ package snapshot
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,15 +14,12 @@ import (
 
 const maxManifestBytes = 64 << 20
 
-func Verify(ctx context.Context, root string, allowIncomplete bool) (Manifest, error) {
-	rootInfo, err := os.Lstat(root)
-	if err != nil || !rootInfo.IsDir() || rootInfo.Mode()&os.ModeSymlink != 0 || rootInfo.Mode().Perm() != 0o700 {
-		return Manifest{}, fmt.Errorf("snapshot root is not a real 0700 directory")
-	}
-	manifestPath := filepath.Join(root, "manifest.json")
-	data, err := readBoundedRegular(manifestPath, maxManifestBytes)
-	if err != nil {
-		return Manifest{}, fmt.Errorf("read manifest: %w", err)
+// DecodeManifest validates the durable manifest object without requiring a
+// restored filesystem tree. Restic candidate classification uses this before
+// exposing a snapshot as a recovery point.
+func DecodeManifest(data []byte) (Manifest, error) {
+	if int64(len(data)) > maxManifestBytes {
+		return Manifest{}, fmt.Errorf("manifest exceeds size limit")
 	}
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
@@ -40,6 +35,23 @@ func Verify(ctx context.Context, root string, allowIncomplete bool) (Manifest, e
 		return Manifest{}, fmt.Errorf("manifest contains too many entries")
 	}
 	if err := manifest.Validate(); err != nil {
+		return Manifest{}, err
+	}
+	return manifest, nil
+}
+
+func Verify(ctx context.Context, root string, allowIncomplete bool) (Manifest, error) {
+	rootInfo, err := os.Lstat(root)
+	if err != nil || !rootInfo.IsDir() || rootInfo.Mode()&os.ModeSymlink != 0 || rootInfo.Mode().Perm() != 0o700 {
+		return Manifest{}, fmt.Errorf("snapshot root is not a real 0700 directory")
+	}
+	manifestPath := filepath.Join(root, "manifest.json")
+	data, err := readBoundedRegular(manifestPath, maxManifestBytes)
+	if err != nil {
+		return Manifest{}, fmt.Errorf("read manifest: %w", err)
+	}
+	manifest, err := DecodeManifest(data)
+	if err != nil {
 		return Manifest{}, err
 	}
 	if manifest.Status == Incomplete && !allowIncomplete {
@@ -66,8 +78,11 @@ func Verify(ctx context.Context, root string, allowIncomplete bool) (Manifest, e
 	}
 	databasePath := filepath.Join(root, "data", "db.sqlite3")
 	migration, err := validateDatabase(ctx, databasePath)
-	if err != nil || migration != manifest.DatabaseMigration {
+	if err != nil {
 		return Manifest{}, fmt.Errorf("validate restored database: %w", err)
+	}
+	if migration != manifest.DatabaseMigration {
+		return Manifest{}, fmt.Errorf("restored database migration does not match manifest")
 	}
 	refs, err := referencedFiles(ctx, databasePath)
 	if err != nil {
@@ -115,7 +130,7 @@ func validateManifestReferences(manifest Manifest, refs []referencedFile) error 
 }
 
 func isDatabaseManagedPath(path string) bool {
-	return strings.HasPrefix(path, "data/attachments/") || strings.HasPrefix(path, "data/sends/")
+	return strings.HasPrefix(path, "data/attachments/")
 }
 
 func walkSnapshot(root string, expected map[string]File) error {
@@ -172,7 +187,7 @@ func readBoundedRegular(path string, limit int64) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	data, err := io.ReadAll(io.LimitReader(f, limit+1))
 	if err != nil {
 		return nil, err
@@ -181,11 +196,6 @@ func readBoundedRegular(path string, limit int64) ([]byte, error) {
 		return nil, fmt.Errorf("file exceeds size limit")
 	}
 	return data, nil
-}
-
-func HashBytes(data []byte) string {
-	sum := sha256.Sum256(data)
-	return hex.EncodeToString(sum[:])
 }
 
 func ContentIDHex(contentID string) (string, error) {

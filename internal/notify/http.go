@@ -57,7 +57,7 @@ func (s *wechatSender) Send(ctx context.Context, event Event) error {
 	if err != nil {
 		return err
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	limited := io.LimitReader(response.Body, maxResponseBytes+1)
 	responseBody, err := io.ReadAll(limited)
 	if err != nil || len(responseBody) > maxResponseBytes {

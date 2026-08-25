@@ -20,9 +20,7 @@ import (
 
 const (
 	testCipherID     = "11111111-1111-4111-8111-111111111111"
-	testSendID       = "22222222-2222-4222-8222-222222222222"
 	testAttachmentID = "0123456789abcdefabcd"
-	testSendFileID   = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 )
 
 func syntheticData(t *testing.T, includeFiles bool) (string, *sql.DB) {
@@ -43,17 +41,15 @@ func syntheticData(t *testing.T, includeFiles bool) (string, *sql.DB) {
 		"CREATE TABLE users (uuid TEXT PRIMARY KEY)",
 		"CREATE TABLE ciphers (uuid TEXT PRIMARY KEY)",
 		"CREATE TABLE attachments (id TEXT PRIMARY KEY, cipher_uuid TEXT NOT NULL REFERENCES ciphers(uuid), file_size INTEGER NOT NULL)",
-		"CREATE TABLE sends (uuid TEXT PRIMARY KEY, atype INTEGER NOT NULL, data TEXT NOT NULL)",
 		"CREATE TABLE activity (id INTEGER PRIMARY KEY, value TEXT NOT NULL)",
 	}
 	for _, statement := range schema {
 		if _, err := db.Exec(statement); err != nil {
-			db.Close()
+			_ = db.Close()
 			t.Fatal(err)
 		}
 	}
 	attachment := []byte("encrypted-attachment")
-	send := []byte("encrypted-send")
 	statements := []struct {
 		query string
 		args  []any
@@ -62,21 +58,18 @@ func syntheticData(t *testing.T, includeFiles bool) (string, *sql.DB) {
 		{"INSERT INTO users(uuid) VALUES ('33333333-3333-4333-8333-333333333333')", nil},
 		{"INSERT INTO ciphers(uuid) VALUES (?)", []any{testCipherID}},
 		{"INSERT INTO attachments(id, cipher_uuid, file_size) VALUES (?, ?, ?)", []any{testAttachmentID, testCipherID, len(attachment)}},
-		{"INSERT INTO sends(uuid, atype, data) VALUES (?, 1, ?)", []any{testSendID, fmt.Sprintf(`{"id":%q,"size":%d,"fileName":"encrypted"}`, testSendFileID, len(send))}},
 	}
 	for _, statement := range statements {
 		if _, err := db.Exec(statement.query, statement.args...); err != nil {
-			db.Close()
+			_ = db.Close()
 			t.Fatal(err)
 		}
 	}
 	if includeFiles {
 		writeFixture(t, filepath.Join(dataDir, "attachments", testCipherID, testAttachmentID), attachment)
-		writeFixture(t, filepath.Join(dataDir, "sends", testSendID, testSendFileID), send)
 	}
 	writeFixture(t, filepath.Join(dataDir, "rsa_key.pem"), []byte("synthetic-rsa"))
-	writeFixture(t, filepath.Join(dataDir, "config.json"), []byte(`{"synthetic":true}`))
-	writeFixture(t, filepath.Join(dataDir, "templates", "mail", "test.hbs"), []byte("template"))
+	writeFixture(t, filepath.Join(dataDir, "rsa_key.pub.pem"), []byte("synthetic-rsa-public"))
 	writeFixture(t, filepath.Join(dataDir, "icon_cache", "ignored"), []byte("ignore"))
 	writeFixture(t, filepath.Join(dataDir, "tmp", "ignored"), []byte("ignore"))
 	writeFixture(t, filepath.Join(dataDir, "backups", "ignored"), []byte("ignore"))
@@ -100,13 +93,15 @@ func writeFixture(t *testing.T, path string, data []byte) {
 
 func TestBuilderCreatesCompleteWhitelistedRecoverySetDuringWALWrites(t *testing.T) {
 	dataDir, db := syntheticData(t, true)
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	stagingDir := filepath.Join(t.TempDir(), "staging")
 	mustSnapshotRoot(t, stagingDir)
 	builder := Builder{DataDir: dataDir, StagingDir: stagingDir}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	var writer sync.WaitGroup
+	var writerErrMu sync.Mutex
+	var writerErr error
 	writer.Add(1)
 	go func() {
 		defer writer.Done()
@@ -115,17 +110,30 @@ func TestBuilderCreatesCompleteWhitelistedRecoverySetDuringWALWrites(t *testing.
 			case <-ctx.Done():
 				return
 			default:
-				_, _ = db.Exec("INSERT INTO activity(value) VALUES (?)", fmt.Sprintf("write-%d", i))
+				if _, err := db.Exec("INSERT INTO activity(value) VALUES (?)", fmt.Sprintf("write-%d", i)); err != nil {
+					writerErrMu.Lock()
+					if writerErr == nil {
+						writerErr = err
+					}
+					writerErrMu.Unlock()
+					return
+				}
 			}
 		}
 	}()
 	result, err := builder.Build(context.Background(), false)
 	cancel()
 	writer.Wait()
+	writerErrMu.Lock()
+	backgroundWriteErr := writerErr
+	writerErrMu.Unlock()
+	if backgroundWriteErr != nil {
+		t.Fatalf("concurrent writer failed: %v", backgroundWriteErr)
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer os.RemoveAll(result.Path)
+	defer func() { _ = os.RemoveAll(result.Path) }()
 	if result.Manifest.Status != Complete {
 		t.Fatalf("status = %s", result.Manifest.Status)
 	}
@@ -140,8 +148,7 @@ func TestBuilderCreatesCompleteWhitelistedRecoverySetDuringWALWrites(t *testing.
 	for _, required := range []string{
 		"data/db.sqlite3",
 		"data/attachments/" + testCipherID + "/" + testAttachmentID,
-		"data/sends/" + testSendID + "/" + testSendFileID,
-		"data/rsa_key.pem", "data/config.json", "data/templates/mail/test.hbs",
+		"data/rsa_key.pem", "data/rsa_key.pub.pem",
 	} {
 		if !slices.Contains(paths, required) {
 			t.Errorf("missing expected path %s", required)
@@ -158,13 +165,13 @@ func TestBuilderCreatesCompleteWhitelistedRecoverySetDuringWALWrites(t *testing.
 
 func TestBuilderRetriesMissingReferencesThenAllowsIncomplete(t *testing.T) {
 	dataDir, db := syntheticData(t, false)
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	builder := Builder{DataDir: dataDir, StagingDir: mustSnapshotRoot(t, filepath.Join(t.TempDir(), "staging"))}
 	if _, err := builder.Build(context.Background(), false); err == nil {
 		t.Fatal("missing references produced a complete result")
 	} else {
 		var missing *MissingFilesError
-		if !errors.As(err, &missing) || missing.Count != 2 {
+		if !errors.As(err, &missing) || missing.Count != 1 {
 			t.Fatalf("error = %v", err)
 		}
 	}
@@ -172,8 +179,8 @@ func TestBuilderRetriesMissingReferencesThenAllowsIncomplete(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer os.RemoveAll(result.Path)
-	if result.Manifest.Status != Incomplete || len(result.Manifest.Missing) != 2 {
+	defer func() { _ = os.RemoveAll(result.Path) }()
+	if result.Manifest.Status != Incomplete || len(result.Manifest.Missing) != 1 {
 		t.Fatalf("manifest = %#v", result.Manifest)
 	}
 	if _, err := Verify(context.Background(), result.Path, false); err == nil {
@@ -184,28 +191,30 @@ func TestBuilderRetriesMissingReferencesThenAllowsIncomplete(t *testing.T) {
 	}
 }
 
-func TestBuilderRejectsTemplateSymlink(t *testing.T) {
+func TestBuilderRejectsRSASymlink(t *testing.T) {
 	dataDir, db := syntheticData(t, true)
-	defer db.Close()
-	link := filepath.Join(dataDir, "templates", "link")
-	if err := os.Symlink(filepath.Join(dataDir, "config.json"), link); err != nil {
+	defer func() { _ = db.Close() }()
+	if err := os.Remove(filepath.Join(dataDir, "rsa_key.pub.pem")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(dataDir, "rsa_key.pem"), filepath.Join(dataDir, "rsa_key.pub.pem")); err != nil {
 		t.Fatal(err)
 	}
 	builder := Builder{DataDir: dataDir, StagingDir: mustSnapshotRoot(t, filepath.Join(t.TempDir(), "staging"))}
 	if _, err := builder.Build(context.Background(), false); err == nil {
-		t.Fatal("template symlink was accepted")
+		t.Fatal("RSA key symlink was accepted")
 	}
 }
 
 func TestVerifyRejectsUnreferencedDatabaseManagedFile(t *testing.T) {
 	dataDir, db := syntheticData(t, true)
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	builder := Builder{DataDir: dataDir, StagingDir: mustSnapshotRoot(t, filepath.Join(t.TempDir(), "staging"))}
 	result, err := builder.Build(context.Background(), false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer os.RemoveAll(result.Path)
+	defer func() { _ = os.RemoveAll(result.Path) }()
 
 	extraPath := "data/attachments/" + testCipherID + "/ffffffffffffffffffff"
 	writeFixture(t, filepath.Join(result.Path, filepath.FromSlash(extraPath)), []byte("unreferenced"))
@@ -227,16 +236,16 @@ func TestVerifyRejectsUnreferencedDatabaseManagedFile(t *testing.T) {
 
 func TestVerifyRejectsUnreferencedMissingDatabaseManagedFile(t *testing.T) {
 	dataDir, db := syntheticData(t, true)
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	builder := Builder{DataDir: dataDir, StagingDir: mustSnapshotRoot(t, filepath.Join(t.TempDir(), "staging"))}
 	result, err := builder.Build(context.Background(), false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer os.RemoveAll(result.Path)
+	defer func() { _ = os.RemoveAll(result.Path) }()
 
 	missing := []Missing{{
-		Path:   "data/sends/" + testSendID + "/ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+		Path:   "data/attachments/" + testCipherID + "/ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
 		Reason: "not_found",
 	}}
 	manifest, err := NewManifest(Incomplete, result.Manifest.DatabaseMigration, result.Manifest.Files, missing)
@@ -246,7 +255,7 @@ func TestVerifyRejectsUnreferencedMissingDatabaseManagedFile(t *testing.T) {
 	writeTestManifest(t, result.Path, manifest)
 
 	if _, err := Verify(context.Background(), result.Path, true); err == nil {
-		t.Fatal("unreferenced missing send was accepted")
+		t.Fatal("unreferenced missing attachment was accepted")
 	}
 }
 
@@ -327,8 +336,7 @@ func TestOpaqueFileIDValidationMatchesVaultwardenPathContract(t *testing.T) {
 	t.Parallel()
 	for _, value := range []string{
 		testAttachmentID,
-		testSendFileID,
-		"legacy-Attachment-ID-001",
+		"Attachment-ID-001",
 	} {
 		if !validOpaqueID(value) {
 			t.Errorf("valid opaque file ID %q was rejected", value)
@@ -344,6 +352,20 @@ func TestOpaqueFileIDValidationMatchesVaultwardenPathContract(t *testing.T) {
 	} {
 		if validOpaqueID(value) {
 			t.Errorf("unsafe opaque file ID %q was accepted", value)
+		}
+	}
+}
+
+func TestManifestUsesStrictSemVerValidation(t *testing.T) {
+	t.Parallel()
+	for _, value := range []string{"0.0.0", "1.2.3-alpha-1", "1.2.3+build.7", "1.2.3-alpha.1+build.7"} {
+		if !validSemVer(value) {
+			t.Fatalf("valid SemVer %q was rejected", value)
+		}
+	}
+	for _, value := range []string{"1.2", "1.2.3-01", "1.2.3-alpha..1", "1.2.3+build+extra", "1.2.3-ümlaut", "01.2.3"} {
+		if validSemVer(value) {
+			t.Fatalf("invalid SemVer %q was accepted", value)
 		}
 	}
 }

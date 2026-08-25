@@ -43,6 +43,8 @@ func NewUnavailableManager(log *slog.Logger) *Manager {
 	return &Manager{log: log}
 }
 
+func (m *Manager) Rebuilt() bool { return m.store != nil && m.store.Rebuilt() }
+
 func ValidateConfigs(configs []config.Notifier) error {
 	for _, cfg := range configs {
 		_, err := senderForConfig(cfg)
@@ -70,7 +72,7 @@ func (m *Manager) EnqueueSuccess(event Event) error {
 	if m.store == nil {
 		return fmt.Errorf("notification persistence is unavailable")
 	}
-	return m.store.EnqueueSuccessReplacingState(m.names, event, "source-integrity")
+	return m.store.EnqueueAll(m.names, event, "success", event.ID)
 }
 
 func (m *Manager) EnqueueState(key string, event Event) error {
@@ -123,6 +125,9 @@ func (m *Manager) runSender(ctx context.Context, sender Sender) {
 				return
 			}
 			failures++
+			if markErr := m.store.MarkUnavailable(sender.Name()); markErr != nil {
+				m.log.Error("notification availability persistence failed", "notifier", sender.Name(), "error_code", "notification_state_failed")
+			}
 			m.log.Error("notification delivery failed", "notifier", sender.Name(), "error_code", "notification_delivery_failed")
 			delay := retryDelay(failures)
 			timer := time.NewTimer(delay)

@@ -78,23 +78,25 @@ func serveCommand(configPath *string) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			defer lock.Close()
+			defer func() { _ = lock.Close() }()
 			log := slog.New(slog.NewJSONHandler(cmd.ErrOrStderr(), nil))
-			runner, err := newRunner(cfg)
-			if err != nil {
-				return err
-			}
-			if err := runner.VerifyVersion(cmd.Context()); err != nil {
-				return err
-			}
+			runner := newWorkerRunner(cfg)
+			runner.Logger = log
+			logConfigWarnings(log, cfg)
 			store, err := state.Open(cfg.StateDir, targetNames(cfg))
 			if err != nil {
 				return err
+			}
+			if store.Rebuilt() {
+				log.Warn("runtime state was rebuilt", "error_code", "runtime_state_rebuilt")
 			}
 			notifiers, err := notify.NewManager(cfg.StateDir, cfg.Notifiers, log)
 			if err != nil {
 				log.Error("notification persistence is unavailable; backup continues", "error_code", "notification_state_failed")
 				notifiers = notify.NewUnavailableManager(log)
+			}
+			if notifiers.Rebuilt() {
+				log.Warn("notification state was rebuilt", "error_code", "notification_state_rebuilt")
 			}
 			ctx, cancel := context.WithCancel(cmd.Context())
 			defer cancel()
@@ -159,23 +161,25 @@ func runCommand(configPath *string) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			defer lock.Close()
+			defer func() { _ = lock.Close() }()
 			log := slog.New(slog.NewJSONHandler(cmd.ErrOrStderr(), nil))
-			runner, err := newRunner(cfg)
-			if err != nil {
-				return err
-			}
-			if err := runner.VerifyVersion(cmd.Context()); err != nil {
-				return err
-			}
+			runner := newWorkerRunner(cfg)
+			runner.Logger = log
+			logConfigWarnings(log, cfg)
 			store, err := state.Open(cfg.StateDir, targetNames(cfg))
 			if err != nil {
 				return err
+			}
+			if store.Rebuilt() {
+				log.Warn("runtime state was rebuilt", "error_code", "runtime_state_rebuilt")
 			}
 			notifiers, err := notify.NewManager(cfg.StateDir, cfg.Notifiers, log)
 			if err != nil {
 				log.Error("notification persistence is unavailable; backup continues", "error_code", "notification_state_failed")
 				notifiers = notify.NewUnavailableManager(log)
+			}
+			if notifiers.Rebuilt() {
+				log.Warn("notification state was rebuilt", "error_code", "notification_state_rebuilt")
 			}
 			ctx, cancel := context.WithCancel(cmd.Context())
 			notifiers.Start(ctx)
@@ -186,15 +190,29 @@ func runCommand(configPath *string) *cobra.Command {
 					err = coordinator.MarkDirty(time.Now())
 				}
 				if err == nil {
+					err = store.Update(func(next *state.State) error {
+						next.Source.NextRetryAt = ""
+						for name, target := range next.Targets {
+							target.NextRetryAt = ""
+							next.Targets[name] = target
+						}
+						return nil
+					})
+				}
+				if err == nil {
 					err = coordinator.Sample(ctx)
 				}
 			}
 			cancel()
 			notifiers.Wait()
-			if err != nil {
-				return err
+			statusErr := writeJSON(cmd.OutOrStdout(), store.Snapshot().PublicStatus(targetNames(cfg)))
+			if statusErr != nil {
+				return statusErr
 			}
-			return writeJSON(cmd.OutOrStdout(), store.Snapshot().PublicStatus(targetNames(cfg)))
+			if err == nil && store.Snapshot().Current != nil {
+				err = fmt.Errorf("one or more backup targets are degraded")
+			}
+			return err
 		},
 	}
 }
@@ -207,17 +225,17 @@ func statusCommand(configPath *string) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			current, err := state.Read(cfg.StateDir)
+			currentStore, err := state.Open(cfg.StateDir, targetNames(cfg))
 			if err != nil {
 				return err
 			}
-			return writeJSON(cmd.OutOrStdout(), current.PublicStatus(targetNames(cfg)))
+			return writeJSON(cmd.OutOrStdout(), currentStore.Snapshot().PublicStatus(targetNames(cfg)))
 		},
 	}
 }
 
 func configCommand(configPath *string) *cobra.Command {
-	var checkCredentials string
+	var checkRepositoryCredentials, checkNotifierMaterial bool
 	command := &cobra.Command{
 		Use: "config", Short: "Validate configuration and print a secret-free v1 summary", Args: usageNoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -225,23 +243,20 @@ func configCommand(configPath *string) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if checkCredentials != "" && checkCredentials != "backup" && checkCredentials != "maintenance" {
-				return &UsageError{Err: fmt.Errorf("--check-credentials must be backup or maintenance")}
-			}
-			if checkCredentials != "" {
+			if checkRepositoryCredentials && len(cfg.Targets) != 0 {
 				runner, err := newRunner(cfg)
 				if err != nil {
 					return err
 				}
 				for _, target := range cfg.Targets {
 					if err := runner.ValidateTarget(target); err != nil {
-						return fmt.Errorf("target %s %s credentials: %w", target.Name, checkCredentials, err)
+						return fmt.Errorf("target %s repository credentials: %w", target.Name, err)
 					}
 				}
-				if checkCredentials == "backup" {
-					if err := notify.ValidateConfigs(cfg.Notifiers); err != nil {
-						return err
-					}
+			}
+			if checkNotifierMaterial {
+				if err := notify.ValidateConfigs(cfg.Notifiers); err != nil {
+					return err
 				}
 			}
 			type targetSummary struct {
@@ -253,20 +268,24 @@ func configCommand(configPath *string) *cobra.Command {
 				Type string `json:"type"`
 			}
 			summary := struct {
-				SchemaVersion      int               `json:"schema_version"`
-				ProductVersion     string            `json:"product_version"`
-				VaultwardenVersion string            `json:"vaultwarden_version"`
-				ResticVersion      string            `json:"restic_version"`
-				CredentialsChecked string            `json:"credentials_checked,omitempty"`
-				Targets            []targetSummary   `json:"targets"`
-				Notifiers          []notifierSummary `json:"notifiers"`
+				SchemaVersion                int               `json:"schema_version"`
+				ProductVersion               string            `json:"product_version"`
+				VaultwardenVersion           string            `json:"vaultwarden_version"`
+				ResticVersion                string            `json:"restic_version"`
+				RepositoryCredentialsChecked bool              `json:"repository_credentials_checked"`
+				NotifierMaterialChecked      bool              `json:"notifier_material_checked"`
+				Warnings                     []string          `json:"warnings"`
+				Targets                      []targetSummary   `json:"targets"`
+				Notifiers                    []notifierSummary `json:"notifiers"`
 			}{
 				SchemaVersion: version.SchemaVersion, ProductVersion: version.Product,
-				VaultwardenVersion: version.Vaultwarden, ResticVersion: version.Restic, CredentialsChecked: checkCredentials,
-				Targets: make([]targetSummary, 0, len(cfg.Targets)), Notifiers: make([]notifierSummary, 0, len(cfg.Notifiers)),
+				VaultwardenVersion: version.Vaultwarden, ResticVersion: version.Restic,
+				RepositoryCredentialsChecked: checkRepositoryCredentials, NotifierMaterialChecked: checkNotifierMaterial,
+				Warnings: make([]string, 0), Targets: make([]targetSummary, 0, len(cfg.Targets)), Notifiers: make([]notifierSummary, 0, len(cfg.Notifiers)),
 			}
 			for _, target := range cfg.Targets {
 				summary.Targets = append(summary.Targets, targetSummary{target.Name, target.Backend()})
+				summary.Warnings = append(summary.Warnings, target.Warnings()...)
 			}
 			for _, notifier := range cfg.Notifiers {
 				summary.Notifiers = append(summary.Notifiers, notifierSummary{notifier.Name, notifier.Type})
@@ -274,7 +293,8 @@ func configCommand(configPath *string) *cobra.Command {
 			return writeJSON(cmd.OutOrStdout(), summary)
 		},
 	}
-	command.Flags().StringVar(&checkCredentials, "check-credentials", "", "validate the mounted backup or maintenance role credentials")
+	command.Flags().BoolVar(&checkRepositoryCredentials, "check-repository-credentials", false, "validate the mounted repository credentials")
+	command.Flags().BoolVar(&checkNotifierMaterial, "check-notifier-material", false, "validate notification material")
 	return command
 }
 
@@ -319,12 +339,27 @@ func repoCommand(configPath *string) *cobra.Command {
 		if snapshotStatus == "all" {
 			status = ""
 		}
-		items, err := runner.Snapshots(ctx, target, status)
+		report, err := runner.ListSnapshots(ctx, target)
+		items := report.Snapshots
+		if status != "" {
+			filtered := make([]restic.SnapshotInfo, 0, len(items))
+			for _, item := range items {
+				if item.Status == status {
+					filtered = append(filtered, item)
+				}
+			}
+			items = filtered
+		}
+		summaries := make([]snapshotSummary, 0, len(items))
+		for _, item := range items {
+			summaries = append(summaries, snapshotSummary{ID: item.ID, Time: item.Time, Status: item.Status, ContentID: item.ContentID})
+		}
 		return struct {
-			SchemaVersion int                   `json:"schema_version"`
-			Target        string                `json:"target"`
-			Snapshots     []restic.SnapshotInfo `json:"snapshots"`
-		}{version.SchemaVersion, target.Name, items}, err
+			SchemaVersion int                      `json:"schema_version"`
+			Target        string                   `json:"target"`
+			Snapshots     []snapshotSummary        `json:"snapshots"`
+			Anomalies     []restic.SnapshotAnomaly `json:"anomalies"`
+		}{version.SchemaVersion, target.Name, summaries, report.Anomalies}, err
 	})
 	snapshotsCommand.Flags().StringVar(&snapshotStatus, "status", "all", "all, complete, or incomplete")
 	snapshotsCommand.PreRunE = func(_ *cobra.Command, _ []string) error {
@@ -367,6 +402,13 @@ func repoCommand(configPath *string) *cobra.Command {
 	pruneCommand.Flags().BoolVar(&apply, "apply", false, "apply deletion; default is Restic dry-run")
 	repo.AddCommand(snapshotsCommand, initCommand, checkCommand, unlockCommand, pruneCommand)
 	return repo
+}
+
+type snapshotSummary struct {
+	ID        string          `json:"id"`
+	Time      string          `json:"time"`
+	Status    snapshot.Status `json:"status"`
+	ContentID string          `json:"content_id"`
 }
 
 func restoreCommand(configPath *string) *cobra.Command {
@@ -424,7 +466,7 @@ func healthcheckCommand() *cobra.Command {
 		if err != nil {
 			return err
 		}
-		defer response.Body.Close()
+		defer func() { _ = response.Body.Close() }()
 		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
 		if response.StatusCode != http.StatusNoContent {
 			return fmt.Errorf("health endpoint returned %d", response.StatusCode)
@@ -436,13 +478,16 @@ func healthcheckCommand() *cobra.Command {
 }
 
 func newRunner(cfg *config.Backup) (restic.Runner, error) {
+	if len(cfg.Targets) == 0 {
+		return restic.Runner{Binary: cfg.ResticBinary, CacheDir: cfg.CacheDir, StagingDir: cfg.StagingDir, Disabled: true}, nil
+	}
 	credentials, err := config.LoadRoleCredentials(config.RoleCredentialsPath, cfg)
 	if err != nil {
 		return restic.Runner{}, err
 	}
 	runner := restic.Runner{
 		Binary: cfg.ResticBinary, CacheDir: cfg.CacheDir, StagingDir: cfg.StagingDir,
-		PasswordFile: config.ResticPasswordPath, Credentials: credentials,
+		PasswordFile: config.ResticPasswordPath, Credentials: credentials, Logger: slog.Default(),
 	}
 	for _, target := range cfg.Targets {
 		if err := runner.ValidateTarget(target); err != nil {
@@ -450,6 +495,33 @@ func newRunner(cfg *config.Backup) (restic.Runner, error) {
 		}
 	}
 	return runner, nil
+}
+
+// newWorkerRunner deliberately defers repository material checks until a
+// target operation. The resident worker and its health endpoint must remain
+// available when a Restic binary, credential mount, password file, or remote
+// repository is temporarily unavailable; the target then records a stable
+// degraded error instead of preventing serve/run from starting.
+func newWorkerRunner(cfg *config.Backup) restic.Runner {
+	if len(cfg.Targets) == 0 {
+		return restic.Runner{Binary: cfg.ResticBinary, CacheDir: cfg.CacheDir, StagingDir: cfg.StagingDir, Disabled: true}
+	}
+	var credentials *config.RoleCredentials
+	if loaded, err := config.LoadRoleCredentials(config.RoleCredentialsPath, cfg); err == nil {
+		credentials = loaded
+	}
+	return restic.Runner{
+		Binary: cfg.ResticBinary, CacheDir: cfg.CacheDir, StagingDir: cfg.StagingDir,
+		PasswordFile: config.ResticPasswordPath, Credentials: credentials,
+	}
+}
+
+func logConfigWarnings(log *slog.Logger, cfg *config.Backup) {
+	for _, target := range cfg.Targets {
+		for _, warning := range target.Warnings() {
+			log.Warn("configuration warning", "target", target.Name, "warning", warning)
+		}
+	}
 }
 func targetNames(cfg *config.Backup) []string {
 	names := make([]string, 0, len(cfg.Targets))

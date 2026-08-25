@@ -178,17 +178,3 @@ func TestEventSenderCoalescesSignals(t *testing.T) {
 		t.Fatalf("event requests = %d, want 1 or 2", got)
 	}
 }
-
-func TestHostValidationHandlesIPv6AndRejectsAmbiguousForms(t *testing.T) {
-	t.Parallel()
-	for _, host := range []string{"vault.example", "vault.example:8443", "192.0.2.1", "[2001:db8::1]", "[2001:db8::1]:8443"} {
-		if !validHost(host) {
-			t.Errorf("valid host rejected: %q", host)
-		}
-	}
-	for _, host := range []string{"", "2001:db8::1", "[192.0.2.1]", "[fe80::1%eth0]", "[2001:db8::1", "[2001:db8::1]extra", "vault.example:0", "vault.example:65536"} {
-		if validHost(host) {
-			t.Errorf("invalid host accepted: %q", host)
-		}
-	}
-}

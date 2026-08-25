@@ -9,6 +9,7 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -30,16 +31,29 @@ type Coordinator struct {
 	log       *slog.Logger
 	wake      chan struct{}
 	dirtyMu   sync.Mutex
+	randomInt func(int64) (int64, error)
 }
 
 type backupRunner interface {
 	Backup(context.Context, config.Target, snapshot.Manifest) (restic.BackupResult, error)
 }
 
+type candidateRunner interface {
+	backupRunner
+	ListSnapshots(context.Context, config.Target) (restic.SnapshotReport, error)
+}
+
 func NewCoordinator(cfg *config.Backup, store *state.Store, resticRunner backupRunner, notifiers *notify.Manager, log *slog.Logger) *Coordinator {
 	return &Coordinator{
 		cfg: cfg, store: store, builder: snapshot.Builder{DataDir: cfg.DataDir, StagingDir: cfg.StagingDir},
 		restic: resticRunner, notifiers: notifiers, log: log, wake: make(chan struct{}, 1),
+		randomInt: func(max int64) (int64, error) {
+			value, err := cryptorand.Int(cryptorand.Reader, big.NewInt(max))
+			if err != nil {
+				return 0, err
+			}
+			return value.Int64(), nil
+		},
 	}
 }
 
@@ -88,7 +102,7 @@ func (c *Coordinator) Run(ctx context.Context) error {
 	if err := c.MarkDirty(time.Now()); err != nil {
 		return err
 	}
-	if err := c.sample(ctx, true); err != nil && ctx.Err() == nil {
+	if err := c.sample(ctx); err != nil && ctx.Err() == nil {
 		c.log.Error("startup recovery-point sampling failed", "error_code", safeCoordinatorCode(err))
 	}
 	for {
@@ -100,13 +114,13 @@ func (c *Coordinator) Run(ctx context.Context) error {
 		snapshotAt := nextSnapshotAt(current, c.cfg, now)
 		retryAt := nextTargetRetryAt(current, now)
 		if !snapshotAt.After(now) {
-			if err := c.sample(ctx, true); err != nil && ctx.Err() == nil {
+			if err := c.sample(ctx); err != nil && ctx.Err() == nil {
 				c.log.Error("recovery-point sampling failed", "error_code", safeCoordinatorCode(err))
 			}
 			continue
 		}
 		if !retryAt.IsZero() && !retryAt.After(now) {
-			if err := c.catchUp(ctx, true); err != nil && ctx.Err() == nil {
+			if err := c.catchUp(ctx); err != nil && ctx.Err() == nil {
 				c.log.Error("target catch-up failed", "error_code", safeCoordinatorCode(err))
 			}
 			continue
@@ -135,10 +149,10 @@ func (c *Coordinator) Sample(ctx context.Context) error {
 	if len(c.cfg.Targets) == 0 {
 		return nil
 	}
-	return c.sample(ctx, false)
+	return c.sample(ctx)
 }
 
-func (c *Coordinator) sample(ctx context.Context, preemptibleUploads bool) (resultErr error) {
+func (c *Coordinator) sample(ctx context.Context) (resultErr error) {
 	current := c.store.Snapshot()
 	runningGeneration := current.DirtyGeneration
 	if err := c.beginWork(runningGeneration); err != nil {
@@ -150,10 +164,19 @@ func (c *Coordinator) sample(ctx context.Context, preemptibleUploads bool) (resu
 		}
 	}()
 
+	localCtx, cancel := context.WithTimeout(ctx, 30*time.Minute)
+	defer cancel()
+	attemptedAt := time.Now()
+	if err := c.store.Update(func(next *state.State) error {
+		next.Source.LastAttemptAt = state.FormatTime(attemptedAt)
+		return nil
+	}); err != nil {
+		return err
+	}
 	var result snapshot.Result
 	var err error
 	for attempt := 1; attempt <= 3; attempt++ {
-		result, err = c.builder.Build(ctx, attempt == 3)
+		result, err = c.builder.Build(localCtx, attempt == 3)
 		if err == nil {
 			break
 		}
@@ -163,14 +186,15 @@ func (c *Coordinator) sample(ctx context.Context, preemptibleUploads bool) (resu
 		}
 		timer := time.NewTimer(c.cfg.MissingRetry.Duration)
 		select {
-		case <-ctx.Done():
+		case <-localCtx.Done():
 			timer.Stop()
-			err = ctx.Err()
+			err = localCtx.Err()
 			attempt = 3
 		case <-timer.C:
 		}
 	}
 	if err != nil {
+		_ = c.markSourceFailure(err, time.Now())
 		_ = c.store.Update(func(next *state.State) error {
 			now := state.FormatTime(time.Now())
 			next.LastSampleAt = now
@@ -184,21 +208,17 @@ func (c *Coordinator) sample(ctx context.Context, preemptibleUploads bool) (resu
 		})
 		return err
 	}
-	if err := c.promote(ctx, result, runningGeneration); err != nil {
+	if err := c.markSourceHealthy(time.Now()); err != nil {
+		return err
+	}
+	if err := c.promote(localCtx, result, runningGeneration); err != nil {
 		_ = os.RemoveAll(result.Path)
 		return err
 	}
-	return c.uploadCurrent(ctx, preemptibleUploads)
+	return c.uploadCurrentWithManifest(ctx, &result.Manifest)
 }
 
-func (c *Coordinator) CatchUp(ctx context.Context) error {
-	if len(c.cfg.Targets) == 0 {
-		return nil
-	}
-	return c.catchUp(ctx, false)
-}
-
-func (c *Coordinator) catchUp(ctx context.Context, preemptible bool) (resultErr error) {
+func (c *Coordinator) catchUp(ctx context.Context) (resultErr error) {
 	if err := c.beginWork(c.store.Snapshot().DirtyGeneration); err != nil {
 		return err
 	}
@@ -207,7 +227,7 @@ func (c *Coordinator) catchUp(ctx context.Context, preemptible bool) (resultErr 
 			resultErr = err
 		}
 	}()
-	return c.uploadCurrent(ctx, preemptible)
+	return c.uploadCurrentWithManifest(ctx, nil)
 }
 
 func (c *Coordinator) beginWork(runningGeneration uint64) error {
@@ -229,15 +249,9 @@ func (c *Coordinator) promote(ctx context.Context, result snapshot.Result, runni
 	currentPath := filepath.Join(c.cfg.StagingDir, "current")
 	previousPath := filepath.Join(c.cfg.StagingDir, ".previous")
 	if _, err := os.Lstat(previousPath); err == nil {
-		if _, verifyErr := snapshot.Verify(ctx, currentPath, true); verifyErr != nil {
-			return fmt.Errorf("stale previous snapshot exists while current is invalid")
-		}
-		if err := os.RemoveAll(previousPath); err != nil {
-			return fmt.Errorf("remove stale previous snapshot: %w", err)
-		}
-		if err := syncCoordinatorDirectory(c.cfg.StagingDir); err != nil {
-			return fmt.Errorf("sync stale snapshot removal: %w", err)
-		}
+		return fmt.Errorf("staging contains a previous recovery point; reconcile before promotion")
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("inspect previous recovery point: %w", err)
 	}
 	hadCurrent := false
 	if _, err := os.Lstat(currentPath); err == nil {
@@ -245,8 +259,6 @@ func (c *Coordinator) promote(ctx context.Context, result snapshot.Result, runni
 			return fmt.Errorf("retain previous recovery point: %w", err)
 		}
 		if err := syncCoordinatorDirectory(c.cfg.StagingDir); err != nil {
-			_ = os.Rename(previousPath, currentPath)
-			_ = syncCoordinatorDirectory(c.cfg.StagingDir)
 			return fmt.Errorf("sync retained recovery point: %w", err)
 		}
 		hadCurrent = true
@@ -254,22 +266,14 @@ func (c *Coordinator) promote(ctx context.Context, result snapshot.Result, runni
 		return fmt.Errorf("inspect current recovery point: %w", err)
 	}
 	if err := os.Rename(result.Path, currentPath); err != nil {
-		if hadCurrent {
-			_ = os.Rename(previousPath, currentPath)
-			_ = syncCoordinatorDirectory(c.cfg.StagingDir)
-		}
 		return fmt.Errorf("promote recovery point: %w", err)
 	}
 	if err := syncCoordinatorDirectory(c.cfg.StagingDir); err != nil {
 		return fmt.Errorf("sync promoted recovery point: %w", err)
 	}
-	if _, err := snapshot.Verify(ctx, currentPath, true); err != nil {
-		return fmt.Errorf("verify promoted recovery point: %w", err)
-	}
 	now := time.Now()
 	if err := c.store.Update(func(next *state.State) error {
 		next.Current = &state.RecoveryPoint{ContentID: result.Manifest.ContentID, Status: result.Manifest.Status}
-		next.LastContentID = result.Manifest.ContentID
 		next.LastSampleAt = state.FormatTime(now)
 		next.LastSnapshotAt = state.FormatTime(now)
 		if next.DirtyGeneration == runningGeneration {
@@ -303,20 +307,26 @@ type uploadResult struct {
 	err     error
 }
 
-func (c *Coordinator) uploadCurrent(ctx context.Context, preemptible bool) error {
+func (c *Coordinator) uploadCurrentWithManifest(ctx context.Context, supplied *snapshot.Manifest) error {
 	current := c.store.Snapshot()
 	if current.Current == nil {
 		return nil
 	}
-	manifest, err := snapshot.Verify(ctx, filepath.Join(c.cfg.StagingDir, "current"), true)
-	if err != nil {
-		return fmt.Errorf("verify pending recovery point: %w", err)
+	manifest := snapshot.Manifest{}
+	if supplied != nil {
+		manifest = *supplied
+	} else {
+		var err error
+		manifest, err = snapshot.Verify(ctx, filepath.Join(c.cfg.StagingDir, "current"), true)
+		if err != nil {
+			return fmt.Errorf("verify pending recovery point: %w", err)
+		}
 	}
 	now := time.Now()
-	var attempts []uploadAttempt
+	attempts := make([]uploadAttempt, 0, len(c.cfg.Targets))
 	for _, target := range c.cfg.Targets {
 		targetState := current.Targets[target.Name]
-		if targetState.ContentID == current.Current.ContentID {
+		if targetContentID(targetState) == current.Current.ContentID {
 			continue
 		}
 		retryAt, _ := state.ParseTime(targetState.NextRetryAt)
@@ -334,81 +344,43 @@ func (c *Coordinator) uploadCurrent(ctx context.Context, preemptible bool) error
 			target := next.Targets[attempt.target.Name]
 			target.State = "catching_up"
 			target.LastAttemptAt = state.FormatTime(now)
+			target.UploadIntent = &state.UploadIntent{ContentID: manifest.ContentID, Status: manifest.Status, StartedAt: state.FormatTime(now)}
 			next.Targets[attempt.target.Name] = target
 		}
 		return nil
 	}); err != nil {
 		return err
 	}
-	uploadCtx, cancelUploads := context.WithCancel(ctx)
-	defer cancelUploads()
 	results := make(chan uploadResult, len(attempts))
 	for _, attempt := range attempts {
 		attempt := attempt
 		go func() {
-			targetCtx, cancel := context.WithTimeout(uploadCtx, c.cfg.TargetTimeout.Duration)
+			targetCtx, cancel := context.WithTimeout(ctx, c.cfg.TargetTimeout.Duration)
 			defer cancel()
 			result, err := c.restic.Backup(targetCtx, attempt.target, manifest)
 			results <- uploadResult{attempt: attempt, result: result, err: err}
 		}()
 	}
-	cancelledForSchedule := false
-	waitOnly := false
 	for remaining := len(attempts); remaining > 0; {
-		var result uploadResult
-		if waitOnly {
-			result = <-results
-		} else {
-			var schedule <-chan time.Time
-			var wake <-chan struct{}
-			var timer *time.Timer
-			if preemptible {
-				now := time.Now()
-				due := nextSnapshotAt(c.store.Snapshot(), c.cfg, now)
-				if !due.After(now) {
-					cancelledForSchedule = true
-					waitOnly = true
-					cancelUploads()
-					continue
-				}
-				timer = time.NewTimer(time.Until(due))
-				schedule = timer.C
-				wake = c.wake
-			}
-			select {
-			case result = <-results:
-				stopTimer(timer)
-			case <-wake:
-				stopTimer(timer)
-				continue
-			case <-schedule:
-				cancelledForSchedule = true
-				waitOnly = true
-				cancelUploads()
-				continue
-			case <-ctx.Done():
-				stopTimer(timer)
-				waitOnly = true
-				cancelUploads()
-				continue
-			}
-		}
+		result := <-results
 		remaining--
 		when := time.Now()
+		if result.err != nil && remoteLookupAllowed(result.err) {
+			if recovered, snapshotID := c.findRemoteContent(ctx, result.attempt.target, manifest); recovered {
+				result.err = nil
+				result.result.SnapshotID = snapshotID
+			}
+		}
 		if result.err == nil {
-			if err := c.store.Update(func(next *state.State) error {
-				target := next.Targets[result.attempt.target.Name]
-				target.State = "healthy"
-				target.ContentID = manifest.ContentID
-				target.SnapshotID = result.result.SnapshotID
-				target.LastSuccessAt = state.FormatTime(when)
-				target.NextRetryAt = ""
-				target.ConsecutiveFailures = 0
-				target.ErrorCode = ""
-				next.Targets[result.attempt.target.Name] = target
-				return nil
-			}); err != nil {
-				return err
+			if err := c.persistTargetSuccess(result.attempt.target.Name, manifest, result.result.SnapshotID, when); err != nil {
+				c.log.Error("target success state persistence failed", "target", result.attempt.target.Name, "error_code", "runtime_state_failed")
+				if recovered, snapshotID := c.findRemoteContent(ctx, result.attempt.target, manifest); recovered {
+					if retryErr := c.persistTargetSuccess(result.attempt.target.Name, manifest, snapshotID, when); retryErr == nil {
+						c.announceRecovery(manifest, when)
+						continue
+					}
+				}
+				continue
 			}
 			if result.attempt.previousState == "degraded" {
 				c.enqueueTargetState("target_recovered", result.attempt.target.Name, "", when)
@@ -417,55 +389,120 @@ func (c *Coordinator) uploadCurrent(ctx context.Context, preemptible bool) error
 			continue
 		}
 		code := resticErrorCode(result.err)
-		if (cancelledForSchedule || ctx.Err() != nil) &&
-			(code == "operation_cancelled" || errors.Is(result.err, context.Canceled) || errors.Is(result.err, context.DeadlineExceeded)) {
-			if err := c.store.Update(func(next *state.State) error {
-				target := next.Targets[result.attempt.target.Name]
-				target.State = result.attempt.previousState
-				target.ErrorCode = result.attempt.previousError
-				target.NextRetryAt = state.FormatTime(when)
-				next.Targets[result.attempt.target.Name] = target
-				return nil
-			}); err != nil {
-				return err
-			}
-			continue
-		}
-		failures := 1
 		latest := c.store.Snapshot().Targets[result.attempt.target.Name]
-		if latest.ConsecutiveFailures < 1_000_000 {
-			failures = latest.ConsecutiveFailures + 1
+		failures := latest.ConsecutiveFailures + 1
+		if failures > 1_000_000 {
+			failures = 1_000_000
 		}
-		retryAt := when.Add(backoff(failures))
-		if errors.Is(ctx.Err(), context.Canceled) {
-			retryAt = when
-		}
+		retryAt := when.Add(c.targetBackoff(failures))
 		if err := c.store.Update(func(next *state.State) error {
 			target := next.Targets[result.attempt.target.Name]
 			target.State = "degraded"
 			target.ErrorCode = code
 			target.ConsecutiveFailures = failures
 			target.NextRetryAt = state.FormatTime(retryAt)
+			target.UploadIntent = nil
 			next.Targets[result.attempt.target.Name] = target
 			return nil
 		}); err != nil {
 			return err
 		}
-		if result.attempt.previousState != "degraded" || result.attempt.previousError != code {
+		if result.attempt.previousState != "degraded" {
 			c.enqueueTargetState("target_degraded", result.attempt.target.Name, code, when)
 		}
 	}
-	return c.cleanupIfCaughtUp()
+	if err := c.cleanupIfCaughtUp(); err != nil {
+		return err
+	}
+	return nil
 }
 
-func stopTimer(timer *time.Timer) {
-	if timer == nil || timer.Stop() {
-		return
+func (c *Coordinator) persistTargetSuccess(name string, manifest snapshot.Manifest, snapshotID string, when time.Time) error {
+	return c.store.Update(func(next *state.State) error {
+		target := next.Targets[name]
+		target.State = "healthy"
+		target.LastRecoveryPoint = &state.RecoveryPoint{ContentID: manifest.ContentID, Status: manifest.Status}
+		if manifest.Status == snapshot.Complete {
+			target.LastCompleteRecoveryPoint = &state.RecoveryPoint{ContentID: manifest.ContentID, Status: manifest.Status}
+			next.LatestCompleteContentID = manifest.ContentID
+		}
+		target.SnapshotID = snapshotID
+		target.LastSuccessAt = state.FormatTime(when)
+		target.NextRetryAt = ""
+		target.ConsecutiveFailures = 0
+		target.ErrorCode = ""
+		target.UploadIntent = nil
+		next.Targets[name] = target
+		return nil
+	})
+}
+
+func remoteLookupAllowed(err error) bool {
+	var operation *restic.OperationError
+	if !errors.As(err, &operation) {
+		return true
 	}
-	select {
-	case <-timer.C:
+	switch operation.Code {
+	case "repository_backend_mismatch", "role_credentials_missing", "backend_credentials_invalid", "password_directory_invalid", "password_file_invalid", "cache_path_invalid", "cache_create_failed", "invalid_content_id", "invalid_manifest":
+		return false
 	default:
+		return true
 	}
+}
+
+func (c *Coordinator) findRemoteContent(ctx context.Context, target config.Target, manifest snapshot.Manifest) (bool, string) {
+	runner, ok := c.restic.(candidateRunner)
+	if !ok {
+		return false, ""
+	}
+	targetCtx, cancel := c.targetContext(ctx)
+	defer cancel()
+	report, err := runner.ListSnapshots(targetCtx, target)
+	if err != nil {
+		return false, ""
+	}
+	var matches []restic.SnapshotInfo
+	for _, candidate := range report.Snapshots {
+		if candidate.ContentID == manifest.ContentID && candidate.Status == manifest.Status {
+			matches = append(matches, candidate)
+		}
+	}
+	if len(matches) == 0 {
+		return false, ""
+	}
+	slices.SortFunc(matches, func(left, right restic.SnapshotInfo) int {
+		if left.Time == right.Time {
+			return strings.Compare(left.ID, right.ID)
+		}
+		return strings.Compare(left.Time, right.Time)
+	})
+	return true, matches[len(matches)-1].ID
+}
+
+func (c *Coordinator) targetContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if c.cfg == nil || c.cfg.TargetTimeout.Duration <= 0 {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, c.cfg.TargetTimeout.Duration)
+}
+
+func (c *Coordinator) targetBackoff(failures int) time.Duration {
+	base := time.Minute
+	for index := 1; index < failures && base < 15*time.Minute; index++ {
+		base *= 2
+	}
+	if base >= 15*time.Minute {
+		return 15 * time.Minute
+	}
+	jitter := base / 5
+	if jitter <= 0 || c.randomInt == nil {
+		return base
+	}
+	extra, err := c.randomInt(int64(jitter) + 1)
+	if err != nil {
+		return base
+	}
+	return base + time.Duration(extra)
 }
 
 func (c *Coordinator) announceRecovery(manifest snapshot.Manifest, when time.Time) {
@@ -476,7 +513,7 @@ func (c *Coordinator) announceRecovery(manifest snapshot.Manifest, when time.Tim
 	available := false
 	for _, configured := range c.cfg.Targets {
 		target := current.Targets[configured.Name]
-		if target.ContentID == manifest.ContentID {
+		if targetContentID(target) == manifest.ContentID {
 			available = true
 			break
 		}
@@ -498,7 +535,7 @@ func (c *Coordinator) cleanupIfCaughtUp() error {
 		return nil
 	}
 	for _, target := range c.cfg.Targets {
-		if current.Targets[target.Name].ContentID != current.Current.ContentID {
+		if targetContentID(current.Targets[target.Name]) != current.Current.ContentID {
 			return nil
 		}
 	}
@@ -511,18 +548,27 @@ func (c *Coordinator) cleanupIfCaughtUp() error {
 	if err := os.Rename(currentPath, deletePath); err != nil {
 		return fmt.Errorf("retire caught-up recovery point: %w", err)
 	}
-	if err := syncCoordinatorDirectory(c.cfg.StagingDir); err != nil {
-		_ = os.Rename(deletePath, currentPath)
-		_ = syncCoordinatorDirectory(c.cfg.StagingDir)
-		return fmt.Errorf("sync retired recovery point: %w", err)
-	}
+	publishErr := syncCoordinatorDirectory(c.cfg.StagingDir)
 	if err := c.store.Update(func(next *state.State) error {
 		next.Current = nil
 		return nil
 	}); err != nil {
-		_ = os.Rename(deletePath, currentPath)
-		_ = syncCoordinatorDirectory(c.cfg.StagingDir)
+		var persistErr *state.PersistError
+		if errors.As(err, &persistErr) && persistErr.PublishState == safefs.Unpublished {
+			if rollbackErr := os.Rename(deletePath, currentPath); rollbackErr != nil {
+				return fmt.Errorf("persist retirement state: %w; restore current recovery point: %v", err, rollbackErr)
+			}
+			if rollbackErr := syncCoordinatorDirectory(c.cfg.StagingDir); rollbackErr != nil {
+				return fmt.Errorf("persist retirement state: %w; sync restored recovery point: %v", err, rollbackErr)
+			}
+		}
+		// A published_unconfirmed state rename is authoritative. Leave the
+		// identified .delete-* entry for Reconcile to clean up instead of
+		// manufacturing a second, contradictory rollback.
 		return err
+	}
+	if publishErr != nil {
+		return fmt.Errorf("retire_published_unconfirmed: %w", publishErr)
 	}
 	if err := os.RemoveAll(deletePath); err != nil {
 		c.log.Error("caught-up local staging cleanup failed", "error_code", "staging_cleanup_failed")
@@ -536,55 +582,76 @@ func (c *Coordinator) Reconcile(ctx context.Context) error {
 	if err := safefs.ValidatePrivateDirectory(c.cfg.StagingDir); err != nil {
 		return err
 	}
-	currentPath := filepath.Join(c.cfg.StagingDir, "current")
-	previousPath := filepath.Join(c.cfg.StagingDir, ".previous")
-	if _, currentErr := os.Lstat(currentPath); errors.Is(currentErr, os.ErrNotExist) {
-		if _, previousStatErr := os.Lstat(previousPath); previousStatErr == nil {
-			previousManifest, previousErr := snapshot.Verify(ctx, previousPath, true)
-			if previousErr != nil {
-				return fmt.Errorf("retained staging recovery point is invalid and was preserved: %w", previousErr)
-			}
-			if err := os.Rename(previousPath, currentPath); err != nil {
-				return fmt.Errorf("recover retained staging recovery point: %w", err)
-			}
-			if err := syncCoordinatorDirectory(c.cfg.StagingDir); err != nil {
-				return fmt.Errorf("sync recovered staging recovery point: %w", err)
-			}
-			if err := c.store.Update(func(next *state.State) error {
-				next.Current = &state.RecoveryPoint{ContentID: previousManifest.ContentID, Status: previousManifest.Status}
-				next.LastContentID = previousManifest.ContentID
-				return nil
-			}); err != nil {
-				return err
-			}
-		} else if !errors.Is(previousStatErr, os.ErrNotExist) {
-			return fmt.Errorf("inspect retained staging recovery point: %w", previousStatErr)
+	entries, err := os.ReadDir(c.cfg.StagingDir)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if name != "current" && name != ".previous" && !strings.HasPrefix(name, ".build-") && !strings.HasPrefix(name, ".delete-") {
+			return fmt.Errorf("unknown staging entry %q", name)
 		}
 	}
-	manifest, verifyErr := snapshot.Verify(ctx, currentPath, true)
-	if verifyErr == nil {
-		if err := c.store.Update(func(next *state.State) error {
-			next.Current = &state.RecoveryPoint{ContentID: manifest.ContentID, Status: manifest.Status}
-			next.LastContentID = manifest.ContentID
-			return nil
-		}); err != nil {
-			return err
-		}
-		if _, previousErr := os.Lstat(previousPath); previousErr == nil {
-			if err := os.RemoveAll(previousPath); err != nil {
-				return fmt.Errorf("remove reconciled previous recovery point: %w", err)
+	currentPath := filepath.Join(c.cfg.StagingDir, "current")
+	previousPath := filepath.Join(c.cfg.StagingDir, ".previous")
+	_, currentErr := os.Lstat(currentPath)
+	if currentErr != nil && !errors.Is(currentErr, os.ErrNotExist) {
+		return fmt.Errorf("inspect current recovery point: %w", currentErr)
+	}
+	_, previousErr := os.Lstat(previousPath)
+	if previousErr != nil && !errors.Is(previousErr, os.ErrNotExist) {
+		return fmt.Errorf("inspect previous recovery point: %w", previousErr)
+	}
+	currentPresent := currentErr == nil
+	previousPresent := previousErr == nil
+	recoveredPrevious := false
+	var currentManifest snapshot.Manifest
+	currentValid := currentPresent
+	if currentValid {
+		currentManifest, currentErr = snapshot.Verify(ctx, currentPath, true)
+		currentValid = currentErr == nil
+	}
+	initialCurrentValid := currentValid
+	var previousManifest snapshot.Manifest
+	previousValid := previousPresent
+	if previousValid {
+		previousManifest, previousErr = snapshot.Verify(ctx, previousPath, true)
+		previousValid = previousErr == nil
+	}
+	if !currentValid && previousValid {
+		if currentPresent {
+			if err := os.RemoveAll(currentPath); err != nil {
+				return fmt.Errorf("remove invalid current recovery point: %w", err)
 			}
 			if err := syncCoordinatorDirectory(c.cfg.StagingDir); err != nil {
-				return fmt.Errorf("sync reconciled previous recovery point removal: %w", err)
+				return err
 			}
-		} else if !errors.Is(previousErr, os.ErrNotExist) {
-			return fmt.Errorf("inspect reconciled previous recovery point: %w", previousErr)
 		}
-	} else if _, statErr := os.Lstat(currentPath); statErr == nil {
-		return fmt.Errorf("current staging recovery point is invalid and was preserved")
-	} else if !errors.Is(statErr, os.ErrNotExist) {
-		return statErr
-	} else if c.store.Snapshot().Current != nil {
+		if err := os.Rename(previousPath, currentPath); err != nil {
+			return fmt.Errorf("recover previous recovery point: %w", err)
+		}
+		if err := syncCoordinatorDirectory(c.cfg.StagingDir); err != nil {
+			return fmt.Errorf("sync recovered recovery point: %w", err)
+		}
+		currentManifest = previousManifest
+		currentValid = true
+		recoveredPrevious = true
+		previousPresent = false
+	}
+	if !currentValid && (currentPresent || previousPresent) {
+		if currentPresent {
+			if err := os.RemoveAll(currentPath); err != nil {
+				return fmt.Errorf("remove invalid current recovery point: %w", err)
+			}
+		}
+		if previousPresent {
+			if err := os.RemoveAll(previousPath); err != nil {
+				return fmt.Errorf("remove invalid previous recovery point: %w", err)
+			}
+		}
+		if err := syncCoordinatorDirectory(c.cfg.StagingDir); err != nil {
+			return err
+		}
 		if err := c.store.Update(func(next *state.State) error {
 			next.Current = nil
 			next.Dirty = true
@@ -592,32 +659,190 @@ func (c *Coordinator) Reconcile(ctx context.Context) error {
 			now := state.FormatTime(time.Now())
 			next.FirstDirtyAt = now
 			next.LastDirtyAt = now
+			next.Source.State = "degraded"
+			next.Source.ErrorCode = "staging_recovery_invalid"
+			return nil
+		}); err != nil {
+			return err
+		}
+	} else if !currentValid && c.store.Snapshot().Current != nil {
+		if err := c.store.Update(func(next *state.State) error {
+			next.Current = nil
+			next.Dirty = true
+			next.DirtyGeneration++
+			now := state.FormatTime(time.Now())
+			next.FirstDirtyAt = now
+			next.LastDirtyAt = now
+			next.Source.State = "degraded"
+			next.Source.ErrorCode = "staging_recovery_missing"
 			return nil
 		}); err != nil {
 			return err
 		}
 	}
-	entries, err := os.ReadDir(c.cfg.StagingDir)
-	if err != nil {
-		return err
-	}
-	removedStale := false
-	for _, entry := range entries {
-		if strings.HasPrefix(entry.Name(), ".build-") || strings.HasPrefix(entry.Name(), ".delete-") {
-			path := filepath.Join(c.cfg.StagingDir, entry.Name())
-			if err := os.RemoveAll(path); err != nil {
-				c.log.Error("stale staging cleanup failed", "error_code", "staging_cleanup_failed")
-			} else {
-				removedStale = true
+	if currentValid {
+		if err := c.store.Update(func(next *state.State) error {
+			next.Current = &state.RecoveryPoint{ContentID: currentManifest.ContentID, Status: currentManifest.Status}
+			return nil
+		}); err != nil {
+			return err
+		}
+		if previousPresent && !recoveredPrevious {
+			if err := os.RemoveAll(previousPath); err != nil {
+				return fmt.Errorf("remove superseded previous recovery point: %w", err)
+			}
+			if err := syncCoordinatorDirectory(c.cfg.StagingDir); err != nil {
+				return err
 			}
 		}
 	}
-	if removedStale {
+	removed := false
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".build-") || strings.HasPrefix(entry.Name(), ".delete-") {
+			if err := os.RemoveAll(filepath.Join(c.cfg.StagingDir, entry.Name())); err != nil {
+				return fmt.Errorf("remove stale staging entry: %w", err)
+			}
+			removed = true
+		}
+	}
+	if removed {
 		if err := syncCoordinatorDirectory(c.cfg.StagingDir); err != nil {
 			return fmt.Errorf("sync stale staging cleanup: %w", err)
 		}
 	}
+	if err := c.reconcileUploadIntents(ctx); err != nil {
+		return err
+	}
+	if c.store.Rebuilt() && !initialCurrentValid {
+		if err := c.rebuildProtection(ctx); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+func (c *Coordinator) reconcileUploadIntents(ctx context.Context) error {
+	runner, ok := c.restic.(candidateRunner)
+	if !ok {
+		return nil
+	}
+	current := c.store.Snapshot()
+	for _, configured := range c.cfg.Targets {
+		targetState := current.Targets[configured.Name]
+		if targetState.UploadIntent == nil {
+			continue
+		}
+		targetCtx, cancel := c.targetContext(ctx)
+		report, err := runner.ListSnapshots(targetCtx, configured)
+		cancel()
+		if err != nil {
+			continue
+		}
+		var matches []restic.SnapshotInfo
+		for _, candidate := range report.Snapshots {
+			if candidate.ContentID == targetState.UploadIntent.ContentID && candidate.Status == targetState.UploadIntent.Status {
+				matches = append(matches, candidate)
+			}
+		}
+		if len(matches) == 0 {
+			continue
+		}
+		slices.SortFunc(matches, func(left, right restic.SnapshotInfo) int {
+			if left.Time == right.Time {
+				return strings.Compare(left.ID, right.ID)
+			}
+			return strings.Compare(left.Time, right.Time)
+		})
+		selected := matches[len(matches)-1]
+		when := time.Now()
+		if err := c.store.Update(func(next *state.State) error {
+			target := next.Targets[configured.Name]
+			target.State = "healthy"
+			target.LastRecoveryPoint = &state.RecoveryPoint{ContentID: selected.ContentID, Status: selected.Status}
+			if selected.Status == snapshot.Complete {
+				target.LastCompleteRecoveryPoint = &state.RecoveryPoint{ContentID: selected.ContentID, Status: selected.Status}
+				next.LatestCompleteContentID = selected.ContentID
+			}
+			target.SnapshotID = selected.ID
+			target.LastSuccessAt = state.FormatTime(when)
+			target.UploadIntent = nil
+			target.NextRetryAt = ""
+			target.ConsecutiveFailures = 0
+			target.ErrorCode = ""
+			next.Targets[configured.Name] = target
+			return nil
+		}); err != nil {
+			return err
+		}
+		current = c.store.Snapshot()
+	}
+	return nil
+}
+
+func (c *Coordinator) rebuildProtection(ctx context.Context) error {
+	runner, ok := c.restic.(candidateRunner)
+	if !ok {
+		return nil
+	}
+	type targetProgress struct {
+		latestAny      *restic.SnapshotInfo
+		latestComplete *restic.SnapshotInfo
+	}
+	progress := make(map[string]targetProgress, len(c.cfg.Targets))
+	var globalLatest *restic.SnapshotInfo
+	for _, configured := range c.cfg.Targets {
+		targetCtx, cancel := c.targetContext(ctx)
+		report, err := runner.ListSnapshots(targetCtx, configured)
+		cancel()
+		if err != nil {
+			continue
+		}
+		var latest targetProgress
+		for index := range report.Snapshots {
+			candidate := &report.Snapshots[index]
+			if latest.latestAny == nil || newerSnapshot(*candidate, *latest.latestAny) {
+				latest.latestAny = candidate
+			}
+			if candidate.Status == snapshot.Complete && (latest.latestComplete == nil || newerSnapshot(*candidate, *latest.latestComplete)) {
+				latest.latestComplete = candidate
+			}
+		}
+		progress[configured.Name] = latest
+		if latest.latestComplete != nil && (globalLatest == nil || newerSnapshot(*latest.latestComplete, *globalLatest)) {
+			globalLatest = latest.latestComplete
+		}
+	}
+	return c.store.Update(func(next *state.State) error {
+		for _, configured := range c.cfg.Targets {
+			latest, exists := progress[configured.Name]
+			if !exists {
+				continue
+			}
+			target := next.Targets[configured.Name]
+			if latest.latestAny != nil {
+				target.LastRecoveryPoint = &state.RecoveryPoint{ContentID: latest.latestAny.ContentID, Status: latest.latestAny.Status}
+				target.SnapshotID = latest.latestAny.ID
+			}
+			if latest.latestComplete != nil {
+				candidate := latest.latestComplete
+				target.LastCompleteRecoveryPoint = &state.RecoveryPoint{ContentID: candidate.ContentID, Status: candidate.Status}
+			}
+			if latest.latestAny != nil || latest.latestComplete != nil {
+				next.Targets[configured.Name] = target
+			}
+		}
+		if globalLatest != nil {
+			next.LatestCompleteContentID = globalLatest.ContentID
+		}
+		return nil
+	})
+}
+
+func newerSnapshot(left, right restic.SnapshotInfo) bool {
+	if left.Time == right.Time {
+		return left.ID > right.ID
+	}
+	return left.Time > right.Time
 }
 
 func syncCoordinatorDirectory(path string) error {
@@ -625,11 +850,14 @@ func syncCoordinatorDirectory(path string) error {
 	if err != nil {
 		return err
 	}
-	defer directory.Close()
+	defer func() { _ = directory.Close() }()
 	return directory.Sync()
 }
 
 func (c *Coordinator) enqueueRecovery(manifest snapshot.Manifest, when time.Time) bool {
+	if c.notifiers == nil {
+		return true
+	}
 	current := c.store.Snapshot()
 	targets := make([]notify.TargetStatus, 0, len(c.cfg.Targets))
 	for _, cfgTarget := range c.cfg.Targets {
@@ -651,10 +879,62 @@ func (c *Coordinator) enqueueRecovery(manifest snapshot.Manifest, when time.Time
 }
 
 func (c *Coordinator) enqueueTargetState(eventType, name, code string, when time.Time) {
+	if c.notifiers == nil {
+		return
+	}
 	event := notify.NewTargetEvent(eventType+":"+name+":"+state.FormatTime(when), eventType, state.FormatTime(when), notify.TargetStatus{Name: name, State: map[string]string{"target_degraded": "degraded", "target_recovered": "healthy"}[eventType], ErrorCode: code})
 	if err := c.notifiers.EnqueueState("target:"+name, event); err != nil {
 		c.log.Error("target-state notification persistence failed", "error_code", "notification_state_failed")
 	}
+}
+
+func (c *Coordinator) markSourceFailure(err error, when time.Time) error {
+	code := safeCoordinatorCode(err)
+	current := c.store.Snapshot()
+	failures := current.Source.ConsecutiveFailures + 1
+	if failures > 1_000_000 {
+		failures = 1_000_000
+	}
+	retryAt := when.Add(sourceBackoff(failures))
+	wasDegraded := current.Source.State == "degraded"
+	if err := c.store.Update(func(next *state.State) error {
+		next.Source.State = "degraded"
+		next.Source.LastAttemptAt = state.FormatTime(when)
+		next.Source.ConsecutiveFailures = failures
+		next.Source.ErrorCode = code
+		next.Source.NextRetryAt = state.FormatTime(retryAt)
+		return nil
+	}); err != nil {
+		return err
+	}
+	if !wasDegraded && c.notifiers != nil {
+		event := notify.NewSourceEvent("source-degraded:"+state.FormatTime(when), "source_degraded", state.FormatTime(when), code)
+		if err := c.notifiers.EnqueueState("source", event); err != nil {
+			c.log.Error("source-state notification persistence failed", "error_code", "notification_state_failed")
+		}
+	}
+	return nil
+}
+
+func (c *Coordinator) markSourceHealthy(when time.Time) error {
+	previous := c.store.Snapshot().Source
+	if err := c.store.Update(func(next *state.State) error {
+		next.Source.State = "healthy"
+		next.Source.LastSuccessAt = state.FormatTime(when)
+		next.Source.ConsecutiveFailures = 0
+		next.Source.ErrorCode = ""
+		next.Source.NextRetryAt = ""
+		return nil
+	}); err != nil {
+		return err
+	}
+	if previous.State == "degraded" && c.notifiers != nil {
+		event := notify.NewSourceEvent("source-recovered:"+state.FormatTime(when), "source_recovered", state.FormatTime(when), "")
+		if err := c.notifiers.EnqueueState("source", event); err != nil {
+			c.log.Error("source-state notification persistence failed", "error_code", "notification_state_failed")
+		}
+	}
+	return nil
 }
 
 func (c *Coordinator) signal() {
@@ -664,27 +944,21 @@ func (c *Coordinator) signal() {
 	}
 }
 
-func backoff(failures int) time.Duration {
-	base := time.Minute
-	for i := 1; i < failures && base < 15*time.Minute; i++ {
-		base *= 2
-	}
-	if base > 15*time.Minute {
-		base = 15 * time.Minute
-	}
-	jitterRange := base / 5
-	if jitterRange <= 0 || base >= 15*time.Minute {
-		return base
-	}
-	random, err := cryptorand.Int(cryptorand.Reader, big.NewInt(int64(jitterRange)+1))
-	if err != nil {
-		return base
-	}
-	result := base + time.Duration(random.Int64())
-	if result > 15*time.Minute {
+func sourceBackoff(failures int) time.Duration {
+	switch {
+	case failures <= 1:
+		return time.Minute
+	case failures == 2:
+		return 2 * time.Minute
+	case failures == 3:
+		return 4 * time.Minute
+	case failures == 4:
+		return 8 * time.Minute
+	case failures <= 7:
 		return 15 * time.Minute
+	default:
+		return 6 * time.Hour
 	}
-	return result
 }
 
 func resticErrorCode(err error) string {
@@ -695,12 +969,22 @@ func resticErrorCode(err error) string {
 	return "backup_failed"
 }
 
+func targetContentID(target state.Target) string {
+	if target.LastRecoveryPoint == nil {
+		return ""
+	}
+	return target.LastRecoveryPoint.ContentID
+}
+
 func safeCoordinatorCode(err error) string {
 	var missing *snapshot.MissingFilesError
 	if errors.As(err, &missing) {
 		return "source_files_unavailable"
 	}
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "operation_timeout"
+	}
+	if errors.Is(err, context.Canceled) {
 		return "operation_cancelled"
 	}
 	return "snapshot_failed"

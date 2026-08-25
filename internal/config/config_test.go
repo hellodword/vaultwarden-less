@@ -52,8 +52,7 @@ func TestBackupRejectsUnknownFieldsMultipleDocumentsAndUnsafeRepositories(t *tes
 		"S3 user info":       minimalBackupYAML + "targets:\n  - name: s3\n    repository: s3:https://user:secret@example.test/bucket/repo\n",
 		"S3 query":           minimalBackupYAML + "targets:\n  - name: s3\n    repository: s3:https://example.test/bucket/repo?secret=value\n",
 		"S3 no bucket":       minimalBackupYAML + "targets:\n  - name: s3\n    repository: s3:https://example.test\n",
-		"B2 no prefix":       minimalBackupYAML + "targets:\n  - name: b2\n    repository: b2:bucket-name:\n",
-		"B2 unsafe path":     minimalBackupYAML + "targets:\n  - name: b2\n    repository: b2:bucket-name:../repository\n",
+		"S3 fragment":        minimalBackupYAML + "targets:\n  - name: s3\n    repository: s3:https://example.test/bucket/repo#fragment\n",
 	} {
 		document := document
 		t.Run(name, func(t *testing.T) {
@@ -84,23 +83,49 @@ func TestDurationRejectsNonStringAndNonPositiveValues(t *testing.T) {
 	}
 }
 
-func TestTargetsSupportOnlyS3AndNativeB2(t *testing.T) {
+func TestTargetsSupportOnlyS3AndSortNames(t *testing.T) {
 	t.Parallel()
 	document := minimalBackupYAML + `targets:
-  - name: archive-s3
-    repository: s3:https://objects.example.test/vaultwarden/restic
+  - name: cold
+    repository: s3:https://objects.example.test/cold/restic
     restic_options:
       s3.bucket-lookup: path
       s3.region: ap-singapore
-  - name: archive-b2
-    repository: b2:bucket-name:vaultwarden/restic
+  - name: primary
+    repository: s3:https://objects.example.test/primary/restic
 `
 	cfg, err := DecodeBackup([]byte(document))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Targets[0].Backend() != "s3" || cfg.Targets[1].Backend() != "b2" {
+	if cfg.Targets[0].Backend() != "s3" || cfg.Targets[1].Backend() != "s3" {
 		t.Fatalf("backends = %q/%q", cfg.Targets[0].Backend(), cfg.Targets[1].Backend())
+	}
+}
+
+func TestConfigSyntaxErrorsHaveStablePublicText(t *testing.T) {
+	t.Parallel()
+	for _, document := range []string{
+		"schema_version: [1\n",
+		"schema_version: 1\n---\nschema_version: 1\n",
+		"schema_version: 1\ntarget_timeout: 30m\nmaintenance_timeout: 12h\nnotifiers: [\n",
+	} {
+		_, err := DecodeBackup([]byte(document))
+		if err == nil || err.Error() != "decode backup config: invalid YAML" {
+			t.Fatalf("syntax error = %v", err)
+		}
+	}
+}
+
+func TestHTTPRepositoryIsAcceptedWithWarning(t *testing.T) {
+	t.Parallel()
+	cfg, err := DecodeBackup([]byte(minimalBackupYAML + "targets:\n  - name: primary\n    repository: s3:http://objects.example.test/bucket/repo\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	warnings := cfg.Targets[0].Warnings()
+	if len(warnings) != 1 || warnings[0] != "plaintext_s3_endpoint" {
+		t.Fatalf("warnings = %#v", warnings)
 	}
 }
 
@@ -108,7 +133,6 @@ func TestS3OptionsUseNarrowTypedValues(t *testing.T) {
 	t.Parallel()
 	for name, option := range map[string]string{
 		"bucket lookup": "s3.bucket-lookup: command injection",
-		"list v1":       "s3.list-objects-v1: sometimes",
 		"region":        "s3.region: region with spaces",
 		"unknown":       "s3.connections: '99'",
 	} {
@@ -155,8 +179,6 @@ func TestRoleCredentialsRequireOnlyConfiguredBackendKeys(t *testing.T) {
 	cfg, err := DecodeBackup([]byte(minimalBackupYAML + `targets:
   - name: primary
     repository: s3:https://objects.example.test/bucket/repository
-  - name: cold
-    repository: b2:cold-bucket:repository
 `))
 	if err != nil {
 		t.Fatal(err)
@@ -167,9 +189,6 @@ targets:
     AWS_ACCESS_KEY_ID: synthetic-access
     AWS_SECRET_ACCESS_KEY: synthetic-secret
     IGNORED_SESSION_TOKEN: ignored
-  cold:
-    B2_ACCOUNT_ID: synthetic-id
-    B2_ACCOUNT_KEY: synthetic-key
   removed-target:
     arbitrary: ignored
 unknown_root_field: ignored
@@ -182,7 +201,7 @@ unknown_root_field: ignored
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(environment) != 2 || environment["AWS_ACCESS_KEY_ID"] != "synthetic-access" {
+	if len(environment) != 2 || environment["AWS_ACCESS_KEY_ID"] != "synthetic-access" || environment["AWS_SECRET_ACCESS_KEY"] != "synthetic-secret" {
 		t.Fatalf("environment = %#v", environment)
 	}
 }

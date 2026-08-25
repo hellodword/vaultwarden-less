@@ -44,25 +44,25 @@ type barkSender struct {
 func newBarkSender(cfg config.Notifier) (Sender, error) {
 	deviceToken := cfg.DeviceToken
 	if len(deviceToken) != 64 {
-		return nil, fmt.Errorf("Bark device token is invalid")
+		return nil, fmt.Errorf("bark device token is invalid")
 	}
 	if _, err := hex.DecodeString(deviceToken); err != nil || strings.ToLower(deviceToken) != deviceToken {
-		return nil, fmt.Errorf("Bark device token is invalid")
+		return nil, fmt.Errorf("bark device token is invalid")
 	}
 	block, remainder := pem.Decode([]byte(cfg.AuthKey))
 	if block == nil || block.Type != "PRIVATE KEY" || len(block.Headers) != 0 {
-		return nil, fmt.Errorf("Bark APNs key is not PEM")
+		return nil, fmt.Errorf("bark APNs key is not PEM")
 	}
 	if strings.TrimSpace(string(remainder)) != "" {
-		return nil, fmt.Errorf("Bark APNs key contains trailing data")
+		return nil, fmt.Errorf("bark APNs key contains trailing data")
 	}
 	parsed, err := x509.ParsePKCS8PrivateKey(block.Bytes)
 	if err != nil {
-		return nil, fmt.Errorf("Bark APNs key is not PKCS#8")
+		return nil, fmt.Errorf("bark APNs key is not PKCS#8")
 	}
 	key, ok := parsed.(*ecdsa.PrivateKey)
 	if !ok || key.Curve != elliptic.P256() {
-		return nil, fmt.Errorf("Bark APNs key is not P-256")
+		return nil, fmt.Errorf("bark APNs key is not P-256")
 	}
 	sound := cfg.Sound
 	if sound == "" {
@@ -106,7 +106,7 @@ func (s *barkSender) Send(ctx context.Context, event Event) error {
 	if err != nil {
 		return err
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 	responseBody, err := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes+1))
 	if err != nil || len(responseBody) > maxResponseBytes {
 		return fmt.Errorf("APNs response exceeded safe bounds")

@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+
+	"github.com/hellodword/vaultwarden-less/internal/safefs"
 )
 
 const maxSecretBytes = 64 << 10
@@ -39,9 +41,9 @@ func ReadBytes(path string, limit int64) ([]byte, error) {
 		_ = syscall.Close(fd)
 		return nil, fmt.Errorf("open private file handle")
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	opened, err := f.Stat()
-	if err != nil || !opened.Mode().IsRegular() || !privateReadableMode(opened) || !sameFileVersion(info, opened) {
+	if err != nil || !opened.Mode().IsRegular() || !privateReadableMode(opened) || !safefs.SameFileVersion(info, opened) {
 		return nil, fmt.Errorf("private file changed while opening")
 	}
 
@@ -57,7 +59,7 @@ func ReadBytes(path string, limit int64) ([]byte, error) {
 		return nil, fmt.Errorf("private file changed while reading")
 	}
 	latest, err := os.Lstat(path)
-	if err != nil || !latest.Mode().IsRegular() || !privateReadableMode(latest) || !sameFileVersion(opened, latest) {
+	if err != nil || !latest.Mode().IsRegular() || !privateReadableMode(latest) || !safefs.SameFileVersion(opened, latest) {
 		return nil, fmt.Errorf("private file changed while reading")
 	}
 	return data[:n], nil
@@ -84,13 +86,4 @@ func privateReadableMode(info os.FileInfo) bool {
 	permissions := info.Mode().Perm()
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	return ok && stat.Uid == uint32(os.Geteuid()) && permissions&0o400 != 0 && permissions&0o077 == 0
-}
-
-func sameFileVersion(left, right os.FileInfo) bool {
-	if left == nil || right == nil || !os.SameFile(left, right) || left.Size() != right.Size() || left.ModTime() != right.ModTime() {
-		return false
-	}
-	leftStat, leftOK := left.Sys().(*syscall.Stat_t)
-	rightStat, rightOK := right.Sys().(*syscall.Stat_t)
-	return leftOK && rightOK && leftStat.Ctim == rightStat.Ctim
 }

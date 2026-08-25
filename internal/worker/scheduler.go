@@ -38,6 +38,16 @@ func nextSnapshotAt(current state.State, cfg *config.Backup, now time.Time) time
 			next = dirtyAt
 		}
 	}
+	if current.Source.State == "degraded" {
+		if retryAt, err := state.ParseTime(current.Source.NextRetryAt); err == nil && !retryAt.IsZero() {
+			// While the source is degraded, the retry schedule is the next
+			// sampling opportunity. A later periodic fallback must not delay it.
+			if retryAt.Before(now) {
+				retryAt = now
+			}
+			next = retryAt
+		}
+	}
 	return next
 }
 
@@ -47,7 +57,7 @@ func nextTargetRetryAt(current state.State, now time.Time) time.Time {
 	}
 	var next time.Time
 	for _, target := range current.Targets {
-		if target.ContentID == current.Current.ContentID {
+		if targetContentID(target) == current.Current.ContentID {
 			continue
 		}
 		retryAt, _ := state.ParseTime(target.NextRetryAt)

@@ -1,136 +1,60 @@
-# Architecture and threat model
+# Architecture
 
-## Process and network boundaries
+## Data flow
 
 ```text
-local Nginx/Caddy
-       |
-       v
-proxy --app network--> vaultwarden --rw--> /data
-  |
-  +--events network--> backup --ro-------> /data
-                           |--rw----------> state/staging/cache
-                           +--outbound----> S3 or native B2 + notifiers
+Vaultwarden /data
+      │ SQLite online backup + stable attachment copy
+      ▼
+verified immutable local recovery point
+      │ per-target Restic upload with independent timeout
+      ▼
+S3 repositories
 ```
 
-Only proxy port 8080 is published, on host loopback by default. `app` and
-`events` are internal Docker networks. The proxy has no config or filesystem
-mount and never receives Restic, backend, APNs, or WeChat material.
+The proxy accepts Vaultwarden mutation requests and sends a strict v1 event to
+the resident worker. A successful 2xx/3xx mutation marks the local state dirty;
+client errors and transport failures do not. The worker debounces events,
+creates at most one immutable local point at a time, and attempts all due
+targets independently.
 
-Backup receives the private main config, common Restic password, and only the
-backup backend role. Maintenance and restore also mount the private main
-config and common password, receive the maintenance backend role, and never
-mount `/data`; restore alone writes below host `./restore`. Because notifier
-material lives in `backup.yaml`, those operator-invoked one-shot services can
-read it even though only the resident backup process consumes it. All images
-and Compose services are currently `linux/amd64` only.
+## Local transaction boundaries
 
-Every bind disables Docker's automatic host-path creation. Application code
-validates existing roots when used but does not implement a deployment-tree
-preflight, create host roots, or repair modes. This removes a duplicated model
-of host layout: orchestration creates the explicit bind sources, while each
-runtime boundary validates only what it consumes.
+SQLite is copied through the SQLite backup API. The copied database is checked
+with `integrity_check`, `foreign_key_check`, the required attachment columns,
+and the actual highest Diesel migration. Attachments and the two exact RSA key
+names are copied only after stable-file checks. A manifest is hashed, written,
+strictly verified once, and the complete tree is synced before promotion.
 
-## Proxy behavior
+Promotion uses `current`, `.previous`, `.build-*`, and `.delete-*` entries. A
+verified build is renamed into `current` only after the old point is retained.
+State and notification files use same-directory temporary files, file fsync,
+rename, and parent-directory fsync. A rename followed by an uncertain parent
+fsync is reported as published-but-unconfirmed and is never rolled back.
 
-The static Go proxy has fixed upstream/event URLs and timeouts. Because the
-host publication is loopback-only and its Compose networks are internal, it
-accepts front-proxy overrides only from loopback or private peers. It validates
-Host, a single IP-valued `X-Real-IP`, and an exact `http`/`https`
-`X-Forwarded-Proto`; other peers' values are ignored. It deletes and rebuilds
-`Forwarded`, `X-Real-IP`, and all `X-Forwarded-*` headers before upstream use.
+Runtime state and notification queues are operational metadata. A safe regular
+file with invalid JSON is rebuilt and an explicit event is logged. Symlinks,
+special files, oversized files, and insecure permissions are hard failures.
+The manifest, local recovery tree, and Restic repository are durable data and
+are never silently migrated.
 
-Any method except `GET`, `HEAD`, `OPTIONS`, or `TRACE` whose upstream response
-is 2xx/3xx emits an idempotent dirty event. This automatically includes PATCH
-and future mutation routes. A capacity-one signal and one sender goroutine
-coalesce events. Worker failure logs a safe code and never delays the client;
-periodic sampling covers a lost event.
+## Network isolation
 
-Limits are 600 MiB per request, 10 seconds to read headers, 30 minutes to read
-or write a request, 2 minutes idle, 5 minutes for upstream response headers,
-2 seconds for event delivery, and 2 minutes for graceful shutdown.
+- `app` is an internal network for Vaultwarden and proxy.
+- `events` is an internal network for proxy and the resident backup worker.
+- `proxy-ingress` is the proxy's published bridge network; IP masquerading is
+  disabled so publication does not turn the proxy into an outbound gateway.
+- `backup-outbound` is available only to the resident backup worker.
+- `maintenance-outbound` is available only to maintenance and restore jobs.
 
-## Worker scheduling and failure isolation
+Maintenance and restore are not members of `events`; they cannot resolve or
+connect to the worker event address. The proxy reconstructs trusted forwarding
+headers from the peer address and limits request bodies to 600 MiB.
 
-The worker takes a non-blocking state-directory lock. Versioned `0600` JSON is
-written using a synced temporary file and atomic rename. With at least one
-target, startup reconciles pending state and samples immediately.
+## Failure model
 
-- changes debounce for 30 seconds;
-- continuous changes wait at most 2 minutes once the minimum interval permits;
-- completed recovery points are at least 5 minutes apart;
-- sampling occurs at least every 15 minutes even without an event;
-- events during backup coalesce into one further generation.
-
-Fifteen minutes bounds local detection and the start of recovery-point work,
-not completion against a failed or slow remote.
-
-Targets have independent caches, backend environments, progress, and retry
-deadlines. They run concurrently. A failure persists exponential backoff from
-1 through 15 minutes with jitter while healthy targets continue. Lagging
-targets catch up only to the newest locally verified point. The old staged
-point is not displaced before the replacement verifies. When a newer local
-sample is due, a retryable slow upload is canceled and later catches up to the
-new latest point.
-
-Zero targets is valid: event/status services remain available but no local
-snapshot or upload is attempted. This is suitable for application-only fresh
-instance validation, not backup protection.
-
-On shutdown, HTTP stops, Restic receives cancellation, and pending content and
-retry state remain persisted. Repository failure appears in status and
-notifications rather than forcing container restart.
-
-## Data consistency boundary
-
-The worker treats `/data/db.sqlite3` as live data and uses SQLite's Online
-Backup API. It never copies the live main file or its WAL/SHM. The independent
-database is moved to DELETE journal mode, then checked with
-`integrity_check`, `foreign_key_check`, and the supported Vaultwarden schema.
-
-Only the fixed snapshot database determines attachment and file Send paths.
-Copies require safe identifiers and containment, regular non-symlink files,
-expected sizes, stable pre/post identity and metadata, and SHA-256. Concurrent
-absence/change triggers a full retry or an explicitly incomplete point.
-Unknown directories, icons, temporary uploads, built-in backups, deployment
-environment, and live SQLite sidecars are excluded.
-
-## Credentials and notifications
-
-The common Restic encryption password is read from a fixed private file. Each
-role has a separate YAML map containing only backend credentials. Backup and
-maintenance can therefore use different cloud identities even though they
-open the same encrypted repository. Each Restic child starts from a scrubbed
-environment and receives only the repository locator, password-file path,
-required backend keys, and allowlisted structured S3 options.
-
-The resident worker invokes only `restic backup`; it never auto-runs init,
-unlock, check, forget, prune, self-update, or repository migration.
-
-Each notifier owns a persistent bounded queue and delivery goroutine. Success
-entries are limited to 100 per notifier with overflow counting; incomplete,
-target-failed, and target-recovered states are replaceable priority entries.
-The first successful target for a content ID creates one summary. Later target
-failure/catch-up produces state transitions. Notification validation,
-persistence, or delivery failure never changes Restic success or blocks future
-sampling.
-
-## Residual risk
-
-The split limits a public proxy compromise, but it does not make the host,
-Docker daemon, kernel, local root, Vaultwarden, backup worker, or maintenance
-identity mutually distrustful. Host/worker control exposes encrypted server
-data, deployment material, and availability-critical credentials.
-
-Vaultwarden E2EE protects vault plaintext only within its model. It does not
-protect configuration, Restic/APNs/WeChat credentials, metadata, availability,
-rollback, or a malicious client. `/data/config.json` is backed up as a data
-asset; `.env`, `.env.vaultwarden`, `backup.yaml`, Compose/front-proxy/TLS
-configuration, and all credentials require an independent protected offline
-inventory.
-
-Version tags without immutable digests permit registry-side artifact changes;
-this is an accepted project choice. Minimal images and security patching reduce
-surface but cannot promise zero vulnerabilities. Findings require component
-and reachability analysis; dependency, base-image, configuration, operator,
-availability, and supply-chain risks remain.
+`/healthz` reports only that the local HTTP process is serving. SQLite,
+notification, Restic, S3, and individual target failures are represented in
+status and notification events while `serve` remains alive. Source retries use
+the fixed 1/2/4/8/15 minute and then 6 hour schedule. Target retries use
+1/2/4/8 minute values with bounded cryptographic jitter and a 15 minute cap.

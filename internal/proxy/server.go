@@ -76,8 +76,6 @@ func newServer(upstream *url.URL, marker DirtyMarker, log *slog.Logger) *Server 
 	return s
 }
 
-func (s *Server) HTTPServer() *http.Server { return s.http }
-
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == HealthPath {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
@@ -87,10 +85,6 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		w.Header().Set("Cache-Control", "no-store")
 		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-	if !validHost(r.Host) {
-		writeError(w, http.StatusBadRequest, "invalid_host", "Invalid Host header")
 		return
 	}
 	if _, _, err := s.forwardedValues(r); err != nil {
@@ -233,68 +227,6 @@ func isMutating(method string) bool {
 	default:
 		return true
 	}
-}
-
-func validHost(hostport string) bool {
-	if hostport == "" || len(hostport) > 255 || strings.ContainsAny(hostport, " \t\r\n/\\,") {
-		return false
-	}
-	host := hostport
-	bracketedIPv6 := false
-	if strings.HasPrefix(hostport, "[") {
-		closing := strings.IndexByte(hostport, ']')
-		if closing < 0 {
-			return false
-		}
-		bracketedIPv6 = true
-		if closing == len(hostport)-1 {
-			host = hostport[1:closing]
-		} else if hostport[closing+1] == ':' {
-			var port string
-			var err error
-			host, port, err = net.SplitHostPort(hostport)
-			if err != nil || !validPort(port) {
-				return false
-			}
-		} else {
-			return false
-		}
-	} else if strings.Contains(hostport, ":") {
-		if strings.Count(hostport, ":") != 1 {
-			return false
-		}
-		var port string
-		var err error
-		host, port, err = net.SplitHostPort(hostport)
-		if err != nil || !validPort(port) {
-			return false
-		}
-	}
-	if addr, err := netip.ParseAddr(host); err == nil {
-		if addr.Zone() != "" {
-			return false
-		}
-		return addr.IsValid() && (bracketedIPv6 && addr.Is6() || !bracketedIPv6 && addr.Is4())
-	}
-	if len(host) > 253 || strings.HasPrefix(host, ".") || strings.HasSuffix(host, ".") {
-		return false
-	}
-	for _, label := range strings.Split(host, ".") {
-		if label == "" || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
-			return false
-		}
-		for _, char := range label {
-			if char != '-' && (char < '0' || char > '9') && (char < 'A' || char > 'Z') && (char < 'a' || char > 'z') {
-				return false
-			}
-		}
-	}
-	return true
-}
-
-func validPort(port string) bool {
-	n, err := strconv.Atoi(port)
-	return err == nil && n >= 1 && n <= 65535
 }
 
 func writeError(w http.ResponseWriter, status int, code, message string) {

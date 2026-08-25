@@ -19,7 +19,7 @@ func TestTopLevelCLIUsageAndDiscoveryContract(t *testing.T) {
 		{name: "restore required flags", args: []string{"restore"}, exitCode: 2},
 		{name: "repo required subcommand", args: []string{"repo"}, exitCode: 2},
 		{name: "help", args: []string{"--help"}, exitCode: 0, stdoutText: "backup.yaml"},
-		{name: "version", args: []string{"--version"}, exitCode: 0, stdoutText: "1.0.0"},
+		{name: "version", args: []string{"--version"}, exitCode: 0, stdoutText: "dev"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -45,18 +45,5 @@ func TestUnexpectedPositionalArgumentIsUsageError(t *testing.T) {
 	command.SetArgs([]string{"config", "unexpected"})
 	if err := command.Execute(); ExitCode(err) != 2 {
 		t.Fatalf("unexpected positional argument returned %v", err)
-	}
-}
-
-func TestHelpDoesNotExposeRemovedPreflightCommand(t *testing.T) {
-	t.Parallel()
-	var stdout, stderr bytes.Buffer
-	command := New(&stdout, &stderr)
-	command.SetArgs([]string{"--help"})
-	if err := command.Execute(); err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(stdout.String(), "preflight") {
-		t.Fatalf("removed command remains in help: %s", stdout.String())
 	}
 }

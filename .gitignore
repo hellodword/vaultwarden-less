@@ -3,20 +3,14 @@
 /staging/
 /cache/
 /restore/
-/repositories/
-/secrets/
 /credentials/
 /config/backup.yaml
 /log/
 /dist/
-/git-backup/
-/restic-cache/
 /tmp/
 
 .env
 .env.vaultwarden
-restic*.json
-rclone*.conf
 
 AGENTS.md
 .agents/

@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"slices"
+	"sort"
 	"strings"
 
 	"github.com/hellodword/vaultwarden-less/internal/config"
@@ -24,18 +24,27 @@ type Request struct {
 }
 
 type Result struct {
-	SchemaVersion int               `json:"schema_version"`
-	Target        string            `json:"target"`
-	SnapshotID    string            `json:"snapshot_id"`
-	Output        string            `json:"output"`
-	Manifest      snapshot.Manifest `json:"manifest"`
+	SchemaVersion        int               `json:"schema_version"`
+	Target               string            `json:"target"`
+	SnapshotID           string            `json:"snapshot_id"`
+	Output               string            `json:"output"`
+	PublishState         string            `json:"publish_state"`
+	ReusedExistingOutput bool              `json:"reused_existing_output"`
+	Manifest             snapshot.Manifest `json:"manifest"`
 }
 
 func Run(ctx context.Context, cfg *config.Backup, runner restic.Runner, request Request) (_ Result, err error) {
 	if err := validateOutput(cfg.DataDir, request.Output); err != nil {
 		return Result{}, err
 	}
-	selected, status, err := selectSnapshot(ctx, runner, request.Target, request.SnapshotID, request.AllowIncomplete)
+	existing, err := outputExists(request.Output)
+	if err != nil {
+		return Result{}, err
+	}
+	if existing.exists && !existing.empty {
+		return reuseExisting(ctx, runner, request, existing.manifest)
+	}
+	selected, err := selectSnapshot(ctx, runner, request.Target, request.SnapshotID, request.AllowIncomplete)
 	if err != nil {
 		return Result{}, err
 	}
@@ -61,81 +70,109 @@ func Run(ctx context.Context, cfg *config.Backup, runner restic.Runner, request 
 	if err != nil {
 		return Result{}, fmt.Errorf("verify restored recovery point: %w", err)
 	}
-	if manifest.Status != status {
-		return Result{}, fmt.Errorf("snapshot tag and manifest status disagree")
-	}
-	contentHex, err := snapshot.ContentIDHex(manifest.ContentID)
-	if err != nil || !slices.Contains(selected.Tags, "content-id="+contentHex) {
-		return Result{}, fmt.Errorf("snapshot content tag and manifest disagree")
+	if err := matchCandidate(selected, manifest); err != nil {
+		return Result{}, err
 	}
 	if err := snapshot.SyncTree(temp); err != nil {
 		return Result{}, fmt.Errorf("sync verified restore tree: %w", err)
 	}
-	outputExisted, err := emptyOutputState(request.Output)
-	if err != nil {
-		return Result{}, err
-	}
-	if outputExisted {
+	if existing.empty {
 		if err := os.Remove(request.Output); err != nil {
 			return Result{}, fmt.Errorf("remove still-empty output directory: %w", err)
 		}
 	}
 	if err := os.Rename(temp, request.Output); err != nil {
-		if outputExisted {
-			_ = os.Mkdir(request.Output, 0o700)
-		}
 		return Result{}, fmt.Errorf("publish verified restore directory: %w", err)
 	}
 	keep = true
-	if err := syncDirectory(parent); err != nil {
-		return Result{}, fmt.Errorf("sync restore parent directory: %w", err)
+	result := Result{
+		SchemaVersion: version.SchemaVersion, Target: request.Target.Name, SnapshotID: selected.ID,
+		Output: request.Output, PublishState: string(safefs.Durable), ReusedExistingOutput: false, Manifest: manifest,
 	}
-	return Result{SchemaVersion: version.SchemaVersion, Target: request.Target.Name, SnapshotID: selected.ID, Output: request.Output, Manifest: manifest}, nil
+	if err := syncDirectory(parent); err != nil {
+		result.PublishState = string(safefs.PublishedUnconfirmed)
+		return result, fmt.Errorf("restore_published_unconfirmed: %w", err)
+	}
+	return result, nil
 }
 
-func selectSnapshot(ctx context.Context, runner restic.Runner, target config.Target, requested string, allowIncomplete bool) (restic.SnapshotInfo, snapshot.Status, error) {
-	filter := snapshot.Complete
-	if requested != "" {
-		filter = ""
+type outputState struct {
+	exists   bool
+	empty    bool
+	manifest snapshot.Manifest
+}
+
+func reuseExisting(ctx context.Context, runner restic.Runner, request Request, manifest snapshot.Manifest) (Result, error) {
+	if manifest.Status == snapshot.Incomplete && !request.AllowIncomplete {
+		return Result{}, fmt.Errorf("incomplete restore output requires --allow-incomplete")
 	}
-	snapshots, err := runner.Snapshots(ctx, target, filter)
+	report, err := runner.ListSnapshots(ctx, request.Target)
 	if err != nil {
-		return restic.SnapshotInfo{}, "", err
+		return Result{}, err
 	}
-	if len(snapshots) == 0 {
-		return restic.SnapshotInfo{}, "", fmt.Errorf("no matching v1 snapshot exists")
+	var candidates []restic.SnapshotInfo
+	for _, candidate := range report.Snapshots {
+		if candidate.ContentID == manifest.ContentID && candidate.Status == manifest.Status &&
+			(request.SnapshotID == "" || request.SnapshotID == candidate.ID) {
+			candidates = append(candidates, candidate)
+		}
 	}
-	selected := snapshots[len(snapshots)-1]
+	if len(candidates) == 0 {
+		return Result{}, fmt.Errorf("existing restore output does not match a valid recovery point")
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].Time == candidates[j].Time {
+			return candidates[i].ID < candidates[j].ID
+		}
+		return candidates[i].Time < candidates[j].Time
+	})
+	selected := candidates[len(candidates)-1]
+	if request.SnapshotID != "" && selected.ID != request.SnapshotID {
+		return Result{}, fmt.Errorf("existing restore output does not match requested snapshot")
+	}
+	if err := snapshot.SyncTree(request.Output); err != nil {
+		return Result{}, fmt.Errorf("sync existing restore tree: %w", err)
+	}
+	if err := syncDirectory(filepath.Dir(request.Output)); err != nil {
+		return Result{}, fmt.Errorf("sync restore parent directory: %w", err)
+	}
+	return Result{
+		SchemaVersion: version.SchemaVersion, Target: request.Target.Name, SnapshotID: selected.ID,
+		Output: request.Output, PublishState: string(safefs.Durable), ReusedExistingOutput: true, Manifest: manifest,
+	}, nil
+}
+
+func selectSnapshot(ctx context.Context, runner restic.Runner, target config.Target, requested string, allowIncomplete bool) (restic.SnapshotInfo, error) {
 	if requested != "" {
-		found := false
-		for _, candidate := range snapshots {
-			if candidate.ID == requested {
-				selected = candidate
-				found = true
-				break
-			}
+		selected, err := runner.FindSnapshot(ctx, target, requested)
+		if err != nil {
+			return restic.SnapshotInfo{}, err
 		}
-		if !found {
-			return restic.SnapshotInfo{}, "", fmt.Errorf("requested snapshot is not a v1 Vaultwarden recovery point")
+		if selected.Status == snapshot.Incomplete && !allowIncomplete {
+			return restic.SnapshotInfo{}, fmt.Errorf("incomplete snapshot requires --allow-incomplete")
+		}
+		return selected, nil
+	}
+	report, err := runner.ListSnapshots(ctx, target)
+	if err != nil {
+		return restic.SnapshotInfo{}, err
+	}
+	for index := len(report.Snapshots) - 1; index >= 0; index-- {
+		if report.Snapshots[index].Status == snapshot.Complete {
+			return report.Snapshots[index], nil
 		}
 	}
-	status := snapshot.Status("")
-	if slices.Contains(selected.Tags, string(snapshot.Complete)) {
-		status = snapshot.Complete
+	return restic.SnapshotInfo{}, fmt.Errorf("no matching valid complete snapshot exists")
+}
+
+func matchCandidate(candidate restic.SnapshotInfo, manifest snapshot.Manifest) error {
+	if candidate.Status != manifest.Status {
+		return fmt.Errorf("snapshot tag and manifest status disagree")
 	}
-	if slices.Contains(selected.Tags, string(snapshot.Incomplete)) {
-		if status != "" {
-			return restic.SnapshotInfo{}, "", fmt.Errorf("snapshot has conflicting integrity tags")
-		}
-		status = snapshot.Incomplete
+	if candidate.ContentID != manifest.ContentID {
+		return fmt.Errorf("snapshot content tag and manifest disagree")
 	}
-	if status == "" {
-		return restic.SnapshotInfo{}, "", fmt.Errorf("snapshot lacks a v1 integrity tag")
-	}
-	if status == snapshot.Incomplete && !allowIncomplete {
-		return restic.SnapshotInfo{}, "", fmt.Errorf("incomplete snapshot requires --allow-incomplete")
-	}
-	return selected, status, nil
+	return nil
 }
 
 func validateOutput(dataDir, output string) error {
@@ -149,32 +186,44 @@ func validateOutput(dataDir, output string) error {
 	if err := realDirectoryChain(parent); err != nil {
 		return fmt.Errorf("restore output parent: %w", err)
 	}
-	if err := safefs.ValidatePrivateDirectory(parent); err != nil {
-		return fmt.Errorf("restore output parent must be an existing private directory: %w", err)
+	if err := safefs.ValidatePrivateDirectory(parent); err != nil || privateDirectoryMode(parent) != 0o700 {
+		return fmt.Errorf("restore output parent must be an existing private 0700 directory")
 	}
-	_, err := emptyOutputState(output)
+	_, err := outputExists(output)
 	return err
 }
 
-func emptyOutputState(path string) (bool, error) {
+func outputExists(path string) (outputState, error) {
 	info, err := os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) {
-		return false, nil
+		return outputState{}, nil
 	}
 	if err != nil {
-		return false, err
+		return outputState{}, err
 	}
-	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return false, fmt.Errorf("restore output must be absent or an empty real directory")
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o700 {
+		return outputState{}, fmt.Errorf("restore output must be absent or a 0700 real directory")
 	}
 	entries, err := os.ReadDir(path)
 	if err != nil {
-		return false, err
+		return outputState{}, err
 	}
-	if len(entries) != 0 {
-		return false, fmt.Errorf("restore output directory is not empty")
+	if len(entries) == 0 {
+		return outputState{exists: true, empty: true}, nil
 	}
-	return true, nil
+	manifest, err := snapshot.Verify(context.Background(), path, true)
+	if err != nil {
+		return outputState{}, fmt.Errorf("validate existing restore output: %w", err)
+	}
+	return outputState{exists: true, manifest: manifest}, nil
+}
+
+func privateDirectoryMode(path string) os.FileMode {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return 0
+	}
+	return info.Mode().Perm()
 }
 
 func realDirectoryChain(path string) error {
@@ -212,6 +261,6 @@ func syncDirectory(path string) error {
 	if err != nil {
 		return err
 	}
-	defer dir.Close()
+	defer func() { _ = dir.Close() }()
 	return dir.Sync()
 }

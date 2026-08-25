@@ -1,22 +1,19 @@
-# Copy this file to config/backup.yaml, keep it private (0400 or 0600), and
-# uncomment only the integrations you use. An empty target list is supported.
+# Copy this file to config/backup.yaml and keep it private (0400 or 0600).
 schema_version: 1
 target_timeout: 30m
 maintenance_timeout: 12h
 targets: []
 notifiers: []
 
-# S3-compatible target (Amazon S3, MinIO, or COS):
+# Every target uses the Restic S3 API. Examples include AWS S3, Backblaze B2
+# S3, Tencent COS, Alibaba OSS, Scaleway Object Storage, and Cloudflare R2.
+# The endpoint may be HTTPS or HTTP; HTTP is accepted with a warning.
 # targets:
 #   - name: primary
 #     repository: s3:https://objects.example.test/bucket/vaultwarden
 #     restic_options:
 #       s3.bucket-lookup: path
 #       s3.region: ap-singapore
-#
-# Native Backblaze B2 target:
-#   - name: cold-copy
-#     repository: b2:bucket-name:vaultwarden
 #
 # Enterprise WeChat notifier. The real URL is a secret, so backup.yaml must
 # remain private.

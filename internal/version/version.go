@@ -1,7 +1,8 @@
 package version
 
+var Product = "dev"
+
 const (
-	Product           = "1.0.0"
 	SchemaVersion     = 1
 	ManifestVersion   = 1
 	StateVersion      = 1
