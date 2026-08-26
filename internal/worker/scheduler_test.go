@@ -275,6 +275,40 @@ func TestWorkerTargetsAreSerialAndPartialResultRetries(t *testing.T) {
 	}
 }
 
+func TestWorkerNotifiesWhenASecondTargetCatchesUpToKnownContent(t *testing.T) {
+	t.Parallel()
+	manifest := workerManifest(t)
+	repository := &orderedRepository{
+		results: map[string]restic.SyncResult{
+			"primary":   syncResult('a', manifest.ContentID, true),
+			"secondary": syncResult('b', manifest.ContentID, false),
+		},
+		errors: map[string]error{
+			"secondary": &restic.OperationError{Code: "command_failed", ExitCode: 1},
+		},
+	}
+	collector := &eventCollector{}
+	worker := New(workerConfig("primary", "secondary"), &fixedSource{manifest: manifest}, repository, collector, discardLogger())
+	first := worker.check(context.Background(), time.Now().UTC())
+	if first.result != "partial" {
+		t.Fatalf("first outcome = %#v", first)
+	}
+	repository.results["primary"] = syncResult('a', manifest.ContentID, false)
+	repository.results["secondary"] = syncResult('b', manifest.ContentID, true)
+	delete(repository.errors, "secondary")
+	second := worker.check(context.Background(), time.Now().UTC())
+	if second.result != "created" {
+		t.Fatalf("catch-up outcome = %#v", second)
+	}
+	events := collector.snapshot()
+	if len(events) != 2 || events[0].ContentID != manifest.ContentID || events[1].ContentID != manifest.ContentID {
+		t.Fatalf("catch-up recovery events = %#v", events)
+	}
+	if len(events[1].Targets) != 2 || events[1].Targets[0].State != "synced" || events[1].Targets[1].State != "created" {
+		t.Fatalf("catch-up event target states = %#v", events[1].Targets)
+	}
+}
+
 func TestWorkerDegradedTransitionsOccurOnceAndRecoverOnce(t *testing.T) {
 	t.Parallel()
 	base := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
@@ -313,12 +347,15 @@ func TestWorkerHTTPContract(t *testing.T) {
 	handler := Handler(worker)
 
 	assertHTTP(t, handler, http.MethodGet, HealthPath, "", "", http.StatusNoContent, "")
-	assertHTTP(t, handler, http.MethodPost, EventsPath, "application/json", `{"schema_version":1}`, http.StatusNoContent, "")
-	assertHTTP(t, handler, http.MethodPost, CheckPath, "application/json", `{"schema_version":1}`, http.StatusAccepted, "{\"schema_version\":1,\"accepted\":true}\n")
-	assertHTTP(t, handler, http.MethodPost, EventsPath, "application/json", `{"schema_version":1,"extra":true}`, http.StatusBadRequest, "")
-	assertHTTP(t, handler, http.MethodPost, EventsPath, "", `{"schema_version":1}`, http.StatusUnsupportedMediaType, "")
-	assertHTTP(t, handler, http.MethodPost, EventsPath, "application/json; charset=utf-8", `{"schema_version":1}`, http.StatusUnsupportedMediaType, "")
+	assertHTTP(t, handler, http.MethodPost, EventsPath, "application/json", `{"schema_version":2}`, http.StatusNoContent, "")
+	assertHTTP(t, handler, http.MethodPost, CheckPath, "application/json", `{"schema_version":2}`, http.StatusAccepted, "{\"schema_version\":2,\"accepted\":true}\n")
+	assertHTTP(t, handler, http.MethodPost, EventsPath, "application/json", `{"schema_version":2,"extra":true}`, http.StatusBadRequest, "")
+	assertHTTP(t, handler, http.MethodPost, EventsPath, "", `{"schema_version":2}`, http.StatusUnsupportedMediaType, "")
+	assertHTTP(t, handler, http.MethodPost, EventsPath, "application/json; charset=utf-8", `{"schema_version":2}`, http.StatusUnsupportedMediaType, "")
 	assertHTTP(t, handler, http.MethodPost, EventsPath, "application/json", strings.Repeat(" ", config.EventMaxBytes+1), http.StatusRequestEntityTooLarge, "")
+	assertHTTP(t, handler, http.MethodPost, EventsPath, "application/json", `{"schema_version":2}`+strings.Repeat(" ", config.EventMaxBytes), http.StatusRequestEntityTooLarge, "")
+	assertHTTP(t, handler, http.MethodGet, HealthPath, "", "unexpected", http.StatusBadRequest, "")
+	assertHTTP(t, handler, http.MethodGet, StatusPath, "", "unexpected", http.StatusBadRequest, "")
 	assertHTTP(t, handler, http.MethodGet, EventsPath, "", "", http.StatusMethodNotAllowed, "")
 	assertHTTP(t, handler, http.MethodGet, StatusPath+"?extra=1", "", "", http.StatusBadRequest, "")
 	assertHTTP(t, handler, http.MethodGet, "/missing", "", "", http.StatusNotFound, "")
@@ -354,7 +391,7 @@ func workerConfig(names ...string) *config.Backup {
 	for _, name := range names {
 		targets = append(targets, config.Target{Name: name})
 	}
-	return &config.Backup{SchemaVersion: 1, Targets: targets}
+	return &config.Backup{SchemaVersion: config.SchemaVersion, Targets: targets}
 }
 
 func syncResult(character byte, contentID string, created bool) restic.SyncResult {

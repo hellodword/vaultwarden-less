@@ -13,11 +13,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hellodword/vaultwarden-less/internal/buildinfo"
 	"github.com/hellodword/vaultwarden-less/internal/config"
 	"github.com/hellodword/vaultwarden-less/internal/restic"
 	restoretool "github.com/hellodword/vaultwarden-less/internal/restore"
 	"github.com/hellodword/vaultwarden-less/internal/snapshot"
-	"github.com/hellodword/vaultwarden-less/internal/version"
 	"github.com/hellodword/vaultwarden-less/internal/worker"
 )
 
@@ -39,8 +39,8 @@ func (repository *fakeRepository) VerifyVersion(context.Context) error {
 func (repository *fakeRepository) Ensure(context.Context, config.Target, snapshot.Manifest) (restic.SyncResult, error) {
 	return restic.SyncResult{}, repository.record("ensure")
 }
-func (repository *fakeRepository) Snapshots(context.Context, config.Target) ([]restic.Snapshot, error) {
-	return repository.snapshots, repository.record("snapshots")
+func (repository *fakeRepository) Snapshots(context.Context, config.Target, int) ([]restic.Snapshot, bool, error) {
+	return repository.snapshots, false, repository.record("snapshots")
 }
 func (repository *fakeRepository) Init(context.Context, config.Target) error {
 	return repository.record("init")
@@ -74,7 +74,7 @@ func TestCLIHelpVersionAndRemovedCommands(t *testing.T) {
 		}
 	}
 	stdout, stderr, code = executeCommand(environment, "--version")
-	if code != 0 || stderr != "" || stdout != "vaultwarden-less-backup "+version.Product+"\n" {
+	if code != 0 || stderr != "" || stdout != "vaultwarden-less-backup "+buildinfo.Version+"\n" {
 		t.Fatalf("version = %d/%q/%q", code, stdout, stderr)
 	}
 }
@@ -122,16 +122,16 @@ func TestWorkerClientCommandsHaveStrictJSONAndNoSecondDocument(t *testing.T) {
 		switch request.URL.Path {
 		case worker.CheckPath:
 			body, _ := io.ReadAll(request.Body)
-			if request.Method != http.MethodPost || request.Header.Get("Content-Type") != "application/json" || string(body) != "{\"schema_version\":1}\n" {
+			if request.Method != http.MethodPost || request.Header.Get("Content-Type") != "application/json" || string(body) != "{\"schema_version\":2}\n" {
 				writer.WriteHeader(http.StatusBadRequest)
 				return
 			}
 			writer.Header().Set("Content-Type", "application/json")
 			writer.WriteHeader(http.StatusAccepted)
-			_, _ = writer.Write([]byte("{\"schema_version\":1,\"accepted\":true}\n"))
+			_, _ = writer.Write([]byte("{\"schema_version\":2,\"accepted\":true}\n"))
 		case worker.StatusPath:
 			writer.Header().Set("Content-Type", "application/json")
-			_, _ = writer.Write([]byte("{\"schema_version\":1,\"state\":\"idle\",\"started_at\":\"2026-08-25T12:00:00Z\",\"next_check_at\":null,\"last_check\":null,\"targets\":[]}"))
+			_, _ = writer.Write([]byte("{\"schema_version\":2,\"state\":\"idle\",\"started_at\":\"2026-08-25T12:00:00Z\",\"next_check_at\":null,\"last_check\":null,\"targets\":[]}"))
 		case worker.HealthPath:
 			writer.WriteHeader(http.StatusNoContent)
 		default:
@@ -184,7 +184,7 @@ func TestRestoreCommandOutputsExactResultShape(t *testing.T) {
 	snapshotID := strings.Repeat("a", 64)
 	restore := func(_ context.Context, _ restoretool.Repository, request restoretool.Request) (restoretool.Result, error) {
 		return restoretool.Result{
-			SchemaVersion: version.SchemaVersion, Target: request.Target.Name, SnapshotID: snapshotID,
+			SchemaVersion: restoretool.ResultSchemaVersion, Target: request.Target.Name, SnapshotID: snapshotID,
 			ContentID: contentID, Output: request.Output,
 		}, nil
 	}
@@ -204,10 +204,13 @@ func testEnvironment(repositoryClient repository, server *httptest.Server, resto
 	}
 	environment := commandEnvironment{
 		loadBackup: func(string) (*config.Backup, error) {
-			return &config.Backup{SchemaVersion: 1, Targets: []config.Target{{Name: "primary", Repository: "s3:https://objects.example.test/bucket"}}, Notifiers: []config.Notifier{}}, nil
+			return &config.Backup{SchemaVersion: config.SchemaVersion, Targets: []config.Target{{Name: "primary", Repository: "s3:https://objects.example.test/bucket"}}, Notifiers: []config.Notifier{}}, nil
 		},
 		loadCredentials: func(string, *config.Backup) (*config.RoleCredentials, error) {
-			return &config.RoleCredentials{SchemaVersion: 1, Targets: map[string]config.S3Credentials{"primary": {AccessKeyID: "test", SecretAccessKey: "test"}}}, nil
+			return &config.RoleCredentials{SchemaVersion: config.SchemaVersion, Targets: map[string]config.S3Credentials{"primary": {AccessKeyID: "test", SecretAccessKey: "test"}}}, nil
+		},
+		loadNotifiers: func(string, *config.Backup) ([]config.Notifier, error) {
+			return []config.Notifier{}, nil
 		},
 		readSecret:     func(string) (string, error) { return "test-password", nil },
 		validateNotify: func([]config.Notifier) error { return nil },
@@ -216,7 +219,8 @@ func testEnvironment(repositoryClient repository, server *httptest.Server, resto
 			return restoretool.Result{}, errors.New("restore should not be called")
 		},
 		httpClient: &http.Client{Timeout: time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }},
-		workerURL:  "http://127.0.0.1:1", credentialsPath: "/credentials/role.yaml", passwordPath: "/credentials/password",
+		workerURL:  "http://127.0.0.1:1", credentialsPath: "/credentials/role.yaml",
+		notifierPath: "/credentials/notifiers.yaml", passwordRoot: "/credentials/restic",
 		resticBinary: "restic", dataDir: "/data", stagingDir: "/staging", cacheDir: "/cache", restoreRoot: "/restore",
 	}
 	if server != nil {
@@ -232,8 +236,7 @@ func testEnvironment(repositoryClient repository, server *httptest.Server, resto
 func executeCommand(environment commandEnvironment, arguments ...string) (string, string, int) {
 	var stdout, stderr bytes.Buffer
 	command := newCommand(&stdout, &stderr, environment)
-	command.SetArgs(arguments)
-	err := command.Execute()
+	err := Execute(command, arguments)
 	if err != nil {
 		_, _ = fmt.Fprintln(&stderr, err)
 	}

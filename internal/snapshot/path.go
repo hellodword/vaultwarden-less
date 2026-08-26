@@ -6,7 +6,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/hellodword/vaultwarden-less/internal/safefs"
+	"github.com/hellodword/vaultwarden-less/internal/privatefs"
 )
 
 var (
@@ -53,5 +53,5 @@ func secureJoin(base, relative string) (string, error) {
 }
 
 func mkdirAllSecure(path string) error {
-	return safefs.EnsurePrivateDirectory(path)
+	return privatefs.EnsurePrivateDirectory(path)
 }

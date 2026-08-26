@@ -14,8 +14,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/hellodword/vaultwarden-less/internal/buildinfo"
 	proxyserver "github.com/hellodword/vaultwarden-less/internal/proxy"
-	"github.com/hellodword/vaultwarden-less/internal/version"
 )
 
 func main() {
@@ -26,7 +26,7 @@ func main() {
 
 func execute(ctx context.Context, arguments []string, stdout, stderr io.Writer) int {
 	if len(arguments) == 1 && arguments[0] == "--version" {
-		_, _ = fmt.Fprintf(stdout, "vaultwarden-less-proxy %s\n", version.Product)
+		_, _ = fmt.Fprintf(stdout, "vaultwarden-less-proxy %s\n", buildinfo.Version)
 		return 0
 	}
 	if len(arguments) == 1 && (arguments[0] == "--help" || arguments[0] == "-h") {

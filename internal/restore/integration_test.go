@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/hellodword/vaultwarden-less/internal/version"
+	"github.com/hellodword/vaultwarden-less/internal/upstream"
 	_ "github.com/mattn/go-sqlite3"
 )
 
@@ -21,14 +21,13 @@ func createSyntheticVaultwarden(t *testing.T, dataDir string) *sql.DB {
 	if err != nil {
 		t.Fatal(err)
 	}
-	statements := []string{
-		`PRAGMA journal_mode = WAL`,
-		`PRAGMA foreign_keys = ON`,
-		`CREATE TABLE attachments (id TEXT PRIMARY KEY, cipher_uuid TEXT NOT NULL, file_size INTEGER NOT NULL)`,
-		`CREATE TABLE ciphers (uuid TEXT PRIMARY KEY)`,
-		`CREATE TABLE users (uuid TEXT PRIMARY KEY)`,
-		`CREATE TABLE sends (uuid TEXT PRIMARY KEY, atype INTEGER NOT NULL, data TEXT NOT NULL)`,
-		`CREATE TABLE __diesel_schema_migrations (version TEXT PRIMARY KEY)`,
+	contract, err := upstream.VaultwardenSchemaContract()
+	if err != nil {
+		t.Fatal(err)
+	}
+	statements := []string{`PRAGMA journal_mode = WAL`, `PRAGMA foreign_keys = ON`}
+	for _, object := range contract.Objects {
+		statements = append(statements, object.SQL)
 	}
 	for _, statement := range statements {
 		if _, err := database.Exec(statement); err != nil {
@@ -36,7 +35,7 @@ func createSyntheticVaultwarden(t *testing.T, dataDir string) *sql.DB {
 			t.Fatal(err)
 		}
 	}
-	if _, err := database.Exec(`INSERT INTO __diesel_schema_migrations(version) VALUES (?)`, version.VaultwardenSchema); err != nil {
+	if _, err := database.Exec(`INSERT INTO __diesel_schema_migrations(version) VALUES (?)`, upstream.VaultwardenMigration); err != nil {
 		_ = database.Close()
 		t.Fatal(err)
 	}
@@ -47,13 +46,16 @@ func createSyntheticVaultwarden(t *testing.T, dataDir string) *sql.DB {
 	sendID := "33333333-3333-3333-3333-333333333333"
 	sendFileID := strings.Repeat("b", 64)
 	sendData := []byte("synthetic file Send")
-	if _, err := database.Exec(`INSERT INTO ciphers(uuid) VALUES (?)`, cipherID); err != nil {
+	if _, err := database.Exec(`INSERT INTO ciphers(uuid, created_at, updated_at, atype, name, data) VALUES (?, '2026-05-05', '2026-05-05', 2, 'cipher', '{}')`, cipherID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := database.Exec(`INSERT INTO attachments(id, cipher_uuid, file_size) VALUES (?, ?, ?)`, attachmentID, cipherID, len(attachment)); err != nil {
+	if _, err := database.Exec(`INSERT INTO attachments(id, cipher_uuid, file_name, file_size) VALUES (?, ?, 'encrypted', ?)`, attachmentID, cipherID, len(attachment)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := database.Exec(`INSERT INTO sends(uuid, atype, data) VALUES (?, 1, ?)`, sendID, fmt.Sprintf(`{"id":%q,"size":%d}`, sendFileID, len(sendData))); err != nil {
+	if _, err := database.Exec(`INSERT INTO sends(
+		uuid, name, atype, data, akey, access_count, creation_date,
+		revision_date, deletion_date, disabled
+	) VALUES (?, 'file send', 1, ?, 'key', 0, '2026-05-05', '2026-05-05', '2026-06-05', 0)`, sendID, fmt.Sprintf(`{"id":%q,"size":%d}`, sendFileID, len(sendData))); err != nil {
 		t.Fatal(err)
 	}
 	writeDataFile(t, filepath.Join(dataDir, "attachments", cipherID, attachmentID), attachment)

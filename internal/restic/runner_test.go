@@ -1,9 +1,11 @@
 package restic
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
@@ -12,7 +14,6 @@ import (
 
 	"github.com/hellodword/vaultwarden-less/internal/config"
 	"github.com/hellodword/vaultwarden-less/internal/snapshot"
-	"github.com/hellodword/vaultwarden-less/internal/version"
 )
 
 var (
@@ -39,7 +40,7 @@ func testRunner(t *testing.T, execute executeFunc) (Runner, config.Target, *[]re
 	if err := os.Mkdir(credentialsDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	password := filepath.Join(credentialsDir, "restic-password")
+	password := filepath.Join(credentialsDir, "primary")
 	if err := os.WriteFile(password, []byte("synthetic-restic-password\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -52,7 +53,7 @@ func testRunner(t *testing.T, execute executeFunc) (Runner, config.Target, *[]re
 		},
 	}
 	credentials := &config.RoleCredentials{
-		SchemaVersion: 1,
+		SchemaVersion: config.SchemaVersion,
 		Targets: map[string]config.S3Credentials{
 			"primary": {AccessKeyID: "synthetic-access", SecretAccessKey: "synthetic-secret"},
 		},
@@ -61,7 +62,7 @@ func testRunner(t *testing.T, execute executeFunc) (Runner, config.Target, *[]re
 	runner := Runner{
 		Binary:       "/usr/local/bin/restic",
 		CacheDir:     cache,
-		PasswordFile: password,
+		PasswordRoot: credentialsDir,
 		Credentials:  credentials,
 	}
 	runner.execute = func(ctx context.Context, binary string, arguments, environment []string, directory string) ([]byte, error) {
@@ -96,9 +97,9 @@ func rawRecoverySnapshot(id, content, when string) rawSnapshot {
 	return rawSnapshot{
 		ID:       id,
 		Time:     when,
-		Hostname: version.SnapshotHost,
-		Tags:     []string{version.SnapshotTag, "content-id=" + strings.TrimPrefix(content, "sha256:")},
-		Paths:    []string{version.SnapshotPath},
+		Hostname: SnapshotHost,
+		Tags:     []string{SnapshotTag, "content-id=" + strings.TrimPrefix(content, "sha256:")},
+		Paths:    []string{SnapshotPath},
 	}
 }
 
@@ -143,7 +144,7 @@ func TestEnsureBacksUpDifferentContentOnceWithFixedIdentity(t *testing.T) {
 					t.Fatalf("forbidden backup argument: %s", forbidden)
 				}
 			}
-			for _, required := range []string{"--host", version.SnapshotHost, "--tag", version.SnapshotTag, "content-id=" + strings.TrimPrefix(manifest.ContentID, "sha256:"), "--", version.SnapshotPath} {
+			for _, required := range []string{"--host", SnapshotHost, "--tag", SnapshotTag, "content-id=" + strings.TrimPrefix(manifest.ContentID, "sha256:"), "--", SnapshotPath} {
 				if !slices.Contains(arguments, required) {
 					t.Fatalf("missing backup argument %q in %#v", required, arguments)
 				}
@@ -202,15 +203,45 @@ func TestSnapshotsUsesOneMetadataQueryAndReturnsNewestFirst(t *testing.T) {
 			rawRecoverySnapshot(secondSnapshotID, secondContentID, "2026-08-25T12:00:00Z"),
 		), nil
 	})
-	items, err := runner.Snapshots(context.Background(), target)
+	items, truncated, err := runner.Snapshots(context.Background(), target, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(*calls) != 1 || len(items) != 2 || items[0].ID != secondSnapshotID || items[1].ID != firstSnapshotID {
+	if truncated || len(*calls) != 1 || len(items) != 2 || items[0].ID != secondSnapshotID || items[1].ID != firstSnapshotID {
 		t.Fatalf("calls/items = %d/%#v", len(*calls), items)
 	}
 	if slices.Contains((*calls)[0].arguments, "dump") {
 		t.Fatal("snapshots invoked manifest dump")
+	}
+}
+
+func TestSnapshotsBoundNormalizesTimesAndReportsTruncation(t *testing.T) {
+	thirdSnapshotID := strings.Repeat("e", 64)
+	thirdContentID := "sha256:" + strings.Repeat("f", 64)
+	runner, target, calls := testRunner(t, func(_ context.Context, _ string, arguments, _ []string, _ string) ([]byte, error) {
+		if operation(arguments) != "snapshots" {
+			t.Fatalf("unexpected operation: %#v", arguments)
+		}
+		return encodedSnapshots(t,
+			rawRecoverySnapshot(firstSnapshotID, firstContentID, "2026-08-25T11:59:59Z"),
+			rawRecoverySnapshot(secondSnapshotID, secondContentID, "2026-08-25T13:00:00+01:00"),
+			rawRecoverySnapshot(thirdSnapshotID, thirdContentID, "2026-08-25T12:00:00.000000000Z"),
+		), nil
+	})
+	items, truncated, err := runner.Snapshots(context.Background(), target, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !truncated || len(items) != 2 || items[0].ID != thirdSnapshotID || items[1].ID != secondSnapshotID {
+		t.Fatalf("bounded snapshots = %#v, truncated=%t", items, truncated)
+	}
+	if items[0].Time != "2026-08-25T12:00:00Z" || items[1].Time != "2026-08-25T12:00:00Z" {
+		t.Fatalf("snapshot times were not normalized: %#v", items)
+	}
+	arguments := (*calls)[0].arguments
+	latest := slices.Index(arguments, "--latest")
+	if latest < 0 || latest+1 >= len(arguments) || arguments[latest+1] != "3" {
+		t.Fatalf("bounded query arguments = %#v", arguments)
 	}
 }
 
@@ -252,7 +283,7 @@ func TestPruneIsOneForgetCallWithFixedRetention(t *testing.T) {
 				if operation(arguments) != "forget" {
 					t.Fatalf("unexpected operation: %#v", arguments)
 				}
-				return []byte(`[{"host":"` + version.SnapshotHost + `","paths":["` + version.SnapshotPath + `"],"keep":[{"id":"` + firstSnapshotID + `"}],"remove":[{"id":"` + secondSnapshotID + `"}]}]`), nil
+				return []byte(`[{"host":"` + SnapshotHost + `","paths":["` + SnapshotPath + `"],"keep":[{"id":"` + firstSnapshotID + `"}],"remove":[{"id":"` + secondSnapshotID + `"}]}]`), nil
 			})
 			result, err := runner.Prune(context.Background(), target, apply)
 			if err != nil {
@@ -291,7 +322,7 @@ func TestRestoreUsesExactSnapshotSubfolderAndCallerContext(t *testing.T) {
 	if err := runner.Restore(ctx, target, firstSnapshotID, destination); err != nil {
 		t.Fatal(err)
 	}
-	if len(*calls) != 1 || !slices.Contains((*calls)[0].arguments, firstSnapshotID+":"+version.SnapshotPath) {
+	if len(*calls) != 1 || !slices.Contains((*calls)[0].arguments, firstSnapshotID+":"+SnapshotPath) {
 		t.Fatalf("restore arguments = %#v", (*calls)[0].arguments)
 	}
 }
@@ -303,7 +334,7 @@ func TestMalformedMetadataAndNonzeroExitFailWithoutGuessingStderr(t *testing.T) 
 		}
 		return nil, &OperationError{Code: "command_failed", ExitCode: 12}
 	})
-	if _, err := runner.Snapshots(context.Background(), target); err == nil {
+	if _, _, err := runner.Snapshots(context.Background(), target, 100); err == nil {
 		t.Fatal("malformed metadata was accepted")
 	}
 	runner.execute = func(context.Context, string, []string, []string, string) ([]byte, error) {
@@ -313,6 +344,28 @@ func TestMalformedMetadataAndNonzeroExitFailWithoutGuessingStderr(t *testing.T) 
 	var operationError *OperationError
 	if !errors.As(err, &operationError) || operationError.Code != "command_failed" || operationError.ExitCode != 1 {
 		t.Fatalf("error = %#v", err)
+	}
+}
+
+func TestStructuredResticLogsExcludeArgumentsAndCredentials(t *testing.T) {
+	runner, target, _ := testRunner(t, func(_ context.Context, _ string, _ []string, _ []string, _ string) ([]byte, error) {
+		return []byte(`{}`), nil
+	})
+	var output bytes.Buffer
+	runner.Logger = slog.New(slog.NewJSONHandler(&output, nil))
+	if err := runner.Init(context.Background(), target); err != nil {
+		t.Fatal(err)
+	}
+	log := output.String()
+	for _, required := range []string{`"operation":"init"`, `"target":"primary"`, `"exit_code":0`} {
+		if !strings.Contains(log, required) {
+			t.Fatalf("structured log is missing %s: %s", required, log)
+		}
+	}
+	for _, forbidden := range []string{target.Repository, "synthetic-access", "synthetic-secret", "synthetic-restic-password", "--password-file"} {
+		if strings.Contains(log, forbidden) {
+			t.Fatalf("structured log exposed %q: %s", forbidden, log)
+		}
 	}
 }
 

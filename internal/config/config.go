@@ -14,17 +14,18 @@ import (
 	"time"
 
 	"github.com/goccy/go-yaml"
-	"github.com/hellodword/vaultwarden-less/internal/safefs"
-	"github.com/hellodword/vaultwarden-less/internal/securefile"
-	"github.com/hellodword/vaultwarden-less/internal/version"
+	"github.com/hellodword/vaultwarden-less/internal/privatefs"
 )
 
 const (
+	SchemaVersion = 2
+
 	MaxConfigBytes = 1 << 20
 
 	DefaultBackupConfigPath = "/config/backup.yaml"
 	RoleCredentialsPath     = "/run/credentials/role/credentials.yaml"
-	ResticPasswordPath      = "/run/credentials/common/restic-password"
+	ResticPasswordRoot      = "/run/credentials/restic"
+	NotifierCredentialsPath = "/run/credentials/notifiers/credentials.yaml"
 
 	ListenAddress     = "0.0.0.0:9090"
 	WorkerURL         = "http://backup:9090"
@@ -33,7 +34,7 @@ const (
 	RecoveryPointPath = "/staging/point"
 	CacheDir          = "/cache"
 	RestoreRoot       = "/restore"
-	ResticBinary      = "/usr/local/bin/restic"
+	ResticBinary      = "/bin/restic"
 
 	QuietWindow           = 30 * time.Second
 	MaximumQuietWindow    = 2 * time.Minute
@@ -61,7 +62,7 @@ var (
 
 var errUnknownYAMLField = errors.New("unknown YAML field")
 
-// Backup is the complete human-authored schema v1 configuration. Scheduling,
+// Backup is the complete human-authored schema v2 configuration. Scheduling,
 // retry, timeout, retention, filesystem and HTTP behavior are product constants.
 type Backup struct {
 	SchemaVersion int        `yaml:"schema_version"`
@@ -79,6 +80,17 @@ type Notifier struct {
 	Name string `yaml:"name"`
 	Type string `yaml:"type"`
 
+	WebhookURL string `yaml:"-"`
+
+	DeviceToken string `yaml:"-"`
+	AuthKey     string `yaml:"-"`
+	KeyID       string `yaml:"-"`
+	TeamID      string `yaml:"-"`
+	Topic       string `yaml:"-"`
+	Sound       string `yaml:"-"`
+}
+
+type NotifierSecrets struct {
 	WebhookURL string `yaml:"webhook_url,omitempty"`
 
 	DeviceToken string `yaml:"device_token,omitempty"`
@@ -87,6 +99,11 @@ type Notifier struct {
 	TeamID      string `yaml:"team_id,omitempty"`
 	Topic       string `yaml:"topic,omitempty"`
 	Sound       string `yaml:"sound,omitempty"`
+}
+
+type NotifierCredentials struct {
+	SchemaVersion int                        `yaml:"schema_version"`
+	Notifiers     map[string]NotifierSecrets `yaml:"notifiers"`
 }
 
 type S3Credentials struct {
@@ -100,10 +117,10 @@ type RoleCredentials struct {
 }
 
 func LoadBackup(path string) (*Backup, error) {
-	if err := safefs.ValidatePrivateDirectory(filepath.Dir(path)); err != nil {
+	if err := privatefs.ValidatePrivateDirectory(filepath.Dir(path)); err != nil {
 		return nil, fmt.Errorf("validate backup config directory: %w", err)
 	}
-	data, err := securefile.ReadBytes(path, MaxConfigBytes)
+	data, err := privatefs.ReadBytes(path, MaxConfigBytes)
 	if err != nil {
 		return nil, fmt.Errorf("read backup config: %w", err)
 	}
@@ -131,10 +148,10 @@ func LoadRoleCredentials(path string, cfg *Backup) (*RoleCredentials, error) {
 	if cfg == nil {
 		return nil, fmt.Errorf("backup config is required")
 	}
-	if err := safefs.ValidatePrivateDirectory(filepath.Dir(path)); err != nil {
+	if err := privatefs.ValidatePrivateDirectory(filepath.Dir(path)); err != nil {
 		return nil, fmt.Errorf("validate role credentials directory: %w", err)
 	}
-	data, err := securefile.ReadBytes(path, MaxConfigBytes)
+	data, err := privatefs.ReadBytes(path, MaxConfigBytes)
 	if err != nil {
 		return nil, fmt.Errorf("read role credentials: %w", err)
 	}
@@ -146,6 +163,31 @@ func LoadRoleCredentials(path string, cfg *Backup) (*RoleCredentials, error) {
 		return nil, fmt.Errorf("validate role credentials: %w", err)
 	}
 	return &credentials, nil
+}
+
+func LoadNotifierCredentials(path string, cfg *Backup) ([]Notifier, error) {
+	if cfg == nil {
+		return nil, fmt.Errorf("backup config is required")
+	}
+	if len(cfg.Notifiers) == 0 {
+		return []Notifier{}, nil
+	}
+	if err := privatefs.ValidatePrivateDirectory(filepath.Dir(path)); err != nil {
+		return nil, fmt.Errorf("validate notifier credentials directory: %w", err)
+	}
+	data, err := privatefs.ReadBytes(path, MaxConfigBytes)
+	if err != nil {
+		return nil, fmt.Errorf("read notifier credentials: %w", err)
+	}
+	var credentials NotifierCredentials
+	if err := decodeOneYAML(data, &credentials); err != nil {
+		return nil, fmt.Errorf("decode notifier credentials: invalid YAML")
+	}
+	resolved, err := credentials.Resolve(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("validate notifier credentials: %w", err)
+	}
+	return resolved, nil
 }
 
 func decodeOneYAML(data []byte, destination any) error {
@@ -168,8 +210,8 @@ func decodeOneYAML(data []byte, destination any) error {
 }
 
 func (c *Backup) Validate() error {
-	if c.SchemaVersion != version.SchemaVersion {
-		return fmt.Errorf("schema_version must be %d", version.SchemaVersion)
+	if c.SchemaVersion != SchemaVersion {
+		return fmt.Errorf("schema_version must be %d", SchemaVersion)
 	}
 	if len(c.Targets) == 0 {
 		return fmt.Errorf("targets must contain at least one entry")
@@ -198,7 +240,7 @@ func (c *Backup) Validate() error {
 	}
 	notifierNames := make(map[string]struct{}, len(c.Notifiers))
 	for index := range c.Notifiers {
-		if err := c.Notifiers[index].validate(); err != nil {
+		if err := c.Notifiers[index].validateReference(); err != nil {
 			return fmt.Errorf("notifiers[%d]: %w", index, err)
 		}
 		if _, duplicate := notifierNames[c.Notifiers[index].Name]; duplicate {
@@ -288,8 +330,8 @@ func validRepository(repository string) bool {
 }
 
 func (c RoleCredentials) Validate(cfg *Backup) error {
-	if c.SchemaVersion != version.SchemaVersion {
-		return fmt.Errorf("schema_version must be %d", version.SchemaVersion)
+	if c.SchemaVersion != SchemaVersion {
+		return fmt.Errorf("schema_version must be %d", SchemaVersion)
 	}
 	if c.Targets == nil || len(c.Targets) != len(cfg.Targets) {
 		return fmt.Errorf("target key set must exactly match backup config")
@@ -332,7 +374,20 @@ func (c S3Credentials) validate() error {
 	return nil
 }
 
-func (n Notifier) validate() error {
+func (n Notifier) validateReference() error {
+	if !namePattern.MatchString(n.Name) {
+		return fmt.Errorf("invalid name %q", n.Name)
+	}
+	if n.Type != "wechat" && n.Type != "bark" {
+		return fmt.Errorf("unsupported type %q", n.Type)
+	}
+	if n.WebhookURL != "" || n.DeviceToken != "" || n.AuthKey != "" || n.KeyID != "" || n.TeamID != "" || n.Topic != "" || n.Sound != "" {
+		return fmt.Errorf("secret fields belong in notifier credentials")
+	}
+	return nil
+}
+
+func (n Notifier) validateResolved() error {
 	if !namePattern.MatchString(n.Name) {
 		return fmt.Errorf("invalid name %q", n.Name)
 	}
@@ -373,6 +428,35 @@ func (n Notifier) validate() error {
 		return fmt.Errorf("unsupported type %q", n.Type)
 	}
 	return nil
+}
+
+func (c NotifierCredentials) Resolve(cfg *Backup) ([]Notifier, error) {
+	if c.SchemaVersion != SchemaVersion {
+		return nil, fmt.Errorf("schema_version must be %d", SchemaVersion)
+	}
+	if c.Notifiers == nil || len(c.Notifiers) != len(cfg.Notifiers) {
+		return nil, fmt.Errorf("notifier key set must exactly match backup config")
+	}
+	resolved := make([]Notifier, 0, len(cfg.Notifiers))
+	for _, reference := range cfg.Notifiers {
+		secrets, exists := c.Notifiers[reference.Name]
+		if !exists {
+			return nil, fmt.Errorf("notifier key set must exactly match backup config")
+		}
+		notifier := reference
+		notifier.WebhookURL = secrets.WebhookURL
+		notifier.DeviceToken = secrets.DeviceToken
+		notifier.AuthKey = secrets.AuthKey
+		notifier.KeyID = secrets.KeyID
+		notifier.TeamID = secrets.TeamID
+		notifier.Topic = secrets.Topic
+		notifier.Sound = secrets.Sound
+		if err := notifier.validateResolved(); err != nil {
+			return nil, fmt.Errorf("notifier %s: %w", reference.Name, err)
+		}
+		resolved = append(resolved, notifier)
+	}
+	return resolved, nil
 }
 
 func parseHTTPSURL(raw string) (*url.URL, error) {

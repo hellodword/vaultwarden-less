@@ -1,6 +1,7 @@
-// Package register contains the small, standard-library-only crypto builder
-// used by the optional Vaultwarden registration E2E. It intentionally does
-// not implement a general Bitwarden client.
+// Package register contains the small, standard-library-only V1 crypto builder
+// used by the registration and initial-organization E2E fixtures. Its protocol
+// fields are reviewed against the Bitwarden CLI and Vaultwarden commits in
+// UPSTREAMS.toml. It intentionally does not implement a general client.
 package register
 
 import (
@@ -8,6 +9,7 @@ import (
 	"crypto/cipher"
 	"crypto/hmac"
 	"crypto/rsa"
+	"crypto/sha1"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
@@ -21,6 +23,7 @@ const (
 	PBKDF2SHA256 = 600000
 	KDFPBKDF2    = 0
 	CipherType2  = 2
+	CipherType4  = 4
 )
 
 type Keys struct {
@@ -84,6 +87,8 @@ type Registration struct {
 	Name                   string          `json:"name"`
 	UserAsymmetricKeys     *AsymmetricKeys `json:"userAsymmetricKeys,omitempty"`
 	EmailVerificationToken string          `json:"emailVerificationToken,omitempty"`
+	SymmetricKey           []byte          `json:"-"`
+	UserPublicKey          *rsa.PublicKey  `json:"-"`
 }
 
 // AsymmetricKeys is the V1 account key pair accepted by Vaultwarden's
@@ -109,30 +114,56 @@ func BuildRegistration(email, password, name string, random io.Reader) (Registra
 	if err != nil {
 		return Registration{}, err
 	}
-	privateKey, err := rsa.GenerateKey(random, 2048)
+	asymmetricKeys, publicKey, err := BuildAsymmetricKeys(symmetric, random)
 	if err != nil {
-		return Registration{}, fmt.Errorf("generate asymmetric key: %w", err)
-	}
-	privateKeyDER, err := x509.MarshalPKCS8PrivateKey(privateKey)
-	if err != nil {
-		return Registration{}, fmt.Errorf("marshal asymmetric private key: %w", err)
-	}
-	publicKeyDER, err := x509.MarshalPKIXPublicKey(&privateKey.PublicKey)
-	if err != nil {
-		return Registration{}, fmt.Errorf("marshal asymmetric public key: %w", err)
-	}
-	encryptedPrivateKey, err := Encrypt(symmetric, privateKeyDER, random)
-	if err != nil {
-		return Registration{}, fmt.Errorf("encrypt asymmetric private key: %w", err)
+		return Registration{}, err
 	}
 	return Registration{
 		Email: email, KDFType: KDFPBKDF2, KDFIterations: PBKDF2SHA256,
 		Key: wrapped, MasterPasswordHash: base64.StdEncoding.EncodeToString(keys.MasterPasswordHash), Name: name,
-		UserAsymmetricKeys: &AsymmetricKeys{
-			EncryptedPrivateKey: encryptedPrivateKey,
-			PublicKey:           base64.StdEncoding.EncodeToString(publicKeyDER),
-		},
+		SymmetricKey: symmetric, UserPublicKey: publicKey,
+		UserAsymmetricKeys: asymmetricKeys,
 	}, nil
+}
+
+func BuildAsymmetricKeys(wrappingKey []byte, random io.Reader) (*AsymmetricKeys, *rsa.PublicKey, error) {
+	privateKey, err := rsa.GenerateKey(random, 2048)
+	if err != nil {
+		return nil, nil, fmt.Errorf("generate asymmetric key: %w", err)
+	}
+	privateKeyDER, err := x509.MarshalPKCS8PrivateKey(privateKey)
+	if err != nil {
+		return nil, nil, fmt.Errorf("marshal asymmetric private key: %w", err)
+	}
+	publicKeyDER, err := x509.MarshalPKIXPublicKey(&privateKey.PublicKey)
+	if err != nil {
+		return nil, nil, fmt.Errorf("marshal asymmetric public key: %w", err)
+	}
+	encryptedPrivateKey, err := Encrypt(wrappingKey, privateKeyDER, random)
+	if err != nil {
+		return nil, nil, fmt.Errorf("encrypt asymmetric private key: %w", err)
+	}
+	return &AsymmetricKeys{
+		EncryptedPrivateKey: encryptedPrivateKey,
+		PublicKey:           base64.StdEncoding.EncodeToString(publicKeyDER),
+	}, &privateKey.PublicKey, nil
+}
+
+// EncapsulateKeyUnsigned implements the Bitwarden V1 RSA-OAEP-SHA1 key
+// encapsulation contract. SHA-1 is fixed by EncString type 4; it is not used
+// for hashing or signatures here.
+func EncapsulateKeyUnsigned(publicKey *rsa.PublicKey, key []byte, random io.Reader) (string, error) {
+	if publicKey == nil {
+		return "", fmt.Errorf("public key is required")
+	}
+	if len(key) != 64 {
+		return "", fmt.Errorf("shared key must be 512 bits")
+	}
+	ciphertext, err := rsa.EncryptOAEP(sha1.New(), random, publicKey, key, nil)
+	if err != nil {
+		return "", fmt.Errorf("encapsulate shared key: %w", err)
+	}
+	return fmt.Sprintf("%d.%s", CipherType4, base64.StdEncoding.EncodeToString(ciphertext)), nil
 }
 
 func (r Registration) JSON() ([]byte, error) { return json.Marshal(r) }

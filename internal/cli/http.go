@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/hellodword/vaultwarden-less/internal/snapshot"
-	"github.com/hellodword/vaultwarden-less/internal/version"
 	"github.com/hellodword/vaultwarden-less/internal/worker"
 	"github.com/spf13/cobra"
 )
@@ -34,7 +33,7 @@ func requestBackupCommand(environment commandEnvironment) *cobra.Command {
 			if err := callWorker(cmd.Context(), environment, http.MethodPost, worker.CheckPath, http.StatusAccepted, &result); err != nil {
 				return err
 			}
-			if result.SchemaVersion != version.SchemaVersion || !result.Accepted {
+			if result.SchemaVersion != worker.SchemaVersion || !result.Accepted {
 				return fmt.Errorf("worker returned an invalid acceptance response")
 			}
 			return writeJSON(cmd.OutOrStdout(), result)
@@ -78,7 +77,7 @@ func callWorker(ctx context.Context, environment commandEnvironment, method, pat
 	}
 	var body io.Reader
 	if method == http.MethodPost {
-		body = bytes.NewReader([]byte("{\"schema_version\":1}\n"))
+		body = bytes.NewReader([]byte(fmt.Sprintf("{\"schema_version\":%d}\n", worker.SchemaVersion)))
 	}
 	request, err := http.NewRequestWithContext(ctx, method, endpoint, body)
 	if err != nil {
@@ -135,7 +134,7 @@ func workerEndpoint(base, path string) (string, error) {
 }
 
 func validateWorkerStatus(status worker.Status) error {
-	if status.SchemaVersion != version.SchemaVersion || !oneOf(status.State, "idle", "debouncing", "checking") || status.Targets == nil {
+	if status.SchemaVersion != worker.SchemaVersion || !oneOf(status.State, "idle", "debouncing", "checking") || status.Targets == nil {
 		return fmt.Errorf("worker returned an invalid status document")
 	}
 	if !validUTCTime(status.StartedAt) || status.NextCheckAt != nil && !validUTCTime(*status.NextCheckAt) {

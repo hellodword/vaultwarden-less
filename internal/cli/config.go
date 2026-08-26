@@ -2,9 +2,9 @@ package cli
 
 import (
 	"fmt"
+	"path/filepath"
 	"strings"
 
-	"github.com/hellodword/vaultwarden-less/internal/version"
 	"github.com/spf13/cobra"
 )
 
@@ -47,22 +47,28 @@ func configCommand(configPath *string, environment commandEnvironment) *cobra.Co
 			if _, err := environment.loadCredentials(environment.credentialsPath, cfg); err != nil {
 				return err
 			}
-			password, err := environment.readSecret(environment.passwordPath)
+			for _, target := range cfg.Targets {
+				password, err := environment.readSecret(filepath.Join(environment.passwordRoot, target.Name))
+				if err != nil {
+					return fmt.Errorf("read Restic password for target %s: %w", target.Name, err)
+				}
+				if strings.ContainsAny(password, "\r\n\x00") {
+					return fmt.Errorf("restic password for target %s contains a forbidden character", target.Name)
+				}
+			}
+			notifiers, err := environment.notifiersFor(cfg)
 			if err != nil {
-				return fmt.Errorf("read Restic password: %w", err)
+				return err
 			}
-			if strings.ContainsAny(password, "\r\n\x00") {
-				return fmt.Errorf("restic password contains a forbidden character")
-			}
-			if err := environment.validateNotify(cfg.Notifiers); err != nil {
+			if err := environment.validateNotify(notifiers); err != nil {
 				return err
 			}
 			result := configValidationResult{
-				SchemaVersion: version.SchemaVersion,
+				SchemaVersion: ResultSchemaVersion,
 				Valid:         true,
 				Warnings:      []string{},
 				Targets:       make([]configTarget, 0, len(cfg.Targets)),
-				Notifiers:     make([]configNotifier, 0, len(cfg.Notifiers)),
+				Notifiers:     make([]configNotifier, 0, len(notifiers)),
 			}
 			for _, target := range cfg.Targets {
 				result.Targets = append(result.Targets, configTarget{Name: target.Name, Backend: target.Backend()})
@@ -70,7 +76,7 @@ func configCommand(configPath *string, environment commandEnvironment) *cobra.Co
 					result.Warnings = append(result.Warnings, target.Name+":"+warning)
 				}
 			}
-			for _, notifier := range cfg.Notifiers {
+			for _, notifier := range notifiers {
 				result.Notifiers = append(result.Notifiers, configNotifier{Name: notifier.Name, Type: notifier.Type})
 			}
 			return writeJSON(cmd.OutOrStdout(), result)

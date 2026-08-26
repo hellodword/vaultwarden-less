@@ -4,6 +4,7 @@ package restore_test
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -11,7 +12,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -24,11 +24,11 @@ import (
 	"github.com/hellodword/vaultwarden-less/internal/restic"
 	restoretool "github.com/hellodword/vaultwarden-less/internal/restore"
 	"github.com/hellodword/vaultwarden-less/internal/snapshot"
-	"github.com/hellodword/vaultwarden-less/internal/version"
+	"github.com/hellodword/vaultwarden-less/internal/upstream"
 	_ "github.com/mattn/go-sqlite3"
 )
 
-const motoServerImage = "ghcr.io/getmoto/motoserver:5.2.2@sha256:0349ef6ecb9cd041293026accda0ea71bfa09925dffae3d76d120d15ecc76971"
+var motoServerImage = "vaultwarden-less-moto:" + upstream.MotoVersion
 
 var (
 	motoHostPort      = flag.Int("moto-host-port", 0, "fixed host port for Moto; zero asks Docker for an ephemeral port")
@@ -52,6 +52,7 @@ func TestMotoResticRoundTrip(t *testing.T) {
 	if _, err := runDocker(ctx, "info"); err != nil {
 		t.Fatalf("Docker daemon is required for the integration test: %v", err)
 	}
+	loadMotoImage(ctx, t)
 
 	containerName := fmt.Sprintf("vaultwarden-less-moto-%d-%d", os.Getpid(), time.Now().UnixNano())
 	publish := "0.0.0.0::5000"
@@ -67,13 +68,7 @@ func TestMotoResticRoundTrip(t *testing.T) {
 		_, _ = runDocker(cleanupContext, "rm", "--force", containerName)
 	})
 
-	sshTarget := strings.TrimSpace(os.Getenv("VWLESS_E2E_SSH_TARGET"))
-	port := waitForPublishedPort(ctx, t, containerName, publishedHost, sshTarget == "")
-	endpointHost := publishedHost
-	endpointPort := port
-	if sshTarget != "" {
-		endpointHost, endpointPort = startSSHTunnel(ctx, t, sshTarget, os.Getenv("VWLESS_E2E_SSH_PORT"), port)
-	}
+	endpointPort := waitForPublishedPort(ctx, t, containerName, publishedHost)
 	createMotoBucket(ctx, t, containerName)
 
 	root := t.TempDir()
@@ -91,16 +86,16 @@ func TestMotoResticRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	credentialsDir := privateDirectory(t, root, "credentials")
-	passwordFile := writeSecret(t, credentialsDir, "restic-password", "moto-restic-password")
+	passwordFile := writeSecret(t, credentialsDir, "moto", "moto-restic-password")
 	target := config.Target{
 		Name:          "moto",
-		Repository:    "s3:http://" + net.JoinHostPort(endpointHost, strconv.Itoa(endpointPort)) + "/vaultwarden-less-test/repository",
+		Repository:    "s3:http://" + net.JoinHostPort(publishedHost, strconv.Itoa(endpointPort)) + "/vaultwarden-less-test/repository",
 		ResticOptions: map[string]string{"s3.bucket-lookup": "path", "s3.region": "us-east-1"},
 	}
-	credentials := &config.RoleCredentials{SchemaVersion: 1, Targets: map[string]config.S3Credentials{
+	credentials := &config.RoleCredentials{SchemaVersion: config.SchemaVersion, Targets: map[string]config.S3Credentials{
 		"moto": {AccessKeyID: "test", SecretAccessKey: "test"},
 	}}
-	runner := restic.NewSystemTestRunner(resticBinary, cacheDir, passwordFile, first.Path, credentials)
+	runner := restic.NewRunner(resticBinary, cacheDir, credentialsDir, first.Path, credentials, nil)
 	if err := runner.VerifyVersion(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -128,8 +123,8 @@ func TestMotoResticRoundTrip(t *testing.T) {
 	if err != nil || !secondSync.Created || secondSync.SnapshotID == firstSync.SnapshotID {
 		t.Fatalf("second sync = %#v/%v", secondSync, err)
 	}
-	listed, err := runner.Snapshots(ctx, target)
-	if err != nil || len(listed) != 2 {
+	listed, truncated, err := runner.Snapshots(ctx, target, 100)
+	if err != nil || truncated || len(listed) != 2 {
 		t.Fatalf("snapshots = %#v/%v", listed, err)
 	}
 	if err := runner.Check(ctx, target, ""); err != nil {
@@ -199,7 +194,15 @@ func mutateSyntheticDatabase(t *testing.T, path string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := database.Exec(`INSERT INTO users(uuid) VALUES ('22222222-2222-2222-2222-222222222222')`); err != nil {
+	if _, err := database.Exec(`INSERT INTO users(
+		uuid, created_at, updated_at, email, name, password_hash, salt,
+		password_iterations, akey, security_stamp, equivalent_domains,
+		excluded_globals
+	) VALUES (
+		'22222222-2222-2222-2222-222222222222',
+		'2026-05-05', '2026-05-05', 'second@example.test', 'Second',
+		X'00', X'00', 600000, 'key', 'stamp', '[]', '[]'
+	)`); err != nil {
 		_ = database.Close()
 		t.Fatal(err)
 	}
@@ -225,7 +228,7 @@ func createMotoBucket(ctx context.Context, t *testing.T, containerName string) {
 	t.Fatalf("create Moto bucket: %v", lastError)
 }
 
-func waitForPublishedPort(ctx context.Context, t *testing.T, name, publishedHost string, requireDial bool) int {
+func waitForPublishedPort(ctx context.Context, t *testing.T, name, publishedHost string) int {
 	t.Helper()
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
@@ -235,9 +238,6 @@ func waitForPublishedPort(ctx context.Context, t *testing.T, name, publishedHost
 			if len(fields) > 0 {
 				_, port, splitError := net.SplitHostPort(fields[0])
 				value, parseError := strconv.Atoi(port)
-				if splitError == nil && parseError == nil && !requireDial {
-					return value
-				}
 				if splitError == nil && parseError == nil {
 					connection, dialError := net.DialTimeout("tcp", net.JoinHostPort(publishedHost, port), time.Second)
 					if dialError == nil {
@@ -257,79 +257,6 @@ func waitForPublishedPort(ctx context.Context, t *testing.T, name, publishedHost
 	return 0
 }
 
-func startSSHTunnel(ctx context.Context, t *testing.T, target, rawPort string, remotePort int) (string, int) {
-	t.Helper()
-	if target == "" || strings.HasPrefix(target, "-") || strings.ContainsAny(target, "\r\n\x00") {
-		t.Fatal("invalid VWLESS_E2E_SSH_TARGET")
-	}
-	sshPort := 22
-	if rawPort != "" {
-		parsed, err := strconv.Atoi(rawPort)
-		if err != nil || parsed < 1 || parsed > 65535 {
-			t.Fatal("invalid VWLESS_E2E_SSH_PORT")
-		}
-		sshPort = parsed
-	}
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	localPort := listener.Addr().(*net.TCPAddr).Port
-	if err := listener.Close(); err != nil {
-		t.Fatal(err)
-	}
-	tunnelContext, cancel := context.WithCancel(ctx)
-	arguments := []string{
-		"-N", "-p", strconv.Itoa(sshPort),
-		"-o", "BatchMode=no",
-		"-o", "ExitOnForwardFailure=yes",
-		"-o", "StrictHostKeyChecking=no",
-		"-o", "UserKnownHostsFile=/dev/null",
-		"-o", "LogLevel=ERROR",
-		"-L", fmt.Sprintf("127.0.0.1:%d:127.0.0.1:%d", localPort, remotePort),
-		target,
-	}
-	binary := "ssh"
-	if os.Getenv("SSHPASS") != "" {
-		binary = "sshpass"
-		arguments = append([]string{"-e", "ssh"}, arguments...)
-	}
-	command := exec.CommandContext(tunnelContext, binary, arguments...)
-	command.Stdout = io.Discard
-	command.Stderr = io.Discard
-	if err := command.Start(); err != nil {
-		cancel()
-		t.Fatalf("start SSH forwarding: %v", err)
-	}
-	done := make(chan error, 1)
-	go func() { done <- command.Wait() }()
-	t.Cleanup(func() {
-		cancel()
-		select {
-		case <-done:
-		case <-time.After(5 * time.Second):
-		}
-	})
-	address := net.JoinHostPort("127.0.0.1", strconv.Itoa(localPort))
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		connection, dialError := net.DialTimeout("tcp", address, 250*time.Millisecond)
-		if dialError == nil {
-			_ = connection.Close()
-			return "127.0.0.1", localPort
-		}
-		select {
-		case err := <-done:
-			cancel()
-			t.Fatalf("SSH forwarding stopped before readiness: %v", err)
-		case <-time.After(100 * time.Millisecond):
-		}
-	}
-	cancel()
-	t.Fatal("SSH forwarding did not become ready")
-	return "", 0
-}
-
 func rawResticBackup(ctx context.Context, binary, cacheDir, passwordFile, recoveryPath string, target config.Target, contentHex string) (string, error) {
 	arguments := []string{
 		"--repo", target.Repository,
@@ -338,8 +265,8 @@ func rawResticBackup(ctx context.Context, binary, cacheDir, passwordFile, recove
 		"--option", "s3.bucket-lookup=path",
 		"--option", "s3.region=us-east-1",
 		"backup", "--json",
-		"--host", version.SnapshotHost,
-		"--tag", version.SnapshotTag,
+		"--host", restic.SnapshotHost,
+		"--tag", restic.SnapshotTag,
 		"--tag", "content-id=" + contentHex,
 		"--", recoveryPath,
 	}
@@ -388,11 +315,34 @@ func validatePublishedHost(t *testing.T, host string) string {
 }
 
 func defaultPublishedHost() string {
-	dockerHost, err := url.Parse(os.Getenv("DOCKER_HOST"))
-	if err == nil && dockerHost.Scheme == "tcp" && dockerHost.Hostname() != "" {
-		return dockerHost.Hostname()
+	if value := strings.TrimSpace(os.Getenv("VWLESS_E2E_PUBLISHED_HOST")); value != "" {
+		return value
 	}
 	return "127.0.0.1"
+}
+
+func loadMotoImage(ctx context.Context, t *testing.T) {
+	t.Helper()
+	repository := filepath.Clean(filepath.Join("..", ".."))
+	command := exec.CommandContext(
+		ctx,
+		"nix",
+		"build",
+		"--no-link",
+		"--print-out-paths",
+		".#moto-image",
+	)
+	command.Dir = repository
+	var diagnostics bytes.Buffer
+	command.Stderr = &diagnostics
+	output, err := command.Output()
+	paths := strings.Fields(string(output))
+	if err != nil || len(paths) != 1 {
+		t.Fatalf("build local Moto image: %v: %s", err, diagnostics.String())
+	}
+	if output, err := runDocker(ctx, "load", "--input", paths[0]); err != nil {
+		t.Fatalf("load local Moto image: %v: %s", err, output)
+	}
 }
 
 func runDocker(ctx context.Context, arguments ...string) (string, error) {

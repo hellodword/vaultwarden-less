@@ -1,4 +1,4 @@
-package safefs
+package privatefs
 
 import (
 	"os"
@@ -61,5 +61,43 @@ func TestValidatePrivateDirectoryDoesNotMutateMountRoot(t *testing.T) {
 	}
 	if err := ValidatePrivateDirectory(path); err == nil {
 		t.Fatal("accepted a private directory with the wrong exact mode")
+	}
+}
+
+func TestAtomicRenamePrimitivesNeverOverwriteByAccident(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	first := filepath.Join(root, "first")
+	second := filepath.Join(root, "second")
+	third := filepath.Join(root, "third")
+	if err := os.WriteFile(first, []byte("first"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := RenameNoReplace(first, second); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(third, []byte("third"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := RenameNoReplace(third, second); err == nil {
+		t.Fatal("RenameNoReplace overwrote an existing path")
+	}
+	if data, err := os.ReadFile(second); err != nil || string(data) != "first" {
+		t.Fatalf("existing path changed: %q/%v", data, err)
+	}
+	if data, err := os.ReadFile(third); err != nil || string(data) != "third" {
+		t.Fatalf("unpublished path changed: %q/%v", data, err)
+	}
+	if err := RenameExchange(second, third); err != nil {
+		t.Fatal(err)
+	}
+	if data, err := os.ReadFile(second); err != nil || string(data) != "third" {
+		t.Fatalf("exchange left wrong second path: %q/%v", data, err)
+	}
+	if data, err := os.ReadFile(third); err != nil || string(data) != "first" {
+		t.Fatalf("exchange left wrong third path: %q/%v", data, err)
+	}
+	if err := SyncDirectory(root); err != nil {
+		t.Fatal(err)
 	}
 }

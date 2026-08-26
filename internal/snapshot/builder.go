@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+
+	"github.com/hellodword/vaultwarden-less/internal/privatefs"
 )
 
 const spaceReserve = int64(64 << 20)
@@ -79,7 +81,9 @@ func (b Builder) Build(ctx context.Context) (_ Result, err error) {
 			return Result{}, fmt.Errorf("referenced file size overflow")
 		}
 	}
-	recoveryRequired, err := checkedSizeSum(referencedBytes, estimatedDatabaseBytes(b.DataDir), spaceReserve)
+	// The online backup is already present on the staging filesystem, so the
+	// second free-space reading must account only for files still to be copied.
+	recoveryRequired, err := remainingCopySpace(referencedBytes)
 	if err != nil {
 		return Result{}, err
 	}
@@ -130,14 +134,33 @@ func (b Builder) Build(ctx context.Context) (_ Result, err error) {
 	return Result{Path: point, Manifest: manifest}, nil
 }
 
-func publishRecoveryPoint(buildDir, point string) (bool, error) {
-	return publishRecoveryPointUsing(buildDir, point, renameExchange)
+func remainingCopySpace(referencedBytes int64) (int64, error) {
+	return checkedSizeSum(referencedBytes, spaceReserve)
 }
 
-func publishRecoveryPointUsing(buildDir, point string, exchange func(string, string) error) (bool, error) {
+func publishRecoveryPoint(buildDir, point string) (bool, error) {
+	return publishRecoveryPointUsing(
+		buildDir,
+		point,
+		privatefs.RenameNoReplace,
+		privatefs.RenameExchange,
+		privatefs.SyncDirectory,
+	)
+}
+
+func publishRecoveryPointUsing(
+	buildDir, point string,
+	noReplace func(string, string) error,
+	exchange func(string, string) error,
+	syncDirectory func(string) error,
+) (bool, error) {
+	parent := filepath.Dir(point)
 	if _, err := os.Lstat(point); errors.Is(err, os.ErrNotExist) {
-		if err := os.Rename(buildDir, point); err != nil {
+		if err := noReplace(buildDir, point); err != nil {
 			return false, fmt.Errorf("publish first recovery point: %w", err)
+		}
+		if err := syncDirectory(parent); err != nil {
+			return true, fmt.Errorf("sync first recovery point publication: %w", err)
 		}
 		return true, nil
 	} else if err != nil {
@@ -149,10 +172,16 @@ func publishRecoveryPointUsing(buildDir, point string, exchange func(string, str
 	if err := exchange(buildDir, point); err != nil {
 		return false, fmt.Errorf("atomically replace recovery point: %w", err)
 	}
+	if err := syncDirectory(parent); err != nil {
+		return true, fmt.Errorf("sync recovery point replacement: %w", err)
+	}
 	// The new verified point is already authoritative. The old point now has
 	// the recognized build name and is safe for this or the next build to clean.
 	if err := os.RemoveAll(buildDir); err != nil {
 		return true, fmt.Errorf("clean replaced recovery point: %w", err)
+	}
+	if err := syncDirectory(parent); err != nil {
+		return true, fmt.Errorf("sync replaced recovery point cleanup: %w", err)
 	}
 	return true, nil
 }

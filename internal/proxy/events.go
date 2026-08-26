@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-var eventBody = []byte("{\"schema_version\":1}\n")
+var eventBody = []byte("{\"schema_version\":2}\n")
 
 // EventSender coalesces any number of dirty marks into a single bounded signal.
 // Delivery never runs in a request goroutine and never delays the proxy response.

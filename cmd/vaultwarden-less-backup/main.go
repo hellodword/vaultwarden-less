@@ -15,7 +15,7 @@ func main() {
 	defer stop()
 	command := cli.New(os.Stdout, os.Stderr)
 	command.SetContext(ctx)
-	err := command.Execute()
+	err := cli.Execute(command, os.Args[1:])
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 	}

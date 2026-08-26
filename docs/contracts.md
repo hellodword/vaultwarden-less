@@ -1,10 +1,14 @@
-# Machine-readable contracts
+# Contracts
 
-Version 0.1.0 intentionally starts new schema, CLI, Restic, and runtime
-contracts. Previous configuration, manifests, control state, and Restic tags
-are neither read nor migrated.
+This release intentionally defines new product-v2 contracts. Configuration
+schema 1, manifest schema 1, worker HTTP schema 1, notification schema 1, and
+the old Restic product tag are not read, migrated, or deleted. The project has
+no historical deployment or database migration layer.
 
-## CLI behavior
+A future breaking change must increment the specific contract it changes. Do
+not reuse one global version constant for unrelated formats.
+
+## CLI
 
 The backup binary exposes:
 
@@ -14,7 +18,7 @@ request-backup
 status
 config validate
 repo init
-repo snapshots
+repo snapshots [--limit 1..1000]
 repo check
 repo unlock
 repo prune [--apply]
@@ -23,45 +27,48 @@ healthcheck
 --version
 ```
 
-The proxy exposes `serve`, `healthcheck`, and `--version`. A successful data
-command writes exactly one JSON document plus a newline to stdout. Runtime
-failure writes no stdout, a safe diagnostic to stderr, and exits 1. Argument
-or usage failure similarly writes only stderr and exits 2. Help and version
-are text. Long-running services emit JSON logs only to stderr.
+The proxy exposes `serve`, `healthcheck`, and `--version`.
+
+A successful data command writes one JSON document plus a newline to stdout.
+Runtime failure writes no stdout, a safe diagnostic to stderr, and exits 1.
+Argument, unknown-command, and flag failure write only stderr and exit 2. Help
+and version are text. Services and Restic audit records are JSON logs on
+stderr.
 
 `request-backup` returns:
 
 ```json
-{"schema_version":1,"accepted":true}
+{"schema_version":2,"accepted":true}
 ```
 
-`repo snapshots` returns newest first, using exactly one Restic metadata query:
+`repo snapshots --limit 100` performs one bounded metadata query and returns
+newest first. Times are normalized to UTC. `truncated` is true when more
+matching snapshots exist:
 
 ```json
-{"schema_version":1,"target":"primary","snapshots":[{"id":"64-lowercase-hex","time":"2026-08-25T12:00:00Z","content_id":"sha256:64-lowercase-hex"}]}
+{"schema_version":2,"target":"primary","limit":100,"truncated":false,"snapshots":[{"id":"<64-lowercase-hex>","time":"2026-08-25T12:00:00Z","content_id":"sha256:<64-lowercase-hex>"}]}
 ```
 
-`repo prune` reports Restic's one forget operation. Dry-run is the default:
+`repo prune` describes one Restic forget operation; dry-run is the default:
 
 ```json
-{"schema_version":1,"operation":"prune","target":"primary","applied":false,"groups":[{"host":"vaultwarden-less","paths":["/staging/point"],"keep_snapshot_ids":[],"remove_snapshot_ids":[]}]}
+{"schema_version":2,"operation":"prune","target":"primary","applied":false,"groups":[{"host":"vaultwarden-less","paths":["/staging/point"],"keep_snapshot_ids":[],"remove_snapshot_ids":[]}]}
 ```
 
 A successful restore returns:
 
 ```json
-{"schema_version":1,"target":"primary","snapshot_id":"64-lowercase-hex","content_id":"sha256:64-lowercase-hex","output":"/restore/drill"}
+{"schema_version":2,"target":"primary","snapshot_id":"<64-lowercase-hex>","content_id":"sha256:<64-lowercase-hex>","output":"/restore/prepared"}
 ```
 
 ## Worker status and HTTP
 
-Status is a process-local snapshot. Arrays are never null; unknown times and
-identifiers are JSON `null`. On restart, `last_check` and historical target
-fields remain null until the startup check supplies new information.
+Status is process-local. Arrays are never null; unavailable times and
+identifiers are JSON `null`:
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "state": "idle",
   "started_at": "2026-08-25T12:00:00Z",
   "next_check_at": null,
@@ -69,7 +76,7 @@ fields remain null until the startup check supplies new information.
     "started_at": "2026-08-25T12:00:30Z",
     "finished_at": "2026-08-25T12:00:40Z",
     "result": "unchanged",
-    "content_id": "sha256:64-lowercase-hex",
+    "content_id": "sha256:<64-lowercase-hex>",
     "error_code": null
   },
   "targets": [{
@@ -77,61 +84,80 @@ fields remain null until the startup check supplies new information.
     "state": "healthy",
     "last_attempt_at": "2026-08-25T12:00:35Z",
     "last_success_at": "2026-08-25T12:00:39Z",
-    "snapshot_id": "64-lowercase-hex",
-    "content_id": "sha256:64-lowercase-hex",
+    "snapshot_id": "<64-lowercase-hex>",
+    "content_id": "sha256:<64-lowercase-hex>",
     "error_code": null
   }]
 }
 ```
 
-Worker state is `idle`, `debouncing`, or `checking`; target state is
-`unknown`, `healthy`, `retrying`, or `degraded`; check result is `unchanged`,
-`created`, `partial`, or `failed`.
+Worker state is `idle`, `debouncing`, or `checking`. Target state is
+`unknown`, `healthy`, `retrying`, or `degraded`. Check result is
+`unchanged`, `created`, `partial`, or `failed`.
 
-The private worker HTTP interface is:
+The private interface is:
 
-- `GET /healthz` returns 204;
-- `POST /v1/events` accepts exactly `{"schema_version":1}` and returns 204;
-- `POST /v1/check` accepts the same body and returns 202 with the acceptance
-  JSON above; and
-- `GET /v1/status` returns status JSON.
+- `GET /healthz`: empty body and query only; returns 204.
+- `GET /v1/status`: empty body and query only; returns status JSON.
+- `POST /v1/events`: exact `Content-Type: application/json` and exact body
+  `{"schema_version":2}`; returns 204.
+- `POST /v1/check`: the same request contract; returns 202 and the acceptance
+  JSON shown above.
 
-JSON content type, bounded body size, method, shape, and unknown fields are
-strictly enforced with explicit 4xx responses. These endpoints are never
-published to the host.
+Methods, query strings, media-type parameters, unknown fields, trailing JSON,
+and bodies over 1024 bytes receive explicit 4xx responses. The endpoints are
+never published to the host.
 
 ## Recovery manifest
 
-`/staging/point/manifest.json` is strict schema v1:
+`/staging/point/manifest.json` is strict schema 2:
 
 ```json
 {
-  "schema_version": 1,
-  "creator_version": "0.1.0",
+  "schema_version": 2,
+  "creator_version": "<product-version>",
   "vaultwarden": {
-    "version": "1.37.2",
-    "database_migration": "20260505120000",
-    "image": "vaultwarden/server:1.37.2@sha256:5d326778c22f063d093d6b0c9c766a28249561632266776f2c93132ab0ad3a80"
+    "version": "<audited-version>",
+    "database_migration": "<audited-latest-migration>",
+    "database_schema_fingerprint": "sha256:<64-lowercase-hex>",
+    "image": "<audited-repository>@sha256:<64-lowercase-hex>"
   },
-  "files": [{"path":"data/db.sqlite3","size":1234,"sha256":"64-lowercase-hex"}],
-  "content_id": "sha256:64-lowercase-hex"
+  "files": [
+    {
+      "path": "data/db.sqlite3",
+      "size": 1234,
+      "sha256": "<64-lowercase-hex>"
+    }
+  ],
+  "content_id": "sha256:<64-lowercase-hex>"
 }
 ```
 
-File entries are unique and strictly path-sorted. The content ID is SHA-256
-over canonical JSON containing schema version, the exact supported
-Vaultwarden tuple, and every path/size/SHA-256 tuple. It excludes time and
-creator version. Readers reject unknown fields and accept only the explicit
-tuple above; generic SemVer or arbitrary 14-digit migrations are not accepted.
+The exact accepted tuple comes from generated constants derived from
+`UPSTREAMS.toml` and the complete schema contract. File entries are unique and
+strictly path-sorted. The content ID is SHA-256 over canonical JSON containing
+manifest schema, the complete Vaultwarden tuple, and every
+path/size/SHA-256 tuple. It excludes creation time and creator version.
+
+Readers reject unknown fields, extra JSON, noncanonical paths, missing database,
+and any tuple not explicitly compiled into the product.
 
 ## Restic identity and retention
 
-New recovery snapshots have host `vaultwarden-less`, path
-`/staging/point`, product tag `vaultwarden-less-recovery-v1`, and exactly one
-`content-id=<64-lowercase-hex>` identity tag. Old product tags are out of scope.
+Recovery snapshots have:
 
-Retention is one Restic `forget --prune`, grouped by `host,paths`, restricted
-to the new host/path/product tag, with:
+```text
+host: vaultwarden-less
+path: /staging/point
+tag: vaultwarden-less-recovery-v2
+identity tag: content-id=<64-lowercase-hex>
+```
+
+Selection and retention always include the fixed host, path, and product tag.
+The old tag is outside this product's read and deletion scope. Explicit
+snapshot selection requires the full 64-character ID.
+
+Retention is one `forget --prune`, grouped by `host,paths`, with:
 
 ```text
 keep-within 24h
@@ -144,10 +170,43 @@ keep-yearly 3
 
 ## Notifications
 
-Event types are `recovery_point_created`, `source_degraded`,
-`source_recovered`, `target_degraded`, and `target_recovered`. Every payload
-has schema version 1 and a non-null `targets` array. A recovery event lists all
-configured target outcomes as `created`, `synced`, or `failed`; it is emitted
-once per process when that content ID first creates at least one snapshot.
-Payloads never contain repository credentials, Restic passwords, webhook
-URLs, APNs keys, or Vaultwarden user data.
+Notification events use schema 2. Types are
+`recovery_point_created`, `source_degraded`, `source_recovered`,
+`target_degraded`, and `target_recovered`. Every payload has a non-null
+`targets` array.
+
+A recovery event is emitted after any check in which at least one target
+creates a snapshot. It lists every configured target as `created`, `synced`,
+or `failed`. Thus a later target catch-up can emit another event for an
+already-known content ID. Transition events are emitted once per continuous
+in-process degraded interval and once on recovery.
+
+Payloads contain no repository locator, repository credential, Restic password,
+notifier endpoint/key, stderr, or Vaultwarden record data.
+
+## Offline bundle
+
+The deployment bundle has its own `bundle_schema_version: 1`; this is not a
+product-v1 runtime contract. A bundle directory contains:
+
+```text
+bundle.json
+images.tar
+images.tar.sha256
+source.tar
+licenses.tar
+licenses.json
+sbom/backup.cdx.json
+sbom/proxy.cdx.json
+sbom/vaultwarden.cdx.json
+```
+
+Creation requires a clean Git commit and Linux/amd64. `bundle.json` records
+the product commit, flake-lock hash, platform, a complete `UPSTREAMS.toml`
+snapshot, exact local image tags, image IDs, and the original Vaultwarden
+digest. Loading first verifies the SHA-256, uses `docker load`, and then
+compares every loaded image ID with metadata.
+
+The bundle contains images and review evidence only. It never contains
+deployment `.env`, Vaultwarden settings, role credentials, Restic passwords,
+notifier credentials, volumes, databases, restore outputs, or user data.

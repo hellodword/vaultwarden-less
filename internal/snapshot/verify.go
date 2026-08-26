@@ -75,12 +75,15 @@ func Verify(ctx context.Context, root string) (Manifest, error) {
 	}
 
 	databasePath := filepath.Join(root, "data", "db.sqlite3")
-	migration, err := validateDatabase(ctx, databasePath)
+	database, err := validateDatabase(ctx, databasePath)
 	if err != nil {
 		return Manifest{}, fmt.Errorf("validate restored database: %w", err)
 	}
-	if migration != manifest.Vaultwarden.DatabaseMigration {
+	if database.Migration != manifest.Vaultwarden.DatabaseMigration {
 		return Manifest{}, fmt.Errorf("restored database migration does not match manifest")
+	}
+	if database.SchemaFingerprint != manifest.Vaultwarden.DatabaseSchemaFingerprint {
+		return Manifest{}, fmt.Errorf("restored database schema does not match manifest")
 	}
 	refs, err := referencedFiles(ctx, databasePath)
 	if err != nil {

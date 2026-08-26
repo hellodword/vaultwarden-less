@@ -1,46 +1,82 @@
 # vaultwarden-less
 
-`vaultwarden-less` 0.1.0 is an opinionated, Linux/amd64 backup and restore
-tool for one supported Vaultwarden boundary: version 1.37.2 with SQLite
-migration `20260505120000`. It places a transparent event proxy in front of
-Vaultwarden, builds a verified recovery point from the live database and its
-referenced attachment and file Send data, and sends that point to one or more
-S3-backed Restic 0.19.1 repositories.
+`vaultwarden-less` is an opinionated Linux/amd64 backup and restore system for
+one explicitly audited Vaultwarden release. It places a transparent event proxy
+in front of Vaultwarden, creates a verified recovery point from SQLite plus the
+attachment and file-Send payloads referenced by that database, and stores that
+point in one or more S3-backed Restic repositories.
 
-The product deliberately has no persistent scheduler database or notification
-queue. Restic snapshots are the durable fact; process-local status is reset on
-restart. A startup check and a check at most 12 hours after the preceding
-successful one recover from lost in-memory signals.
+The project is intentionally early. It does not carry compatibility code for
+older configuration, manifests, databases, tags, or deployment layouts. A
+change to a durable contract must be made explicit, versioned, tested, and
+documented.
 
-## Supported deployment
+## Sources of truth
 
-- Nix supplies the pinned development, build, test, and operations environment.
-- Just is the only outer command interface. Recipes invoke a tool or durable
-  script inside exactly one `nix develop` environment.
-- Dockerfile/Buildx builds the product image; the flake does not build or
-  publish a product package or OCI image.
-- Compose runs Vaultwarden, the loopback-only proxy, and the worker as the
-  deployment directory's configured UID/GID. Nginx or another trusted edge
-  must sanitize forwarding headers before sending root-path traffic to the
-  proxy.
+The repository is designed to be understandable before it is upgradeable:
 
-## Quick start
+- [`VERSION`](VERSION) is the product version.
+- [`UPSTREAMS.toml`](UPSTREAMS.toml) records every audited upstream tag,
+  commit, digest, source hash, and audit surface.
+- [`internal/upstream/vaultwarden-schema.json`](internal/upstream/vaultwarden-schema.json)
+  is the complete accepted SQLite schema.
+- [`Justfile`](Justfile) is the operator and developer command index.
+- [`deploy/compose.yml`](deploy/compose.yml) is the only shipped deployment
+  topology.
+- [`docs/upstream-maintenance.md`](docs/upstream-maintenance.md) is the
+  one-upstream-at-a-time review procedure.
 
-Install Nix with flakes enabled and provide a Docker daemon with Compose and
-Buildx. Then use the project command app:
+Hosted workflows, registry publication, and container build recipes outside
+Nix are not part of the project. Nix builds the product binaries, patched
+Restic, and all project-owned images locally. The official Vaultwarden image is
+pulled only by its audited digest and retagged with a local-only name.
+
+## Recovery boundary
+
+A recovery point contains exactly:
+
+- an SQLite online-backup copy at `data/db.sqlite3`;
+- attachment files referenced by that copy; and
+- file-Send payloads referenced by that copy.
+
+It excludes RSA keys, `config.json`, caches, templates, temporary files,
+SQLite sidecars, Vaultwarden-created backups, and orphaned payloads. After a
+restore, Vaultwarden creates a new RSA key, so existing access, refresh, invite,
+attachment, and download tokens may stop working. Users should establish fresh
+sessions.
+
+The scheduler and notifier queues are in memory. Restic snapshots are the
+durable fact. Startup and periodic checks recover from lost process-local
+signals; they do not reconstruct notification history.
+
+## Commands
+
+Use the pinned Just app as the only outer interface:
 
 ```sh
+nix run .#just -- --list
+nix run .#just -- check
+nix run .#just -- check-full
+```
+
+Recipes enter either the full development shell or the lightweight deployment
+shell themselves. Do not install project tools globally.
+
+For deployment, build the complete image bundle on a fast Linux/amd64 machine,
+copy it to the target, and load it there:
+
+```sh
+nix run .#just -- bundle
+nix run .#just -- bundle-load dist/vaultwarden-less-<version>-linux-amd64
 nix run .#just -- init
 ```
 
-`init` creates only missing private directories and files. It never overwrites
-existing content. Edit `.env.vaultwarden`, `config/backup.yaml`,
-`credentials/backup/credentials.yaml`, and
-`credentials/maintenance/credentials.yaml`; keep all of
-them private. For a remote Docker daemon, set `DEPLOY_UID` and `DEPLOY_GID` in
-`.env` to the owner of the bind-mounted remote deployment directory.
+The bundle is a checked `docker save` archive. The deployment device performs
+`docker load`; it does not compile Vaultwarden-less or Restic. See
+[Operations](docs/operations.md#offline-image-transfer) before initial
+deployment.
 
-Validate, initialize the repository, and start the stack:
+After editing the generated private configuration:
 
 ```sh
 nix run .#just -- config-validate
@@ -49,33 +85,15 @@ nix run .#just -- up
 nix run .#just -- status
 ```
 
-Only the proxy is published, at `127.0.0.1:8080` by default. The worker HTTP
-API remains on the private Compose `events` network.
-
-## Recovery boundary
-
-A recovery point contains only:
-
-- `data/db.sqlite3` copied with SQLite's online backup API;
-- attachment files referenced by the copied database; and
-- file Send payloads referenced by the copied database.
-
-It excludes RSA keys, `config.json`, caches, templates, temporary files,
-SQLite sidecars, Vaultwarden-created database backups, and orphan files. A
-restored Vaultwarden generates a new RSA key, so old access, refresh, invite,
-attachment, and download tokens can stop working. Users must sign in again.
-
-The 0.1.0 configuration, manifest, runtime, and Restic tag contracts are new.
-There is no migration from earlier state or snapshots, and new retention
-commands do not delete snapshots carrying earlier product tags.
+Only the proxy is published, on loopback by default. A trusted TLS edge must
+remove untrusted forwarding headers and send root-path HTTP/WebSocket traffic
+to that proxy. The worker API remains on a private Compose network.
 
 ## Documentation
 
-- [Configuration](docs/configuration.md)
 - [Architecture](docs/architecture.md)
-- [Operations](docs/operations.md)
-- [Machine-readable contracts](docs/contracts.md)
-
-`VERSION` is the single product version source. The pinned Go, Restic,
-Vaultwarden, builder, and runtime image versions are part of the reviewed
-release boundary.
+- [Configuration](docs/configuration.md)
+- [Contracts](docs/contracts.md)
+- [Operations and recovery](docs/operations.md)
+- [Upstream review and upgrade strategy](docs/upstream-maintenance.md)
+- [Licensing and provenance](NOTICE.md)

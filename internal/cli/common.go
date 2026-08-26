@@ -6,22 +6,25 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/hellodword/vaultwarden-less/internal/config"
 	"github.com/hellodword/vaultwarden-less/internal/notify"
+	"github.com/hellodword/vaultwarden-less/internal/privatefs"
 	"github.com/hellodword/vaultwarden-less/internal/restic"
 	restoretool "github.com/hellodword/vaultwarden-less/internal/restore"
-	"github.com/hellodword/vaultwarden-less/internal/securefile"
 	"github.com/hellodword/vaultwarden-less/internal/snapshot"
 )
+
+const ResultSchemaVersion = 2
 
 type repository interface {
 	VerifyVersion(context.Context) error
 	Ensure(context.Context, config.Target, snapshot.Manifest) (restic.SyncResult, error)
-	Snapshots(context.Context, config.Target) ([]restic.Snapshot, error)
+	Snapshots(context.Context, config.Target, int) ([]restic.Snapshot, bool, error)
 	Init(context.Context, config.Target) error
 	Unlock(context.Context, config.Target) error
 	Check(context.Context, config.Target, string) error
@@ -35,6 +38,7 @@ type restoreFunc func(context.Context, restoretool.Repository, restoretool.Reque
 type commandEnvironment struct {
 	loadBackup      func(string) (*config.Backup, error)
 	loadCredentials func(string, *config.Backup) (*config.RoleCredentials, error)
+	loadNotifiers   func(string, *config.Backup) ([]config.Notifier, error)
 	readSecret      func(string) (string, error)
 	validateNotify  func([]config.Notifier) error
 	repository      func(*config.Backup) (repository, error)
@@ -42,19 +46,23 @@ type commandEnvironment struct {
 	httpClient      *http.Client
 	workerURL       string
 	credentialsPath string
-	passwordPath    string
+	notifierPath    string
+	passwordRoot    string
 	resticBinary    string
 	dataDir         string
 	stagingDir      string
 	cacheDir        string
 	restoreRoot     string
+	logger          *slog.Logger
 }
 
-func defaultEnvironment() commandEnvironment {
+func defaultEnvironment(stderr io.Writer) commandEnvironment {
+	logger := slog.New(slog.NewJSONHandler(stderr, nil))
 	environment := commandEnvironment{
 		loadBackup:      config.LoadBackup,
 		loadCredentials: config.LoadRoleCredentials,
-		readSecret:      securefile.Read,
+		loadNotifiers:   config.LoadNotifierCredentials,
+		readSecret:      privatefs.Read,
 		validateNotify:  notify.ValidateConfigs,
 		restore:         restoretool.Run,
 		httpClient: &http.Client{
@@ -65,24 +73,28 @@ func defaultEnvironment() commandEnvironment {
 		},
 		workerURL:       config.WorkerURL,
 		credentialsPath: config.RoleCredentialsPath,
-		passwordPath:    config.ResticPasswordPath,
+		notifierPath:    config.NotifierCredentialsPath,
+		passwordRoot:    config.ResticPasswordRoot,
 		resticBinary:    config.ResticBinary,
 		dataDir:         config.DataDir,
 		stagingDir:      config.StagingDir,
 		cacheDir:        config.CacheDir,
 		restoreRoot:     config.RestoreRoot,
+		logger:          logger,
 	}
 	environment.repository = func(cfg *config.Backup) (repository, error) {
 		credentials, err := environment.loadCredentials(environment.credentialsPath, cfg)
 		if err != nil {
 			return nil, err
 		}
-		return restic.Runner{
-			Binary:       environment.resticBinary,
-			CacheDir:     environment.cacheDir,
-			PasswordFile: environment.passwordPath,
-			Credentials:  credentials,
-		}, nil
+		return restic.NewRunner(
+			environment.resticBinary,
+			environment.cacheDir,
+			environment.passwordRoot,
+			"",
+			credentials,
+			environment.logger,
+		), nil
 	}
 	return environment
 }
@@ -99,6 +111,13 @@ func (environment commandEnvironment) repositoryFor(cfg *config.Backup) (reposit
 		return nil, fmt.Errorf("repository client is unavailable")
 	}
 	return environment.repository(cfg)
+}
+
+func (environment commandEnvironment) notifiersFor(cfg *config.Backup) ([]config.Notifier, error) {
+	if environment.loadNotifiers == nil {
+		return nil, fmt.Errorf("notifier credential loader is unavailable")
+	}
+	return environment.loadNotifiers(environment.notifierPath, cfg)
 }
 
 func findTarget(cfg *config.Backup, name string) (config.Target, error) {

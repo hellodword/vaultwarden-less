@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,15 +21,20 @@ import (
 	"time"
 
 	"github.com/hellodword/vaultwarden-less/internal/config"
-	"github.com/hellodword/vaultwarden-less/internal/safefs"
-	"github.com/hellodword/vaultwarden-less/internal/securefile"
+	"github.com/hellodword/vaultwarden-less/internal/privatefs"
 	"github.com/hellodword/vaultwarden-less/internal/snapshot"
-	"github.com/hellodword/vaultwarden-less/internal/version"
+	"github.com/hellodword/vaultwarden-less/internal/upstream"
 )
 
 const (
 	maxCommandOutput = 16 << 20
 	maxStderrOutput  = 1 << 20
+
+	SnapshotHost          = "vaultwarden-less"
+	SnapshotPath          = "/staging/point"
+	SnapshotTag           = "vaultwarden-less-recovery-v2"
+	DefaultSnapshotsLimit = 100
+	MaxSnapshotsLimit     = 1000
 )
 
 type OperationError struct {
@@ -67,8 +73,9 @@ type executeFunc func(context.Context, string, []string, []string, string) ([]by
 type Runner struct {
 	Binary       string
 	CacheDir     string
-	PasswordFile string
+	PasswordRoot string
 	Credentials  *config.RoleCredentials
+	Logger       *slog.Logger
 
 	execute      executeFunc
 	recoveryPath string
@@ -79,12 +86,12 @@ func (r Runner) VerifyVersion(ctx context.Context) error {
 	if binary == "" {
 		binary = config.ResticBinary
 	}
-	output, err := r.run(ctx, binary, []string{"version"}, sanitizedEnvironment(nil), "")
+	output, err := r.runLogged(ctx, "version", "", binary, []string{"version"}, sanitizedEnvironment(nil), "")
 	if err != nil {
 		return err
 	}
 	value := strings.TrimSpace(string(output))
-	if value != "restic "+version.Restic && !strings.HasPrefix(value, "restic "+version.Restic+" ") {
+	if value != "restic "+upstream.ResticVersion && !strings.HasPrefix(value, "restic "+upstream.ResticVersion+" ") {
 		return &OperationError{Code: "version_mismatch", ExitCode: -1}
 	}
 	return nil
@@ -111,12 +118,12 @@ func (r Runner) Ensure(ctx context.Context, target config.Target, manifest snaps
 	}
 	arguments := append(base,
 		"backup", "--json",
-		"--host", version.SnapshotHost,
-		"--tag", version.SnapshotTag,
+		"--host", SnapshotHost,
+		"--tag", SnapshotTag,
 		"--tag", "content-id="+contentHex,
 		"--", r.path(),
 	)
-	output, err := r.runCommand(ctx, arguments, environment, "")
+	output, err := r.runTargetCommand(ctx, target, "backup", arguments, environment, "")
 	if err != nil {
 		return SyncResult{}, err
 	}
@@ -124,7 +131,9 @@ func (r Runner) Ensure(ctx context.Context, target config.Target, manifest snaps
 	if err != nil {
 		return SyncResult{}, &OperationError{Code: "backup_result_invalid", ExitCode: -1}
 	}
-	return SyncResult{SnapshotID: snapshotID, ContentID: manifest.ContentID, Created: true}, nil
+	result := SyncResult{SnapshotID: snapshotID, ContentID: manifest.ContentID, Created: true}
+	r.logResult("restic recovery snapshot synchronized", target.Name, result)
+	return result, nil
 }
 
 func (r Runner) Latest(ctx context.Context, target config.Target) (*Snapshot, error) {
@@ -141,18 +150,27 @@ func (r Runner) Latest(ctx context.Context, target config.Target) (*Snapshot, er
 	return &items[0], nil
 }
 
-func (r Runner) Snapshots(ctx context.Context, target config.Target) ([]Snapshot, error) {
-	items, err := r.snapshotQuery(ctx, target, nil)
+func (r Runner) Snapshots(ctx context.Context, target config.Target, limit int) ([]Snapshot, bool, error) {
+	if limit < 1 || limit > MaxSnapshotsLimit {
+		return nil, false, &OperationError{Code: "snapshots_limit_invalid", ExitCode: -1}
+	}
+	items, err := r.snapshotQuery(ctx, target, []string{"--latest", strconv.Itoa(limit + 1)})
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	sort.Slice(items, func(left, right int) bool {
-		if items[left].Time == items[right].Time {
+		leftTime, _ := time.Parse(time.RFC3339Nano, items[left].Time)
+		rightTime, _ := time.Parse(time.RFC3339Nano, items[right].Time)
+		if leftTime.Equal(rightTime) {
 			return items[left].ID > items[right].ID
 		}
-		return items[left].Time > items[right].Time
+		return leftTime.After(rightTime)
 	})
-	return items, nil
+	truncated := len(items) > limit
+	if truncated {
+		items = items[:limit]
+	}
+	return items, truncated, nil
 }
 
 func (r Runner) ResolveSnapshot(ctx context.Context, target config.Target, requested string) (Snapshot, error) {
@@ -186,12 +204,12 @@ func (r Runner) snapshotQuery(ctx context.Context, target config.Target, additio
 	}
 	arguments := append(base,
 		"snapshots", "--json",
-		"--host", version.SnapshotHost,
+		"--host", SnapshotHost,
 		"--path", r.path(),
-		"--tag", version.SnapshotTag,
+		"--tag", SnapshotTag,
 	)
 	arguments = append(arguments, additional...)
-	output, err := r.runCommand(ctx, arguments, environment, "")
+	output, err := r.runTargetCommand(ctx, target, "snapshots", arguments, environment, "")
 	if err != nil {
 		return nil, err
 	}
@@ -228,9 +246,9 @@ func (r Runner) Check(ctx context.Context, target config.Target, readDataSubset 
 func (r Runner) Prune(ctx context.Context, target config.Target, apply bool) (PruneResult, error) {
 	arguments := []string{
 		"forget", "--json", "--prune",
-		"--host", version.SnapshotHost,
+		"--host", SnapshotHost,
 		"--path", r.path(),
-		"--tag", version.SnapshotTag,
+		"--tag", SnapshotTag,
 		"--group-by", "host,paths",
 		"--keep-within", "24h",
 		"--keep-hourly", "48",
@@ -271,14 +289,14 @@ func (r Runner) path() string {
 	if r.recoveryPath != "" {
 		return r.recoveryPath
 	}
-	return version.SnapshotPath
+	return SnapshotPath
 }
 
 func validateRestoreDestination(path string) error {
 	if path == "" || !filepath.IsAbs(path) || filepath.Clean(path) != path {
 		return &OperationError{Code: "restore_target_invalid", ExitCode: -1}
 	}
-	if err := safefs.ValidatePrivateDirectory(path); err != nil {
+	if err := privatefs.ValidatePrivateDirectory(path); err != nil {
 		return &OperationError{Code: "restore_target_invalid", ExitCode: -1}
 	}
 	return nil
@@ -289,7 +307,7 @@ func (r Runner) maintenance(ctx context.Context, target config.Target, command [
 	if err != nil {
 		return nil, err
 	}
-	return r.runCommand(ctx, append(base, command...), environment, "")
+	return r.runTargetCommand(ctx, target, command[0], append(base, command...), environment, "")
 }
 
 func (r Runner) targetCommand(target config.Target) ([]string, []string, error) {
@@ -303,27 +321,31 @@ func (r Runner) targetCommand(target config.Target) ([]string, []string, error) 
 	if err != nil {
 		return nil, nil, &OperationError{Code: "credentials_invalid", ExitCode: -1}
 	}
-	if err := safefs.ValidatePrivateDirectory(filepath.Dir(r.PasswordFile)); err != nil {
+	if err := privatefs.ValidatePrivateDirectory(r.PasswordRoot); err != nil {
 		return nil, nil, &OperationError{Code: "password_path_invalid", ExitCode: -1}
 	}
-	password, err := securefile.Read(r.PasswordFile)
+	passwordFile := filepath.Join(r.PasswordRoot, target.Name)
+	if filepath.Dir(passwordFile) != filepath.Clean(r.PasswordRoot) {
+		return nil, nil, &OperationError{Code: "password_path_invalid", ExitCode: -1}
+	}
+	password, err := privatefs.Read(passwordFile)
 	if err != nil || strings.ContainsAny(password, "\r\n\x00") {
 		return nil, nil, &OperationError{Code: "password_file_invalid", ExitCode: -1}
 	}
-	if err := safefs.ValidatePrivateDirectory(r.CacheDir); err != nil {
+	if err := privatefs.ValidatePrivateDirectory(r.CacheDir); err != nil {
 		return nil, nil, &OperationError{Code: "cache_path_invalid", ExitCode: -1}
 	}
 	cache := filepath.Join(r.CacheDir, target.Name)
 	if filepath.Dir(cache) != filepath.Clean(r.CacheDir) {
 		return nil, nil, &OperationError{Code: "cache_path_invalid", ExitCode: -1}
 	}
-	if err := safefs.EnsurePrivateDirectory(cache); err != nil {
+	if err := privatefs.EnsurePrivateDirectory(cache); err != nil {
 		return nil, nil, &OperationError{Code: "cache_create_failed", ExitCode: -1}
 	}
 
 	base := []string{
 		"--repo", target.Repository,
-		"--password-file", r.PasswordFile,
+		"--password-file", passwordFile,
 		"--cache-dir", cache,
 	}
 	optionNames := make([]string, 0, len(target.ResticOptions))
@@ -356,12 +378,62 @@ func sanitizedEnvironment(credentials map[string]string) []string {
 	return environment
 }
 
-func (r Runner) runCommand(ctx context.Context, arguments, environment []string, directory string) ([]byte, error) {
+func (r Runner) runTargetCommand(ctx context.Context, target config.Target, operation string, arguments, environment []string, directory string) ([]byte, error) {
 	binary := r.Binary
 	if binary == "" {
 		binary = config.ResticBinary
 	}
-	return r.run(ctx, binary, arguments, environment, directory)
+	return r.runLogged(ctx, operation, target.Name, binary, arguments, environment, directory)
+}
+
+func (r Runner) runLogged(ctx context.Context, operation, target, binary string, arguments, environment []string, directory string) ([]byte, error) {
+	started := time.Now()
+	output, err := r.run(ctx, binary, arguments, environment, directory)
+	if r.Logger == nil {
+		return output, err
+	}
+	attributes := []any{
+		"operation", operation,
+		"duration_ms", time.Since(started).Milliseconds(),
+		"exit_code", operationExitCode(err),
+	}
+	if target != "" {
+		attributes = append(attributes, "target", target)
+	}
+	if err == nil {
+		r.Logger.Info("restic operation completed", attributes...)
+	} else {
+		var operationError *OperationError
+		if errors.As(err, &operationError) {
+			attributes = append(attributes, "error_code", operationError.Code)
+		}
+		r.Logger.Error("restic operation failed", attributes...)
+	}
+	return output, err
+}
+
+func operationExitCode(err error) int {
+	if err == nil {
+		return 0
+	}
+	var operationError *OperationError
+	if errors.As(err, &operationError) {
+		return operationError.ExitCode
+	}
+	return -1
+}
+
+func (r Runner) logResult(message, target string, result SyncResult) {
+	if r.Logger == nil {
+		return
+	}
+	r.Logger.Info(
+		message,
+		"target", target,
+		"snapshot_id", result.SnapshotID,
+		"content_id", result.ContentID,
+		"created", result.Created,
+	)
 }
 
 func (r Runner) run(ctx context.Context, binary string, arguments, environment []string, directory string) ([]byte, error) {
@@ -424,7 +496,7 @@ func parseSnapshots(data []byte, expectedPath string) ([]Snapshot, error) {
 	result := make([]Snapshot, 0, len(raw))
 	seen := make(map[string]struct{}, len(raw))
 	for _, item := range raw {
-		if !validSnapshotID(item.ID) || item.Hostname != version.SnapshotHost || !slices.Equal(item.Paths, []string{expectedPath}) {
+		if !validSnapshotID(item.ID) || item.Hostname != SnapshotHost || !slices.Equal(item.Paths, []string{expectedPath}) {
 			return nil, &OperationError{Code: "snapshots_result_invalid", ExitCode: -1}
 		}
 		when, err := time.Parse(time.RFC3339Nano, item.Time)
@@ -452,7 +524,7 @@ func parseSnapshots(data []byte, expectedPath string) ([]Snapshot, error) {
 }
 
 func contentTag(tags []string) (string, bool) {
-	if countTag(tags, version.SnapshotTag) != 1 {
+	if countTag(tags, SnapshotTag) != 1 {
 		return "", false
 	}
 	content := ""
@@ -522,7 +594,7 @@ func parseForgetGroups(data []byte, expectedPath string) ([]PruneGroup, error) {
 	}
 	groups := make([]PruneGroup, 0, len(raw))
 	for _, group := range raw {
-		if group.Host != version.SnapshotHost || !slices.Equal(group.Paths, []string{expectedPath}) {
+		if group.Host != SnapshotHost || !slices.Equal(group.Paths, []string{expectedPath}) {
 			return nil, fmt.Errorf("unexpected forget group")
 		}
 		parsed := PruneGroup{

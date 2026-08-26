@@ -9,8 +9,11 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/hellodword/vaultwarden-less/internal/version"
+	"github.com/hellodword/vaultwarden-less/internal/buildinfo"
+	"github.com/hellodword/vaultwarden-less/internal/upstream"
 )
+
+const ManifestVersion = 2
 
 type File struct {
 	Path   string `json:"path"`
@@ -19,9 +22,10 @@ type File struct {
 }
 
 type VaultwardenTuple struct {
-	Version           string `json:"version"`
-	DatabaseMigration string `json:"database_migration"`
-	Image             string `json:"image"`
+	Version                   string `json:"version"`
+	DatabaseMigration         string `json:"database_migration"`
+	DatabaseSchemaFingerprint string `json:"database_schema_fingerprint"`
+	Image                     string `json:"image"`
 }
 
 type Manifest struct {
@@ -39,9 +43,10 @@ type contentPayload struct {
 }
 
 var supportedVaultwardenTuples = []VaultwardenTuple{{
-	Version:           version.Vaultwarden,
-	DatabaseMigration: version.VaultwardenSchema,
-	Image:             version.VaultwardenImage,
+	Version:                   upstream.VaultwardenVersion,
+	DatabaseMigration:         upstream.VaultwardenMigration,
+	DatabaseSchemaFingerprint: upstream.VaultwardenSchemaFingerprint,
+	Image:                     upstream.VaultwardenImageRepository + "@" + upstream.VaultwardenImageDigest,
 }}
 
 func NewManifest(files []File) (Manifest, error) {
@@ -53,8 +58,8 @@ func NewManifest(files []File) (Manifest, error) {
 		return strings.Compare(left.Path, right.Path)
 	})
 	manifest := Manifest{
-		SchemaVersion:  version.ManifestVersion,
-		CreatorVersion: version.Product,
+		SchemaVersion:  ManifestVersion,
+		CreatorVersion: buildinfo.Version,
 		Vaultwarden:    supportedVaultwardenTuples[0],
 		Files:          files,
 	}
@@ -84,7 +89,7 @@ func (m Manifest) CalculateContentID() (string, error) {
 }
 
 func (m Manifest) Validate() error {
-	if m.SchemaVersion != version.ManifestVersion {
+	if m.SchemaVersion != ManifestVersion {
 		return fmt.Errorf("unsupported manifest schema")
 	}
 	if !validCreatorVersion(m.CreatorVersion) {

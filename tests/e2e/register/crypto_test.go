@@ -2,7 +2,11 @@ package register
 
 import (
 	"bytes"
+	cryptorand "crypto/rand"
+	"crypto/rsa"
+	"crypto/sha1"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"strings"
@@ -44,6 +48,9 @@ func TestRegistrationUsesCurrentRegistrationShape(t *testing.T) {
 	if !strings.HasPrefix(registration.Key, "2.") || registration.MasterPasswordHash == "" {
 		t.Fatal("registration crypto fields are missing or malformed")
 	}
+	if len(registration.SymmetricKey) != 64 {
+		t.Fatal("registration did not retain its test-only symmetric key")
+	}
 	data, err := registration.JSON()
 	if err != nil {
 		t.Fatal(err)
@@ -51,6 +58,14 @@ func TestRegistrationUsesCurrentRegistrationShape(t *testing.T) {
 	var fields map[string]any
 	if err := json.Unmarshal(data, &fields); err != nil {
 		t.Fatal(err)
+	}
+	if registration.UserPublicKey == nil {
+		t.Fatal("registration did not retain its test-only public key")
+	}
+	for _, name := range []string{"SymmetricKey", "symmetricKey", "UserPublicKey", "userPublicKey"} {
+		if _, exists := fields[name]; exists {
+			t.Fatal("test-only symmetric key was serialized")
+		}
 	}
 	for _, name := range []string{"email", "kdfType", "kdfIterations", "key", "masterPasswordHash", "name"} {
 		if _, ok := fields[name]; !ok {
@@ -60,6 +75,33 @@ func TestRegistrationUsesCurrentRegistrationShape(t *testing.T) {
 	keys, ok := fields["userAsymmetricKeys"].(map[string]any)
 	if !ok || !strings.HasPrefix(stringValue(keys["encryptedPrivateKey"]), "2.") || stringValue(keys["publicKey"]) == "" {
 		t.Fatal("registration asymmetric keys are missing or malformed")
+	}
+}
+
+func TestEncapsulateKeyUnsignedUsesBitwardenType4RSAOAEP(t *testing.T) {
+	privateKey, err := rsa.GenerateKey(cryptorand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := bytes.Repeat([]byte{0x42}, 64)
+	value, err := EncapsulateKeyUnsigned(&privateKey.PublicKey, key, cryptorand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, ok := strings.CutPrefix(value, "4.")
+	if !ok || strings.Contains(encoded, "|") {
+		t.Fatalf("invalid asymmetric EncString shape")
+	}
+	ciphertext, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plaintext, err := rsa.DecryptOAEP(sha1.New(), cryptorand.Reader, privateKey, ciphertext, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(plaintext, key) {
+		t.Fatal("RSA-OAEP key encapsulation did not round trip")
 	}
 }
 

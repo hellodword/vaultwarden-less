@@ -12,7 +12,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/hellodword/vaultwarden-less/internal/version"
+	"github.com/hellodword/vaultwarden-less/internal/upstream"
 	_ "github.com/mattn/go-sqlite3"
 )
 
@@ -45,14 +45,13 @@ func syntheticData(t *testing.T, includeFiles bool) fixture {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = database.Close() })
-	statements := []string{
-		"PRAGMA journal_mode=WAL",
-		"PRAGMA foreign_keys=ON",
-		"CREATE TABLE __diesel_schema_migrations (version TEXT PRIMARY KEY NOT NULL, run_on TEXT NOT NULL)",
-		"CREATE TABLE ciphers (uuid TEXT PRIMARY KEY)",
-		"CREATE TABLE attachments (id TEXT PRIMARY KEY, cipher_uuid TEXT NOT NULL REFERENCES ciphers(uuid), file_size INTEGER NOT NULL)",
-		"CREATE TABLE sends (uuid TEXT PRIMARY KEY, atype INTEGER NOT NULL, data TEXT NOT NULL)",
-		"CREATE TABLE activity (id INTEGER PRIMARY KEY, value TEXT NOT NULL)",
+	contract, err := upstream.VaultwardenSchemaContract()
+	if err != nil {
+		t.Fatal(err)
+	}
+	statements := []string{"PRAGMA journal_mode=WAL", "PRAGMA foreign_keys=ON"}
+	for _, object := range contract.Objects {
+		statements = append(statements, object.SQL)
 	}
 	for _, statement := range statements {
 		if _, err := database.Exec(statement); err != nil {
@@ -65,11 +64,17 @@ func syntheticData(t *testing.T, includeFiles bool) fixture {
 		query string
 		args  []any
 	}{
-		{"INSERT INTO __diesel_schema_migrations(version, run_on) VALUES (?, '2026-05-05')", []any{version.VaultwardenSchema}},
-		{"INSERT INTO ciphers(uuid) VALUES (?)", []any{testCipherID}},
-		{"INSERT INTO attachments(id, cipher_uuid, file_size) VALUES (?, ?, ?)", []any{testAttachmentID, testCipherID, len(attachmentData)}},
-		{"INSERT INTO sends(uuid, atype, data) VALUES (?, 1, ?)", []any{testSendID, `{"id":"` + testSendFileID + `","size":` + decimal(len(sendData)) + `,"fileName":"encrypted"}`}},
-		{"INSERT INTO sends(uuid, atype, data) VALUES ('33333333-3333-4333-8333-333333333333', 0, 'text sends need no file and are not parsed')", nil},
+		{"INSERT INTO __diesel_schema_migrations(version, run_on) VALUES (?, '2026-05-05')", []any{upstream.VaultwardenMigration}},
+		{"INSERT INTO ciphers(uuid, created_at, updated_at, atype, name, data) VALUES (?, '2026-05-05', '2026-05-05', 2, 'cipher', '{}')", []any{testCipherID}},
+		{"INSERT INTO attachments(id, cipher_uuid, file_name, file_size) VALUES (?, ?, 'encrypted', ?)", []any{testAttachmentID, testCipherID, len(attachmentData)}},
+		{`INSERT INTO sends(
+			uuid, name, atype, data, akey, access_count, creation_date,
+			revision_date, deletion_date, disabled
+		) VALUES (?, 'file send', 1, ?, 'key', 0, '2026-05-05', '2026-05-05', '2026-06-05', 0)`, []any{testSendID, `{"id":"` + testSendFileID + `","size":` + decimal(len(sendData)) + `,"fileName":"encrypted"}`}},
+		{`INSERT INTO sends(
+			uuid, name, atype, data, akey, access_count, creation_date,
+			revision_date, deletion_date, disabled
+		) VALUES ('33333333-3333-4333-8333-333333333333', 'text send', 0, 'text sends need no file and are not parsed', 'key', 0, '2026-05-05', '2026-05-05', '2026-06-05', 0)`, nil},
 	}
 	for _, insert := range inserts {
 		if _, err := database.Exec(insert.query, insert.args...); err != nil {
@@ -216,7 +221,10 @@ func TestTwoStageSendWindowPreservesPreviousPoint(t *testing.T) {
 	newSendID := "44444444-4444-4444-8444-444444444444"
 	newFileID := strings.Repeat("c", 64)
 	if _, err := data.database.Exec(
-		"INSERT INTO sends(uuid, atype, data) VALUES (?, 1, ?)",
+		`INSERT INTO sends(
+			uuid, name, atype, data, akey, access_count, creation_date,
+			revision_date, deletion_date, disabled
+		) VALUES (?, 'missing file', 1, ?, 'key', 0, '2026-05-05', '2026-05-05', '2026-06-05', 0)`,
 		newSendID,
 		`{"id":"`+newFileID+`","size":12}`,
 	); err != nil {
@@ -330,6 +338,17 @@ func TestBuilderRejectsUnsupportedMigrationAndUnsafeReferences(t *testing.T) {
 	}
 }
 
+func TestBuilderRejectsSchemaDriftAtTheSameMigration(t *testing.T) {
+	t.Parallel()
+	data := syntheticData(t, true)
+	if _, err := data.database.Exec("CREATE TABLE unexpected_history_residue (id TEXT PRIMARY KEY)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (Builder{DataDir: data.dataDir, StagingDir: privateDirectory(t, "staging")}).Build(context.Background()); err == nil {
+		t.Fatal("database schema drift was accepted")
+	}
+}
+
 func TestVerifyRejectsEveryTreeMismatch(t *testing.T) {
 	tests := map[string]func(t *testing.T, result Result){
 		"extra file": func(t *testing.T, result Result) {
@@ -418,7 +437,7 @@ func TestManifestStrictlyRejectsUnknownFieldsAndUnsupportedTuple(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	withUnknown := strings.Replace(string(data), `"schema_version":1`, `"schema_version":1,"status":"complete"`, 1)
+	withUnknown := strings.Replace(string(data), `"schema_version":2`, `"schema_version":2,"status":"complete"`, 1)
 	if _, err := DecodeManifest([]byte(withUnknown)); err == nil {
 		t.Fatal("old manifest field was accepted")
 	}
@@ -468,6 +487,17 @@ func TestSpacePreflightRejectsImpossibleRequirement(t *testing.T) {
 	}
 }
 
+func TestSecondSpacePreflightCountsOnlyFilesStillToCopy(t *testing.T) {
+	t.Parallel()
+	required, err := remainingCopySpace(1234)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if required != 1234+spaceReserve {
+		t.Fatalf("remaining copy requirement = %d", required)
+	}
+}
+
 func TestAtomicPublicationFailurePreservesPreviousPoint(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
@@ -487,7 +517,13 @@ func TestAtomicPublicationFailurePreservesPreviousPoint(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := errors.New("synthetic exchange failure")
-	published, err := publishRecoveryPointUsing(build, point, func(string, string) error { return want })
+	published, err := publishRecoveryPointUsing(
+		build,
+		point,
+		func(string, string) error { return errors.New("unexpected no-replace call") },
+		func(string, string) error { return want },
+		func(string) error { return nil },
+	)
 	if published || !errors.Is(err, want) {
 		t.Fatalf("publication result = %t/%v", published, err)
 	}

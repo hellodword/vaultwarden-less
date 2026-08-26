@@ -24,7 +24,11 @@ func serveCommand(configPath *string, environment commandEnvironment) *cobra.Com
 			if err != nil {
 				return err
 			}
-			if err := environment.validateNotify(cfg.Notifiers); err != nil {
+			notifiers, err := environment.notifiersFor(cfg)
+			if err != nil {
+				return err
+			}
+			if err := environment.validateNotify(notifiers); err != nil {
 				return err
 			}
 			repository, err := environment.repositoryFor(cfg)
@@ -35,7 +39,10 @@ func serveCommand(configPath *string, environment commandEnvironment) *cobra.Com
 				return err
 			}
 
-			logger := slog.New(slog.NewJSONHandler(cmd.ErrOrStderr(), nil))
+			logger := environment.logger
+			if logger == nil {
+				logger = slog.New(slog.NewJSONHandler(cmd.ErrOrStderr(), nil))
+			}
 			for _, target := range cfg.Targets {
 				for _, warning := range target.Warnings() {
 					logger.Warn("configuration warning", "target", target.Name, "warning", warning)
@@ -43,7 +50,7 @@ func serveCommand(configPath *string, environment commandEnvironment) *cobra.Com
 			}
 			ctx, cancel := context.WithCancel(cmd.Context())
 			defer cancel()
-			notifications := notify.NewManager(cfg.Notifiers, logger)
+			notifications := notify.NewManager(notifiers, logger)
 			notifications.Start(ctx)
 			backupWorker := worker.New(cfg, snapshot.Builder{DataDir: environment.dataDir, StagingDir: environment.stagingDir}, repository, notifications, logger)
 			server := worker.NewHTTPServer(backupWorker)

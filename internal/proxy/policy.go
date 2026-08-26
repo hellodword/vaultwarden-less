@@ -5,8 +5,6 @@ import (
 	"strings"
 )
 
-const vaultwardenVersion = "1.37.2"
-
 type routeRule struct {
 	method  string
 	pattern string
@@ -14,9 +12,9 @@ type routeRule struct {
 	reason  string
 }
 
-// ignoredRoutes is audited against Vaultwarden 1.37.2. These routes change
-// authentication, device, telemetry, download-access, or discovery state, not
-// the durable user vault that a recovery point is intended to preserve.
+// ignoredRoutes is audited against the Vaultwarden revision in UPSTREAMS.toml.
+// These routes change authentication, device, telemetry, or discovery state,
+// not the durable user vault that a recovery point is intended to preserve.
 var ignoredRoutes = []routeRule{
 	// src/api/identity.rs:59 — token issuance is session state, not vault content.
 	{http.MethodPost, "/identity/connect/token", "src/api/identity.rs:59", "token issuance"},
@@ -46,14 +44,6 @@ var ignoredRoutes = []routeRule{
 	{http.MethodPut, "/api/auth-requests/{auth_request_id}", "src/api/core/accounts.rs:1656", "login approval response"},
 	// src/api/core/events.rs:164 — event collection is telemetry/audit ingestion, not vault content.
 	{http.MethodPost, "/events/collect", "src/api/core/events.rs:164", "event collection"},
-	// src/api/core/sends.rs:451 — Send access returns content and updates access metadata only.
-	{http.MethodPost, "/api/sends/access", "src/api/core/sends.rs:451", "Send access"},
-	// src/api/core/sends.rs:469 — legacy Send access returns content and updates access metadata only.
-	{http.MethodPost, "/api/sends/access/{access_id}", "src/api/core/sends.rs:469", "legacy Send access"},
-	// src/api/core/sends.rs:526 — file access issues a download response and updates access metadata only.
-	{http.MethodPost, "/api/sends/access/file/{file_id}", "src/api/core/sends.rs:526", "Send file access"},
-	// src/api/core/sends.rs:544 — legacy file access issues a download response and updates access metadata only.
-	{http.MethodPost, "/api/sends/{send_id}/access/file/{file_id}", "src/api/core/sends.rs:544", "legacy Send file access"},
 	// src/api/core/organizations.rs:923 — SSO domain verification is a read-like discovery call.
 	{http.MethodPost, "/api/organizations/domain/sso/verified", "src/api/core/organizations.rs:923", "SSO domain discovery"},
 	// src/api/core/organizations.rs:1753 — public-key lookup is read-like member discovery.

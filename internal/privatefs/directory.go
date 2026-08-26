@@ -1,4 +1,4 @@
-package safefs
+package privatefs
 
 import (
 	"fmt"

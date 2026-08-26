@@ -9,11 +9,12 @@ import (
 	"strings"
 
 	"github.com/hellodword/vaultwarden-less/internal/config"
+	"github.com/hellodword/vaultwarden-less/internal/privatefs"
 	"github.com/hellodword/vaultwarden-less/internal/restic"
-	"github.com/hellodword/vaultwarden-less/internal/safefs"
 	"github.com/hellodword/vaultwarden-less/internal/snapshot"
-	"github.com/hellodword/vaultwarden-less/internal/version"
 )
+
+const ResultSchemaVersion = 2
 
 type Repository interface {
 	ResolveSnapshot(context.Context, config.Target, string) (restic.Snapshot, error)
@@ -68,18 +69,15 @@ func Run(ctx context.Context, repository Repository, request Request) (_ Result,
 	if manifest.ContentID != selected.ContentID {
 		return Result{}, fmt.Errorf("restored manifest does not match snapshot content tag")
 	}
-	if _, err := os.Lstat(request.Output); !errors.Is(err, os.ErrNotExist) {
-		if err == nil {
-			return Result{}, fmt.Errorf("restore output appeared before publication")
-		}
-		return Result{}, fmt.Errorf("inspect restore output before publication: %w", err)
-	}
-	if err := os.Rename(temporary, request.Output); err != nil {
+	if err := privatefs.RenameNoReplace(temporary, request.Output); err != nil {
 		return Result{}, fmt.Errorf("publish verified restore directory: %w", err)
 	}
 	published = true
+	if err := privatefs.SyncDirectory(parent); err != nil {
+		return Result{}, fmt.Errorf("sync verified restore publication: %w", err)
+	}
 	return Result{
-		SchemaVersion: version.SchemaVersion,
+		SchemaVersion: ResultSchemaVersion,
 		Target:        request.Target.Name,
 		SnapshotID:    selected.ID,
 		ContentID:     manifest.ContentID,
@@ -117,7 +115,7 @@ func validateOutput(restoreRoot, output string) error {
 }
 
 func exactPrivateDirectory(path string) error {
-	if err := safefs.ValidatePrivateDirectory(path); err != nil {
+	if err := privatefs.ValidatePrivateDirectory(path); err != nil {
 		return err
 	}
 	info, err := os.Lstat(path)

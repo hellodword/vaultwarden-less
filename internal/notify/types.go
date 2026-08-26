@@ -7,8 +7,9 @@ import (
 	"time"
 
 	"github.com/hellodword/vaultwarden-less/internal/snapshot"
-	"github.com/hellodword/vaultwarden-less/internal/version"
 )
+
+const SchemaVersion = 2
 
 type Event struct {
 	SchemaVersion int            `json:"schema_version"`
@@ -33,7 +34,7 @@ func NewRecoveryEvent(id, occurredAt, contentID string, targets []TargetStatus) 
 		targets = []TargetStatus{}
 	}
 	return Event{
-		SchemaVersion: version.SchemaVersion,
+		SchemaVersion: SchemaVersion,
 		ID:            id,
 		Type:          "recovery_point_created",
 		OccurredAt:    occurredAt,
@@ -49,7 +50,7 @@ func NewSourceEvent(id, eventType, occurredAt, errorCode string) Event {
 		errorCode = ""
 	}
 	return Event{
-		SchemaVersion: version.SchemaVersion,
+		SchemaVersion: SchemaVersion,
 		ID:            id,
 		Type:          eventType,
 		OccurredAt:    occurredAt,
@@ -61,7 +62,7 @@ func NewSourceEvent(id, eventType, occurredAt, errorCode string) Event {
 
 func NewTargetEvent(id, eventType, occurredAt string, target TargetStatus) Event {
 	return Event{
-		SchemaVersion: version.SchemaVersion,
+		SchemaVersion: SchemaVersion,
 		ID:            id,
 		Type:          eventType,
 		OccurredAt:    occurredAt,
@@ -70,7 +71,7 @@ func NewTargetEvent(id, eventType, occurredAt string, target TargetStatus) Event
 }
 
 func (event Event) Validate() error {
-	if event.SchemaVersion != version.SchemaVersion || event.ID == "" || len(event.ID) > 256 || strings.ContainsAny(event.ID, "\r\n\x00") {
+	if event.SchemaVersion != SchemaVersion || event.ID == "" || len(event.ID) > 256 || strings.ContainsAny(event.ID, "\r\n\x00") {
 		return fmt.Errorf("invalid notification envelope")
 	}
 	when, err := time.Parse(time.RFC3339Nano, event.OccurredAt)

@@ -22,12 +22,40 @@ func TestVaultwardenBackupRestoreE2E(t *testing.T) {
 	unique := time.Now().UnixNano()
 	firstEmail := fmt.Sprintf("vaultwarden-less-e2e-one-%d@example.com", unique)
 	secondEmail := fmt.Sprintf("vaultwarden-less-e2e-two-%d@example.com", unique)
-	registerAccount(ctx, t, harness.publicHTTP, firstEmail, testPassword)
-	registerAccount(ctx, t, harness.publicHTTP, secondEmail, testPassword)
-	firstClient := newBitwardenCLI(t, filepath.Join(harness.localRoot, "bw-first"), harness.publicTLS, firstEmail, testPassword)
-	secondClient := newBitwardenCLI(t, filepath.Join(harness.localRoot, "bw-second"), harness.publicTLS, secondEmail, testPassword)
+	firstRegistration := registerAccount(ctx, t, harness.publicHTTP, firstEmail, testPassword)
+	_ = registerAccount(ctx, t, harness.publicHTTP, secondEmail, testPassword)
+	firstClient := newBitwardenCLI(t, filepath.Join(harness.localRoot, "bw-first"), harness.publicTLS, harness.tlsCAFile, firstEmail, testPassword)
+	secondClient := newBitwardenCLI(t, filepath.Join(harness.localRoot, "bw-second"), harness.publicTLS, harness.tlsCAFile, secondEmail, testPassword)
 	firstClient.login(ctx)
 	secondClient.login(ctx)
+	organizationName := "Vaultwarden-less Recovery Organization"
+	initialCollectionName := "Default Recovery Collection"
+	organizationID := createOrganization(
+		ctx,
+		t,
+		harness.publicHTTP,
+		firstEmail,
+		organizationName,
+		initialCollectionName,
+		firstRegistration,
+	)
+	firstClient.sync(ctx)
+	initialCollection := firstClient.collectionByName(ctx, organizationID, initialCollectionName)
+	if stringValue(firstClient.getOrganization(ctx, organizationID)["name"]) != organizationName {
+		t.Fatal("created organization was not readable through the official CLI")
+	}
+	collectionName := "Audited Recovery Collection"
+	collectionID := firstClient.createOrganizationCollection(ctx, organizationID, collectionName)
+	organizationItemID := firstClient.createOrganizationItem(
+		ctx,
+		"Organization Recovery Item",
+		organizationItemPassword,
+		organizationID,
+		collectionID,
+	)
+	if stringValue(initialCollection["id"]) == collectionID {
+		t.Fatal("organization collection creation reused the initial collection")
+	}
 
 	folderName := "Vaultwarden-less Recovery Folder"
 	folderID := firstClient.createFolder(ctx, folderName)
@@ -70,6 +98,16 @@ func TestVaultwardenBackupRestoreE2E(t *testing.T) {
 		t.Fatal("item mutation did not change the recovery content ID")
 	}
 
+	limitedData := []byte("access-limited Send payload\n")
+	limitedPath := privateTestPath(t, harness.localRoot, "limited-send.bin", limitedData)
+	limitedSendID := firstClient.createFileSendWithLimit(ctx, limitedPath, "Access Count Recovery Send", 1)
+	harness.waitSnapshotCount(3, 7*time.Minute)
+	limitedDownload := filepath.Join(harness.localRoot, "limited-send-download.bin")
+	firstClient.getFileSend(ctx, limitedSendID, limitedDownload)
+	assertFileContent(t, limitedDownload, limitedData)
+	accessSnapshots := harness.waitSnapshotCount(4, 7*time.Minute)
+	latestSnapshot := accessSnapshots.Snapshots[0]
+
 	// Restart intentionally erases all scheduler history. The startup check is
 	// the product's recovery mechanism and must not create a duplicate snapshot
 	// for identical content.
@@ -77,20 +115,29 @@ func TestVaultwardenBackupRestoreE2E(t *testing.T) {
 	harness.waitHealthy("backup", 2*time.Minute)
 	harness.waitUnchangedCheck("", 2*time.Minute)
 	afterUnchanged, err := harness.snapshots()
-	if err != nil || len(afterUnchanged.Snapshots) != 2 {
+	if err != nil || len(afterUnchanged.Snapshots) != 4 {
 		t.Fatalf("unchanged startup check changed snapshot count: %#v/%v", afterUnchanged, err)
 	}
 
 	latest := harness.restore("", "drill")
-	if latest.SnapshotID != secondSnapshot.ID || latest.ContentID != secondSnapshot.ContentID {
-		t.Fatalf("latest restore = %#v, want snapshot %s", latest, secondSnapshot.ID)
+	if latest.SnapshotID != latestSnapshot.ID || latest.ContentID != latestSnapshot.ContentID {
+		t.Fatalf("latest restore = %#v, want snapshot %s", latest, latestSnapshot.ID)
 	}
 	harness.stopProduction()
-	harness.startDrill(filepath.Join(harness.deployRoot, "restore", "drill"))
+	harness.startDrill("drill")
 	firstClient.expectSyncFailure(ctx)
 
-	restoredFirst := newBitwardenCLI(t, filepath.Join(harness.localRoot, "bw-restored-first"), harness.publicTLS, firstEmail, testPassword)
+	restoredFirst := newBitwardenCLI(t, filepath.Join(harness.localRoot, "bw-restored-first"), harness.publicTLS, harness.tlsCAFile, firstEmail, testPassword)
 	restoredFirst.login(ctx)
+	if stringValue(restoredFirst.getOrganization(ctx, organizationID)["name"]) != organizationName {
+		t.Fatal("organization did not survive restore")
+	}
+	if stringValue(restoredFirst.collectionByName(ctx, organizationID, collectionName)["id"]) != collectionID {
+		t.Fatal("organization collection did not survive restore")
+	}
+	if itemPassword(t, restoredFirst.getItem(ctx, organizationItemID)) != organizationItemPassword {
+		t.Fatal("organization item did not survive restore")
+	}
 	restoredFolder := restoredFirst.getFolder(ctx, folderID)
 	if stringValue(restoredFolder["name"]) != folderName {
 		t.Fatalf("restored folder name = %q", stringValue(restoredFolder["name"]))
@@ -105,7 +152,8 @@ func TestVaultwardenBackupRestoreE2E(t *testing.T) {
 	restoredSend := filepath.Join(harness.localRoot, "restored-send.bin")
 	restoredFirst.getFileSend(ctx, sendID, restoredSend)
 	assertFileContent(t, restoredSend, sendData)
-	restoredSecond := newBitwardenCLI(t, filepath.Join(harness.localRoot, "bw-restored-second"), harness.publicTLS, secondEmail, testPassword)
+	restoredFirst.expectFileSendAccessFailure(ctx, limitedSendID)
+	restoredSecond := newBitwardenCLI(t, filepath.Join(harness.localRoot, "bw-restored-second"), harness.publicTLS, harness.tlsCAFile, secondEmail, testPassword)
 	restoredSecond.login(ctx)
 	if itemPassword(t, restoredSecond.getItem(ctx, secondItemID)) != secondPassword {
 		t.Fatal("second user's item did not survive restore")
@@ -116,8 +164,8 @@ func TestVaultwardenBackupRestoreE2E(t *testing.T) {
 	if old.SnapshotID != firstSnapshot.ID || old.ContentID != firstSnapshot.ContentID {
 		t.Fatalf("explicit old restore = %#v", old)
 	}
-	harness.startDrill(filepath.Join(harness.deployRoot, "restore", "old"))
-	oldClient := newBitwardenCLI(t, filepath.Join(harness.localRoot, "bw-restored-old"), harness.publicTLS, firstEmail, testPassword)
+	harness.startDrill("old")
+	oldClient := newBitwardenCLI(t, filepath.Join(harness.localRoot, "bw-restored-old"), harness.publicTLS, harness.tlsCAFile, firstEmail, testPassword)
 	oldClient.login(ctx)
 	if itemPassword(t, oldClient.getItem(ctx, itemID)) != oldItemPassword {
 		t.Fatal("explicit old snapshot did not restore the old item content")

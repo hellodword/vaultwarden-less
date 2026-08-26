@@ -14,7 +14,6 @@ import (
 	"github.com/hellodword/vaultwarden-less/internal/notify"
 	"github.com/hellodword/vaultwarden-less/internal/restic"
 	"github.com/hellodword/vaultwarden-less/internal/snapshot"
-	"github.com/hellodword/vaultwarden-less/internal/version"
 )
 
 type Source interface {
@@ -74,7 +73,6 @@ type Worker struct {
 	status         Status
 	sourceFailure  failureState
 	targetFailures []failureState
-	notified       map[string]struct{}
 	eventSequence  uint64
 }
 
@@ -92,13 +90,12 @@ func newWithClock(cfg *config.Backup, source Source, repository Repository, noti
 		config: cfg, source: source, repository: repository, notifications: notifications, logger: logger, clock: currentClock,
 		demand: make(chan struct{}, 1),
 		status: Status{
-			SchemaVersion: version.SchemaVersion,
+			SchemaVersion: SchemaVersion,
 			State:         "idle",
 			StartedAt:     formatTime(started),
 			Targets:       targets,
 		},
 		targetFailures: make([]failureState, len(cfg.Targets)),
-		notified:       map[string]struct{}{},
 	}
 }
 
@@ -262,15 +259,12 @@ func (worker *Worker) check(ctx context.Context, started time.Time) checkOutcome
 	}
 
 	if created > 0 {
-		if _, alreadyNotified := worker.notified[built.Manifest.ContentID]; !alreadyNotified {
-			worker.notified[built.Manifest.ContentID] = struct{}{}
-			worker.enqueue(notify.NewRecoveryEvent(
-				worker.nextEventID("recovery_point_created", worker.clock.Now()),
-				eventTime(worker.clock.Now()),
-				built.Manifest.ContentID,
-				targetNotifications,
-			))
-		}
+		worker.enqueue(notify.NewRecoveryEvent(
+			worker.nextEventID("recovery_point_created", worker.clock.Now()),
+			eventTime(worker.clock.Now()),
+			built.Manifest.ContentID,
+			targetNotifications,
+		))
 	}
 	if failed == 0 {
 		result := "unchanged"

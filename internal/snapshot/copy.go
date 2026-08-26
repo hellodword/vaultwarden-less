@@ -12,7 +12,7 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/hellodword/vaultwarden-less/internal/safefs"
+	"github.com/hellodword/vaultwarden-less/internal/privatefs"
 )
 
 type ConsistencyError struct {
@@ -75,7 +75,7 @@ func copyStableFile(ctx context.Context, dataDir, destinationRoot string, ref re
 		afterRead()
 	}
 	after, err := source.Stat()
-	if err != nil || !safefs.SameFileVersion(before, after) || written != before.Size() {
+	if err != nil || !privatefs.SameFileVersion(before, after) || written != before.Size() {
 		return File{}, &ConsistencyError{Path: ref.Path, Reason: "changed_during_copy"}
 	}
 	latest, err := openSourceFile(dataDir, ref.Path)
@@ -87,7 +87,7 @@ func copyStableFile(ctx context.Context, dataDir, destinationRoot string, ref re
 	}
 	latestInfo, statErr := latest.Stat()
 	closeErr := latest.Close()
-	if statErr != nil || closeErr != nil || !safefs.SameFileVersion(before, latestInfo) {
+	if statErr != nil || closeErr != nil || !privatefs.SameFileVersion(before, latestInfo) {
 		return File{}, &ConsistencyError{Path: ref.Path, Reason: "changed_during_copy"}
 	}
 	if written != ref.ExpectedSize {

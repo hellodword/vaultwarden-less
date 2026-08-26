@@ -10,10 +10,11 @@ import (
 	"time"
 
 	"github.com/hellodword/vaultwarden-less/internal/config"
-	"github.com/hellodword/vaultwarden-less/internal/version"
 )
 
 const (
+	SchemaVersion = 2
+
 	HealthPath = "/healthz"
 	EventsPath = "/v1/events"
 	CheckPath  = "/v1/check"
@@ -56,10 +57,18 @@ func Handler(worker *Worker) http.Handler {
 				methodNotAllowed(writer, http.MethodGet)
 				return
 			}
+			if !emptyRequestBody(request) {
+				writeError(writer, http.StatusBadRequest, "invalid_request", "GET requests must have an empty body.")
+				return
+			}
 			writer.WriteHeader(http.StatusNoContent)
 		case StatusPath:
 			if request.Method != http.MethodGet {
 				methodNotAllowed(writer, http.MethodGet)
+				return
+			}
+			if !emptyRequestBody(request) {
+				writeError(writer, http.StatusBadRequest, "invalid_request", "GET requests must have an empty body.")
 				return
 			}
 			writeJSON(writer, http.StatusOK, worker.Status())
@@ -74,7 +83,7 @@ func Handler(worker *Worker) http.Handler {
 					writeError(writer, invalid.status, invalid.code, invalid.message)
 					return
 				}
-				writeError(writer, http.StatusBadRequest, "invalid_request", "Request must be strict schema v1 JSON.")
+				writeError(writer, http.StatusBadRequest, "invalid_request", "Request must be strict schema v2 JSON.")
 				return
 			}
 			worker.Request()
@@ -82,7 +91,7 @@ func Handler(worker *Worker) http.Handler {
 				writer.WriteHeader(http.StatusNoContent)
 				return
 			}
-			writeJSON(writer, http.StatusAccepted, acceptedResponse{SchemaVersion: version.SchemaVersion, Accepted: true})
+			writeJSON(writer, http.StatusAccepted, acceptedResponse{SchemaVersion: SchemaVersion, Accepted: true})
 		default:
 			writeError(writer, http.StatusNotFound, "not_found", "Endpoint not found.")
 		}
@@ -109,6 +118,9 @@ func decodeEventRequest(writer http.ResponseWriter, request *http.Request) error
 			message: "Content-Type must be exactly application/json.",
 		}
 	}
+	if request.ContentLength > config.EventMaxBytes {
+		return &requestError{status: http.StatusRequestEntityTooLarge, code: "request_too_large", message: "Request body is too large."}
+	}
 	request.Body = http.MaxBytesReader(writer, request.Body, config.EventMaxBytes)
 	decoder := json.NewDecoder(request.Body)
 	decoder.DisallowUnknownFields()
@@ -120,14 +132,30 @@ func decodeEventRequest(writer http.ResponseWriter, request *http.Request) error
 		}
 		return errors.New("invalid request body")
 	}
-	if body.SchemaVersion != version.SchemaVersion {
+	if body.SchemaVersion != SchemaVersion {
 		return errors.New("invalid request body")
 	}
 	var extra any
 	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			return &requestError{status: http.StatusRequestEntityTooLarge, code: "request_too_large", message: "Request body is too large."}
+		}
 		return errors.New("request contains trailing JSON")
 	}
 	return nil
+}
+
+func emptyRequestBody(request *http.Request) bool {
+	if request.ContentLength > 0 {
+		return false
+	}
+	if request.Body == nil || request.Body == http.NoBody {
+		return true
+	}
+	var one [1]byte
+	read, err := request.Body.Read(one[:])
+	return read == 0 && errors.Is(err, io.EOF)
 }
 
 func methodNotAllowed(writer http.ResponseWriter, allowed string) {

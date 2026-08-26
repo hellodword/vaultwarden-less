@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/url"
 	"os"
 	"os/exec"
@@ -21,12 +22,13 @@ type bitwardenCLI struct {
 	path     string
 	appdata  string
 	server   string
+	caFile   string
 	email    string
 	password string
 	session  string
 }
 
-func newBitwardenCLI(t *testing.T, appdata, server, email, password string) *bitwardenCLI {
+func newBitwardenCLI(t *testing.T, appdata, server, caFile, email, password string) *bitwardenCLI {
 	t.Helper()
 	path, err := exec.LookPath("bw")
 	if err != nil {
@@ -35,7 +37,10 @@ func newBitwardenCLI(t *testing.T, appdata, server, email, password string) *bit
 	if err := os.Mkdir(appdata, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	return &bitwardenCLI{t: t, path: path, appdata: appdata, server: server, email: email, password: password}
+	if info, err := os.Stat(caFile); err != nil || !info.Mode().IsRegular() {
+		t.Fatal("Bitwarden CLI test CA must be a regular file")
+	}
+	return &bitwardenCLI{t: t, path: path, appdata: appdata, server: server, caFile: caFile, email: email, password: password}
 }
 
 func (client *bitwardenCLI) login(ctx context.Context) {
@@ -46,6 +51,10 @@ func (client *bitwardenCLI) login(ctx context.Context) {
 	if client.session == "" {
 		client.t.Fatal("Bitwarden CLI returned an empty session")
 	}
+	client.run(ctx, nil, "sync", "--force")
+}
+
+func (client *bitwardenCLI) sync(ctx context.Context) {
 	client.run(ctx, nil, "sync", "--force")
 }
 
@@ -60,7 +69,7 @@ func (client *bitwardenCLI) run(ctx context.Context, input []byte, arguments ...
 
 func (client *bitwardenCLI) tryRun(ctx context.Context, input []byte, arguments ...string) ([]byte, string, error) {
 	command := exec.CommandContext(ctx, client.path, append([]string{"--nointeraction"}, arguments...)...)
-	command.Env = cliEnvironment(client.appdata, client.password, client.session)
+	command.Env = cliEnvironment(client.appdata, client.caFile, client.password, client.session)
 	if input != nil {
 		command.Stdin = bytes.NewReader(input)
 	}
@@ -105,6 +114,71 @@ func (client *bitwardenCLI) createItem(ctx context.Context, name, password, fold
 		"fields": []any{}, "secureNote": nil, "card": nil,
 	}
 	return client.createEncodedObject(ctx, "item", item)
+}
+
+func (client *bitwardenCLI) createOrganizationItem(ctx context.Context, name, password, organizationID, collectionID string) string {
+	item := map[string]any{
+		"organizationId": organizationID,
+		"collectionIds":  []string{collectionID},
+		"folderId":       nil,
+		"type":           1,
+		"reprompt":       0,
+		"name":           name,
+		"notes":          "organization recovery E2E note",
+		"favorite":       false,
+		"login": map[string]any{
+			"username": "organization@example.com",
+			"password": password,
+			"uris":     []any{},
+		},
+		"fields": []any{}, "secureNote": nil, "card": nil,
+	}
+	return client.createEncodedObject(ctx, "item", item)
+}
+
+func (client *bitwardenCLI) getOrganization(ctx context.Context, id string) map[string]any {
+	return decodeJSONObject(client.t, client.run(ctx, nil, "--raw", "get", "organization", id), "organization")
+}
+
+func (client *bitwardenCLI) collectionByName(ctx context.Context, organizationID, name string) map[string]any {
+	client.t.Helper()
+	var collections []map[string]any
+	data := client.run(ctx, nil, "--raw", "list", "org-collections", "--organizationid", organizationID)
+	if err := json.Unmarshal(data, &collections); err != nil {
+		client.t.Fatal("Bitwarden CLI returned an invalid organization collection list")
+	}
+	for _, collection := range collections {
+		if stringValue(collection["name"]) == name && stringValue(collection["id"]) != "" {
+			return collection
+		}
+	}
+	client.t.Fatalf("organization collection %q was not found", name)
+	return nil
+}
+
+func (client *bitwardenCLI) createOrganizationCollection(ctx context.Context, organizationID, name string) string {
+	object := map[string]any{
+		"organizationId": organizationID,
+		"name":           name,
+		"externalId":     nil,
+		"groups":         []any{},
+		"users":          []any{},
+	}
+	data, err := json.Marshal(object)
+	if err != nil {
+		client.t.Fatal(err)
+	}
+	encoded := strings.TrimSpace(string(client.run(ctx, data, "encode")))
+	created := decodeJSONObject(
+		client.t,
+		client.run(ctx, nil, "--raw", "create", "org-collection", encoded, "--organizationid", organizationID),
+		"organization collection",
+	)
+	id := stringValue(created["id"])
+	if id == "" {
+		client.t.Fatal("created organization collection has no ID")
+	}
+	return id
 }
 
 func (client *bitwardenCLI) createEncodedObject(ctx context.Context, objectType string, object map[string]any) string {
@@ -156,7 +230,15 @@ func (client *bitwardenCLI) getAttachment(ctx context.Context, attachmentID, ite
 }
 
 func (client *bitwardenCLI) createFileSend(ctx context.Context, path, name string) string {
-	object := decodeJSONObject(client.t, client.run(ctx, nil, "--raw", "send", "--file", path, "--name", name, "--fullObject"), "file Send")
+	return client.createFileSendWithLimit(ctx, path, name, 0)
+}
+
+func (client *bitwardenCLI) createFileSendWithLimit(ctx context.Context, path, name string, maximumAccesses int) string {
+	arguments := []string{"--raw", "send", "--file", path, "--name", name, "--fullObject"}
+	if maximumAccesses > 0 {
+		arguments = append(arguments, "--maxAccessCount", fmt.Sprintf("%d", maximumAccesses))
+	}
+	object := decodeJSONObject(client.t, client.run(ctx, nil, arguments...), "file Send")
 	id := stringValue(object["id"])
 	if id == "" {
 		client.t.Fatal("created file Send has no ID")
@@ -165,6 +247,27 @@ func (client *bitwardenCLI) createFileSend(ctx context.Context, path, name strin
 }
 
 func (client *bitwardenCLI) getFileSend(ctx context.Context, id, output string) {
+	sendURL := client.fileSendURL(ctx, id)
+	_, diagnostics, err := client.tryRun(ctx, nil, "send", "receive", sendURL, "--output", output)
+	if err != nil {
+		diagnostics = strings.ReplaceAll(diagnostics, sendURL, "<redacted-send-url>")
+		client.t.Fatalf("Bitwarden CLI file Send receive failed: %v: %s", err, client.sanitize(diagnostics))
+	}
+}
+
+func (client *bitwardenCLI) expectFileSendAccessFailure(ctx context.Context, id string) {
+	client.t.Helper()
+	sendURL := client.fileSendURL(ctx, id)
+	output := filepath.Join(client.appdata, "unexpected-send-output")
+	if _, diagnostics, err := client.tryRun(ctx, nil, "send", "receive", sendURL, "--output", output); err == nil {
+		client.t.Fatal("access-limited Send remained downloadable after its limit")
+	} else if strings.Contains(client.sanitize(diagnostics), client.password) {
+		client.t.Fatal("Send failure diagnostics exposed a password")
+	}
+}
+
+func (client *bitwardenCLI) fileSendURL(ctx context.Context, id string) string {
+	client.t.Helper()
 	var send struct {
 		AccessURL string         `json:"accessUrl"`
 		File      map[string]any `json:"file"`
@@ -177,11 +280,7 @@ func (client *bitwardenCLI) getFileSend(ctx context.Context, id, output string) 
 	if err != nil || serverErr != nil || accessURL.Scheme != serverURL.Scheme || accessURL.Host != serverURL.Host || accessURL.User != nil || accessURL.Fragment == "" {
 		client.t.Fatal("Bitwarden CLI returned an unsafe file Send URL")
 	}
-	_, diagnostics, err := client.tryRun(ctx, nil, "send", "receive", send.AccessURL, "--output", output)
-	if err != nil {
-		diagnostics = strings.ReplaceAll(diagnostics, send.AccessURL, "<redacted-send-url>")
-		client.t.Fatalf("Bitwarden CLI file Send receive failed: %v: %s", err, client.sanitize(diagnostics))
-	}
+	return send.AccessURL
 }
 
 func decodeJSONObject(t *testing.T, data []byte, label string) map[string]any {
@@ -216,18 +315,18 @@ func stringValue(value any) string {
 	return result
 }
 
-func cliEnvironment(appdata, password, session string) []string {
+func cliEnvironment(appdata, caFile, password, session string) []string {
 	environment := make([]string, 0, len(os.Environ())+4)
 	for _, value := range os.Environ() {
 		name, _, ok := strings.Cut(value, "=")
-		if ok && name != "BITWARDENCLI_APPDATA_DIR" && name != "BW_SESSION" && name != cliPasswordEnvironment && name != "NODE_TLS_REJECT_UNAUTHORIZED" {
+		if ok && name != "BITWARDENCLI_APPDATA_DIR" && name != "BW_SESSION" && name != cliPasswordEnvironment && name != "NODE_EXTRA_CA_CERTS" && name != "NODE_TLS_REJECT_UNAUTHORIZED" {
 			environment = append(environment, value)
 		}
 	}
 	environment = append(environment,
 		"BITWARDENCLI_APPDATA_DIR="+appdata,
 		cliPasswordEnvironment+"="+password,
-		"NODE_TLS_REJECT_UNAUTHORIZED=0",
+		"NODE_EXTRA_CA_CERTS="+caFile,
 	)
 	if session != "" {
 		environment = append(environment, "BW_SESSION="+session)

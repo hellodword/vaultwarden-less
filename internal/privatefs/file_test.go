@@ -1,4 +1,4 @@
-package securefile
+package privatefs
 
 import (
 	"os"

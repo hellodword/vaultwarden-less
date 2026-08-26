@@ -1,5 +1,5 @@
 {
-  description = "vaultwarden-less development environment";
+  description = "Auditable, locally built Vaultwarden backup and restore";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -15,27 +15,47 @@
     let
       system = "x86_64-linux";
       pkgs = import nixpkgs { inherit system; };
-      go = import ./nix/go-1.26.7.nix { inherit pkgs; };
-      treefmt = import ./nix/treefmt.nix {
-        inherit pkgs treefmt-nix;
+      upstreams = builtins.fromTOML (builtins.readFile ./UPSTREAMS.toml);
+      productVersion = builtins.replaceStrings [ "\n" ] [ "" ] (builtins.readFile ./VERSION);
+      toolchain = import ./nix/toolchain.nix {
+        inherit pkgs treefmt-nix upstreams;
+      };
+      packages = import ./nix/packages.nix {
+        inherit pkgs upstreams productVersion;
+        inherit (toolchain) go;
+        source = ./.;
       };
     in
     {
-      devShells.${system}.default = import ./nix/dev-shell.nix {
-        inherit pkgs go treefmt;
+      packages.${system} = packages // {
+        default = packages.backup;
       };
 
-      formatter.${system} = treefmt.config.build.wrapper;
+      devShells.${system} = {
+        default = pkgs.mkShell {
+          packages = toolchain.devPackages ++ [ packages."restic-patched" ];
+          GOTOOLCHAIN = "local";
+          CGO_ENABLED = "1";
+        };
+
+        deploy = pkgs.mkShell {
+          packages = toolchain.deployPackages;
+        };
+      };
+
+      formatter.${system} = toolchain.treefmt.config.build.wrapper;
 
       checks.${system} = import ./nix/checks.nix {
         inherit
           inputs
           pkgs
-          go
-          treefmt
+          packages
+          upstreams
           ;
+        inherit (toolchain) go treefmt;
+        source = ./.;
       };
 
-      apps.${system}.just = import ./nix/just-app.nix { inherit pkgs; };
+      apps.${system}.just = toolchain.justApp;
     };
 }

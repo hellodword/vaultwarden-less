@@ -15,7 +15,7 @@ import (
 	"github.com/hellodword/vaultwarden-less/internal/config"
 	"github.com/hellodword/vaultwarden-less/internal/restic"
 	"github.com/hellodword/vaultwarden-less/internal/snapshot"
-	"github.com/hellodword/vaultwarden-less/internal/version"
+	"github.com/hellodword/vaultwarden-less/internal/upstream"
 	_ "github.com/mattn/go-sqlite3"
 )
 
@@ -70,14 +70,15 @@ func recoveryTemplate(t *testing.T) (string, snapshot.Manifest) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	statements := []string{
-		"PRAGMA journal_mode=DELETE",
-		"PRAGMA foreign_keys=ON",
-		"CREATE TABLE __diesel_schema_migrations (version TEXT PRIMARY KEY NOT NULL)",
-		"CREATE TABLE attachments (id TEXT PRIMARY KEY, cipher_uuid TEXT NOT NULL, file_size INTEGER NOT NULL)",
-		"CREATE TABLE sends (uuid TEXT PRIMARY KEY, atype INTEGER NOT NULL, data TEXT NOT NULL)",
-		"INSERT INTO __diesel_schema_migrations(version) VALUES ('" + version.VaultwardenSchema + "')",
+	contract, err := upstream.VaultwardenSchemaContract()
+	if err != nil {
+		t.Fatal(err)
 	}
+	statements := []string{"PRAGMA journal_mode=DELETE", "PRAGMA foreign_keys=ON"}
+	for _, object := range contract.Objects {
+		statements = append(statements, object.SQL)
+	}
+	statements = append(statements, "INSERT INTO __diesel_schema_migrations(version) VALUES ('"+upstream.VaultwardenMigration+"')")
 	for _, statement := range statements {
 		if _, err := database.Exec(statement); err != nil {
 			_ = database.Close()
@@ -164,7 +165,7 @@ func TestRunPublishesOneVerifiedDirectory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.SchemaVersion != 1 || result.Target != "primary" || result.SnapshotID != repository.selected.ID || result.ContentID != manifest.ContentID || result.Output != output {
+	if result.SchemaVersion != ResultSchemaVersion || result.Target != "primary" || result.SnapshotID != repository.selected.ID || result.ContentID != manifest.ContentID || result.Output != output {
 		t.Fatalf("result = %#v", result)
 	}
 	if repository.resolveCalls != 1 || repository.restoreCalls != 1 || repository.resolvedWith != "" {

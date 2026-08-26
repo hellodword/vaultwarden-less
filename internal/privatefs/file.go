@@ -1,4 +1,4 @@
-package securefile
+package privatefs
 
 import (
 	"fmt"
@@ -7,8 +7,6 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
-
-	"github.com/hellodword/vaultwarden-less/internal/safefs"
 )
 
 const maxSecretBytes = 64 << 10
@@ -43,7 +41,7 @@ func ReadBytes(path string, limit int64) ([]byte, error) {
 	}
 	defer func() { _ = f.Close() }()
 	opened, err := f.Stat()
-	if err != nil || !opened.Mode().IsRegular() || !privateReadableMode(opened) || !safefs.SameFileVersion(info, opened) {
+	if err != nil || !opened.Mode().IsRegular() || !privateReadableMode(opened) || !SameFileVersion(info, opened) {
 		return nil, fmt.Errorf("private file changed while opening")
 	}
 
@@ -59,7 +57,7 @@ func ReadBytes(path string, limit int64) ([]byte, error) {
 		return nil, fmt.Errorf("private file changed while reading")
 	}
 	latest, err := os.Lstat(path)
-	if err != nil || !latest.Mode().IsRegular() || !privateReadableMode(latest) || !safefs.SameFileVersion(opened, latest) {
+	if err != nil || !latest.Mode().IsRegular() || !privateReadableMode(latest) || !SameFileVersion(opened, latest) {
 		return nil, fmt.Errorf("private file changed while reading")
 	}
 	return data[:n], nil

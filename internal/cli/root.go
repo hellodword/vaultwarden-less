@@ -4,10 +4,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"strings"
 
+	"github.com/hellodword/vaultwarden-less/internal/buildinfo"
 	"github.com/hellodword/vaultwarden-less/internal/config"
-	"github.com/hellodword/vaultwarden-less/internal/version"
 	"github.com/spf13/cobra"
 )
 
@@ -21,22 +20,32 @@ func ExitCode(err error) int {
 		return 0
 	}
 	var usage *UsageError
-	if errors.As(err, &usage) || strings.Contains(err.Error(), "unknown command") || strings.Contains(err.Error(), "unknown flag") {
+	if errors.As(err, &usage) {
 		return 2
 	}
 	return 1
 }
 
 func New(stdout, stderr io.Writer) *cobra.Command {
-	return newCommand(stdout, stderr, defaultEnvironment())
+	return newCommand(stdout, stderr, defaultEnvironment(stderr))
+}
+
+// Execute classifies Cobra's otherwise untyped command-resolution failures at
+// the boundary, before any command action can run.
+func Execute(command *cobra.Command, arguments []string) error {
+	command.SetArgs(arguments)
+	if _, _, err := command.Find(arguments); err != nil {
+		return &UsageError{Err: err}
+	}
+	return command.Execute()
 }
 
 func newCommand(stdout, stderr io.Writer, environment commandEnvironment) *cobra.Command {
 	configPath := config.DefaultBackupConfigPath
 	root := &cobra.Command{
 		Use:           "vaultwarden-less-backup",
-		Short:         "Create and restore vaultwarden-less 0.1 recovery points",
-		Version:       version.Product,
+		Short:         "Create and restore vaultwarden-less recovery points",
+		Version:       buildinfo.Version,
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		Args:          noArguments,

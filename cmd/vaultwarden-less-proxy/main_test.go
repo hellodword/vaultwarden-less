@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/hellodword/vaultwarden-less/internal/version"
+	"github.com/hellodword/vaultwarden-less/internal/buildinfo"
 )
 
 func TestProxyCLIHelpVersionAndUsage(t *testing.T) {
@@ -22,7 +22,7 @@ func TestProxyCLIHelpVersionAndUsage(t *testing.T) {
 		{[]string{"--help"}, 0, "serve|healthcheck", false},
 		{[]string{"serve", "--help"}, 0, "vaultwarden-less-proxy serve", false},
 		{[]string{"healthcheck", "--help"}, 0, "vaultwarden-less-proxy healthcheck", false},
-		{[]string{"--version"}, 0, "vaultwarden-less-proxy " + version.Product + "\n", false},
+		{[]string{"--version"}, 0, "vaultwarden-less-proxy " + buildinfo.Version + "\n", false},
 		{nil, 2, "", true},
 		{[]string{"unknown"}, 2, "", true},
 		{[]string{"serve", "extra"}, 2, "", true},

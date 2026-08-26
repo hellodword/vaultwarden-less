@@ -7,7 +7,6 @@ import (
 
 	"github.com/hellodword/vaultwarden-less/internal/config"
 	"github.com/hellodword/vaultwarden-less/internal/restic"
-	"github.com/hellodword/vaultwarden-less/internal/version"
 	"github.com/spf13/cobra"
 )
 
@@ -23,6 +22,8 @@ type operationResult struct {
 type snapshotsResult struct {
 	SchemaVersion int               `json:"schema_version"`
 	Target        string            `json:"target"`
+	Limit         int               `json:"limit"`
+	Truncated     bool              `json:"truncated"`
 	Snapshots     []restic.Snapshot `json:"snapshots"`
 }
 
@@ -84,16 +85,30 @@ func repoCommand(configPath *string, environment commandEnvironment) *cobra.Comm
 		}
 		return successfulOperation("init", target.Name), nil
 	})
-	snapshotsCommand := operation("snapshots", "List new-product snapshots from newest to oldest", func(ctx context.Context, repository repository, target config.Target) (any, error) {
-		snapshots, err := repository.Snapshots(ctx, target)
+	limit := restic.DefaultSnapshotsLimit
+	snapshotsCommand := operation("snapshots", "List recovery snapshots from newest to oldest", func(ctx context.Context, repository repository, target config.Target) (any, error) {
+		snapshots, truncated, err := repository.Snapshots(ctx, target, limit)
 		if err != nil {
 			return nil, err
 		}
 		if snapshots == nil {
 			snapshots = []restic.Snapshot{}
 		}
-		return snapshotsResult{SchemaVersion: version.SchemaVersion, Target: target.Name, Snapshots: snapshots}, nil
+		return snapshotsResult{
+			SchemaVersion: ResultSchemaVersion,
+			Target:        target.Name,
+			Limit:         limit,
+			Truncated:     truncated,
+			Snapshots:     snapshots,
+		}, nil
 	})
+	snapshotsCommand.Flags().IntVar(&limit, "limit", restic.DefaultSnapshotsLimit, "maximum snapshots to return (1-1000)")
+	snapshotsCommand.PreRunE = func(_ *cobra.Command, _ []string) error {
+		if limit < 1 || limit > restic.MaxSnapshotsLimit {
+			return usageError("--limit must be between 1 and 1000")
+		}
+		return nil
+	}
 	var subset string
 	checkCommand := operation("check", "Check repository metadata and optional one-twelfth data subset", func(ctx context.Context, repository repository, target config.Target) (any, error) {
 		if err := repository.Check(ctx, target, subset); err != nil {
@@ -124,7 +139,7 @@ func repoCommand(configPath *string, environment commandEnvironment) *cobra.Comm
 			result.Groups = []restic.PruneGroup{}
 		}
 		return pruneResult{
-			SchemaVersion: version.SchemaVersion,
+			SchemaVersion: ResultSchemaVersion,
 			Operation:     "prune",
 			Target:        target.Name,
 			Applied:       result.Applied,
@@ -137,7 +152,7 @@ func repoCommand(configPath *string, environment commandEnvironment) *cobra.Comm
 }
 
 func successfulOperation(operation, target string) operationResult {
-	return operationResult{SchemaVersion: version.SchemaVersion, Operation: operation, Target: target, Success: true}
+	return operationResult{SchemaVersion: ResultSchemaVersion, Operation: operation, Target: target, Success: true}
 }
 
 func validSubset(value string) bool {

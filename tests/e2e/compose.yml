@@ -1,0 +1,155 @@
+x-e2e-volume: &e2e-volume
+  type: volume
+  volume:
+    nocopy: true
+
+services:
+  moto:
+    image: ${MOTO_IMAGE:?set MOTO_IMAGE}
+    pull_policy: never
+    platform: linux/amd64
+    restart: "no"
+    command: ["-H", "0.0.0.0"]
+    networks:
+      backup-outbound:
+        aliases: ["moto"]
+      maintenance-outbound:
+        aliases: ["moto"]
+
+  vaultwarden:
+    environment:
+      SIGNUPS_ALLOWED: "true"
+      SIGNUPS_VERIFY: "false"
+      INVITATIONS_ALLOWED: "true"
+    volumes:
+      - <<: *e2e-volume
+        source: e2e-data
+        target: /data
+
+  proxy:
+    ports: !override
+      - "${E2E_PUBLISH_ADDRESS:-127.0.0.1}:${E2E_PROXY_HOST_PORT:-0}:8080"
+
+  backup:
+    volumes:
+      - <<: *e2e-volume
+        source: e2e-data
+        target: /data
+        read_only: true
+      - <<: *e2e-volume
+        source: e2e-staging
+        target: /staging
+      - <<: *e2e-volume
+        source: e2e-cache
+        target: /cache
+      - <<: *e2e-volume
+        source: e2e-config
+        target: /config
+        read_only: true
+      - <<: *e2e-volume
+        source: e2e-backup-credentials
+        target: /run/credentials/role
+        read_only: true
+      - <<: *e2e-volume
+        source: e2e-restic-credentials
+        target: /run/credentials/restic
+        read_only: true
+      - <<: *e2e-volume
+        source: e2e-notifier-credentials
+        target: /run/credentials/notifiers
+        read_only: true
+
+  maintenance:
+    volumes:
+      - <<: *e2e-volume
+        source: e2e-cache
+        target: /cache
+      - <<: *e2e-volume
+        source: e2e-config
+        target: /config
+        read_only: true
+      - <<: *e2e-volume
+        source: e2e-maintenance-credentials
+        target: /run/credentials/role
+        read_only: true
+      - <<: *e2e-volume
+        source: e2e-restic-credentials
+        target: /run/credentials/restic
+        read_only: true
+
+  restore:
+    volumes:
+      - <<: *e2e-volume
+        source: e2e-restore
+        target: /restore
+      - <<: *e2e-volume
+        source: e2e-cache
+        target: /cache
+      - <<: *e2e-volume
+        source: e2e-config
+        target: /config
+        read_only: true
+      - <<: *e2e-volume
+        source: e2e-maintenance-credentials
+        target: /run/credentials/role
+        read_only: true
+      - <<: *e2e-volume
+        source: e2e-restic-credentials
+        target: /run/credentials/restic
+        read_only: true
+
+  drill-copy:
+    volumes:
+      - <<: *e2e-volume
+        source: e2e-restore
+        target: /source
+        read_only: true
+      - <<: *e2e-volume
+        source: e2e-drill-data
+        target: /drill-data
+
+  drill-vaultwarden:
+    ports: !override
+      - "${E2E_PUBLISH_ADDRESS:-127.0.0.1}:${E2E_DRILL_HOST_PORT:-0}:80"
+    volumes:
+      - <<: *e2e-volume
+        source: e2e-drill-data
+        target: /data
+
+networks:
+  proxy-ingress:
+    driver_opts: {}
+  drill-ingress:
+    driver_opts: {}
+
+volumes:
+  e2e-data:
+    external: true
+    name: ${E2E_PROJECT:?set E2E_PROJECT}_data
+  e2e-staging:
+    external: true
+    name: ${E2E_PROJECT:?set E2E_PROJECT}_staging
+  e2e-cache:
+    external: true
+    name: ${E2E_PROJECT:?set E2E_PROJECT}_cache
+  e2e-restore:
+    external: true
+    name: ${E2E_PROJECT:?set E2E_PROJECT}_restore
+  e2e-config:
+    external: true
+    name: ${E2E_PROJECT:?set E2E_PROJECT}_config
+  e2e-backup-credentials:
+    external: true
+    name: ${E2E_PROJECT:?set E2E_PROJECT}_backup_credentials
+  e2e-maintenance-credentials:
+    external: true
+    name: ${E2E_PROJECT:?set E2E_PROJECT}_maintenance_credentials
+  e2e-restic-credentials:
+    external: true
+    name: ${E2E_PROJECT:?set E2E_PROJECT}_restic_credentials
+  e2e-notifier-credentials:
+    external: true
+    name: ${E2E_PROJECT:?set E2E_PROJECT}_notifier_credentials
+  e2e-drill-data:
+    external: true
+    name: ${E2E_PROJECT:?set E2E_PROJECT}_drill_data

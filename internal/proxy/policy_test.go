@@ -8,11 +8,8 @@ import (
 
 func TestRoutePolicyVersionAndAuditedIgnoreTable(t *testing.T) {
 	t.Parallel()
-	if vaultwardenVersion != "1.37.2" {
-		t.Fatalf("policy version = %q", vaultwardenVersion)
-	}
-	if len(ignoredRoutes) != 20 {
-		t.Fatalf("ignore route count = %d, want 20", len(ignoredRoutes))
+	if len(ignoredRoutes) != 16 {
+		t.Fatalf("ignore route count = %d, want 16", len(ignoredRoutes))
 	}
 	seen := map[string]struct{}{}
 	for _, rule := range ignoredRoutes {
@@ -58,6 +55,10 @@ func TestRoutePolicyOnlySuccessfulWritesTrigger(t *testing.T) {
 		{http.MethodPut, "/api/folders/folder", 201, true},
 		{http.MethodPatch, "/api/ciphers/item", 204, true},
 		{http.MethodDelete, "/api/sends/send", 299, true},
+		{http.MethodPost, "/api/sends/access", 200, true},
+		{http.MethodPost, "/api/sends/access/value", 200, true},
+		{http.MethodPost, "/api/sends/access/file/value", 200, true},
+		{http.MethodPost, "/api/sends/value/access/file/value", 200, true},
 		{http.MethodGet, "/api/ciphers", 200, false},
 		{http.MethodHead, "/api/ciphers", 200, false},
 		{http.MethodOptions, "/api/ciphers", 200, false},

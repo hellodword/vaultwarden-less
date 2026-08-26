@@ -1,0 +1,68 @@
+[vaultwarden]
+version = "1.37.2"
+source_tag = "1.37.2"
+source_commit = "46d71107f5094460dd5ecbe1dbac6e6c71e5189a"
+database_migration = "20260505120000"
+image_repository = "docker.io/vaultwarden/server"
+image_digest = "sha256:5d326778c22f063d093d6b0c9c766a28249561632266776f2c93132ab0ad3a80"
+schema_contract = "internal/upstream/vaultwarden-schema.json"
+audit_paths = [
+  "migrations/sqlite/**",
+  "src/api/**",
+  "src/db/**",
+  "src/main.rs",
+  "docker/**",
+]
+
+[bitwarden_cli]
+version = "2026.7.0"
+source_tag = "cli-v2026.7.0"
+source_commit = "82186c3d92c0da14aa86c848b781d949a8a6202a"
+audit_paths = [
+  "apps/cli/**",
+  "libs/auth/**",
+  "libs/common/**",
+  "libs/key-management/**",
+  "libs/node/**",
+]
+
+[restic]
+version = "0.19.1"
+source_tag = "v0.19.1"
+source_commit = "6aa3a516ce654808a1f28f9fa21e9b7c8e6e90bf"
+source_hash = "sha256-lj2+SZFvZl/WcC4aV7yZMEYVOyDNMFeHJbUWS53usqg="
+release_archive_sha256 = "bb9b1a19040744d26d8a79be029d4e6b189c45ccc9d8831d7fe367d3c33df725"
+vendor_hash = "sha256-I7DT3fZTaPEXP/zogjS55wfPIS3QGoVkp9E4LLTFz/c="
+audit_paths = [
+  "cmd/restic/**",
+  "internal/**",
+  "go.mod",
+  "go.sum",
+  "CHANGELOG.md",
+]
+
+[moto]
+version = "5.2.2"
+source_tag = "5.2.2"
+source_commit = "837595545cc4a4bb8fede2cff84b2b2373443981"
+audit_paths = [
+  "moto/s3/**",
+  "moto/server.py",
+  "pyproject.toml",
+  "CHANGELOG.md",
+]
+
+[go]
+version = "1.26.7"
+source_tag = "go1.26.7"
+source_commit = "e3336a22ad3f0a90bd252c95d8b5544e02674205"
+source_url = "https://go.dev/dl/go1.26.7.linux-amd64.tar.gz"
+source_hash = "sha256-/7X43hDGJVDf3atms2tXAwch4KRKMhjp4Rgde1nxIco="
+audit_paths = [
+  "src/cmd/**",
+  "src/crypto/**",
+  "src/database/sql/**",
+  "src/net/**",
+  "src/os/**",
+  "src/runtime/**",
+]

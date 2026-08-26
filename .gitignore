@@ -4,13 +4,12 @@
 /cache/
 /restore/
 /credentials/
-/config/backup.yaml
+/config/
 /log/
 /dist/
 /tmp/
 
 .env
-.env.vaultwarden
 
 AGENTS.md
 .agents/

@@ -16,13 +16,18 @@ import (
 	"strings"
 	"time"
 
-	"github.com/hellodword/vaultwarden-less/internal/version"
+	"github.com/hellodword/vaultwarden-less/internal/upstream"
 	"github.com/mattn/go-sqlite3"
 )
 
 type referencedFile struct {
 	Path         string
 	ExpectedSize int64
+}
+
+type databaseValidation struct {
+	Migration         string
+	SchemaFingerprint string
 }
 
 var unsignedIntegerPattern = regexp.MustCompile(`^(0|[1-9][0-9]*)$`)
@@ -173,10 +178,10 @@ func sqliteURI(path, mode string) string {
 	return uri.String()
 }
 
-func validateDatabase(ctx context.Context, path string) (string, error) {
+func validateDatabase(ctx context.Context, path string) (databaseValidation, error) {
 	database, err := sql.Open("sqlite3", sqliteURI(path, "ro"))
 	if err != nil {
-		return "", fmt.Errorf("open recovery database: %w", err)
+		return databaseValidation{}, fmt.Errorf("open recovery database: %w", err)
 	}
 	defer func() { _ = database.Close() }()
 	database.SetMaxOpenConns(1)
@@ -184,71 +189,90 @@ func validateDatabase(ctx context.Context, path string) (string, error) {
 
 	rows, err := database.QueryContext(ctx, "PRAGMA integrity_check")
 	if err != nil {
-		return "", fmt.Errorf("run integrity_check: %w", err)
+		return databaseValidation{}, fmt.Errorf("run integrity_check: %w", err)
 	}
 	var integrityResults []string
 	for rows.Next() {
 		var result string
 		if err := rows.Scan(&result); err != nil {
 			_ = rows.Close()
-			return "", fmt.Errorf("read integrity_check: %w", err)
+			return databaseValidation{}, fmt.Errorf("read integrity_check: %w", err)
 		}
 		integrityResults = append(integrityResults, result)
 	}
 	if err := rows.Err(); err != nil {
 		_ = rows.Close()
-		return "", fmt.Errorf("iterate integrity_check: %w", err)
+		return databaseValidation{}, fmt.Errorf("iterate integrity_check: %w", err)
 	}
 	if err := rows.Close(); err != nil {
-		return "", fmt.Errorf("close integrity_check: %w", err)
+		return databaseValidation{}, fmt.Errorf("close integrity_check: %w", err)
 	}
 	if !slices.Equal(integrityResults, []string{"ok"}) {
-		return "", fmt.Errorf("integrity_check failed")
+		return databaseValidation{}, fmt.Errorf("integrity_check failed")
 	}
 
 	rows, err = database.QueryContext(ctx, "PRAGMA foreign_key_check")
 	if err != nil {
-		return "", fmt.Errorf("run foreign_key_check: %w", err)
+		return databaseValidation{}, fmt.Errorf("run foreign_key_check: %w", err)
 	}
 	if rows.Next() {
 		_ = rows.Close()
-		return "", fmt.Errorf("foreign_key_check failed")
+		return databaseValidation{}, fmt.Errorf("foreign_key_check failed")
 	}
 	if err := rows.Err(); err != nil {
 		_ = rows.Close()
-		return "", fmt.Errorf("iterate foreign_key_check: %w", err)
+		return databaseValidation{}, fmt.Errorf("iterate foreign_key_check: %w", err)
 	}
 	if err := rows.Close(); err != nil {
-		return "", fmt.Errorf("close foreign_key_check: %w", err)
+		return databaseValidation{}, fmt.Errorf("close foreign_key_check: %w", err)
 	}
 
-	required := []struct {
-		table   string
-		columns []string
-	}{
-		{table: "attachments", columns: []string{"cipher_uuid", "id", "file_size"}},
-		{table: "sends", columns: []string{"uuid", "atype", "data"}},
-		{table: "__diesel_schema_migrations", columns: []string{"version"}},
+	contract, err := upstream.VaultwardenSchemaContract()
+	if err != nil {
+		return databaseValidation{}, err
 	}
-	for _, requirement := range required {
-		var count int
-		if err := database.QueryRowContext(ctx, "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?", requirement.table).Scan(&count); err != nil || count != 1 {
-			return "", fmt.Errorf("required table %s is missing", requirement.table)
+	rows, err = database.QueryContext(ctx, `
+		SELECT type, name, tbl_name, coalesce(sql, '')
+		FROM sqlite_schema
+		WHERE type IN ('index', 'table', 'trigger', 'view')
+		  AND name NOT LIKE 'sqlite_%'
+		ORDER BY type, name
+	`)
+	if err != nil {
+		return databaseValidation{}, fmt.Errorf("read database schema: %w", err)
+	}
+	objects := make([]upstream.SchemaObject, 0, len(contract.Objects))
+	for rows.Next() {
+		var object upstream.SchemaObject
+		if err := rows.Scan(&object.Type, &object.Name, &object.Table, &object.SQL); err != nil {
+			_ = rows.Close()
+			return databaseValidation{}, fmt.Errorf("read database schema object: %w", err)
 		}
-		for _, column := range requirement.columns {
-			if err := database.QueryRowContext(ctx, "SELECT count(*) FROM pragma_table_info(?) WHERE name = ?", requirement.table, column).Scan(&count); err != nil || count != 1 {
-				return "", fmt.Errorf("required column %s.%s is missing", requirement.table, column)
-			}
-		}
+		object.SQL = strings.TrimSpace(object.SQL)
+		objects = append(objects, object)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return databaseValidation{}, fmt.Errorf("iterate database schema: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return databaseValidation{}, fmt.Errorf("close database schema: %w", err)
+	}
+	if !slices.Equal(objects, contract.Objects) {
+		return databaseValidation{}, fmt.Errorf("database schema does not match audited Vaultwarden contract")
+	}
+	schemaFingerprint := upstream.SchemaFingerprint(objects)
+	if schemaFingerprint != contract.Fingerprint {
+		return databaseValidation{}, fmt.Errorf("database schema fingerprint mismatch")
 	}
 	var migration sql.NullString
 	if err := database.QueryRowContext(ctx, "SELECT max(version) FROM __diesel_schema_migrations").Scan(&migration); err != nil {
-		return "", fmt.Errorf("read database migration: %w", err)
+		return databaseValidation{}, fmt.Errorf("read database migration: %w", err)
 	}
-	if !migration.Valid || migration.String != version.VaultwardenSchema {
-		return "", fmt.Errorf("unsupported database migration")
+	if !migration.Valid || migration.String != upstream.VaultwardenMigration {
+		return databaseValidation{}, fmt.Errorf("unsupported database migration")
 	}
-	return migration.String, nil
+	return databaseValidation{Migration: migration.String, SchemaFingerprint: schemaFingerprint}, nil
 }
 
 func referencedFiles(ctx context.Context, path string) ([]referencedFile, error) {
