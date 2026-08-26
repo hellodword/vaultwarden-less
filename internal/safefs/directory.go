@@ -8,9 +8,8 @@ import (
 	"syscall"
 )
 
-// ValidatePrivateDirectory validates an existing mount root without creating
-// it or changing its permissions. Owner write permission is optional; group
-// and other users must have no access.
+// ValidatePrivateDirectory validates an existing exact 0700 mount root without
+// creating it or changing its permissions.
 func ValidatePrivateDirectory(path string) error {
 	if path == "" || path == string(filepath.Separator) || !filepath.IsAbs(path) || filepath.Clean(path) != path {
 		return fmt.Errorf("private directory path must be clean, absolute, and non-root")
@@ -21,8 +20,8 @@ func ValidatePrivateDirectory(path string) error {
 	}
 	permissions := info.Mode().Perm()
 	stat, ownerKnown := info.Sys().(*syscall.Stat_t)
-	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || !ownerKnown || stat.Uid != uint32(os.Geteuid()) || permissions&0o100 == 0 || permissions&0o077 != 0 {
-		return fmt.Errorf("path must be a real directory owned by effective UID %d, owner-traversable, and inaccessible to group and other users", os.Geteuid())
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || !ownerKnown || stat.Uid != uint32(os.Geteuid()) || permissions != 0o700 {
+		return fmt.Errorf("path must be a real 0700 directory owned by effective UID %d", os.Geteuid())
 	}
 	return nil
 }
@@ -64,4 +63,17 @@ func validateDirectoryChain(path string, allowMissing bool) error {
 		}
 	}
 	return nil
+}
+
+// SameFileVersion identifies the same regular-file contents boundary used by
+// stable-copy and private secret readers. Ctime catches in-place replacement
+// on filesystems where size and mtime are preserved.
+func SameFileVersion(left, right os.FileInfo) bool {
+	if left == nil || right == nil || !left.Mode().IsRegular() || !right.Mode().IsRegular() ||
+		!os.SameFile(left, right) || left.Size() != right.Size() || left.ModTime() != right.ModTime() {
+		return false
+	}
+	leftStat, leftOK := left.Sys().(*syscall.Stat_t)
+	rightStat, rightOK := right.Sys().(*syscall.Stat_t)
+	return leftOK && rightOK && leftStat.Ctim == rightStat.Ctim
 }

@@ -7,15 +7,9 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/hellodword/vaultwarden-less/internal/version"
-)
-
-type Status string
-
-const (
-	Complete   Status = "complete"
-	Incomplete Status = "incomplete"
 )
 
 type File struct {
@@ -24,79 +18,62 @@ type File struct {
 	SHA256 string `json:"sha256"`
 }
 
-type Missing struct {
-	Path   string `json:"path"`
-	Reason string `json:"reason"`
+type VaultwardenTuple struct {
+	Version           string `json:"version"`
+	DatabaseMigration string `json:"database_migration"`
+	Image             string `json:"image"`
 }
 
 type Manifest struct {
-	SchemaVersion      int       `json:"schema_version"`
-	VaultwardenVersion string    `json:"vaultwarden_version"`
-	DatabaseMigration  string    `json:"database_migration"`
-	Status             Status    `json:"status"`
-	Files              []File    `json:"files"`
-	Missing            []Missing `json:"missing"`
-	ContentID          string    `json:"content_id"`
+	SchemaVersion  int              `json:"schema_version"`
+	CreatorVersion string           `json:"creator_version"`
+	Vaultwarden    VaultwardenTuple `json:"vaultwarden"`
+	Files          []File           `json:"files"`
+	ContentID      string           `json:"content_id"`
 }
 
 type contentPayload struct {
-	SchemaVersion      int       `json:"schema_version"`
-	VaultwardenVersion string    `json:"vaultwarden_version"`
-	DatabaseMigration  string    `json:"database_migration"`
-	Status             Status    `json:"status"`
-	Files              []File    `json:"files"`
-	Missing            []Missing `json:"missing"`
+	SchemaVersion int              `json:"schema_version"`
+	Vaultwarden   VaultwardenTuple `json:"vaultwarden"`
+	Files         []File           `json:"files"`
 }
 
-func NewManifest(status Status, migration string, files []File, missing []Missing) (Manifest, error) {
-	if status != Complete && status != Incomplete {
-		return Manifest{}, fmt.Errorf("invalid manifest status %q", status)
-	}
-	if status == Complete && len(missing) != 0 {
-		return Manifest{}, fmt.Errorf("complete manifest cannot contain missing files")
-	}
+var supportedVaultwardenTuples = []VaultwardenTuple{{
+	Version:           version.Vaultwarden,
+	DatabaseMigration: version.VaultwardenSchema,
+	Image:             version.VaultwardenImage,
+}}
+
+func NewManifest(files []File) (Manifest, error) {
 	files = slices.Clone(files)
-	missing = slices.Clone(missing)
 	if files == nil {
 		files = []File{}
 	}
-	if missing == nil {
-		missing = []Missing{}
-	}
-	slices.SortFunc(files, func(a, b File) int { return strings.Compare(a.Path, b.Path) })
-	slices.SortFunc(missing, func(a, b Missing) int {
-		if cmp := strings.Compare(a.Path, b.Path); cmp != 0 {
-			return cmp
-		}
-		return strings.Compare(a.Reason, b.Reason)
+	slices.SortFunc(files, func(left, right File) int {
+		return strings.Compare(left.Path, right.Path)
 	})
-	m := Manifest{
-		SchemaVersion:      version.ManifestVersion,
-		VaultwardenVersion: version.Vaultwarden,
-		DatabaseMigration:  migration,
-		Status:             status,
-		Files:              files,
-		Missing:            missing,
+	manifest := Manifest{
+		SchemaVersion:  version.ManifestVersion,
+		CreatorVersion: version.Product,
+		Vaultwarden:    supportedVaultwardenTuples[0],
+		Files:          files,
 	}
-	id, err := m.CalculateContentID()
+	contentID, err := manifest.CalculateContentID()
 	if err != nil {
 		return Manifest{}, err
 	}
-	m.ContentID = id
-	if err := m.Validate(); err != nil {
+	manifest.ContentID = contentID
+	if err := manifest.Validate(); err != nil {
 		return Manifest{}, err
 	}
-	return m, nil
+	return manifest, nil
 }
 
 func (m Manifest) CalculateContentID() (string, error) {
 	payload := contentPayload{
-		SchemaVersion:      m.SchemaVersion,
-		VaultwardenVersion: m.VaultwardenVersion,
-		DatabaseMigration:  m.DatabaseMigration,
-		Status:             m.Status,
-		Files:              m.Files,
-		Missing:            m.Missing,
+		SchemaVersion: m.SchemaVersion,
+		Vaultwarden:   m.Vaultwarden,
+		Files:         m.Files,
 	}
 	data, err := json.Marshal(payload)
 	if err != nil {
@@ -107,43 +84,31 @@ func (m Manifest) CalculateContentID() (string, error) {
 }
 
 func (m Manifest) Validate() error {
-	if m.SchemaVersion != version.ManifestVersion || !validSemVer(m.VaultwardenVersion) {
-		return fmt.Errorf("unsupported manifest or Vaultwarden version")
+	if m.SchemaVersion != version.ManifestVersion {
+		return fmt.Errorf("unsupported manifest schema")
 	}
-	if !validMigration(m.DatabaseMigration) {
-		return fmt.Errorf("unsupported Vaultwarden database migration")
+	if !validCreatorVersion(m.CreatorVersion) {
+		return fmt.Errorf("invalid creator version")
 	}
-	if m.Status != Complete && m.Status != Incomplete {
-		return fmt.Errorf("invalid manifest status")
+	if !supportedVaultwardenTuple(m.Vaultwarden) {
+		return fmt.Errorf("unsupported Vaultwarden tuple")
 	}
-	if m.Files == nil || m.Missing == nil {
-		return fmt.Errorf("manifest file and missing lists must be arrays")
-	}
-	if m.Status == Complete && len(m.Missing) != 0 || m.Status == Incomplete && len(m.Missing) == 0 {
-		return fmt.Errorf("manifest status and missing entries disagree")
+	if m.Files == nil {
+		return fmt.Errorf("manifest files must be an array")
 	}
 	previous := ""
-	paths := make(map[string]struct{}, len(m.Files))
 	databasePresent := false
 	for _, file := range m.Files {
-		if !validManifestPath(file.Path) || file.Path == "manifest.json" || file.Path <= previous || file.Size < 0 || !validHash(file.SHA256) {
-			return fmt.Errorf("invalid or unsorted manifest file entry")
+		if !validManifestPath(file.Path) || file.Path <= previous || file.Size < 0 || !validHash(file.SHA256) {
+			return fmt.Errorf("invalid, duplicate, or unsorted manifest file entry")
 		}
-		paths[file.Path] = struct{}{}
-		databasePresent = databasePresent || file.Path == "data/db.sqlite3"
+		if file.Path == "data/db.sqlite3" {
+			databasePresent = true
+		}
 		previous = file.Path
 	}
 	if !databasePresent {
-		return fmt.Errorf("manifest does not contain the snapshot database")
-	}
-	previous = ""
-	for _, missing := range m.Missing {
-		_, alsoPresent := paths[missing.Path]
-		if !validManifestPath(missing.Path) || missing.Path == "manifest.json" || missing.Path == "data/db.sqlite3" ||
-			missing.Path <= previous || !validMissingReason(missing.Reason) || alsoPresent {
-			return fmt.Errorf("invalid or unsorted missing entry")
-		}
-		previous = missing.Path
+		return fmt.Errorf("manifest does not contain data/db.sqlite3")
 	}
 	want, err := m.CalculateContentID()
 	if err != nil {
@@ -155,90 +120,33 @@ func (m Manifest) Validate() error {
 	return nil
 }
 
+func supportedVaultwardenTuple(tuple VaultwardenTuple) bool {
+	return slices.Contains(supportedVaultwardenTuples, tuple)
+}
+
+func validCreatorVersion(value string) bool {
+	if value == "" || len(value) > 128 || !utf8.ValidString(value) {
+		return false
+	}
+	for _, character := range value {
+		if character < 0x20 || character == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
 func validHash(value string) bool {
-	if len(value) != 64 {
+	if len(value) != 64 || strings.ToLower(value) != value {
 		return false
 	}
 	_, err := hex.DecodeString(value)
-	return err == nil && strings.ToLower(value) == value
+	return err == nil
 }
 
-func validMissingReason(value string) bool {
-	return value == "not_found" || value == "size_mismatch" || value == "changed_during_copy"
-}
-
-func validSemVer(value string) bool {
-	if len(value) == 0 || len(value) > 128 {
-		return false
+func ContentIDHex(contentID string) (string, error) {
+	if !strings.HasPrefix(contentID, "sha256:") || !validHash(strings.TrimPrefix(contentID, "sha256:")) {
+		return "", fmt.Errorf("invalid content ID")
 	}
-	coreAndBuild := strings.SplitN(value, "+", 2)
-	if coreAndBuild[0] == "" {
-		return false
-	}
-	coreAndPre := strings.SplitN(coreAndBuild[0], "-", 2)
-	if len(coreAndPre) > 2 || !validSemVerCore(coreAndPre[0]) {
-		return false
-	}
-	if len(coreAndPre) == 2 && !validSemVerIdentifiers(coreAndPre[1], true) {
-		return false
-	}
-	if len(coreAndBuild) == 2 && !validSemVerIdentifiers(coreAndBuild[1], false) {
-		return false
-	}
-	return true
-}
-
-func validSemVerCore(value string) bool {
-	parts := strings.Split(value, ".")
-	if len(parts) != 3 {
-		return false
-	}
-	for _, part := range parts {
-		if part == "" || len(part) > 1 && part[0] == '0' {
-			return false
-		}
-		for _, char := range part {
-			if char < '0' || char > '9' {
-				return false
-			}
-		}
-	}
-	return true
-}
-
-func validSemVerIdentifiers(value string, prerelease bool) bool {
-	identifiers := strings.Split(value, ".")
-	if len(identifiers) == 0 {
-		return false
-	}
-	for _, identifier := range identifiers {
-		if identifier == "" {
-			return false
-		}
-		allDigits := true
-		for _, char := range identifier {
-			if (char < '0' || char > '9') && (char < 'A' || char > 'Z') && (char < 'a' || char > 'z') && char != '-' {
-				return false
-			}
-			if char < '0' || char > '9' {
-				allDigits = false
-			}
-		}
-		if prerelease && allDigits && len(identifier) > 1 && identifier[0] == '0' {
-			return false
-		}
-	}
-	return true
-}
-
-func validMigration(value string) bool {
-	if len(value) != 14 {
-		return false
-	}
-	for _, char := range value {
-		if char < '0' || char > '9' {
-			return false
-		}
-	}
-	return true
+	return strings.TrimPrefix(contentID, "sha256:"), nil
 }

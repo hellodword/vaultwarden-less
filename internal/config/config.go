@@ -26,12 +26,28 @@ const (
 	RoleCredentialsPath     = "/run/credentials/role/credentials.yaml"
 	ResticPasswordPath      = "/run/credentials/common/restic-password"
 
-	ListenAddress = "0.0.0.0:9090"
-	DataDir       = "/data"
-	StateDir      = "/state"
-	StagingDir    = "/staging"
-	CacheDir      = "/cache"
-	ResticBinary  = "/usr/local/bin/restic"
+	ListenAddress     = "0.0.0.0:9090"
+	WorkerURL         = "http://backup:9090"
+	DataDir           = "/data"
+	StagingDir        = "/staging"
+	RecoveryPointPath = "/staging/point"
+	CacheDir          = "/cache"
+	RestoreRoot       = "/restore"
+	ResticBinary      = "/usr/local/bin/restic"
+
+	QuietWindow           = 30 * time.Second
+	MaximumQuietWindow    = 2 * time.Minute
+	MinimumCheckInterval  = 5 * time.Minute
+	FallbackCheckInterval = 12 * time.Hour
+	ConsistencyRetry      = 30 * time.Second
+	FailureRetry          = 5 * time.Minute
+	DegradedAfter         = 30 * time.Minute
+	EventRetry            = 30 * time.Second
+	TargetTimeout         = 2 * time.Hour
+	MaintenanceTimeout    = 24 * time.Hour
+	NotifierTimeout       = 10 * time.Second
+	ShutdownTimeout       = 2 * time.Minute
+	EventMaxBytes         = 1024
 )
 
 var (
@@ -45,31 +61,12 @@ var (
 
 var errUnknownYAMLField = errors.New("unknown YAML field")
 
-// Backup is the complete human-authored v1 configuration. Runtime paths,
-// scheduler timing and event-server limits are fixed product behavior and are
-// populated after decoding rather than exposed as YAML fields.
+// Backup is the complete human-authored schema v1 configuration. Scheduling,
+// retry, timeout, retention, filesystem and HTTP behavior are product constants.
 type Backup struct {
-	SchemaVersion      int        `yaml:"schema_version"`
-	TargetTimeout      Duration   `yaml:"target_timeout"`
-	MaintenanceTimeout Duration   `yaml:"maintenance_timeout"`
-	Targets            []Target   `yaml:"targets,omitempty"`
-	Notifiers          []Notifier `yaml:"notifiers,omitempty"`
-
-	ListenAddress      string   `yaml:"-"`
-	DataDir            string   `yaml:"-"`
-	StateDir           string   `yaml:"-"`
-	StagingDir         string   `yaml:"-"`
-	CacheDir           string   `yaml:"-"`
-	ResticBinary       string   `yaml:"-"`
-	Debounce           Duration `yaml:"-"`
-	MaxWait            Duration `yaml:"-"`
-	MinInterval        Duration `yaml:"-"`
-	SampleInterval     Duration `yaml:"-"`
-	MissingRetry       Duration `yaml:"-"`
-	ShutdownTimeout    Duration `yaml:"-"`
-	EventMaxBytes      int64    `yaml:"-"`
-	EventRatePerSecond float64  `yaml:"-"`
-	EventBurst         int      `yaml:"-"`
+	SchemaVersion int        `yaml:"schema_version"`
+	Targets       []Target   `yaml:"targets"`
+	Notifiers     []Notifier `yaml:"notifiers,omitempty"`
 }
 
 type Target struct {
@@ -78,17 +75,9 @@ type Target struct {
 	ResticOptions map[string]string `yaml:"restic_options,omitempty"`
 }
 
-func (t Target) Warnings() []string {
-	if strings.HasPrefix(t.Repository, "s3:http://") {
-		return []string{"plaintext_s3_endpoint"}
-	}
-	return []string{}
-}
-
 type Notifier struct {
-	Name    string   `yaml:"name"`
-	Type    string   `yaml:"type"`
-	Timeout Duration `yaml:"timeout"`
+	Name string `yaml:"name"`
+	Type string `yaml:"type"`
 
 	WebhookURL string `yaml:"webhook_url,omitempty"`
 
@@ -100,15 +89,20 @@ type Notifier struct {
 	Sound       string `yaml:"sound,omitempty"`
 }
 
-// RoleCredentials is intentionally permissive about unknown targets and
-// fields. Only the configured target and the keys required by its repository
-// form are consumed.
+type S3Credentials struct {
+	AccessKeyID     string `yaml:"AWS_ACCESS_KEY_ID"`
+	SecretAccessKey string `yaml:"AWS_SECRET_ACCESS_KEY"`
+}
+
 type RoleCredentials struct {
-	SchemaVersion int                          `yaml:"schema_version"`
-	Targets       map[string]map[string]string `yaml:"targets"`
+	SchemaVersion int                      `yaml:"schema_version"`
+	Targets       map[string]S3Credentials `yaml:"targets"`
 }
 
 func LoadBackup(path string) (*Backup, error) {
+	if err := safefs.ValidatePrivateDirectory(filepath.Dir(path)); err != nil {
+		return nil, fmt.Errorf("validate backup config directory: %w", err)
+	}
 	data, err := securefile.ReadBytes(path, MaxConfigBytes)
 	if err != nil {
 		return nil, fmt.Errorf("read backup config: %w", err)
@@ -120,8 +114,8 @@ func DecodeBackup(data []byte) (*Backup, error) {
 	if len(data) > MaxConfigBytes {
 		return nil, fmt.Errorf("backup config exceeds %d bytes", MaxConfigBytes)
 	}
-	cfg := defaultBackup()
-	if err := decodeOneYAML(data, &cfg, true); err != nil {
+	var cfg Backup
+	if err := decodeOneYAML(data, &cfg); err != nil {
 		if errors.Is(err, errUnknownYAMLField) {
 			return nil, fmt.Errorf("decode backup config: unknown field")
 		}
@@ -134,6 +128,9 @@ func DecodeBackup(data []byte) (*Backup, error) {
 }
 
 func LoadRoleCredentials(path string, cfg *Backup) (*RoleCredentials, error) {
+	if cfg == nil {
+		return nil, fmt.Errorf("backup config is required")
+	}
 	if err := safefs.ValidatePrivateDirectory(filepath.Dir(path)); err != nil {
 		return nil, fmt.Errorf("validate role credentials directory: %w", err)
 	}
@@ -142,31 +139,19 @@ func LoadRoleCredentials(path string, cfg *Backup) (*RoleCredentials, error) {
 		return nil, fmt.Errorf("read role credentials: %w", err)
 	}
 	var credentials RoleCredentials
-	if err := decodeOneYAML(data, &credentials, false); err != nil {
+	if err := decodeOneYAML(data, &credentials); err != nil {
 		return nil, fmt.Errorf("decode role credentials: invalid YAML")
 	}
-	if credentials.SchemaVersion != version.SchemaVersion {
-		return nil, fmt.Errorf("role credentials schema_version must be %d", version.SchemaVersion)
-	}
-	if credentials.Targets == nil {
-		return nil, fmt.Errorf("role credentials targets must be a mapping")
-	}
-	for _, target := range cfg.Targets {
-		if _, err := credentials.Environment(target); err != nil {
-			return nil, fmt.Errorf("target %s credentials: %w", target.Name, err)
-		}
+	if err := credentials.Validate(cfg); err != nil {
+		return nil, fmt.Errorf("validate role credentials: %w", err)
 	}
 	return &credentials, nil
 }
 
-func decodeOneYAML(data []byte, destination any, strict bool) error {
-	options := []yaml.DecodeOption{}
-	if strict {
-		options = append(options, yaml.DisallowUnknownField())
-	}
-	decoder := yaml.NewDecoder(bytes.NewReader(data), options...)
+func decodeOneYAML(data []byte, destination any) error {
+	decoder := yaml.NewDecoder(bytes.NewReader(data), yaml.DisallowUnknownField())
 	if err := decoder.Decode(destination); err != nil {
-		if strict && strings.Contains(strings.ToLower(err.Error()), "unknown field") {
+		if strings.Contains(strings.ToLower(err.Error()), "unknown field") {
 			return errUnknownYAMLField
 		}
 		return err
@@ -182,55 +167,27 @@ func decodeOneYAML(data []byte, destination any, strict bool) error {
 	return err
 }
 
-func defaultBackup() Backup {
-	return Backup{
-		ListenAddress:      ListenAddress,
-		DataDir:            DataDir,
-		StateDir:           StateDir,
-		StagingDir:         StagingDir,
-		CacheDir:           CacheDir,
-		ResticBinary:       ResticBinary,
-		Debounce:           Duration{Duration: 30 * time.Second},
-		MaxWait:            Duration{Duration: 2 * time.Minute},
-		MinInterval:        Duration{Duration: 5 * time.Minute},
-		SampleInterval:     Duration{Duration: 15 * time.Minute},
-		MissingRetry:       Duration{Duration: 30 * time.Second},
-		ShutdownTimeout:    Duration{Duration: 2 * time.Minute},
-		EventMaxBytes:      1024,
-		EventRatePerSecond: 10,
-		EventBurst:         20,
-	}
-}
-
 func (c *Backup) Validate() error {
 	if c.SchemaVersion != version.SchemaVersion {
 		return fmt.Errorf("schema_version must be %d", version.SchemaVersion)
 	}
-	if c.TargetTimeout.Duration < time.Minute || c.TargetTimeout.Duration > 2*time.Hour {
-		return fmt.Errorf("target_timeout must be between 1m and 2h")
-	}
-	if c.MaintenanceTimeout.Duration < time.Minute || c.MaintenanceTimeout.Duration > 24*time.Hour {
-		return fmt.Errorf("maintenance_timeout must be between 1m and 24h")
+	if len(c.Targets) == 0 {
+		return fmt.Errorf("targets must contain at least one entry")
 	}
 	if len(c.Targets) > 32 {
 		return fmt.Errorf("targets must not contain more than 32 entries")
 	}
-	if c.Targets == nil {
-		c.Targets = []Target{}
-	}
-	for index := 1; index < len(c.Targets); index++ {
-		if c.Targets[index-1].Name >= c.Targets[index].Name {
-			return fmt.Errorf("targets must be sorted by name")
-		}
-	}
+	targetNames := make(map[string]struct{}, len(c.Targets))
 	for index := range c.Targets {
-		if err := c.Targets[index].validateFields(); err != nil {
+		if err := c.Targets[index].Validate(); err != nil {
 			return fmt.Errorf("targets[%d]: %w", index, err)
 		}
-	}
-	for index := range c.Targets {
-		if err := c.Targets[index].validateOptions(); err != nil {
-			return fmt.Errorf("targets[%d].restic_options: %w", index, err)
+		if _, duplicate := targetNames[c.Targets[index].Name]; duplicate {
+			return fmt.Errorf("target names must be unique")
+		}
+		targetNames[c.Targets[index].Name] = struct{}{}
+		if c.Targets[index].ResticOptions == nil {
+			c.Targets[index].ResticOptions = map[string]string{}
 		}
 	}
 	if len(c.Notifiers) > 16 {
@@ -239,17 +196,26 @@ func (c *Backup) Validate() error {
 	if c.Notifiers == nil {
 		c.Notifiers = []Notifier{}
 	}
-	for index := 1; index < len(c.Notifiers); index++ {
-		if c.Notifiers[index-1].Name >= c.Notifiers[index].Name {
-			return fmt.Errorf("notifiers must be sorted by name")
-		}
-	}
+	notifierNames := make(map[string]struct{}, len(c.Notifiers))
 	for index := range c.Notifiers {
 		if err := c.Notifiers[index].validate(); err != nil {
 			return fmt.Errorf("notifiers[%d]: %w", index, err)
 		}
+		if _, duplicate := notifierNames[c.Notifiers[index].Name]; duplicate {
+			return fmt.Errorf("notifier names must be unique")
+		}
+		notifierNames[c.Notifiers[index].Name] = struct{}{}
 	}
 	return nil
+}
+
+func (c Backup) Target(name string) (Target, bool) {
+	for _, target := range c.Targets {
+		if target.Name == name {
+			return target, true
+		}
+	}
+	return Target{}, false
 }
 
 func (t Target) Backend() string {
@@ -259,24 +225,20 @@ func (t Target) Backend() string {
 	return ""
 }
 
-func (t Target) Validate() error {
-	if err := t.validateFields(); err != nil {
-		return err
+func (t Target) Warnings() []string {
+	if strings.HasPrefix(t.Repository, "s3:http://") {
+		return []string{"plaintext_s3_endpoint"}
 	}
-	return t.validateOptions()
+	return []string{}
 }
 
-func (t Target) validateFields() error {
+func (t Target) Validate() error {
 	if !namePattern.MatchString(t.Name) {
 		return fmt.Errorf("invalid name %q", t.Name)
 	}
 	if !validRepository(t.Repository) {
 		return fmt.Errorf("repository must be an s3:http[s]:// locator without embedded credentials")
 	}
-	return nil
-}
-
-func (t Target) validateOptions() error {
 	optionNames := make([]string, 0, len(t.ResticOptions))
 	for name := range t.ResticOptions {
 		optionNames = append(optionNames, name)
@@ -305,10 +267,7 @@ func (t Target) validateOptions() error {
 }
 
 func validRepository(repository string) bool {
-	if repository == "" || len(repository) > 4096 || strings.ContainsAny(repository, "\r\n\x00") {
-		return false
-	}
-	if !strings.HasPrefix(repository, "s3:") {
+	if repository == "" || len(repository) > 4096 || strings.ContainsAny(repository, "\r\n\x00") || !strings.HasPrefix(repository, "s3:") {
 		return false
 	}
 	parsed, err := url.Parse(strings.TrimPrefix(repository, "s3:"))
@@ -328,35 +287,54 @@ func validRepository(repository string) bool {
 	return true
 }
 
+func (c RoleCredentials) Validate(cfg *Backup) error {
+	if c.SchemaVersion != version.SchemaVersion {
+		return fmt.Errorf("schema_version must be %d", version.SchemaVersion)
+	}
+	if c.Targets == nil || len(c.Targets) != len(cfg.Targets) {
+		return fmt.Errorf("target key set must exactly match backup config")
+	}
+	for _, target := range cfg.Targets {
+		value, exists := c.Targets[target.Name]
+		if !exists {
+			return fmt.Errorf("target key set must exactly match backup config")
+		}
+		if err := value.validate(); err != nil {
+			return fmt.Errorf("target %s: %w", target.Name, err)
+		}
+	}
+	return nil
+}
+
 func (c RoleCredentials) Environment(target Target) (map[string]string, error) {
 	values, exists := c.Targets[target.Name]
 	if !exists {
 		return nil, fmt.Errorf("target entry is missing")
 	}
-	var names []string
-	switch target.Backend() {
-	case "s3":
-		names = []string{"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"}
-	default:
-		return nil, fmt.Errorf("repository backend is unsupported")
+	if err := values.validate(); err != nil {
+		return nil, err
 	}
-	environment := make(map[string]string, len(names))
-	for _, name := range names {
-		value, exists := values[name]
-		if !exists || value == "" || len(value) > 64<<10 || strings.ContainsAny(value, "\r\n\x00") {
-			return nil, fmt.Errorf("required key %s is missing or invalid", name)
-		}
-		environment[name] = value
-	}
-	return environment, nil
+	return map[string]string{
+		"AWS_ACCESS_KEY_ID":     values.AccessKeyID,
+		"AWS_SECRET_ACCESS_KEY": values.SecretAccessKey,
+	}, nil
 }
 
-func (n *Notifier) validate() error {
+func (c S3Credentials) validate() error {
+	for name, value := range map[string]string{
+		"AWS_ACCESS_KEY_ID":     c.AccessKeyID,
+		"AWS_SECRET_ACCESS_KEY": c.SecretAccessKey,
+	} {
+		if value == "" || len(value) > 64<<10 || strings.ContainsAny(value, "\r\n\x00") {
+			return fmt.Errorf("required key %s is missing or invalid", name)
+		}
+	}
+	return nil
+}
+
+func (n Notifier) validate() error {
 	if !namePattern.MatchString(n.Name) {
 		return fmt.Errorf("invalid name %q", n.Name)
-	}
-	if n.Timeout.Duration < time.Second || n.Timeout.Duration > time.Minute {
-		return fmt.Errorf("timeout must be between 1s and 1m")
 	}
 	switch n.Type {
 	case "wechat":

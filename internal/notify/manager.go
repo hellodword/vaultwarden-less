@@ -10,156 +10,169 @@ import (
 	"github.com/hellodword/vaultwarden-less/internal/config"
 )
 
+const notifierQueueCapacity = 16
+
+var defaultRetryOffsets = []time.Duration{0, time.Minute, 5 * time.Minute}
+
+type senderWorker struct {
+	sender Sender
+	queue  chan Event
+}
+
 type Manager struct {
-	store   *QueueStore
-	senders []Sender
-	names   []string
-	log     *slog.Logger
-	wg      sync.WaitGroup
+	workers      []senderWorker
+	log          *slog.Logger
+	retryOffsets []time.Duration
+	wg           sync.WaitGroup
+	startOnce    sync.Once
 }
 
 type lazySender struct {
-	cfg    config.Notifier
+	config config.Notifier
 	mu     sync.Mutex
 	sender Sender
 }
 
-func NewManager(stateDir string, configs []config.Notifier, log *slog.Logger) (*Manager, error) {
+func NewManager(configs []config.Notifier, logger *slog.Logger) *Manager {
 	senders := make([]Sender, 0, len(configs))
-	names := make([]string, 0, len(configs))
-	for _, cfg := range configs {
-		sender := &lazySender{cfg: cfg}
-		senders = append(senders, sender)
-		names = append(names, cfg.Name)
+	for _, notifier := range configs {
+		senders = append(senders, &lazySender{config: notifier})
 	}
-	store, err := OpenQueueStore(stateDir, names)
-	if err != nil {
-		return nil, err
-	}
-	return &Manager{store: store, senders: senders, names: names, log: log}, nil
+	return newManagerWithSenders(senders, logger, defaultRetryOffsets)
 }
 
-func NewUnavailableManager(log *slog.Logger) *Manager {
-	return &Manager{log: log}
+func newManagerWithSenders(senders []Sender, logger *slog.Logger, retryOffsets []time.Duration) *Manager {
+	workers := make([]senderWorker, 0, len(senders))
+	for _, sender := range senders {
+		workers = append(workers, senderWorker{sender: sender, queue: make(chan Event, notifierQueueCapacity)})
+	}
+	return &Manager{workers: workers, log: logger, retryOffsets: append([]time.Duration(nil), retryOffsets...)}
 }
-
-func (m *Manager) Rebuilt() bool { return m.store != nil && m.store.Rebuilt() }
 
 func ValidateConfigs(configs []config.Notifier) error {
-	for _, cfg := range configs {
-		_, err := senderForConfig(cfg)
-		if err != nil {
-			return fmt.Errorf("initialize notifier %s: %w", cfg.Name, err)
+	for _, notifier := range configs {
+		if _, err := senderForConfig(notifier); err != nil {
+			return fmt.Errorf("initialize notifier %s: %w", notifier.Name, err)
 		}
 	}
 	return nil
 }
 
-func (m *Manager) Start(ctx context.Context) {
-	for _, sender := range m.senders {
-		sender := sender
-		m.wg.Add(1)
-		go func() {
-			defer m.wg.Done()
-			m.runSender(ctx, sender)
-		}()
-	}
-}
-
-func (m *Manager) Wait() { m.wg.Wait() }
-
-func (m *Manager) EnqueueSuccess(event Event) error {
-	if m.store == nil {
-		return fmt.Errorf("notification persistence is unavailable")
-	}
-	return m.store.EnqueueAll(m.names, event, "success", event.ID)
-}
-
-func (m *Manager) EnqueueState(key string, event Event) error {
-	if m.store == nil {
-		return fmt.Errorf("notification persistence is unavailable")
-	}
-	return m.store.EnqueueAll(m.names, event, "state", key)
-}
-
-func (s *lazySender) Name() string { return s.cfg.Name }
-
-func (s *lazySender) Send(ctx context.Context, event Event) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.sender == nil {
-		sender, err := senderForConfig(s.cfg)
-		if err != nil {
-			return err
+func (manager *Manager) Start(ctx context.Context) {
+	manager.startOnce.Do(func() {
+		for index := range manager.workers {
+			worker := &manager.workers[index]
+			manager.wg.Add(1)
+			go func() {
+				defer manager.wg.Done()
+				manager.runWorker(ctx, worker)
+			}()
 		}
-		s.sender = sender
-	}
-	return s.sender.Send(ctx, event)
+	})
 }
 
-func senderForConfig(cfg config.Notifier) (Sender, error) {
-	switch cfg.Type {
-	case "wechat":
-		return newWechatSender(cfg)
-	case "bark":
-		return newBarkSender(cfg)
-	default:
-		return nil, fmt.Errorf("unsupported notifier type")
+func (manager *Manager) Wait() { manager.wg.Wait() }
+
+// Enqueue never blocks backup work. A full notifier queue drops this event and
+// records only a safe structured error.
+func (manager *Manager) Enqueue(event Event) {
+	if manager == nil {
+		return
+	}
+	if err := event.Validate(); err != nil {
+		manager.logError("notification_invalid", "")
+		return
+	}
+	for index := range manager.workers {
+		worker := &manager.workers[index]
+		copy := event
+		copy.Targets = append([]TargetStatus{}, event.Targets...)
+		select {
+		case worker.queue <- copy:
+		default:
+			manager.logError("notification_queue_full", worker.sender.Name())
+		}
 	}
 }
 
-func (m *Manager) runSender(ctx context.Context, sender Sender) {
-	failures := 0
+func (manager *Manager) runWorker(ctx context.Context, worker *senderWorker) {
 	for {
-		item, exists := m.store.Peek(sender.Name())
-		if !exists {
-			select {
-			case <-ctx.Done():
-				return
-			case <-m.store.Wake(sender.Name()):
-				continue
-			}
+		select {
+		case <-ctx.Done():
+			return
+		case event := <-worker.queue:
+			manager.deliver(ctx, worker.sender, event)
 		}
-		if err := sender.Send(ctx, item.Event); err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			failures++
-			if markErr := m.store.MarkUnavailable(sender.Name()); markErr != nil {
-				m.log.Error("notification availability persistence failed", "notifier", sender.Name(), "error_code", "notification_state_failed")
-			}
-			m.log.Error("notification delivery failed", "notifier", sender.Name(), "error_code", "notification_delivery_failed")
-			delay := retryDelay(failures)
+	}
+}
+
+func (manager *Manager) deliver(ctx context.Context, sender Sender, event Event) {
+	offsets := manager.retryOffsets
+	if len(offsets) == 0 {
+		offsets = defaultRetryOffsets
+	}
+	var previousOffset time.Duration
+	for attempt, offset := range offsets {
+		delay := offset - previousOffset
+		if delay < 0 {
+			delay = 0
+		}
+		previousOffset = offset
+		if delay != 0 {
 			timer := time.NewTimer(delay)
 			select {
 			case <-ctx.Done():
 				timer.Stop()
 				return
 			case <-timer.C:
-				continue
 			}
 		}
-		failures = 0
-		if err := m.store.Ack(sender.Name(), item.Event.ID); err != nil {
-			m.log.Error("notification acknowledgement persistence failed", "notifier", sender.Name(), "error_code", "notification_state_failed")
-			timer := time.NewTimer(time.Minute)
-			select {
-			case <-ctx.Done():
-				timer.Stop()
-				return
-			case <-timer.C:
-			}
+		if err := sender.Send(ctx, event); err == nil {
+			return
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		manager.logError("notification_delivery_failed", sender.Name())
+		if attempt == len(offsets)-1 {
+			return
 		}
 	}
 }
 
-func retryDelay(failures int) time.Duration {
-	delay := time.Minute
-	for i := 1; i < failures && delay < 15*time.Minute; i++ {
-		delay *= 2
+func (manager *Manager) logError(code, notifier string) {
+	if manager.log == nil {
+		return
 	}
-	if delay > 15*time.Minute {
-		return 15 * time.Minute
+	if notifier == "" {
+		manager.log.Error("notification operation failed", "error_code", code)
+		return
 	}
-	return delay
+	manager.log.Error("notification operation failed", "notifier", notifier, "error_code", code)
+}
+
+func (sender *lazySender) Name() string { return sender.config.Name }
+
+func (sender *lazySender) Send(ctx context.Context, event Event) error {
+	sender.mu.Lock()
+	defer sender.mu.Unlock()
+	if sender.sender == nil {
+		initialized, err := senderForConfig(sender.config)
+		if err != nil {
+			return err
+		}
+		sender.sender = initialized
+	}
+	return sender.sender.Send(ctx, event)
+}
+
+func senderForConfig(notifier config.Notifier) (Sender, error) {
+	switch notifier.Type {
+	case "wechat":
+		return newWechatSender(notifier)
+	case "bark":
+		return newBarkSender(notifier)
+	default:
+		return nil, fmt.Errorf("unsupported notifier type")
+	}
 }

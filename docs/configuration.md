@@ -1,83 +1,106 @@
 # Configuration
 
-`backup.yaml` is private YAML with schema version 1:
+All product configuration and credential files are strict schema v1 YAML.
+Unknown fields, extra YAML documents, unsupported notifier-specific fields,
+and implicit environment credentials are rejected. Each file must be a
+non-symlink regular file with mode 0600 beneath a real mode 0700 directory.
+
+## Backup configuration
+
+`config/backup.yaml` contains targets in their serial execution order and
+optional notifiers:
 
 ```yaml
 schema_version: 1
-target_timeout: 30m
-maintenance_timeout: 12h
-targets: []
-notifiers: []
-```
 
-Targets and notifiers are sorted by name. The validator reports the first
-semantic error in a fixed order. YAML syntax errors are exposed as the stable
-message `decode backup config: invalid YAML`; syntax parser details are not a
-configuration contract.
-
-## S3 target
-
-The repository form is exactly an S3 locator without embedded credentials:
-
-```yaml
 targets:
   - name: primary
-    repository: s3:https://s3.example.test/bucket/vaultwarden
+    repository: s3:https://objects.example.test/bucket/vaultwarden
     restic_options:
       s3.bucket-lookup: path
-      s3.region: us-east-1
-```
+      s3.region: ap-singapore
 
-The endpoint may use `http://`; configuration output and startup logs then
-include `plaintext_s3_endpoint`. Query strings, fragments, user information,
-empty bucket components, control characters, and path traversal components are
-rejected. Only `s3.bucket-lookup` (`auto`, `dns`, or `path`) and `s3.region`
-are accepted options.
-
-All supported object-storage providers use this same S3 contract. Examples of
-the endpoint and option conventions are available from the providers:
-
-- AWS S3: `s3:https://s3.us-east-1.amazonaws.com/bucket/prefix`
-- Backblaze B2 S3: `s3:https://s3.us-west-004.backblazeb2.com/bucket/prefix`
-- Tencent COS: `s3:https://cos.ap-singapore.myqcloud.com/bucket/prefix`
-- Alibaba OSS: `s3:https://oss-cn-hangzhou.aliyuncs.com/bucket/prefix`
-- Scaleway: `s3:https://s3.fr-par.scw.cloud/bucket/prefix`
-- Cloudflare R2: `s3:https://account-id.r2.cloudflarestorage.com/bucket/prefix`
-
-The credentials file may contain extra target names and keys. The worker reads
-only `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` for each configured target.
-Repository checks verify the mounted material; they do not assert a provider
-role name. Use `config --check-repository-credentials` to opt into that check.
-
-The one Restic password file is shared by every target. Treat it as having the
-blast radius of the complete configured repository set.
-
-## Notifications
-
-Notification material is kept in private `backup.yaml`:
-
-```yaml
 notifiers:
   - name: operations
     type: wechat
-    timeout: 10s
-    webhook_url: https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=REPLACE_ME
+    webhook_url: https://example.invalid/secret
 ```
 
-The other supported type is `bark`, which uses its APNs device token, key,
-team, topic, and optional sound fields. Use
-`config --check-notifier-material` independently of repository checks.
+`serve` requires at least one target. Names are unique and retain declaration
+order. Repositories must be credential-free `s3:https://...` locators. An
+`s3:http://...` locator is permitted for local/Moto use but produces the
+`plaintext_s3_endpoint` warning. Query strings, fragments, user information,
+path traversal, and empty path components are rejected.
 
-## Zero-target mode
+Only these Restic options are supported:
 
-An empty target list is valid. The worker does not open Restic, read repository
-credentials or the password file, create a local recovery point, or touch the
-staging directory. Events, status, notification queue handling, and liveness
-continue to work.
+- `s3.bucket-lookup`: `auto`, `dns`, or `path`;
+- `s3.region`: a non-empty region identifier.
 
-## Compose settings
+Scheduling, retry intervals, timeouts, retention, filesystem paths, Restic
+identity, and supported Vaultwarden versions are fixed product behavior, not
+configuration fields.
 
-The product image uses fixed UID/GID `65532:65532`. Vaultwarden settings come
-only from `.env.vaultwarden`; do not put its application configuration in a
-second Compose environment file. Put Nginx or Caddy in front of the loopback
-proxy binding.
+## Role credentials
+
+`credentials/backup/credentials.yaml` and
+`credentials/maintenance/credentials.yaml` have the same strict schema:
+
+```yaml
+schema_version: 1
+targets:
+  primary:
+    AWS_ACCESS_KEY_ID: "..."
+    AWS_SECRET_ACCESS_KEY: "..."
+```
+
+Their target key sets must exactly equal the keys in `backup.yaml`. Each
+target accepts exactly the two shown values; session tokens, extra keys, and
+environment fallback are unsupported. The resident worker uses the backup
+file. Repository maintenance and restore share the maintenance file. Compose
+mounts only `credentials/backup` into the resident worker and only
+`credentials/maintenance` into one-shot maintenance/restore services; both
+receive the separate shared-password directory.
+
+`credentials/common/restic-password` is one shared 0600 Restic password used
+for all targets. Its compromise therefore affects every configured repository.
+
+## Notifiers
+
+Notifier secrets remain in private `backup.yaml`. This means maintenance and
+restore jobs can read those secrets; that is an accepted deployment boundary.
+
+WeChat accepts only `name`, `type: wechat`, and an HTTPS `webhook_url`. Bark
+uses direct APNs delivery and accepts only:
+
+```yaml
+- name: phone
+  type: bark
+  device_token: 64-lowercase-hex
+  auth_key: |
+    -----BEGIN PRIVATE KEY-----
+    ...
+    -----END PRIVATE KEY-----
+  key_id: ABC123
+  team_id: TEAM123
+  topic: me.fin.bark
+  sound: "1107"
+```
+
+The APNs key must be a PKCS#8 P-256 private key. `sound` is optional.
+
+## Initialization and ownership
+
+Run `nix run .#just -- init`. The initializer uses exclusive creation and
+never replaces existing content. It creates `data`, `staging`, `cache`,
+`restore`, `config`, and `credentials` as mode 0700; writes private templates,
+a random Restic password, and ignored `.env` files as mode 0600; and rejects
+symlinks, wrong permissions, or wrong ownership.
+
+`.env` records `DEPLOY_UID`, `DEPLOY_GID`, absolute bind paths, ports, and the
+product image. Every service that touches a bind mount runs with this UID/GID.
+When Docker runs remotely, these values must identify the remote deployment
+directory owner, not the local caller.
+
+Vaultwarden application settings live only in `.env.vaultwarden`. The file is
+not part of the recovery set and must be backed up separately.

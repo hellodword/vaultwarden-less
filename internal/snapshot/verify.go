@@ -10,28 +10,26 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 )
 
 const maxManifestBytes = 64 << 20
 
-// DecodeManifest validates the durable manifest object without requiring a
-// restored filesystem tree. Restic candidate classification uses this before
-// exposing a snapshot as a recovery point.
 func DecodeManifest(data []byte) (Manifest, error) {
 	if int64(len(data)) > maxManifestBytes {
 		return Manifest{}, fmt.Errorf("manifest exceeds size limit")
 	}
-	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.DisallowUnknownFields()
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
 	var manifest Manifest
-	if err := dec.Decode(&manifest); err != nil {
+	if err := decoder.Decode(&manifest); err != nil {
 		return Manifest{}, fmt.Errorf("decode manifest: %w", err)
 	}
 	var extra any
-	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
 		return Manifest{}, fmt.Errorf("manifest contains multiple JSON values")
 	}
-	if len(manifest.Files) > 1_000_000 || len(manifest.Missing) > 1_000_000 {
+	if len(manifest.Files) > 1_000_000 {
 		return Manifest{}, fmt.Errorf("manifest contains too many entries")
 	}
 	if err := manifest.Validate(); err != nil {
@@ -40,48 +38,48 @@ func DecodeManifest(data []byte) (Manifest, error) {
 	return manifest, nil
 }
 
-func Verify(ctx context.Context, root string, allowIncomplete bool) (Manifest, error) {
-	rootInfo, err := os.Lstat(root)
-	if err != nil || !rootInfo.IsDir() || rootInfo.Mode()&os.ModeSymlink != 0 || rootInfo.Mode().Perm() != 0o700 {
-		return Manifest{}, fmt.Errorf("snapshot root is not a real 0700 directory")
+func Verify(ctx context.Context, root string) (Manifest, error) {
+	if err := validateOwnedDirectory(root); err != nil {
+		return Manifest{}, fmt.Errorf("recovery root is invalid: %w", err)
 	}
-	manifestPath := filepath.Join(root, "manifest.json")
-	data, err := readBoundedRegular(manifestPath, maxManifestBytes)
+	manifestData, err := readBoundedRegular(filepath.Join(root, "manifest.json"), maxManifestBytes)
 	if err != nil {
 		return Manifest{}, fmt.Errorf("read manifest: %w", err)
 	}
-	manifest, err := DecodeManifest(data)
+	manifest, err := DecodeManifest(manifestData)
 	if err != nil {
 		return Manifest{}, err
 	}
-	if manifest.Status == Incomplete && !allowIncomplete {
-		return Manifest{}, fmt.Errorf("incomplete snapshot requires explicit authorization")
-	}
 
-	expected := map[string]File{"manifest.json": {Path: "manifest.json"}}
+	expectedFiles := map[string]File{"manifest.json": {Path: "manifest.json"}}
+	allowedDirectories := map[string]struct{}{root: {}}
 	for _, file := range manifest.Files {
-		expected[file.Path] = file
+		expectedFiles[file.Path] = file
 		path, err := secureJoin(root, file.Path)
 		if err != nil {
 			return Manifest{}, err
 		}
-		actual, err := hashRegularFile(path)
+		actual, err := hashRegularFile(ctx, path)
 		if err != nil {
 			return Manifest{}, fmt.Errorf("verify %s: %w", file.Path, err)
 		}
 		if actual.Size != file.Size || actual.SHA256 != file.SHA256 {
 			return Manifest{}, fmt.Errorf("file hash or size mismatch for %s", file.Path)
 		}
+		for directory := filepath.Dir(path); directory != root; directory = filepath.Dir(directory) {
+			allowedDirectories[directory] = struct{}{}
+		}
 	}
-	if err := walkSnapshot(root, expected); err != nil {
+	if err := walkRecoveryTree(root, expectedFiles, allowedDirectories); err != nil {
 		return Manifest{}, err
 	}
+
 	databasePath := filepath.Join(root, "data", "db.sqlite3")
 	migration, err := validateDatabase(ctx, databasePath)
 	if err != nil {
 		return Manifest{}, fmt.Errorf("validate restored database: %w", err)
 	}
-	if migration != manifest.DatabaseMigration {
+	if migration != manifest.Vaultwarden.DatabaseMigration {
 		return Manifest{}, fmt.Errorf("restored database migration does not match manifest")
 	}
 	refs, err := referencedFiles(ctx, databasePath)
@@ -95,46 +93,26 @@ func Verify(ctx context.Context, root string, allowIncomplete bool) (Manifest, e
 }
 
 func validateManifestReferences(manifest Manifest, refs []referencedFile) error {
-	filePaths := make(map[string]struct{}, len(manifest.Files))
+	files := make(map[string]File, len(manifest.Files))
 	for _, file := range manifest.Files {
-		filePaths[file.Path] = struct{}{}
+		if file.Path != "data/db.sqlite3" {
+			files[file.Path] = file
+		}
 	}
-	missingPaths := make(map[string]struct{}, len(manifest.Missing))
-	for _, missing := range manifest.Missing {
-		missingPaths[missing.Path] = struct{}{}
+	if len(files) != len(refs) {
+		return fmt.Errorf("manifest path set does not match database references")
 	}
-	referencePaths := make(map[string]struct{}, len(refs))
 	for _, ref := range refs {
-		referencePaths[ref.Path] = struct{}{}
-		_, present := filePaths[ref.Path]
-		_, absent := missingPaths[ref.Path]
-		if present == absent {
-			return fmt.Errorf("database reference must appear exactly once in manifest")
-		}
-	}
-	for path := range filePaths {
-		if isDatabaseManagedPath(path) {
-			if _, ok := referencePaths[path]; !ok {
-				return fmt.Errorf("manifest contains a file not referenced by the database")
-			}
-		}
-	}
-	for path := range missingPaths {
-		if isDatabaseManagedPath(path) {
-			if _, ok := referencePaths[path]; !ok {
-				return fmt.Errorf("manifest contains a missing file not referenced by the database")
-			}
+		file, exists := files[ref.Path]
+		if !exists || file.Size != ref.ExpectedSize {
+			return fmt.Errorf("manifest path set does not match database references")
 		}
 	}
 	return nil
 }
 
-func isDatabaseManagedPath(path string) bool {
-	return strings.HasPrefix(path, "data/attachments/")
-}
-
-func walkSnapshot(root string, expected map[string]File) error {
-	seen := make(map[string]struct{}, len(expected))
+func walkRecoveryTree(root string, expectedFiles map[string]File, allowedDirectories map[string]struct{}) error {
+	seen := make(map[string]struct{}, len(expectedFiles))
 	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -143,25 +121,29 @@ func walkSnapshot(root string, expected map[string]File) error {
 		if err != nil {
 			return err
 		}
-		if info.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("snapshot contains a symlink")
+		stat, ownerKnown := info.Sys().(*syscall.Stat_t)
+		if info.Mode()&os.ModeSymlink != 0 || !ownerKnown || stat.Uid != uint32(os.Geteuid()) {
+			return fmt.Errorf("recovery tree contains an unsafe entry")
 		}
 		if info.IsDir() {
-			if path != root && info.Mode().Perm() != 0o700 {
-				return fmt.Errorf("snapshot directory permissions are not 0700")
+			if info.Mode().Perm() != 0o700 {
+				return fmt.Errorf("recovery directory permissions are not 0700")
+			}
+			if _, allowed := allowedDirectories[path]; !allowed {
+				return fmt.Errorf("recovery tree contains an unlisted directory")
 			}
 			return nil
 		}
 		if !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
-			return fmt.Errorf("snapshot contains a special or insecure file")
+			return fmt.Errorf("recovery tree contains a special or insecure file")
 		}
 		relative, err := filepath.Rel(root, path)
 		if err != nil {
 			return err
 		}
 		relative = filepath.ToSlash(relative)
-		if _, ok := expected[relative]; !ok {
-			return fmt.Errorf("snapshot contains an unlisted file")
+		if _, expected := expectedFiles[relative]; !expected {
+			return fmt.Errorf("recovery tree contains an unlisted file")
 		}
 		seen[relative] = struct{}{}
 		return nil
@@ -169,8 +151,8 @@ func walkSnapshot(root string, expected map[string]File) error {
 	if err != nil {
 		return err
 	}
-	if len(seen) != len(expected) {
-		return fmt.Errorf("snapshot is missing a listed file")
+	if len(seen) != len(expectedFiles) {
+		return fmt.Errorf("recovery tree is missing a listed file")
 	}
 	return nil
 }
@@ -181,14 +163,14 @@ func readBoundedRegular(path string, limit int64) ([]byte, error) {
 		return nil, err
 	}
 	if !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 || info.Size() > limit {
-		return nil, fmt.Errorf("file is not a bounded secure regular file")
+		return nil, fmt.Errorf("file is not a bounded 0600 regular file")
 	}
-	f, err := os.Open(path)
+	file, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = f.Close() }()
-	data, err := io.ReadAll(io.LimitReader(f, limit+1))
+	defer func() { _ = file.Close() }()
+	data, err := io.ReadAll(io.LimitReader(file, limit+1))
 	if err != nil {
 		return nil, err
 	}
@@ -198,9 +180,6 @@ func readBoundedRegular(path string, limit int64) ([]byte, error) {
 	return data, nil
 }
 
-func ContentIDHex(contentID string) (string, error) {
-	if !strings.HasPrefix(contentID, "sha256:") || !validHash(strings.TrimPrefix(contentID, "sha256:")) {
-		return "", fmt.Errorf("invalid content ID")
-	}
-	return strings.TrimPrefix(contentID, "sha256:"), nil
+func IsContentID(value string) bool {
+	return strings.HasPrefix(value, "sha256:") && validHash(strings.TrimPrefix(value, "sha256:"))
 }

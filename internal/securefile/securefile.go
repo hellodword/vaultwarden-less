@@ -13,8 +13,8 @@ import (
 
 const maxSecretBytes = 64 << 10
 
-// ReadBytes reads a bounded, regular, non-symlink private file. Owner write
-// permission is optional, but group and other users must have no access.
+// ReadBytes reads a bounded, regular, non-symlink 0600 file owned by the
+// effective user.
 func ReadBytes(path string, limit int64) ([]byte, error) {
 	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
 		return nil, fmt.Errorf("private file path must be clean and absolute")
@@ -27,7 +27,7 @@ func ReadBytes(path string, limit int64) ([]byte, error) {
 		return nil, fmt.Errorf("private path is not a regular file")
 	}
 	if !privateReadableMode(info) {
-		return nil, fmt.Errorf("private file must be owned by effective UID %d, owner-readable, and inaccessible to group and other users", os.Geteuid())
+		return nil, fmt.Errorf("private file must be owned by effective UID %d with mode 0600", os.Geteuid())
 	}
 	if limit < 1 || info.Size() > limit {
 		return nil, fmt.Errorf("private file exceeds %d bytes", limit)
@@ -85,5 +85,5 @@ func Read(path string) (string, error) {
 func privateReadableMode(info os.FileInfo) bool {
 	permissions := info.Mode().Perm()
 	stat, ok := info.Sys().(*syscall.Stat_t)
-	return ok && stat.Uid == uint32(os.Geteuid()) && permissions&0o400 != 0 && permissions&0o077 == 0
+	return ok && stat.Uid == uint32(os.Geteuid()) && permissions == 0o600
 }

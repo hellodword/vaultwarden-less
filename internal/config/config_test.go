@@ -3,56 +3,59 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 )
 
 const minimalBackupYAML = `schema_version: 1
-target_timeout: 30m
-maintenance_timeout: 12h
+targets:
+  - name: primary
+    repository: s3:https://objects.example.test/bucket/repository
 `
 
-func TestTrackedBackupTemplateValidates(t *testing.T) {
+func TestBackupSchemaPreservesTargetOrderAndRequiresTargets(t *testing.T) {
 	t.Parallel()
-	data, err := os.ReadFile(filepath.Join("..", "..", "config", "backup.template.yaml"))
+	document := `schema_version: 1
+targets:
+  - name: cold
+    repository: s3:https://objects.example.test/cold/restic
+  - name: primary
+    repository: s3:https://objects.example.test/primary/restic
+`
+	cfg, err := DecodeBackup([]byte(document))
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := DecodeBackup(data)
-	if err != nil {
-		t.Fatal(err)
+	names := []string{cfg.Targets[0].Name, cfg.Targets[1].Name}
+	if !slices.Equal(names, []string{"cold", "primary"}) {
+		t.Fatalf("target order = %#v", names)
 	}
-	if len(cfg.Targets) != 0 || len(cfg.Notifiers) != 0 {
-		t.Fatalf("template should default to no external integrations: %#v", cfg)
-	}
-}
-
-func TestBackupAllowsOmittedOrEmptyTargets(t *testing.T) {
-	t.Parallel()
-	for _, suffix := range []string{"", "targets: []\n"} {
-		cfg, err := DecodeBackup([]byte(minimalBackupYAML + suffix))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if cfg.Targets == nil || len(cfg.Targets) != 0 {
-			t.Fatalf("targets = %#v", cfg.Targets)
+	for _, invalid := range []string{
+		"schema_version: 1\ntargets: []\n",
+		"schema_version: 1\n",
+		minimalBackupYAML + "  - name: primary\n    repository: s3:https://objects.example.test/other/repository\n",
+	} {
+		if _, err := DecodeBackup([]byte(invalid)); err == nil {
+			t.Fatal("invalid target list was accepted")
 		}
 	}
 }
 
-func TestBackupRejectsUnknownFieldsMultipleDocumentsAndUnsafeRepositories(t *testing.T) {
+func TestBackupRejectsUnknownFieldsDurationsAndUnsafeRepositories(t *testing.T) {
 	t.Parallel()
 	for name, document := range map[string]string{
 		"unknown field":      minimalBackupYAML + "state_dir: /elsewhere\n",
-		"duplicate key":      minimalBackupYAML + "target_timeout: 20m\n",
+		"duration":           minimalBackupYAML + "target_timeout: 30m\n",
+		"duplicate key":      minimalBackupYAML + "schema_version: 1\n",
 		"multiple documents": minimalBackupYAML + "---\nschema_version: 1\n",
-		"local repository":   minimalBackupYAML + "targets:\n  - name: local\n    repository: /srv/restic\n",
-		"REST repository":    minimalBackupYAML + "targets:\n  - name: rest\n    repository: rest:https://example.test/repo\n",
-		"S3 user info":       minimalBackupYAML + "targets:\n  - name: s3\n    repository: s3:https://user:secret@example.test/bucket/repo\n",
-		"S3 query":           minimalBackupYAML + "targets:\n  - name: s3\n    repository: s3:https://example.test/bucket/repo?secret=value\n",
-		"S3 no bucket":       minimalBackupYAML + "targets:\n  - name: s3\n    repository: s3:https://example.test\n",
-		"S3 fragment":        minimalBackupYAML + "targets:\n  - name: s3\n    repository: s3:https://example.test/bucket/repo#fragment\n",
+		"local repository":   "schema_version: 1\ntargets:\n  - name: local\n    repository: /srv/restic\n",
+		"REST repository":    "schema_version: 1\ntargets:\n  - name: rest\n    repository: rest:https://example.test/repo\n",
+		"S3 user info":       "schema_version: 1\ntargets:\n  - name: s3\n    repository: s3:https://user:secret@example.test/bucket/repo\n",
+		"S3 query":           "schema_version: 1\ntargets:\n  - name: s3\n    repository: s3:https://example.test/bucket/repo?secret=value\n",
+		"S3 no bucket":       "schema_version: 1\ntargets:\n  - name: s3\n    repository: s3:https://example.test\n",
+		"S3 fragment":        "schema_version: 1\ntargets:\n  - name: s3\n    repository: s3:https://example.test/bucket/repo#fragment\n",
 	} {
 		document := document
 		t.Run(name, func(t *testing.T) {
@@ -73,89 +76,35 @@ func TestYAMLErrorsDoNotEchoSecretValues(t *testing.T) {
 	}
 }
 
-func TestDurationRejectsNonStringAndNonPositiveValues(t *testing.T) {
+func TestHTTPRepositoryWarnsAndS3OptionsAreNarrow(t *testing.T) {
 	t.Parallel()
-	for _, value := range []string{"0s", "-1s", "1"} {
-		document := "schema_version: 1\ntarget_timeout: " + value + "\nmaintenance_timeout: 12h\n"
-		if _, err := DecodeBackup([]byte(document)); err == nil {
-			t.Fatalf("accepted invalid duration %q", value)
-		}
-	}
-}
-
-func TestTargetsSupportOnlyS3AndSortNames(t *testing.T) {
-	t.Parallel()
-	document := minimalBackupYAML + `targets:
-  - name: cold
-    repository: s3:https://objects.example.test/cold/restic
-    restic_options:
-      s3.bucket-lookup: path
-      s3.region: ap-singapore
-  - name: primary
-    repository: s3:https://objects.example.test/primary/restic
-`
-	cfg, err := DecodeBackup([]byte(document))
+	cfg, err := DecodeBackup([]byte("schema_version: 1\ntargets:\n  - name: primary\n    repository: s3:http://objects.example.test/bucket/repo\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Targets[0].Backend() != "s3" || cfg.Targets[1].Backend() != "s3" {
-		t.Fatalf("backends = %q/%q", cfg.Targets[0].Backend(), cfg.Targets[1].Backend())
-	}
-}
-
-func TestConfigSyntaxErrorsHaveStablePublicText(t *testing.T) {
-	t.Parallel()
-	for _, document := range []string{
-		"schema_version: [1\n",
-		"schema_version: 1\n---\nschema_version: 1\n",
-		"schema_version: 1\ntarget_timeout: 30m\nmaintenance_timeout: 12h\nnotifiers: [\n",
-	} {
-		_, err := DecodeBackup([]byte(document))
-		if err == nil || err.Error() != "decode backup config: invalid YAML" {
-			t.Fatalf("syntax error = %v", err)
-		}
-	}
-}
-
-func TestHTTPRepositoryIsAcceptedWithWarning(t *testing.T) {
-	t.Parallel()
-	cfg, err := DecodeBackup([]byte(minimalBackupYAML + "targets:\n  - name: primary\n    repository: s3:http://objects.example.test/bucket/repo\n"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	warnings := cfg.Targets[0].Warnings()
-	if len(warnings) != 1 || warnings[0] != "plaintext_s3_endpoint" {
+	if warnings := cfg.Targets[0].Warnings(); !slices.Equal(warnings, []string{"plaintext_s3_endpoint"}) {
 		t.Fatalf("warnings = %#v", warnings)
 	}
-}
-
-func TestS3OptionsUseNarrowTypedValues(t *testing.T) {
-	t.Parallel()
-	for name, option := range map[string]string{
-		"bucket lookup": "s3.bucket-lookup: command injection",
-		"region":        "s3.region: region with spaces",
-		"unknown":       "s3.connections: '99'",
+	for _, option := range []string{
+		"s3.bucket-lookup: command injection",
+		"s3.region: region with spaces",
+		"s3.connections: '99'",
 	} {
-		option := option
-		t.Run(name, func(t *testing.T) {
-			document := minimalBackupYAML + "targets:\n  - name: primary\n    repository: s3:https://objects.example.test/bucket/repository\n    restic_options:\n      " + option + "\n"
-			if _, err := DecodeBackup([]byte(document)); err == nil {
-				t.Fatal("invalid S3 option was accepted")
-			}
-		})
+		document := minimalBackupYAML + "    restic_options:\n      " + option + "\n"
+		if _, err := DecodeBackup([]byte(document)); err == nil {
+			t.Fatalf("invalid S3 option was accepted: %s", option)
+		}
 	}
 }
 
-func TestNotifierContractContainsOnlyWechatAndBark(t *testing.T) {
+func TestNotifierFieldsAreStrictForEachType(t *testing.T) {
 	t.Parallel()
-	document := minimalBackupYAML + `notifiers:
+	valid := minimalBackupYAML + `notifiers:
   - name: operations
     type: wechat
-    timeout: 10s
     webhook_url: https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=placeholder
   - name: phone
     type: bark
-    timeout: 10s
     device_token: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     auth_key: |
       -----BEGIN PRIVATE KEY-----
@@ -165,35 +114,33 @@ func TestNotifierContractContainsOnlyWechatAndBark(t *testing.T) {
     team_id: TEAM123
     topic: me.fin.bark
 `
-	if _, err := DecodeBackup([]byte(document)); err != nil {
+	if _, err := DecodeBackup([]byte(valid)); err != nil {
 		t.Fatal(err)
 	}
-	unsupported := minimalBackupYAML + "notifiers:\n  - name: generic\n    type: webhook\n    timeout: 10s\n    webhook_url: https://example.test/hook\n"
-	if _, err := DecodeBackup([]byte(unsupported)); err == nil {
-		t.Fatal("generic webhook was accepted")
+	for _, suffix := range []string{
+		"notifiers:\n  - name: operations\n    type: wechat\n    webhook_url: https://example.test/hook\n    device_token: " + strings.Repeat("a", 64) + "\n",
+		"notifiers:\n  - name: operations\n    type: wechat\n    timeout: 10s\n    webhook_url: https://example.test/hook\n",
+		"notifiers:\n  - name: generic\n    type: webhook\n    webhook_url: https://example.test/hook\n",
+	} {
+		if _, err := DecodeBackup([]byte(minimalBackupYAML + suffix)); err == nil {
+			t.Fatal("invalid notifier was accepted")
+		}
 	}
 }
 
-func TestRoleCredentialsRequireOnlyConfiguredBackendKeys(t *testing.T) {
+func TestRoleCredentialsRequireExactTargetsAndFields(t *testing.T) {
 	t.Parallel()
-	cfg, err := DecodeBackup([]byte(minimalBackupYAML + `targets:
-  - name: primary
-    repository: s3:https://objects.example.test/bucket/repository
-`))
+	cfg, err := DecodeBackup([]byte(minimalBackupYAML))
 	if err != nil {
 		t.Fatal(err)
 	}
-	path := writePrivateFile(t, `schema_version: 1
+	valid := `schema_version: 1
 targets:
   primary:
     AWS_ACCESS_KEY_ID: synthetic-access
     AWS_SECRET_ACCESS_KEY: synthetic-secret
-    IGNORED_SESSION_TOKEN: ignored
-  removed-target:
-    arbitrary: ignored
-unknown_root_field: ignored
-`)
-	credentials, err := LoadRoleCredentials(path, cfg)
+`
+	credentials, err := LoadRoleCredentials(writePrivateFile(t, valid), cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -204,47 +151,65 @@ unknown_root_field: ignored
 	if len(environment) != 2 || environment["AWS_ACCESS_KEY_ID"] != "synthetic-access" || environment["AWS_SECRET_ACCESS_KEY"] != "synthetic-secret" {
 		t.Fatalf("environment = %#v", environment)
 	}
+
+	for _, invalid := range []string{
+		`schema_version: 1
+targets:
+  primary:
+    AWS_ACCESS_KEY_ID: synthetic-access
+`,
+		valid + "  removed-target:\n    AWS_ACCESS_KEY_ID: other\n    AWS_SECRET_ACCESS_KEY: other\n",
+		`schema_version: 1
+targets:
+  primary:
+    AWS_ACCESS_KEY_ID: synthetic-access
+    AWS_SECRET_ACCESS_KEY: synthetic-secret
+    AWS_SESSION_TOKEN: forbidden
+`,
+		valid + "unknown_root_field: forbidden\n",
+	} {
+		if _, err := LoadRoleCredentials(writePrivateFile(t, invalid), cfg); err == nil {
+			t.Fatal("invalid role credentials were accepted")
+		}
+	}
 }
 
-func TestRoleCredentialsRejectMissingRequiredKeyAndUnsafeFileMode(t *testing.T) {
+func TestPrivateConfigAndCredentialParentsMustBe0700(t *testing.T) {
 	t.Parallel()
-	cfg, err := DecodeBackup([]byte(minimalBackupYAML + "targets:\n  - name: primary\n    repository: s3:https://objects.example.test/bucket/repository\n"))
-	if err != nil {
+	directory := filepath.Join(t.TempDir(), "config")
+	if err := os.Mkdir(directory, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	path := writePrivateFile(t, "schema_version: 1\ntargets:\n  primary:\n    AWS_ACCESS_KEY_ID: present\n")
-	if _, err := LoadRoleCredentials(path, cfg); err == nil {
-		t.Fatal("missing secret access key was accepted")
-	}
-	if err := os.Chmod(path, 0o640); err != nil {
+	path := filepath.Join(directory, "backup.yaml")
+	if err := os.WriteFile(path, []byte(minimalBackupYAML), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := LoadRoleCredentials(path, cfg); err == nil {
-		t.Fatal("group-readable credentials were accepted")
+	if _, err := LoadBackup(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(directory, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadBackup(path); err == nil {
+		t.Fatal("public config parent was accepted")
 	}
 }
 
-func TestFixedRuntimeDefaultsAreNotYAMLFields(t *testing.T) {
+func TestFixedRuntimePolicy(t *testing.T) {
 	t.Parallel()
-	cfg, err := DecodeBackup([]byte(minimalBackupYAML))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.DataDir != DataDir || cfg.StateDir != StateDir || cfg.Debounce.Duration != 30*time.Second {
-		t.Fatalf("fixed defaults not populated: %#v", cfg)
-	}
-	if _, err := DecodeBackup([]byte(minimalBackupYAML + "data_dir: /other\n")); err == nil {
-		t.Fatal("fixed runtime path was accepted from YAML")
+	if QuietWindow != 30*time.Second || MaximumQuietWindow != 2*time.Minute || MinimumCheckInterval != 5*time.Minute ||
+		FallbackCheckInterval != 12*time.Hour || ConsistencyRetry != 30*time.Second || FailureRetry != 5*time.Minute || DegradedAfter != 30*time.Minute {
+		t.Fatal("fixed scheduler policy changed")
 	}
 }
 
 func writePrivateFile(t *testing.T, contents string) string {
 	t.Helper()
-	dir := filepath.Join(t.TempDir(), "credentials")
-	if err := os.Mkdir(dir, 0o700); err != nil {
+	directory := filepath.Join(t.TempDir(), "credentials")
+	if err := os.Mkdir(directory, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	path := filepath.Join(dir, "private.yaml")
+	path := filepath.Join(directory, "private.yaml")
 	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
 		t.Fatal(err)
 	}

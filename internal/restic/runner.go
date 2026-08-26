@@ -9,12 +9,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
-	"net/url"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -23,670 +23,553 @@ import (
 	"github.com/hellodword/vaultwarden-less/internal/safefs"
 	"github.com/hellodword/vaultwarden-less/internal/securefile"
 	"github.com/hellodword/vaultwarden-less/internal/snapshot"
-	"github.com/hellodword/vaultwarden-less/internal/state"
 	"github.com/hellodword/vaultwarden-less/internal/version"
 )
 
 const (
-	maxCommandOutput  = 16 << 20
-	maxManifestOutput = 64 << 20
-	maxStderrCapture  = 1 << 20
-	maxStderrLog      = 64 << 10
+	maxCommandOutput = 16 << 20
+	maxStderrOutput  = 1 << 20
 )
-
-type Runner struct {
-	Binary       string
-	CacheDir     string
-	StagingDir   string
-	PasswordFile string
-	Credentials  *config.RoleCredentials
-	Logger       *slog.Logger
-	Disabled     bool
-}
 
 type OperationError struct {
 	Code     string
 	ExitCode int
-	Stderr   string
 }
 
 func (e *OperationError) Error() string { return "restic operation failed: " + e.Code }
 
-type BackupResult struct{ SnapshotID string }
-
-type SnapshotInfo struct {
-	ID        string            `json:"id"`
-	Time      string            `json:"time"`
-	Host      string            `json:"host"`
-	Tags      []string          `json:"tags"`
-	Paths     []string          `json:"paths"`
-	Status    snapshot.Status   `json:"status"`
-	ContentID string            `json:"content_id"`
-	Manifest  snapshot.Manifest `json:"-"`
+type Snapshot struct {
+	ID        string `json:"id"`
+	Time      string `json:"time"`
+	ContentID string `json:"content_id"`
 }
 
-type SnapshotAnomaly struct {
-	SnapshotID string `json:"snapshot_id"`
-	ErrorCode  string `json:"error_code"`
+type SyncResult struct {
+	SnapshotID string
+	ContentID  string
+	Created    bool
 }
 
-type SnapshotReport struct {
-	Snapshots []SnapshotInfo
-	Anomalies []SnapshotAnomaly
+type PruneGroup struct {
+	Host              string   `json:"host"`
+	Paths             []string `json:"paths"`
+	KeepSnapshotIDs   []string `json:"keep_snapshot_ids"`
+	RemoveSnapshotIDs []string `json:"remove_snapshot_ids"`
 }
 
 type PruneResult struct {
-	Status             snapshot.Status `json:"status"`
-	KeptCount          int             `json:"kept_count"`
-	RemovedCount       int             `json:"removed_count"`
-	KeptSnapshotIDs    []string        `json:"kept_snapshot_ids"`
-	RemovedSnapshotIDs []string        `json:"removed_snapshot_ids"`
+	Applied bool         `json:"applied"`
+	Groups  []PruneGroup `json:"groups"`
 }
 
-func (r Runner) ValidateTarget(target config.Target) error {
-	if r.Disabled {
-		return nil
-	}
-	_, _, err := r.environment(target)
-	if err != nil {
-		r.logTargetError(target, "validate", err)
-	}
-	return err
+type executeFunc func(context.Context, string, []string, []string, string) ([]byte, error)
+
+type Runner struct {
+	Binary       string
+	CacheDir     string
+	PasswordFile string
+	Credentials  *config.RoleCredentials
+
+	execute      executeFunc
+	recoveryPath string
 }
 
 func (r Runner) VerifyVersion(ctx context.Context) error {
-	if r.Disabled {
-		return nil
+	binary := r.Binary
+	if binary == "" {
+		binary = config.ResticBinary
 	}
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	stdout, err := r.run(ctx, "version", "", []string{"TMPDIR=/tmp"}, []string{"version"}, maxCommandOutput)
+	output, err := r.run(ctx, binary, []string{"version"}, sanitizedEnvironment(nil), "")
 	if err != nil {
-		operationErr := r.operationError(ctx, err, "version")
-		r.logOperationError(config.Target{}, "version", operationErr)
-		return operationErr
+		return err
 	}
-	value := strings.TrimSpace(string(stdout))
+	value := strings.TrimSpace(string(output))
 	if value != "restic "+version.Restic && !strings.HasPrefix(value, "restic "+version.Restic+" ") {
-		return &OperationError{Code: "restic_version_mismatch"}
+		return &OperationError{Code: "version_mismatch", ExitCode: -1}
 	}
 	return nil
 }
 
-func (r Runner) Backup(ctx context.Context, target config.Target, manifest snapshot.Manifest) (BackupResult, error) {
-	if r.Disabled {
-		return BackupResult{}, &OperationError{Code: "restic_disabled"}
-	}
+func (r Runner) Ensure(ctx context.Context, target config.Target, manifest snapshot.Manifest) (SyncResult, error) {
 	if err := manifest.Validate(); err != nil {
-		return BackupResult{}, &OperationError{Code: "invalid_manifest"}
+		return SyncResult{}, &OperationError{Code: "invalid_manifest", ExitCode: -1}
 	}
-	env, globals, err := r.environment(target)
+	latest, err := r.Latest(ctx, target)
 	if err != nil {
-		r.logTargetError(target, "backup", err)
-		return BackupResult{}, err
+		return SyncResult{}, err
 	}
-	cache, err := r.targetCache(target.Name)
+	if latest != nil && latest.ContentID == manifest.ContentID {
+		return SyncResult{SnapshotID: latest.ID, ContentID: manifest.ContentID, Created: false}, nil
+	}
+	base, environment, err := r.targetCommand(target)
 	if err != nil {
-		r.logTargetError(target, "backup", err)
-		return BackupResult{}, err
+		return SyncResult{}, err
 	}
 	contentHex, err := snapshot.ContentIDHex(manifest.ContentID)
 	if err != nil {
-		return BackupResult{}, &OperationError{Code: "invalid_content_id"}
+		return SyncResult{}, &OperationError{Code: "invalid_content_id", ExitCode: -1}
 	}
-	args := append(globals,
-		"backup", "--json", "--cache-dir", cache,
+	arguments := append(base,
+		"backup", "--json",
 		"--host", version.SnapshotHost,
 		"--tag", version.SnapshotTag,
-		"--tag", string(manifest.Status),
 		"--tag", "content-id="+contentHex,
-		"data", "manifest.json",
+		"--", r.path(),
 	)
-	stdout, err := r.run(ctx, "backup", filepath.Join(r.StagingDir, "current"), env, args, maxCommandOutput)
+	output, err := r.runCommand(ctx, arguments, environment, "")
 	if err != nil {
-		return BackupResult{}, r.operationErrorForTarget(ctx, err, "backup", target)
+		return SyncResult{}, err
 	}
-	var result BackupResult
-	scanner := bufio.NewScanner(bytes.NewReader(stdout))
-	scanner.Buffer(make([]byte, 64<<10), maxCommandOutput)
-	for scanner.Scan() {
-		var message struct {
-			MessageType string `json:"message_type"`
-			SnapshotID  string `json:"snapshot_id"`
+	snapshotID, err := parseBackupSnapshotID(output)
+	if err != nil {
+		return SyncResult{}, &OperationError{Code: "backup_result_invalid", ExitCode: -1}
+	}
+	return SyncResult{SnapshotID: snapshotID, ContentID: manifest.ContentID, Created: true}, nil
+}
+
+func (r Runner) Latest(ctx context.Context, target config.Target) (*Snapshot, error) {
+	items, err := r.snapshotQuery(ctx, target, []string{"--latest", "1"})
+	if err != nil {
+		return nil, err
+	}
+	if len(items) == 0 {
+		return nil, nil
+	}
+	if len(items) != 1 {
+		return nil, &OperationError{Code: "snapshots_result_invalid", ExitCode: -1}
+	}
+	return &items[0], nil
+}
+
+func (r Runner) Snapshots(ctx context.Context, target config.Target) ([]Snapshot, error) {
+	items, err := r.snapshotQuery(ctx, target, nil)
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(items, func(left, right int) bool {
+		if items[left].Time == items[right].Time {
+			return items[left].ID > items[right].ID
 		}
-		if json.Unmarshal(scanner.Bytes(), &message) == nil && message.MessageType == "summary" {
-			result.SnapshotID = message.SnapshotID
+		return items[left].Time > items[right].Time
+	})
+	return items, nil
+}
+
+func (r Runner) ResolveSnapshot(ctx context.Context, target config.Target, requested string) (Snapshot, error) {
+	if requested == "" {
+		latest, err := r.Latest(ctx, target)
+		if err != nil {
+			return Snapshot{}, err
 		}
+		if latest == nil {
+			return Snapshot{}, &OperationError{Code: "snapshot_not_found", ExitCode: -1}
+		}
+		return *latest, nil
 	}
-	if scanner.Err() != nil || !validSnapshotID(result.SnapshotID) {
-		return BackupResult{}, &OperationError{Code: "backup_result_invalid"}
+	if !validSnapshotID(requested) {
+		return Snapshot{}, &OperationError{Code: "snapshot_id_invalid", ExitCode: -1}
 	}
-	return result, nil
+	items, err := r.snapshotQuery(ctx, target, []string{requested})
+	if err != nil {
+		return Snapshot{}, err
+	}
+	if len(items) != 1 || items[0].ID != requested {
+		return Snapshot{}, &OperationError{Code: "snapshot_not_found", ExitCode: -1}
+	}
+	return items[0], nil
+}
+
+func (r Runner) snapshotQuery(ctx context.Context, target config.Target, additional []string) ([]Snapshot, error) {
+	base, environment, err := r.targetCommand(target)
+	if err != nil {
+		return nil, err
+	}
+	arguments := append(base,
+		"snapshots", "--json",
+		"--host", version.SnapshotHost,
+		"--path", r.path(),
+		"--tag", version.SnapshotTag,
+	)
+	arguments = append(arguments, additional...)
+	output, err := r.runCommand(ctx, arguments, environment, "")
+	if err != nil {
+		return nil, err
+	}
+	return parseSnapshots(output, r.path())
 }
 
 func (r Runner) Init(ctx context.Context, target config.Target) error {
-	_, err := r.maintenance(ctx, target, "init", []string{"init"})
+	_, err := r.maintenance(ctx, target, []string{"init", "--json"})
 	return err
 }
 
 func (r Runner) Unlock(ctx context.Context, target config.Target) error {
-	cache, err := r.targetCache(target.Name)
-	if err != nil {
-		r.logTargetError(target, "unlock", err)
-		return err
-	}
-	_, err = r.maintenance(ctx, target, "unlock", []string{"unlock", "--cache-dir", cache})
+	_, err := r.maintenance(ctx, target, []string{"unlock", "--json"})
 	return err
 }
 
 func (r Runner) Check(ctx context.Context, target config.Target, readDataSubset string) error {
-	cache, err := r.targetCache(target.Name)
-	if err != nil {
-		r.logTargetError(target, "check", err)
-		return err
-	}
-	args := []string{"check", "--cache-dir", cache}
+	arguments := []string{"check", "--json"}
 	if readDataSubset != "" {
-		args = append(args, "--read-data-subset", readDataSubset)
+		parts := strings.Split(readDataSubset, "/")
+		if len(parts) != 2 || parts[1] != "12" {
+			return &OperationError{Code: "read_subset_invalid", ExitCode: -1}
+		}
+		part, err := strconv.Atoi(parts[0])
+		if err != nil || part < 1 || part > 12 {
+			return &OperationError{Code: "read_subset_invalid", ExitCode: -1}
+		}
+		arguments = append(arguments, "--read-data-subset", readDataSubset)
 	}
-	_, err = r.maintenance(ctx, target, "check", args)
+	_, err := r.maintenance(ctx, target, arguments)
 	return err
 }
 
-// Snapshots returns valid candidates only. Call ListSnapshots when the caller
-// must expose anomalies or decide whether an explicit ID is unsafe.
-func (r Runner) Snapshots(ctx context.Context, target config.Target, status snapshot.Status) ([]SnapshotInfo, error) {
-	report, err := r.ListSnapshots(ctx, target)
+func (r Runner) Prune(ctx context.Context, target config.Target, apply bool) (PruneResult, error) {
+	arguments := []string{
+		"forget", "--json", "--prune",
+		"--host", version.SnapshotHost,
+		"--path", r.path(),
+		"--tag", version.SnapshotTag,
+		"--group-by", "host,paths",
+		"--keep-within", "24h",
+		"--keep-hourly", "48",
+		"--keep-daily", "14",
+		"--keep-weekly", "8",
+		"--keep-monthly", "12",
+		"--keep-yearly", "3",
+	}
+	if !apply {
+		arguments = append(arguments, "--dry-run")
+	}
+	output, err := r.maintenance(ctx, target, arguments)
 	if err != nil {
-		return nil, err
+		return PruneResult{}, err
 	}
-	result := make([]SnapshotInfo, 0, len(report.Snapshots))
-	for _, item := range report.Snapshots {
-		if status == "" || item.Status == status {
-			result = append(result, item)
-		}
-	}
-	if status != "" && status != snapshot.Complete && status != snapshot.Incomplete {
-		return nil, &OperationError{Code: "snapshot_status_invalid"}
-	}
-	return result, nil
-}
-
-func (r Runner) ListSnapshots(ctx context.Context, target config.Target) (SnapshotReport, error) {
-	if r.Disabled {
-		return SnapshotReport{Snapshots: []SnapshotInfo{}, Anomalies: []SnapshotAnomaly{}}, nil
-	}
-	cache, err := r.targetCache(target.Name)
+	groups, err := parseForgetGroups(output, r.path())
 	if err != nil {
-		r.logTargetError(target, "snapshots", err)
-		return SnapshotReport{}, err
+		return PruneResult{}, &OperationError{Code: "prune_result_invalid", ExitCode: -1}
 	}
-	args := []string{"snapshots", "--json", "--cache-dir", cache, "--host", version.SnapshotHost, "--tag", version.SnapshotTag}
-	stdout, err := r.maintenance(ctx, target, "snapshots", args)
-	if err != nil {
-		return SnapshotReport{}, err
-	}
-	var raw []rawSnapshot
-	decoder := json.NewDecoder(bytes.NewReader(stdout))
-	if err := decoder.Decode(&raw); err != nil {
-		return SnapshotReport{}, &OperationError{Code: "snapshots_result_invalid"}
-	}
-	var extra any
-	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
-		return SnapshotReport{}, &OperationError{Code: "snapshots_result_invalid"}
-	}
-	report := SnapshotReport{Snapshots: []SnapshotInfo{}, Anomalies: []SnapshotAnomaly{}}
-	for _, item := range raw {
-		if !slices.Contains(item.Tags, version.SnapshotTag) {
-			continue
-		}
-		candidate, code, hardErr := r.classifyCandidate(ctx, target, item, cache)
-		if hardErr != nil {
-			return SnapshotReport{}, hardErr
-		}
-		if code != "" {
-			report.Anomalies = append(report.Anomalies, SnapshotAnomaly{SnapshotID: item.ID, ErrorCode: code})
-			continue
-		}
-		report.Snapshots = append(report.Snapshots, candidate)
-	}
-	sort.Slice(report.Snapshots, func(i, j int) bool {
-		if report.Snapshots[i].Time == report.Snapshots[j].Time {
-			return report.Snapshots[i].ID < report.Snapshots[j].ID
-		}
-		return report.Snapshots[i].Time < report.Snapshots[j].Time
-	})
-	sort.Slice(report.Anomalies, func(i, j int) bool { return report.Anomalies[i].SnapshotID < report.Anomalies[j].SnapshotID })
-	return report, nil
-}
-
-type rawSnapshot struct {
-	ID       string          `json:"id"`
-	Time     json.RawMessage `json:"time"`
-	Hostname string          `json:"hostname"`
-	Tags     []string        `json:"tags"`
-	Paths    []string        `json:"paths"`
-}
-
-func (r Runner) classifyCandidate(ctx context.Context, target config.Target, raw rawSnapshot, cache string) (SnapshotInfo, string, error) {
-	if !validSnapshotID(raw.ID) {
-		return SnapshotInfo{}, "snapshot_id_invalid", nil
-	}
-	if raw.Hostname != version.SnapshotHost {
-		return SnapshotInfo{}, "snapshot_host_invalid", nil
-	}
-	when, ok := parseSnapshotTime(raw.Time)
-	if !ok {
-		return SnapshotInfo{}, "snapshot_time_invalid", nil
-	}
-	status, contentHex, ok := identityTags(raw.Tags)
-	if !ok {
-		return SnapshotInfo{}, "snapshot_tag_invalid", nil
-	}
-	data, err := r.dumpManifest(ctx, target, cache, raw.ID)
-	if err != nil {
-		var operation *OperationError
-		if errors.As(err, &operation) {
-			switch operation.Code {
-			case "operation_timeout", "operation_cancelled", "repository_missing", "repository_locked", "repository_password_invalid", "backend_credentials_invalid", "role_credentials_missing", "password_directory_invalid", "password_file_invalid", "cache_path_invalid", "cache_create_failed", "restic_runtime_failed", "restic_process_failed", "restic_exit_unknown":
-				return SnapshotInfo{}, "", err
-			default:
-				return SnapshotInfo{}, "snapshot_manifest_invalid", nil
-			}
-		}
-		return SnapshotInfo{}, "snapshot_manifest_invalid", nil
-	}
-	manifest, err := snapshot.DecodeManifest(data)
-	if err != nil {
-		return SnapshotInfo{}, "snapshot_manifest_invalid", nil
-	}
-	manifestHex, err := snapshot.ContentIDHex(manifest.ContentID)
-	if err != nil || string(manifest.Status) != status || manifestHex != contentHex {
-		return SnapshotInfo{}, "snapshot_manifest_tag_mismatch", nil
-	}
-	return SnapshotInfo{
-		ID: raw.ID, Time: state.FormatTime(when), Host: raw.Hostname, Tags: slices.Clone(raw.Tags), Paths: slices.Clone(raw.Paths),
-		Status: manifest.Status, ContentID: manifest.ContentID, Manifest: manifest,
-	}, "", nil
-}
-
-func parseSnapshotTime(raw json.RawMessage) (time.Time, bool) {
-	var value string
-	if err := json.Unmarshal(raw, &value); err != nil {
-		return time.Time{}, false
-	}
-	parsed, err := time.Parse(time.RFC3339Nano, value)
-	return parsed, err == nil && !parsed.IsZero()
-}
-
-func identityTags(tags []string) (string, string, bool) {
-	if countTag(tags, version.SnapshotTag) != 1 {
-		return "", "", false
-	}
-	status := ""
-	for _, candidate := range []snapshot.Status{snapshot.Complete, snapshot.Incomplete} {
-		if countTag(tags, string(candidate)) > 1 {
-			return "", "", false
-		}
-		if slices.Contains(tags, string(candidate)) {
-			if status != "" {
-				return "", "", false
-			}
-			status = string(candidate)
-		}
-	}
-	if status == "" {
-		return "", "", false
-	}
-	content := ""
-	for _, tag := range tags {
-		if strings.HasPrefix(tag, "content-id=") {
-			if content != "" {
-				return "", "", false
-			}
-			content = strings.TrimPrefix(tag, "content-id=")
-		}
-	}
-	if !validSnapshotID(content) {
-		return "", "", false
-	}
-	return status, content, true
-}
-
-func countTag(tags []string, want string) int {
-	count := 0
-	for _, tag := range tags {
-		if tag == want {
-			count++
-		}
-	}
-	return count
-}
-
-func (r Runner) FindSnapshot(ctx context.Context, target config.Target, requested string) (SnapshotInfo, error) {
-	if !validSnapshotID(requested) {
-		return SnapshotInfo{}, &OperationError{Code: "snapshot_candidate_invalid"}
-	}
-	report, err := r.ListSnapshots(ctx, target)
-	if err != nil {
-		return SnapshotInfo{}, err
-	}
-	for _, item := range report.Snapshots {
-		if item.ID == requested {
-			return item, nil
-		}
-	}
-	for _, anomaly := range report.Anomalies {
-		if anomaly.SnapshotID == requested {
-			return SnapshotInfo{}, &OperationError{Code: "snapshot_candidate_invalid"}
-		}
-	}
-	return SnapshotInfo{}, &OperationError{Code: "snapshot_candidate_invalid"}
-}
-
-func (r Runner) dumpManifest(ctx context.Context, target config.Target, cache, snapshotID string) ([]byte, error) {
-	// dump is intentionally a separate command so every candidate is validated
-	// against the durable manifest instead of trusting snapshot metadata.
-	env, globals, err := r.environment(target)
-	if err != nil {
-		r.logTargetError(target, "dump", err)
-		return nil, err
-	}
-	stdout, err := r.run(ctx, "dump", "", env, append(globals, "dump", "--cache-dir", cache, snapshotID, "/manifest.json"), maxManifestOutput)
-	if err != nil {
-		return nil, r.operationErrorForTarget(ctx, err, "dump", target)
-	}
-	return stdout, nil
+	return PruneResult{Applied: apply, Groups: groups}, nil
 }
 
 func (r Runner) Restore(ctx context.Context, target config.Target, snapshotID, destination string) error {
 	if !validSnapshotID(snapshotID) {
-		return &OperationError{Code: "snapshot_id_invalid"}
+		return &OperationError{Code: "snapshot_id_invalid", ExitCode: -1}
 	}
-	cache, err := r.targetCache(target.Name)
-	if err != nil {
-		r.logTargetError(target, "restore", err)
+	if err := validateRestoreDestination(destination); err != nil {
 		return err
 	}
-	_, err = r.maintenance(ctx, target, "restore", []string{"restore", "--cache-dir", cache, "--verify", "--target", destination, snapshotID})
+	_, err := r.maintenance(ctx, target, []string{
+		"restore", "--verify", "--target", destination,
+		snapshotID + ":" + r.path(),
+	})
 	return err
 }
 
-func (r Runner) Prune(ctx context.Context, target config.Target, apply bool) ([]PruneResult, error) {
-	report, err := r.ListSnapshots(ctx, target)
+func (r Runner) path() string {
+	if r.recoveryPath != "" {
+		return r.recoveryPath
+	}
+	return version.SnapshotPath
+}
+
+func validateRestoreDestination(path string) error {
+	if path == "" || !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return &OperationError{Code: "restore_target_invalid", ExitCode: -1}
+	}
+	if err := safefs.ValidatePrivateDirectory(path); err != nil {
+		return &OperationError{Code: "restore_target_invalid", ExitCode: -1}
+	}
+	return nil
+}
+
+func (r Runner) maintenance(ctx context.Context, target config.Target, command []string) ([]byte, error) {
+	base, environment, err := r.targetCommand(target)
 	if err != nil {
 		return nil, err
 	}
-	if len(report.Anomalies) != 0 {
-		return nil, &OperationError{Code: "snapshot_anomaly_blocks_prune"}
-	}
-	cache, err := r.targetCache(target.Name)
-	if err != nil {
-		r.logTargetError(target, "prune", err)
-		return nil, err
-	}
-	// Both dry-runs must be parsed before an apply can remove anything.
-	reports := make([]PruneResult, 0, 2)
-	for _, status := range []snapshot.Status{snapshot.Complete, snapshot.Incomplete} {
-		output, err := r.forget(ctx, target, cache, status, false)
-		if err != nil {
-			return nil, err
-		}
-		parsed, err := parseForgetOutput(output, status, false)
-		if err != nil {
-			return nil, &OperationError{Code: "prune_result_invalid"}
-		}
-		reports = append(reports, parsed)
-	}
-	if !apply {
-		return reports, nil
-	}
-	for index, status := range []snapshot.Status{snapshot.Complete, snapshot.Incomplete} {
-		output, err := r.forget(ctx, target, cache, status, true)
-		if err != nil {
-			return nil, err
-		}
-		parsed, err := parseForgetOutput(output, status, true)
-		if err != nil {
-			if index > 0 {
-				return nil, &OperationError{Code: "prune_partial"}
-			}
-			return nil, &OperationError{Code: "prune_result_invalid"}
-		}
-		reports[index] = parsed
-	}
-	return reports, nil
+	return r.runCommand(ctx, append(base, command...), environment, "")
 }
 
-func (r Runner) forget(ctx context.Context, target config.Target, cache string, status snapshot.Status, apply bool) ([]byte, error) {
-	args := []string{"forget", "--json", "--cache-dir", cache, "--host", version.SnapshotHost, "--tag", version.SnapshotTag + "," + string(status), "--group-by", "host"}
-	if status == snapshot.Complete {
-		args = append(args, "--keep-within", "24h", "--keep-hourly", "48", "--keep-daily", "14", "--keep-weekly", "8", "--keep-monthly", "12", "--keep-yearly", "3")
-	} else {
-		args = append(args, "--keep-within", "24h", "--keep-daily", "7")
-	}
-	if apply {
-		args = append(args, "--prune")
-	} else {
-		args = append(args, "--dry-run")
-	}
-	return r.maintenance(ctx, target, "forget", args)
-}
-
-type forgetGroup struct {
-	Tags    []string         `json:"tags"`
-	Host    string           `json:"host"`
-	Paths   []string         `json:"paths"`
-	Keep    []forgetSnapshot `json:"keep"`
-	Remove  []forgetSnapshot `json:"remove"`
-	Reasons []keepReason     `json:"reasons"`
-}
-
-type keepReason struct {
-	Snapshot forgetSnapshot `json:"snapshot"`
-	Matches  []string       `json:"matches"`
-}
-
-type forgetSnapshot struct {
-	Time           time.Time       `json:"time"`
-	Parent         string          `json:"parent"`
-	Tree           string          `json:"tree"`
-	Paths          []string        `json:"paths"`
-	Hostname       string          `json:"hostname"`
-	Username       string          `json:"username"`
-	UID            uint32          `json:"uid"`
-	GID            uint32          `json:"gid"`
-	Excludes       []string        `json:"excludes"`
-	Tags           []string        `json:"tags"`
-	ProgramVersion string          `json:"program_version"`
-	Summary        json.RawMessage `json:"summary"`
-	ID             string          `json:"id"`
-	ShortID        string          `json:"short_id"`
-}
-
-type pruneSummary struct {
-	MessageType string          `json:"message_type"`
-	Blobs       *pruneBlobs     `json:"blobs"`
-	Bytes       *pruneSizes     `json:"bytes"`
-	Packfiles   *prunePackfiles `json:"packfiles"`
-}
-
-type pruneBlobs struct {
-	Used         uint64 `json:"used"`
-	Duplicate    uint64 `json:"duplicate"`
-	Unused       uint64 `json:"unused"`
-	Total        uint64 `json:"total"`
-	Repack       uint64 `json:"repack"`
-	RepackRemove uint64 `json:"repack_remove"`
-	Remove       uint64 `json:"remove"`
-	RemoveTotal  uint64 `json:"remove_total"`
-	Remaining    uint64 `json:"remaining"`
-}
-
-type pruneSizes struct {
-	Used            uint64 `json:"used"`
-	Duplicate       uint64 `json:"duplicate"`
-	Unused          uint64 `json:"unused"`
-	Unreferenced    uint64 `json:"unreferenced"`
-	Uncompressed    uint64 `json:"uncompressed"`
-	Total           uint64 `json:"total"`
-	Repack          uint64 `json:"repack"`
-	RepackRemove    uint64 `json:"repack_remove"`
-	Remove          uint64 `json:"remove"`
-	RemoveTotal     uint64 `json:"remove_total"`
-	Remaining       uint64 `json:"remaining"`
-	RemainingUnused uint64 `json:"remaining_unused"`
-}
-
-type prunePackfiles struct {
-	Used         uint64 `json:"used"`
-	Unused       uint64 `json:"unused"`
-	PartlyUsed   uint64 `json:"partly_used"`
-	Unreferenced uint64 `json:"unreferenced"`
-	Total        uint64 `json:"total"`
-	Keep         uint64 `json:"keep"`
-	Repack       uint64 `json:"repack"`
-	Remove       uint64 `json:"remove"`
-	RemoveTotal  uint64 `json:"remove_total"`
-}
-
-func parseForgetOutput(data []byte, status snapshot.Status, applied bool) (PruneResult, error) {
-	trimmed := bytes.TrimSpace(data)
-	if len(trimmed) == 0 || trimmed[0] != '[' {
-		return PruneResult{}, fmt.Errorf("forget output must start with an array")
-	}
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.DisallowUnknownFields()
-	var groups []forgetGroup
-	if err := decoder.Decode(&groups); err != nil {
-		return PruneResult{}, err
-	}
-	result := PruneResult{Status: status, KeptSnapshotIDs: []string{}, RemovedSnapshotIDs: []string{}}
-	seen := map[string]struct{}{}
-	for _, group := range groups {
-		for _, item := range group.Keep {
-			if !validSnapshotID(item.ID) {
-				return PruneResult{}, fmt.Errorf("invalid kept snapshot ID")
-			}
-			if _, exists := seen[item.ID]; exists {
-				return PruneResult{}, fmt.Errorf("duplicate snapshot ID")
-			}
-			seen[item.ID] = struct{}{}
-			result.KeptSnapshotIDs = append(result.KeptSnapshotIDs, item.ID)
-		}
-		for _, item := range group.Remove {
-			if !validSnapshotID(item.ID) {
-				return PruneResult{}, fmt.Errorf("invalid removed snapshot ID")
-			}
-			if _, exists := seen[item.ID]; exists {
-				return PruneResult{}, fmt.Errorf("duplicate snapshot ID")
-			}
-			seen[item.ID] = struct{}{}
-			result.RemovedSnapshotIDs = append(result.RemovedSnapshotIDs, item.ID)
-		}
-	}
-	if !applied {
-		var extra any
-		if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
-			return PruneResult{}, fmt.Errorf("extra forget output")
-		}
-	} else {
-		// Restic 0.19.1 emits the forget groups as JSON and, after a
-		// successful --prune, no second JSON value. Accept the documented
-		// optional summary shape as well so a future pinned Restic release
-		// cannot silently add an unvalidated value.
-		var summary pruneSummary
-		if err := decoder.Decode(&summary); err != nil {
-			if !errors.Is(err, io.EOF) {
-				return PruneResult{}, fmt.Errorf("invalid prune summary")
-			}
-		} else {
-			if summary.MessageType != "summary" || summary.Blobs == nil || summary.Bytes == nil || summary.Packfiles == nil {
-				return PruneResult{}, fmt.Errorf("unknown prune summary")
-			}
-			var extra any
-			if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
-				return PruneResult{}, fmt.Errorf("extra prune output")
-			}
-		}
-	}
-	sort.Strings(result.KeptSnapshotIDs)
-	sort.Strings(result.RemovedSnapshotIDs)
-	result.KeptCount = len(result.KeptSnapshotIDs)
-	result.RemovedCount = len(result.RemovedSnapshotIDs)
-	return result, nil
-}
-
-func (r Runner) maintenance(ctx context.Context, target config.Target, operation string, command []string) ([]byte, error) {
-	env, globals, err := r.environment(target)
-	if err != nil {
-		r.logTargetError(target, operation, err)
-		return nil, err
-	}
-	stdout, err := r.run(ctx, operation, "", env, append(globals, command...), maxCommandOutput)
-	if err != nil {
-		return nil, r.operationErrorForTarget(ctx, err, operation, target)
-	}
-	return stdout, nil
-}
-
-func (r Runner) environment(target config.Target) ([]string, []string, error) {
+func (r Runner) targetCommand(target config.Target) ([]string, []string, error) {
 	if err := target.Validate(); err != nil {
-		return nil, nil, &OperationError{Code: "repository_backend_mismatch"}
+		return nil, nil, &OperationError{Code: "target_invalid", ExitCode: -1}
 	}
 	if r.Credentials == nil {
-		return nil, nil, &OperationError{Code: "role_credentials_missing"}
+		return nil, nil, &OperationError{Code: "credentials_missing", ExitCode: -1}
 	}
 	credentialEnvironment, err := r.Credentials.Environment(target)
 	if err != nil {
-		return nil, nil, &OperationError{Code: "backend_credentials_invalid"}
+		return nil, nil, &OperationError{Code: "credentials_invalid", ExitCode: -1}
 	}
 	if err := safefs.ValidatePrivateDirectory(filepath.Dir(r.PasswordFile)); err != nil {
-		return nil, nil, &OperationError{Code: "password_directory_invalid"}
+		return nil, nil, &OperationError{Code: "password_path_invalid", ExitCode: -1}
 	}
 	password, err := securefile.Read(r.PasswordFile)
-	if err != nil || strings.ContainsAny(password, "\r\n") {
-		return nil, nil, &OperationError{Code: "password_file_invalid"}
+	if err != nil || strings.ContainsAny(password, "\r\n\x00") {
+		return nil, nil, &OperationError{Code: "password_file_invalid", ExitCode: -1}
 	}
-	_ = password // Reading validates the file; Restic receives only its path.
-	env := []string{"RESTIC_REPOSITORY=" + target.Repository, "RESTIC_PASSWORD_FILE=" + r.PasswordFile, "TMPDIR=/tmp"}
-	names := make([]string, 0, len(credentialEnvironment))
-	for name := range credentialEnvironment {
-		names = append(names, name)
+	if err := safefs.ValidatePrivateDirectory(r.CacheDir); err != nil {
+		return nil, nil, &OperationError{Code: "cache_path_invalid", ExitCode: -1}
 	}
-	sort.Strings(names)
-	for _, name := range names {
-		env = append(env, name+"="+credentialEnvironment[name])
+	cache := filepath.Join(r.CacheDir, target.Name)
+	if filepath.Dir(cache) != filepath.Clean(r.CacheDir) {
+		return nil, nil, &OperationError{Code: "cache_path_invalid", ExitCode: -1}
 	}
-	globals := []string{}
+	if err := safefs.EnsurePrivateDirectory(cache); err != nil {
+		return nil, nil, &OperationError{Code: "cache_create_failed", ExitCode: -1}
+	}
+
+	base := []string{
+		"--repo", target.Repository,
+		"--password-file", r.PasswordFile,
+		"--cache-dir", cache,
+	}
 	optionNames := make([]string, 0, len(target.ResticOptions))
 	for name := range target.ResticOptions {
 		optionNames = append(optionNames, name)
 	}
 	sort.Strings(optionNames)
 	for _, name := range optionNames {
-		globals = append(globals, "-o", name+"="+target.ResticOptions[name])
+		base = append(base, "--option", name+"="+target.ResticOptions[name])
 	}
-	return env, globals, nil
+	environment := sanitizedEnvironment(credentialEnvironment)
+	return base, environment, nil
 }
 
-func (r Runner) targetCache(name string) (string, error) {
-	if err := safefs.ValidatePrivateDirectory(r.CacheDir); err != nil {
-		return "", &OperationError{Code: "cache_path_invalid"}
+func sanitizedEnvironment(credentials map[string]string) []string {
+	environment := make([]string, 0, len(os.Environ())+3)
+	for _, value := range os.Environ() {
+		name, _, ok := strings.Cut(value, "=")
+		if !ok || strings.HasPrefix(name, "AWS_") || strings.HasPrefix(name, "RESTIC_") || name == "TMPDIR" {
+			continue
+		}
+		environment = append(environment, value)
 	}
-	path := filepath.Join(r.CacheDir, name)
-	if filepath.Dir(path) != filepath.Clean(r.CacheDir) {
-		return "", &OperationError{Code: "cache_path_invalid"}
+	environment = append(environment, "TMPDIR=/tmp")
+	for _, name := range []string{"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"} {
+		if value, ok := credentials[name]; ok {
+			environment = append(environment, name+"="+value)
+		}
 	}
-	if err := safefs.EnsurePrivateDirectory(path); err != nil {
-		return "", &OperationError{Code: "cache_create_failed"}
-	}
-	return path, nil
+	return environment
 }
 
-func validSnapshotTags(tags []string) bool {
-	_, _, ok := identityTags(tags)
-	return ok
+func (r Runner) runCommand(ctx context.Context, arguments, environment []string, directory string) ([]byte, error) {
+	binary := r.Binary
+	if binary == "" {
+		binary = config.ResticBinary
+	}
+	return r.run(ctx, binary, arguments, environment, directory)
+}
+
+func (r Runner) run(ctx context.Context, binary string, arguments, environment []string, directory string) ([]byte, error) {
+	if r.execute != nil {
+		return r.execute(ctx, binary, slices.Clone(arguments), slices.Clone(environment), directory)
+	}
+	command := exec.CommandContext(ctx, binary, arguments...)
+	command.Dir = directory
+	command.Env = environment
+	command.Cancel = func() error {
+		if command.Process == nil {
+			return nil
+		}
+		return command.Process.Signal(syscall.SIGTERM)
+	}
+	command.WaitDelay = 10 * time.Second
+	stdout := &limitedBuffer{limit: maxCommandOutput}
+	stderr := &limitedBuffer{limit: maxStderrOutput}
+	command.Stdout = stdout
+	command.Stderr = stderr
+	err := command.Run()
+	if err != nil || stdout.exceeded || stderr.exceeded {
+		if errors.Is(ctx.Err(), context.Canceled) {
+			return nil, &OperationError{Code: "cancelled", ExitCode: -1}
+		}
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return nil, &OperationError{Code: "timeout", ExitCode: -1}
+		}
+		exitCode := -1
+		var exitError *exec.ExitError
+		if errors.As(err, &exitError) {
+			exitCode = exitError.ExitCode()
+		}
+		if stdout.exceeded || stderr.exceeded {
+			return nil, &OperationError{Code: "output_limit", ExitCode: exitCode}
+		}
+		return nil, &OperationError{Code: "command_failed", ExitCode: exitCode}
+	}
+	return stdout.Bytes(), nil
+}
+
+type rawSnapshot struct {
+	ID       string   `json:"id"`
+	Time     string   `json:"time"`
+	Hostname string   `json:"hostname"`
+	Tags     []string `json:"tags"`
+	Paths    []string `json:"paths"`
+}
+
+func parseSnapshots(data []byte, expectedPath string) ([]Snapshot, error) {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	var raw []rawSnapshot
+	if err := decoder.Decode(&raw); err != nil {
+		return nil, &OperationError{Code: "snapshots_result_invalid", ExitCode: -1}
+	}
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		return nil, &OperationError{Code: "snapshots_result_invalid", ExitCode: -1}
+	}
+	result := make([]Snapshot, 0, len(raw))
+	seen := make(map[string]struct{}, len(raw))
+	for _, item := range raw {
+		if !validSnapshotID(item.ID) || item.Hostname != version.SnapshotHost || !slices.Equal(item.Paths, []string{expectedPath}) {
+			return nil, &OperationError{Code: "snapshots_result_invalid", ExitCode: -1}
+		}
+		when, err := time.Parse(time.RFC3339Nano, item.Time)
+		if err != nil || when.IsZero() {
+			return nil, &OperationError{Code: "snapshots_result_invalid", ExitCode: -1}
+		}
+		contentHex, ok := contentTag(item.Tags)
+		if !ok {
+			return nil, &OperationError{Code: "snapshots_result_invalid", ExitCode: -1}
+		}
+		if _, duplicate := seen[item.ID]; duplicate {
+			return nil, &OperationError{Code: "snapshots_result_invalid", ExitCode: -1}
+		}
+		seen[item.ID] = struct{}{}
+		result = append(result, Snapshot{
+			ID:        item.ID,
+			Time:      when.UTC().Format(time.RFC3339Nano),
+			ContentID: "sha256:" + contentHex,
+		})
+	}
+	if result == nil {
+		result = []Snapshot{}
+	}
+	return result, nil
+}
+
+func contentTag(tags []string) (string, bool) {
+	if countTag(tags, version.SnapshotTag) != 1 {
+		return "", false
+	}
+	content := ""
+	for _, tag := range tags {
+		if !strings.HasPrefix(tag, "content-id=") {
+			continue
+		}
+		if content != "" {
+			return "", false
+		}
+		content = strings.TrimPrefix(tag, "content-id=")
+	}
+	return content, validSnapshotID(content)
+}
+
+func countTag(tags []string, expected string) int {
+	count := 0
+	for _, tag := range tags {
+		if tag == expected {
+			count++
+		}
+	}
+	return count
+}
+
+func parseBackupSnapshotID(data []byte) (string, error) {
+	scanner := bufio.NewScanner(bytes.NewReader(data))
+	scanner.Buffer(make([]byte, 64<<10), maxCommandOutput)
+	snapshotID := ""
+	for scanner.Scan() {
+		var message struct {
+			MessageType string `json:"message_type"`
+			SnapshotID  string `json:"snapshot_id"`
+		}
+		if err := json.Unmarshal(scanner.Bytes(), &message); err != nil {
+			return "", err
+		}
+		if message.MessageType == "summary" {
+			if snapshotID != "" {
+				return "", fmt.Errorf("multiple backup summaries")
+			}
+			snapshotID = message.SnapshotID
+		}
+	}
+	if err := scanner.Err(); err != nil || !validSnapshotID(snapshotID) {
+		return "", fmt.Errorf("invalid backup summary")
+	}
+	return snapshotID, nil
+}
+
+type forgetGroup struct {
+	Host   string           `json:"host"`
+	Paths  []string         `json:"paths"`
+	Keep   []forgetSnapshot `json:"keep"`
+	Remove []forgetSnapshot `json:"remove"`
+}
+
+type forgetSnapshot struct {
+	ID string `json:"id"`
+}
+
+func parseForgetGroups(data []byte, expectedPath string) ([]PruneGroup, error) {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	var raw []forgetGroup
+	if err := decoder.Decode(&raw); err != nil {
+		return nil, err
+	}
+	groups := make([]PruneGroup, 0, len(raw))
+	for _, group := range raw {
+		if group.Host != version.SnapshotHost || !slices.Equal(group.Paths, []string{expectedPath}) {
+			return nil, fmt.Errorf("unexpected forget group")
+		}
+		parsed := PruneGroup{
+			Host:              group.Host,
+			Paths:             slices.Clone(group.Paths),
+			KeepSnapshotIDs:   []string{},
+			RemoveSnapshotIDs: []string{},
+		}
+		seen := map[string]struct{}{}
+		for _, entry := range group.Keep {
+			if !validSnapshotID(entry.ID) {
+				return nil, fmt.Errorf("invalid kept snapshot ID")
+			}
+			if _, duplicate := seen[entry.ID]; duplicate {
+				return nil, fmt.Errorf("duplicate snapshot ID")
+			}
+			seen[entry.ID] = struct{}{}
+			parsed.KeepSnapshotIDs = append(parsed.KeepSnapshotIDs, entry.ID)
+		}
+		for _, entry := range group.Remove {
+			if !validSnapshotID(entry.ID) {
+				return nil, fmt.Errorf("invalid removed snapshot ID")
+			}
+			if _, duplicate := seen[entry.ID]; duplicate {
+				return nil, fmt.Errorf("duplicate snapshot ID")
+			}
+			seen[entry.ID] = struct{}{}
+			parsed.RemoveSnapshotIDs = append(parsed.RemoveSnapshotIDs, entry.ID)
+		}
+		sort.Strings(parsed.KeepSnapshotIDs)
+		sort.Strings(parsed.RemoveSnapshotIDs)
+		groups = append(groups, parsed)
+	}
+	for {
+		var trailing map[string]any
+		err := decoder.Decode(&trailing)
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil || trailing == nil {
+			return nil, fmt.Errorf("invalid trailing prune output")
+		}
+	}
+	if groups == nil {
+		groups = []PruneGroup{}
+	}
+	return groups, nil
 }
 
 func validSnapshotID(value string) bool {
@@ -697,203 +580,23 @@ func validSnapshotID(value string) bool {
 	return err == nil
 }
 
-type commandError struct {
-	err         error
-	contextErr  error
-	exitCode    int
-	stderr      string
-	stdoutLimit bool
-	stderrLimit bool
-}
-
-func (e *commandError) Error() string { return e.err.Error() }
-func (e *commandError) Unwrap() error { return e.err }
-
-func (r Runner) run(ctx context.Context, operation, dir string, env, args []string, stdoutLimit int) ([]byte, error) {
-	cmd := exec.CommandContext(ctx, r.Binary, args...)
-	cmd.Dir = dir
-	cmd.Env = env
-	cmd.Cancel = func() error {
-		if cmd.Process == nil {
-			return nil
-		}
-		return cmd.Process.Signal(syscall.SIGTERM)
-	}
-	cmd.WaitDelay = 10 * time.Second
-	stdout := &limitedBuffer{limit: stdoutLimit}
-	stderr := &limitedBuffer{limit: maxStderrCapture}
-	cmd.Stdout = stdout
-	cmd.Stderr = stderr
-	err := cmd.Run()
-	if err != nil || stdout.exceeded || stderr.exceeded {
-		exitCode := -1
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			exitCode = exitErr.ExitCode()
-		}
-		return nil, &commandError{err: errOrOutputError(err, stdout.exceeded || stderr.exceeded), contextErr: ctx.Err(), exitCode: exitCode, stderr: sanitizeStderr(stderr.Bytes(), r.secretValues(env)), stdoutLimit: stdout.exceeded, stderrLimit: stderr.exceeded}
-	}
-	return stdout.Bytes(), nil
-}
-
-func errOrOutputError(err error, exceeded bool) error {
-	if err != nil {
-		return err
-	}
-	if exceeded {
-		return errors.New("restic output exceeded safe limit")
-	}
-	return errors.New("restic command failed")
-}
-
-func (r Runner) secretValues(env []string) []string {
-	values := []string{}
-	for _, item := range env {
-		name, value, ok := strings.Cut(item, "=")
-		if ok && (name == "AWS_ACCESS_KEY_ID" || name == "AWS_SECRET_ACCESS_KEY") {
-			values = append(values, value)
-		}
-	}
-	if r.PasswordFile != "" {
-		if value, err := securefile.Read(r.PasswordFile); err == nil {
-			values = append(values, value)
-		}
-	}
-	return values
-}
-
-func sanitizeStderr(data []byte, secrets []string) string {
-	value := string(data)
-	for _, secret := range secrets {
-		if secret != "" {
-			value = strings.ReplaceAll(value, secret, "[REDACTED]")
-		}
-	}
-	if len(value) > maxStderrLog {
-		value = value[:maxStderrLog] + "...[truncated]"
-	}
-	return value
-}
-
-func (r Runner) operationError(ctx context.Context, err error, operation string) *OperationError {
-	var operationError *OperationError
-	if errors.As(err, &operationError) {
-		return operationError
-	}
-	var commandErr *commandError
-	if !errors.As(err, &commandErr) {
-		return &OperationError{Code: "restic_process_failed"}
-	}
-	code := classifyRunError(ctx, commandErr, operation)
-	return &OperationError{Code: code, ExitCode: commandErr.exitCode, Stderr: commandErr.stderr}
-}
-
-func (r Runner) operationErrorForTarget(ctx context.Context, err error, operation string, target config.Target) *OperationError {
-	operationErr := r.operationError(ctx, err, operation)
-	r.logOperationError(target, operation, operationErr)
-	return operationErr
-}
-
-func (r Runner) logTargetError(target config.Target, operation string, err error) {
-	var operationErr *OperationError
-	if errors.As(err, &operationErr) {
-		r.logOperationError(target, operation, operationErr)
-	}
-}
-
-func (r Runner) logOperationError(target config.Target, operation string, operationErr *OperationError) {
-	if r.Logger == nil || operationErr == nil {
-		return
-	}
-	attrs := []any{
-		"operation", operation,
-		"backend", target.Backend(),
-		"error_code", operationErr.Code,
-		"exit_code", operationErr.ExitCode,
-	}
-	if target.Name != "" {
-		attrs = append(attrs, "target", target.Name)
-	}
-	if target.Repository != "" {
-		if parsed, err := url.Parse(strings.TrimPrefix(target.Repository, "s3:")); err == nil {
-			attrs = append(attrs, "s3_scheme", parsed.Scheme, "s3_host", parsed.Host, "s3_path", parsed.Path)
-		}
-	}
-	if operationErr.Stderr != "" {
-		attrs = append(attrs, "stderr", operationErr.Stderr)
-	}
-	r.Logger.Error("restic operation failed", attrs...)
-}
-
-func classifyRunError(ctx context.Context, err error, operation string) string {
-	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		return "operation_timeout"
-	}
-	if errors.Is(ctx.Err(), context.Canceled) {
-		return "operation_cancelled"
-	}
-	var commandErr *commandError
-	if errors.As(err, &commandErr) {
-		if errors.Is(commandErr.contextErr, context.DeadlineExceeded) {
-			return "operation_timeout"
-		}
-		if errors.Is(commandErr.contextErr, context.Canceled) {
-			return "operation_cancelled"
-		}
-		if errors.Is(commandErr.err, context.DeadlineExceeded) {
-			return "operation_timeout"
-		}
-		if errors.Is(commandErr.err, context.Canceled) {
-			return "operation_cancelled"
-		}
-		if commandErr.stdoutLimit || commandErr.stderrLimit {
-			return "restic_output_exceeded"
-		}
-		switch commandErr.exitCode {
-		case 1:
-			return "repository_operation_failed"
-		case 2:
-			return "restic_runtime_failed"
-		case 3:
-			if operation == "backup" {
-				return "source_data_unreadable"
-			}
-			if operation == "forget" || operation == "prune" {
-				return "snapshot_remove_partial"
-			}
-			return "repository_operation_failed"
-		case 10:
-			return "repository_missing"
-		case 11:
-			return "repository_locked"
-		case 12:
-			return "repository_password_invalid"
-		case 130:
-			return "operation_cancelled"
-		default:
-			return "restic_exit_unknown"
-		}
-	}
-	return "restic_process_failed"
-}
-
 type limitedBuffer struct {
 	bytes.Buffer
 	limit    int
 	exceeded bool
 }
 
-func (b *limitedBuffer) Write(data []byte) (int, error) {
+func (buffer *limitedBuffer) Write(data []byte) (int, error) {
 	original := len(data)
-	remaining := b.limit - b.Len()
+	remaining := buffer.limit - buffer.Len()
 	if remaining <= 0 {
-		b.exceeded = true
+		buffer.exceeded = true
 		return original, nil
 	}
 	if len(data) > remaining {
 		data = data[:remaining]
-		b.exceeded = true
+		buffer.exceeded = true
 	}
-	_, _ = b.Buffer.Write(data)
+	_, _ = buffer.Buffer.Write(data)
 	return original, nil
 }

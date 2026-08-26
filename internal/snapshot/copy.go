@@ -15,15 +15,20 @@ import (
 	"github.com/hellodword/vaultwarden-less/internal/safefs"
 )
 
-type changedFileError struct{ reason string }
+type ConsistencyError struct {
+	Path   string
+	Reason string
+}
 
-func (e changedFileError) Error() string { return e.reason }
+func (e *ConsistencyError) Error() string {
+	return fmt.Sprintf("database-referenced file %s is not stable: %s", e.Path, e.Reason)
+}
 
-func copyStableFile(ctx context.Context, dataDir, destinationRoot string, ref referencedFile) (File, error) {
+func copyStableFile(ctx context.Context, dataDir, destinationRoot string, ref referencedFile, afterRead func()) (File, error) {
 	source, err := openSourceFile(dataDir, ref.Path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return File{}, changedFileError{reason: "not_found"}
+			return File{}, &ConsistencyError{Path: ref.Path, Reason: "not_found"}
 		}
 		return File{}, fmt.Errorf("open contained source file: %w", err)
 	}
@@ -32,8 +37,8 @@ func copyStableFile(ctx context.Context, dataDir, destinationRoot string, ref re
 	if err != nil || !before.Mode().IsRegular() {
 		return File{}, fmt.Errorf("inspect source file")
 	}
-	if ref.ExpectedSize >= 0 && before.Size() != ref.ExpectedSize {
-		return File{}, changedFileError{reason: "size_mismatch"}
+	if before.Size() != ref.ExpectedSize {
+		return File{}, &ConsistencyError{Path: ref.Path, Reason: "size_mismatch"}
 	}
 
 	destinationPath, err := secureJoin(destinationRoot, ref.Path)
@@ -54,6 +59,7 @@ func copyStableFile(ctx context.Context, dataDir, destinationRoot string, ref re
 			_ = os.Remove(destinationPath)
 		}
 	}()
+
 	hash := sha256.New()
 	written, err := copyWithContext(ctx, io.MultiWriter(destination, hash), source)
 	if err != nil {
@@ -65,24 +71,27 @@ func copyStableFile(ctx context.Context, dataDir, destinationRoot string, ref re
 	if err := destination.Chmod(0o600); err != nil {
 		return File{}, fmt.Errorf("secure destination file: %w", err)
 	}
+	if afterRead != nil {
+		afterRead()
+	}
 	after, err := source.Stat()
 	if err != nil || !safefs.SameFileVersion(before, after) || written != before.Size() {
-		return File{}, changedFileError{reason: "changed_during_copy"}
+		return File{}, &ConsistencyError{Path: ref.Path, Reason: "changed_during_copy"}
 	}
 	latest, err := openSourceFile(dataDir, ref.Path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return File{}, changedFileError{reason: "not_found"}
+			return File{}, &ConsistencyError{Path: ref.Path, Reason: "not_found"}
 		}
 		return File{}, fmt.Errorf("reopen contained source file: %w", err)
 	}
 	latestInfo, statErr := latest.Stat()
 	closeErr := latest.Close()
 	if statErr != nil || closeErr != nil || !safefs.SameFileVersion(before, latestInfo) {
-		return File{}, changedFileError{reason: "changed_during_copy"}
+		return File{}, &ConsistencyError{Path: ref.Path, Reason: "changed_during_copy"}
 	}
-	if ref.ExpectedSize >= 0 && written != ref.ExpectedSize {
-		return File{}, changedFileError{reason: "size_mismatch"}
+	if written != ref.ExpectedSize {
+		return File{}, &ConsistencyError{Path: ref.Path, Reason: "size_mismatch"}
 	}
 	if err := destination.Close(); err != nil {
 		return File{}, fmt.Errorf("close destination file: %w", err)
@@ -96,15 +105,7 @@ func openSourceFile(dataDir, relative string) (*os.File, error) {
 		return nil, fmt.Errorf("invalid source path")
 	}
 	cleanRelative := strings.TrimPrefix(relative, "data/")
-	if cleanRelative == "" || filepath.IsAbs(cleanRelative) || filepath.Clean(cleanRelative) != cleanRelative || filepath.ToSlash(cleanRelative) != cleanRelative {
-		return nil, fmt.Errorf("invalid source path")
-	}
 	parts := strings.Split(cleanRelative, "/")
-	for _, part := range parts {
-		if part == "" || part == "." || part == ".." {
-			return nil, fmt.Errorf("invalid source path component")
-		}
-	}
 	directoryFD, err := syscall.Open(dataDir, syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		return nil, err
@@ -157,21 +158,21 @@ func copyWithContext(ctx context.Context, destination io.Writer, source io.Reade
 	}
 }
 
-func hashRegularFile(path string) (File, error) {
+func hashRegularFile(ctx context.Context, path string) (File, error) {
 	info, err := os.Lstat(path)
 	if err != nil {
 		return File{}, err
 	}
 	if !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
-		return File{}, fmt.Errorf("snapshot file is not a secure regular file")
+		return File{}, fmt.Errorf("recovery file is not a 0600 regular file")
 	}
-	f, err := os.Open(path)
+	file, err := os.Open(path)
 	if err != nil {
 		return File{}, err
 	}
-	defer func() { _ = f.Close() }()
+	defer func() { _ = file.Close() }()
 	hash := sha256.New()
-	size, err := io.Copy(hash, f)
+	size, err := copyWithContext(ctx, hash, file)
 	if err != nil {
 		return File{}, err
 	}

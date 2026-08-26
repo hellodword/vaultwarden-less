@@ -1,15 +1,12 @@
 package worker
 
 import (
-	"context"
+	"bytes"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"mime"
 	"net/http"
-	"strconv"
-	"sync"
 	"time"
 
 	"github.com/hellodword/vaultwarden-less/internal/config"
@@ -17,134 +14,143 @@ import (
 )
 
 const (
+	HealthPath = "/healthz"
 	EventsPath = "/v1/events"
-	HealthPath = "/.vaultwarden-less/healthz"
+	CheckPath  = "/v1/check"
+	StatusPath = "/v1/status"
 )
 
-type DirtySink interface {
-	MarkDirty(time.Time) error
+type eventRequest struct {
+	SchemaVersion int `json:"schema_version"`
 }
 
-type EventServer struct {
-	cfg     *config.Backup
-	sink    DirtySink
-	http    *http.Server
-	limiter tokenBucket
+type acceptedResponse struct {
+	SchemaVersion int  `json:"schema_version"`
+	Accepted      bool `json:"accepted"`
 }
 
-type tokenBucket struct {
-	mu       sync.Mutex
-	tokens   float64
-	last     time.Time
-	rate     float64
-	capacity float64
+type errorResponse struct {
+	Error struct {
+		Code    string `json:"code"`
+		Message string `json:"message"`
+	} `json:"error"`
 }
 
-func NewEventServer(cfg *config.Backup, sink DirtySink) *EventServer {
-	server := &EventServer{
-		cfg:     cfg,
-		sink:    sink,
-		limiter: tokenBucket{tokens: float64(cfg.EventBurst), last: time.Now(), rate: cfg.EventRatePerSecond, capacity: float64(cfg.EventBurst)},
-	}
-	mux := http.NewServeMux()
-	mux.HandleFunc(EventsPath, server.handleEvent)
-	mux.HandleFunc(HealthPath, server.handleHealth)
-	server.http = &http.Server{
-		Addr: cfg.ListenAddress, Handler: mux,
-		ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 10 * time.Second,
-		WriteTimeout: 10 * time.Second, IdleTimeout: time.Minute, MaxHeaderBytes: 64 << 10,
-	}
-	return server
+type requestError struct {
+	status  int
+	code    string
+	message string
 }
 
-func (s *EventServer) ListenAndServe() error {
-	err := s.http.ListenAndServe()
-	if errors.Is(err, http.ErrServerClosed) {
-		return nil
-	}
-	return err
-}
+func (err *requestError) Error() string { return err.code }
 
-func (s *EventServer) Shutdown(ctx context.Context) error { return s.http.Shutdown(ctx) }
-
-func (s *EventServer) handleHealth(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet && r.Method != http.MethodHead {
-		w.Header().Set("Allow", "GET, HEAD")
-		writeHTTPError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Method not allowed")
-		return
-	}
-	w.Header().Set("Cache-Control", "no-store")
-	w.WriteHeader(http.StatusNoContent)
-}
-
-func (s *EventServer) handleEvent(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		w.Header().Set("Allow", "POST")
-		writeHTTPError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Method not allowed")
-		return
-	}
-	if !s.limiter.allow(time.Now()) {
-		writeHTTPError(w, http.StatusTooManyRequests, "rate_limited", "Event rate limit exceeded")
-		return
-	}
-	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
-	if err != nil || mediaType != "application/json" {
-		writeHTTPError(w, http.StatusUnsupportedMediaType, "unsupported_media_type", "Content-Type must be application/json")
-		return
-	}
-	if r.ContentLength > s.cfg.EventMaxBytes {
-		writeHTTPError(w, http.StatusRequestEntityTooLarge, "event_too_large", "Event body too large")
-		return
-	}
-	r.Body = http.MaxBytesReader(w, r.Body, s.cfg.EventMaxBytes)
-	dec := json.NewDecoder(r.Body)
-	dec.DisallowUnknownFields()
-	var event struct {
-		SchemaVersion int `json:"schema_version"`
-	}
-	if err := dec.Decode(&event); err != nil {
-		var tooLarge *http.MaxBytesError
-		if errors.As(err, &tooLarge) {
-			writeHTTPError(w, http.StatusRequestEntityTooLarge, "event_too_large", "Event body too large")
+func Handler(worker *Worker) http.Handler {
+	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.RawQuery != "" {
+			writeError(writer, http.StatusBadRequest, "invalid_request", "Query parameters are not supported.")
 			return
 		}
-		writeHTTPError(w, http.StatusBadRequest, "invalid_event", "Invalid event body")
-		return
+		switch request.URL.Path {
+		case HealthPath:
+			if request.Method != http.MethodGet {
+				methodNotAllowed(writer, http.MethodGet)
+				return
+			}
+			writer.WriteHeader(http.StatusNoContent)
+		case StatusPath:
+			if request.Method != http.MethodGet {
+				methodNotAllowed(writer, http.MethodGet)
+				return
+			}
+			writeJSON(writer, http.StatusOK, worker.Status())
+		case EventsPath, CheckPath:
+			if request.Method != http.MethodPost {
+				methodNotAllowed(writer, http.MethodPost)
+				return
+			}
+			if err := decodeEventRequest(writer, request); err != nil {
+				var invalid *requestError
+				if errors.As(err, &invalid) {
+					writeError(writer, invalid.status, invalid.code, invalid.message)
+					return
+				}
+				writeError(writer, http.StatusBadRequest, "invalid_request", "Request must be strict schema v1 JSON.")
+				return
+			}
+			worker.Request()
+			if request.URL.Path == EventsPath {
+				writer.WriteHeader(http.StatusNoContent)
+				return
+			}
+			writeJSON(writer, http.StatusAccepted, acceptedResponse{SchemaVersion: version.SchemaVersion, Accepted: true})
+		default:
+			writeError(writer, http.StatusNotFound, "not_found", "Endpoint not found.")
+		}
+	})
+}
+
+func NewHTTPServer(worker *Worker) *http.Server {
+	return &http.Server{
+		Addr:              config.ListenAddress,
+		Handler:           Handler(worker),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       30 * time.Second,
+		MaxHeaderBytes:    16 << 10,
+	}
+}
+
+func decodeEventRequest(writer http.ResponseWriter, request *http.Request) error {
+	mediaType, parameters, err := mime.ParseMediaType(request.Header.Get("Content-Type"))
+	if err != nil || mediaType != "application/json" || len(parameters) != 0 {
+		return &requestError{
+			status: http.StatusUnsupportedMediaType, code: "unsupported_media_type",
+			message: "Content-Type must be exactly application/json.",
+		}
+	}
+	request.Body = http.MaxBytesReader(writer, request.Body, config.EventMaxBytes)
+	decoder := json.NewDecoder(request.Body)
+	decoder.DisallowUnknownFields()
+	var body eventRequest
+	if err := decoder.Decode(&body); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			return &requestError{status: http.StatusRequestEntityTooLarge, code: "request_too_large", message: "Request body is too large."}
+		}
+		return errors.New("invalid request body")
+	}
+	if body.SchemaVersion != version.SchemaVersion {
+		return errors.New("invalid request body")
 	}
 	var extra any
-	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) || event.SchemaVersion != version.SchemaVersion {
-		writeHTTPError(w, http.StatusBadRequest, "invalid_event", "Invalid event body")
-		return
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		return errors.New("request contains trailing JSON")
 	}
-	if err := s.sink.MarkDirty(time.Now()); err != nil {
-		writeHTTPError(w, http.StatusServiceUnavailable, "state_unavailable", "Event state unavailable")
-		return
-	}
-	w.Header().Set("Cache-Control", "no-store")
-	w.WriteHeader(http.StatusNoContent)
+	return nil
 }
 
-func (b *tokenBucket) allow(now time.Time) bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	elapsed := now.Sub(b.last).Seconds()
-	if elapsed > 0 {
-		b.tokens += elapsed * b.rate
-		if b.tokens > b.capacity {
-			b.tokens = b.capacity
-		}
-		b.last = now
-	}
-	if b.tokens < 1 {
-		return false
-	}
-	b.tokens--
-	return true
+func methodNotAllowed(writer http.ResponseWriter, allowed string) {
+	writer.Header().Set("Allow", allowed)
+	writeError(writer, http.StatusMethodNotAllowed, "method_not_allowed", "Method not allowed.")
 }
 
-func writeHTTPError(w http.ResponseWriter, status int, code, message string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Cache-Control", "no-store")
-	w.WriteHeader(status)
-	_, _ = fmt.Fprintf(w, "{\"error\":{\"code\":%s,\"message\":%s}}\n", strconv.Quote(code), strconv.Quote(message))
+func writeError(writer http.ResponseWriter, status int, code, message string) {
+	response := errorResponse{}
+	response.Error.Code = code
+	response.Error.Message = message
+	writeJSON(writer, status, response)
+}
+
+func writeJSON(writer http.ResponseWriter, status int, value any) {
+	var buffer bytes.Buffer
+	encoder := json.NewEncoder(&buffer)
+	encoder.SetEscapeHTML(true)
+	if err := encoder.Encode(value); err != nil {
+		writer.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	writer.Header().Set("Content-Type", "application/json")
+	writer.WriteHeader(status)
+	_, _ = writer.Write(buffer.Bytes())
 }

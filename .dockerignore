@@ -1,11 +1,15 @@
 **
 !go.mod
 !go.sum
+!VERSION
 !cmd/
 !cmd/**
 !internal/
 !internal/**
 !docker/
-!docker/*.Dockerfile
+!docker/Dockerfile
 !LICENSE
-!THIRD_PARTY_LICENSES.md
+!NOTICE.md
+!licenses/
+!licenses/third-party/
+!licenses/third-party/**

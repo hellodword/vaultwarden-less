@@ -8,7 +8,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
-	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
@@ -28,6 +27,7 @@ const (
 	IdleTimeout                   = 2 * time.Minute
 	UpstreamResponseHeaderTimeout = 5 * time.Minute
 	EventTimeout                  = 2 * time.Second
+	EventRetry                    = 30 * time.Second
 	ShutdownTimeout               = 2 * time.Minute
 )
 
@@ -87,10 +87,6 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	if _, _, err := s.forwardedValues(r); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_forwarded_header", "Invalid forwarding header")
-		return
-	}
 	if r.ContentLength > MaxRequestBytes {
 		writeError(w, http.StatusRequestEntityTooLarge, "request_too_large", "Request body exceeds 600 MiB")
 		return
@@ -112,19 +108,13 @@ func (s *Server) Shutdown(ctx context.Context) error {
 }
 
 func (s *Server) rewrite(pr *httputil.ProxyRequest) {
-	clientIP, proto, _ := s.forwardedValues(pr.In)
-	removeForwardingHeaders(pr.Out.Header)
 	pr.SetURL(s.upstream)
 	pr.Out.Host = pr.In.Host
-	pr.Out.Header.Set("X-Real-IP", clientIP.String())
-	pr.Out.Header.Set("X-Forwarded-For", clientIP.String())
-	pr.Out.Header.Set("X-Forwarded-Host", pr.In.Host)
-	pr.Out.Header.Set("X-Forwarded-Proto", proto)
-	pr.Out.Header.Set("Forwarded", formatForwarded(clientIP, proto, pr.In.Host))
+	copyForwardingHeaders(pr.Out.Header, pr.In.Header)
 }
 
 func (s *Server) modifyResponse(resp *http.Response) error {
-	if resp.StatusCode >= 200 && resp.StatusCode < 400 && isMutating(resp.Request.Method) {
+	if s.marker != nil && shouldRequestBackup(resp.Request.Method, resp.Request.URL.Path, resp.StatusCode) {
 		s.marker.MarkDirty()
 	}
 	return nil
@@ -140,63 +130,12 @@ func (s *Server) proxyError(w http.ResponseWriter, _ *http.Request, err error) {
 	writeError(w, http.StatusBadGateway, "upstream_unavailable", "Upstream unavailable")
 }
 
-func (s *Server) forwardedValues(r *http.Request) (netip.Addr, string, error) {
-	peer, err := remoteIP(r.RemoteAddr)
-	if err != nil {
-		return netip.Addr{}, "", err
-	}
-	proto := "http"
-	if r.TLS != nil {
-		proto = "https"
-	}
-	if !s.trusts(peer) {
-		return peer, proto, nil
-	}
-	client := peer
-	if len(r.Header.Values("X-Real-IP")) > 1 || len(r.Header.Values("X-Forwarded-Proto")) > 1 {
-		return netip.Addr{}, "", fmt.Errorf("multiple forwarding header values")
-	}
-	if raw := r.Header.Get("X-Real-IP"); raw != "" {
-		if strings.Contains(raw, ",") || strings.TrimSpace(raw) != raw {
-			return netip.Addr{}, "", fmt.Errorf("invalid X-Real-IP")
-		}
-		parsed, err := netip.ParseAddr(raw)
-		if err != nil || parsed.Zone() != "" {
-			return netip.Addr{}, "", fmt.Errorf("invalid X-Real-IP")
-		}
-		client = parsed.Unmap()
-	}
-	if raw := r.Header.Get("X-Forwarded-Proto"); raw != "" {
-		if raw != "http" && raw != "https" {
-			return netip.Addr{}, "", fmt.Errorf("invalid X-Forwarded-Proto")
-		}
-		proto = raw
-	}
-	return client, proto, nil
-}
-
-func (s *Server) trusts(addr netip.Addr) bool {
-	return addr.IsLoopback() || addr.IsPrivate()
-}
-
 func mustURL(raw string) *url.URL {
 	parsed, err := url.Parse(raw)
 	if err != nil {
 		panic(err)
 	}
 	return parsed
-}
-
-func remoteIP(remote string) (netip.Addr, error) {
-	host, _, err := net.SplitHostPort(remote)
-	if err != nil {
-		return netip.Addr{}, fmt.Errorf("invalid peer address")
-	}
-	addr, err := netip.ParseAddr(host)
-	if err != nil || addr.Zone() != "" {
-		return netip.Addr{}, fmt.Errorf("invalid peer address")
-	}
-	return addr.Unmap(), nil
 }
 
 func removeForwardingHeaders(header http.Header) {
@@ -208,24 +147,16 @@ func removeForwardingHeaders(header http.Header) {
 	}
 }
 
-func formatForwarded(ip netip.Addr, proto, host string) string {
-	forValue := ip.String()
-	if ip.Is6() {
-		forValue = "[" + forValue + "]"
-	}
-	return "for=" + quoteForwarded(forValue) + ";proto=" + proto + ";host=" + quoteForwarded(host)
-}
-
-func quoteForwarded(value string) string {
-	return `"` + strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(value) + `"`
-}
-
-func isMutating(method string) bool {
-	switch method {
-	case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace:
-		return false
-	default:
-		return true
+func copyForwardingHeaders(destination, source http.Header) {
+	removeForwardingHeaders(destination)
+	for name, values := range source {
+		lower := strings.ToLower(name)
+		if lower != "forwarded" && lower != "x-real-ip" && !strings.HasPrefix(lower, "x-forwarded-") {
+			continue
+		}
+		for _, value := range values {
+			destination.Add(name, value)
+		}
 	}
 }
 

@@ -31,7 +31,7 @@ func newWechatSender(cfg config.Notifier) (Sender, error) {
 	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.Fragment != "" {
 		return nil, fmt.Errorf("WeChat webhook URL is invalid")
 	}
-	return &wechatSender{name: cfg.Name, url: cfg.WebhookURL, client: strictClient(cfg.Timeout.Duration)}, nil
+	return &wechatSender{name: cfg.Name, url: cfg.WebhookURL, client: strictClient(config.NotifierTimeout)}, nil
 }
 
 func (s *wechatSender) Name() string { return s.name }

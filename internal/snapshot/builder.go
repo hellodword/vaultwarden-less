@@ -8,11 +8,8 @@ import (
 	"math"
 	"os"
 	"path/filepath"
-	"slices"
 	"strings"
 	"syscall"
-
-	"github.com/hellodword/vaultwarden-less/internal/safefs"
 )
 
 const spaceReserve = int64(64 << 20)
@@ -20,6 +17,9 @@ const spaceReserve = int64(64 << 20)
 type Builder struct {
 	DataDir    string
 	StagingDir string
+
+	beforeCopy func(string)
+	afterCopy  func(string)
 }
 
 type Result struct {
@@ -27,35 +27,29 @@ type Result struct {
 	Manifest Manifest
 }
 
-type MissingFilesError struct {
-	Count int
-}
-
-func (e *MissingFilesError) Error() string {
-	return fmt.Sprintf("%d database-referenced or changing files were unavailable", e.Count)
-}
-
-// Build creates a verified snapshot in a new private staging directory. The
-// caller owns Result.Path. If allowIncomplete is false, any unavailable or
-// concurrently changing whitelisted file aborts the attempt.
-func (b Builder) Build(ctx context.Context, allowIncomplete bool) (_ Result, err error) {
+// Build constructs and verifies a complete recovery point, then publishes it
+// as StagingDir/point. A failed build leaves any prior point untouched.
+func (b Builder) Build(ctx context.Context) (_ Result, err error) {
 	if err := validateOwnedDirectory(b.DataDir); err != nil {
 		return Result{}, fmt.Errorf("validate data directory: %w", err)
 	}
-	if err := safefs.ValidatePrivateDirectory(b.StagingDir); err != nil {
+	if err := validateOwnedDirectory(b.StagingDir); err != nil {
 		return Result{}, fmt.Errorf("validate staging directory: %w", err)
+	}
+	if err := cleanupTransientBuilds(b.StagingDir); err != nil {
+		return Result{}, fmt.Errorf("clean transient recovery builds: %w", err)
 	}
 	buildDir, err := os.MkdirTemp(b.StagingDir, ".build-")
 	if err != nil {
-		return Result{}, fmt.Errorf("create snapshot staging directory: %w", err)
+		return Result{}, fmt.Errorf("create recovery build directory: %w", err)
 	}
 	if err := os.Chmod(buildDir, 0o700); err != nil {
 		_ = os.RemoveAll(buildDir)
-		return Result{}, fmt.Errorf("secure snapshot staging directory: %w", err)
+		return Result{}, fmt.Errorf("secure recovery build directory: %w", err)
 	}
-	keep := false
+	published := false
 	defer func() {
-		if !keep {
+		if !published {
 			_ = os.RemoveAll(buildDir)
 		}
 	}()
@@ -71,15 +65,10 @@ func (b Builder) Build(ctx context.Context, allowIncomplete bool) (_ Result, err
 	if err := onlineBackup(ctx, filepath.Join(b.DataDir, "db.sqlite3"), databasePath); err != nil {
 		return Result{}, err
 	}
-	migration, err := validateDatabase(ctx, databasePath)
-	if err != nil {
-		return Result{}, fmt.Errorf("validate snapshot database: %w", err)
+	if _, err := validateDatabase(ctx, databasePath); err != nil {
+		return Result{}, fmt.Errorf("validate recovery database: %w", err)
 	}
 	refs, err := referencedFiles(ctx, databasePath)
-	if err != nil {
-		return Result{}, err
-	}
-	optional, optionalBytes, err := b.optionalFiles()
 	if err != nil {
 		return Result{}, err
 	}
@@ -90,117 +79,133 @@ func (b Builder) Build(ctx context.Context, allowIncomplete bool) (_ Result, err
 			return Result{}, fmt.Errorf("referenced file size overflow")
 		}
 	}
-	recoveryRequired, err := checkedSizeSum(referencedBytes, optionalBytes, spaceReserve)
+	recoveryRequired, err := checkedSizeSum(referencedBytes, estimatedDatabaseBytes(b.DataDir), spaceReserve)
 	if err != nil {
 		return Result{}, err
 	}
 	if err := preflightSpace(b.StagingDir, recoveryRequired); err != nil {
 		return Result{}, err
 	}
-	refs = append(refs, optional...)
-	slices.SortFunc(refs, func(a, c referencedFile) int { return strings.Compare(a.Path, c.Path) })
-	for i := 1; i < len(refs); i++ {
-		if refs[i-1].Path == refs[i].Path {
-			return Result{}, fmt.Errorf("duplicate source path in snapshot set")
-		}
-	}
 
-	databaseFile, err := hashRegularFile(databasePath)
+	databaseFile, err := hashRegularFile(ctx, databasePath)
 	if err != nil {
-		return Result{}, fmt.Errorf("hash snapshot database: %w", err)
+		return Result{}, fmt.Errorf("hash recovery database: %w", err)
 	}
 	databaseFile.Path = "data/db.sqlite3"
 	files := []File{databaseFile}
-	missing := make([]Missing, 0)
 	for _, ref := range refs {
-		file, err := copyStableFile(ctx, b.DataDir, buildDir, ref)
-		if err == nil {
-			files = append(files, file)
-			continue
+		if b.beforeCopy != nil {
+			b.beforeCopy(ref.Path)
 		}
-		var changed changedFileError
-		if errors.As(err, &changed) {
-			missing = append(missing, Missing{Path: ref.Path, Reason: changed.reason})
-			continue
+		var afterRead func()
+		if b.afterCopy != nil {
+			afterRead = func() { b.afterCopy(ref.Path) }
 		}
-		return Result{}, fmt.Errorf("copy %s: %w", ref.Path, err)
+		file, err := copyStableFile(ctx, b.DataDir, buildDir, ref, afterRead)
+		if err != nil {
+			return Result{}, fmt.Errorf("copy %s: %w", ref.Path, err)
+		}
+		files = append(files, file)
 	}
-	if len(missing) != 0 && !allowIncomplete {
-		return Result{}, &MissingFilesError{Count: len(missing)}
-	}
-	status := Complete
-	if len(missing) != 0 {
-		status = Incomplete
-	}
-	manifest, err := NewManifest(status, migration, files, missing)
+
+	manifest, err := NewManifest(files)
 	if err != nil {
 		return Result{}, err
 	}
-	manifestBytes, err := json.MarshalIndent(manifest, "", "  ")
+	if err := writeManifest(filepath.Join(buildDir, "manifest.json"), manifest); err != nil {
+		return Result{}, err
+	}
+	if _, err := Verify(ctx, buildDir); err != nil {
+		return Result{}, fmt.Errorf("verify recovery build: %w", err)
+	}
+
+	point := filepath.Join(b.StagingDir, "point")
+	newPointPublished, err := publishRecoveryPoint(buildDir, point)
+	if newPointPublished {
+		published = true
+	}
 	if err != nil {
-		return Result{}, fmt.Errorf("encode manifest: %w", err)
+		return Result{}, err
 	}
-	manifestBytes = append(manifestBytes, '\n')
-	manifestPath := filepath.Join(buildDir, "manifest.json")
-	manifestFile, err := os.OpenFile(manifestPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-	if err != nil {
-		return Result{}, fmt.Errorf("create manifest: %w", err)
-	}
-	if _, err := manifestFile.Write(manifestBytes); err != nil {
-		_ = manifestFile.Close()
-		return Result{}, fmt.Errorf("write manifest: %w", err)
-	}
-	if err := manifestFile.Sync(); err != nil {
-		_ = manifestFile.Close()
-		return Result{}, fmt.Errorf("sync manifest: %w", err)
-	}
-	if err := manifestFile.Close(); err != nil {
-		return Result{}, fmt.Errorf("close manifest: %w", err)
-	}
-	if _, err := Verify(ctx, buildDir, true); err != nil {
-		return Result{}, fmt.Errorf("verify completed staging set: %w", err)
-	}
-	if err := SyncTree(buildDir); err != nil {
-		return Result{}, fmt.Errorf("sync snapshot directory tree: %w", err)
-	}
-	keep = true
-	return Result{Path: buildDir, Manifest: manifest}, nil
+	return Result{Path: point, Manifest: manifest}, nil
 }
 
-func (b Builder) optionalFiles() ([]referencedFile, int64, error) {
-	entries, err := os.ReadDir(b.DataDir)
-	if err != nil {
-		return nil, 0, fmt.Errorf("list data directory whitelist: %w", err)
+func publishRecoveryPoint(buildDir, point string) (bool, error) {
+	return publishRecoveryPointUsing(buildDir, point, renameExchange)
+}
+
+func publishRecoveryPointUsing(buildDir, point string, exchange func(string, string) error) (bool, error) {
+	if _, err := os.Lstat(point); errors.Is(err, os.ErrNotExist) {
+		if err := os.Rename(buildDir, point); err != nil {
+			return false, fmt.Errorf("publish first recovery point: %w", err)
+		}
+		return true, nil
+	} else if err != nil {
+		return false, fmt.Errorf("inspect existing recovery point: %w", err)
 	}
-	var refs []referencedFile
-	var total int64
+	if err := validateOwnedDirectory(point); err != nil {
+		return false, fmt.Errorf("validate existing recovery point: %w", err)
+	}
+	if err := exchange(buildDir, point); err != nil {
+		return false, fmt.Errorf("atomically replace recovery point: %w", err)
+	}
+	// The new verified point is already authoritative. The old point now has
+	// the recognized build name and is safe for this or the next build to clean.
+	if err := os.RemoveAll(buildDir); err != nil {
+		return true, fmt.Errorf("clean replaced recovery point: %w", err)
+	}
+	return true, nil
+}
+
+func writeManifest(path string, manifest Manifest) error {
+	data, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode manifest: %w", err)
+	}
+	data = append(data, '\n')
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return fmt.Errorf("create manifest: %w", err)
+	}
+	open := true
+	defer func() {
+		if open {
+			_ = file.Close()
+		}
+	}()
+	if _, err := file.Write(data); err != nil {
+		return fmt.Errorf("write manifest: %w", err)
+	}
+	if err := file.Sync(); err != nil {
+		return fmt.Errorf("sync manifest: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		open = false
+		return fmt.Errorf("close manifest: %w", err)
+	}
+	open = false
+	return nil
+}
+
+func cleanupTransientBuilds(stagingDir string) error {
+	entries, err := os.ReadDir(stagingDir)
+	if err != nil {
+		return err
+	}
 	for _, entry := range entries {
-		name := entry.Name()
-		if name != "rsa_key.pem" && name != "rsa_key.pub.pem" {
+		if !strings.HasPrefix(entry.Name(), ".build-") {
 			continue
 		}
-		if strings.Contains(name, "/") {
-			return nil, 0, fmt.Errorf("invalid whitelisted data entry")
-		}
-		info, err := os.Lstat(filepath.Join(b.DataDir, name))
-		if err != nil {
-			return nil, 0, fmt.Errorf("inspect whitelisted data entry: %w", err)
-		}
-		if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
-			return nil, 0, fmt.Errorf("whitelisted data entry is not a regular file")
-		}
-		refs = append(refs, referencedFile{Path: "data/" + name, ExpectedSize: info.Size()})
-		total, err = checkedSizeSum(total, info.Size())
-		if err != nil {
-			return nil, 0, fmt.Errorf("optional file size overflow")
+		if err := os.RemoveAll(filepath.Join(stagingDir, entry.Name())); err != nil {
+			return err
 		}
 	}
-	return refs, total, nil
+	return nil
 }
 
 func validateOwnedDirectory(path string) error {
-	if path == string(filepath.Separator) {
-		return fmt.Errorf("filesystem root is not a supported data directory")
+	if path == "" || path == string(filepath.Separator) || !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return fmt.Errorf("path must be clean, absolute, and non-root")
 	}
 	info, err := os.Lstat(path)
 	if err != nil {
@@ -208,7 +213,7 @@ func validateOwnedDirectory(path string) error {
 	}
 	stat, ownerKnown := info.Sys().(*syscall.Stat_t)
 	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || !ownerKnown || stat.Uid != uint32(os.Geteuid()) || info.Mode().Perm() != 0o700 {
-		return fmt.Errorf("path is not a real 0700 directory")
+		return fmt.Errorf("path must be a real 0700 directory owned by effective UID %d", os.Geteuid())
 	}
 	return nil
 }
@@ -250,57 +255,4 @@ func preflightSpace(path string, required int64) error {
 		return fmt.Errorf("insufficient staging space: need at least %d bytes", required)
 	}
 	return nil
-}
-
-// SyncTree flushes every regular file and then every directory from leaves to
-// root so a subsequently synced rename cannot publish only part of a verified
-// recovery set after a crash.
-func SyncTree(root string) error {
-	var directories []string
-	if err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if entry.IsDir() {
-			directories = append(directories, path)
-			return nil
-		}
-		info, err := entry.Info()
-		if err != nil {
-			return err
-		}
-		if !info.Mode().IsRegular() {
-			return fmt.Errorf("snapshot tree contains a non-regular file")
-		}
-		file, err := os.Open(path)
-		if err != nil {
-			return err
-		}
-		syncErr := file.Sync()
-		closeErr := file.Close()
-		if syncErr != nil {
-			return syncErr
-		}
-		return closeErr
-	}); err != nil {
-		return err
-	}
-	slices.SortFunc(directories, func(left, right string) int {
-		return len(right) - len(left)
-	})
-	for _, path := range directories {
-		if err := syncDirectory(path); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func syncDirectory(path string) error {
-	dir, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = dir.Close() }()
-	return dir.Sync()
 }

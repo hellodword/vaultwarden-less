@@ -17,10 +17,13 @@ var eventBody = []byte("{\"schema_version\":1}\n")
 // EventSender coalesces any number of dirty marks into a single bounded signal.
 // Delivery never runs in a request goroutine and never delays the proxy response.
 type EventSender struct {
-	url    *url.URL
-	client *http.Client
-	log    *slog.Logger
-	signal chan struct{}
+	url            *url.URL
+	client         *http.Client
+	log            *slog.Logger
+	signal         chan struct{}
+	retry          time.Duration
+	failing        bool
+	lastFailureLog time.Time
 }
 
 func NewEventSender(log *slog.Logger) *EventSender {
@@ -41,6 +44,7 @@ func newEventSender(target *url.URL, timeout time.Duration, log *slog.Logger) *E
 		},
 		log:    log,
 		signal: make(chan struct{}, 1),
+		retry:  EventRetry,
 	}
 }
 
@@ -55,17 +59,56 @@ func (s *EventSender) Run(ctx context.Context, wg *sync.WaitGroup) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		pending := true // Startup always requests one worker check.
 		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-s.signal:
-				if err := s.send(ctx); err != nil {
-					s.log.Error("backup event delivery failed; periodic sampling remains active", "error_code", "event_delivery_failed")
+			if !pending {
+				select {
+				case <-ctx.Done():
+					return
+				case <-s.signal:
+					pending = true
 				}
+			}
+			if err := s.send(ctx); err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				s.recordFailure()
+				timer := time.NewTimer(s.retry)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return
+				case <-timer.C:
+				}
+				continue
+			}
+			s.recordRecovery()
+			select {
+			case <-s.signal:
+				pending = true
+			default:
+				pending = false
 			}
 		}
 	}()
+}
+
+func (s *EventSender) recordFailure() {
+	now := time.Now().UTC()
+	if s.log != nil && (!s.failing || now.Sub(s.lastFailureLog) >= 5*time.Minute) {
+		s.log.Error("backup event delivery failed; pending signal retained", "error_code", "event_delivery_failed")
+		s.lastFailureLog = now
+	}
+	s.failing = true
+}
+
+func (s *EventSender) recordRecovery() {
+	if s.failing && s.log != nil {
+		s.log.Info("backup event delivery recovered", "event", "event_delivery_recovered")
+	}
+	s.failing = false
+	s.lastFailureLog = time.Time{}
 }
 
 func (s *EventSender) send(ctx context.Context) error {

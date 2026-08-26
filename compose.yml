@@ -1,10 +1,10 @@
 name: vaultwarden-less
 
-x-product-image: &product-image ghcr.io/hellodword/vaultwarden-less:${PRODUCT_VERSION:-dev}
+x-product-image: &product-image ${PRODUCT_IMAGE:?set PRODUCT_IMAGE in .env}
 x-service-defaults: &service-defaults
   platform: linux/amd64
   restart: unless-stopped
-  user: "65532:65532"
+  user: "${DEPLOY_UID:?set DEPLOY_UID}:${DEPLOY_GID:?set DEPLOY_GID}"
   logging:
     driver: local
     options:
@@ -20,12 +20,15 @@ services:
     <<: *service-defaults
     image: vaultwarden/server:1.37.2@sha256:5d326778c22f063d093d6b0c9c766a28249561632266776f2c93132ab0ad3a80
     hostname: vaultwarden
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
     env_file:
       - path: ${VAULTWARDEN_ENV_FILE:-.env.vaultwarden}
         required: true
     volumes:
       - type: bind
-        source: ./data
+        source: ${DEPLOY_ROOT:-.}/data
         target: /data
         bind:
           create_host_path: false
@@ -42,13 +45,9 @@ services:
   proxy:
     <<: *service-defaults
     image: *product-image
-    build:
-      context: .
-      dockerfile: docker/Dockerfile
-      args:
-        PRODUCT_VERSION: "${PRODUCT_VERSION:-dev}"
     hostname: proxy
     entrypoint: ["/usr/local/bin/vaultwarden-less-proxy"]
+    command: ["serve"]
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
@@ -72,50 +71,46 @@ services:
     <<: *service-defaults
     image: *product-image
     hostname: backup
+    entrypoint: ["/usr/local/bin/vaultwarden-less-backup"]
+    command: ["serve", "--config", "/config/backup.yaml"]
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
     volumes:
       - type: bind
-        source: ./data
+        source: ${DEPLOY_ROOT:-.}/data
         target: /data
         read_only: true
         bind:
           create_host_path: false
       - type: bind
-        source: ./state
-        target: /state
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ./staging
+        source: ${DEPLOY_ROOT:-.}/staging
         target: /staging
         bind:
           create_host_path: false
       - type: bind
-        source: ./cache
+        source: ${DEPLOY_ROOT:-.}/cache
         target: /cache
         bind:
           create_host_path: false
       - type: bind
-        source: ./config/backup.yaml
-        target: /config/backup.yaml
+        source: ${DEPLOY_ROOT:-.}/config
+        target: /config
         read_only: true
         bind:
           create_host_path: false
       - type: bind
-        source: ./credentials/common
+        source: ${DEPLOY_ROOT:-.}/credentials/common
         target: /run/credentials/common
         read_only: true
         bind:
           create_host_path: false
       - type: bind
-        source: ./credentials/backup
+        source: ${DEPLOY_ROOT:-.}/credentials/backup
         target: /run/credentials/role
         read_only: true
         bind:
           create_host_path: false
-    command: ["serve", "--config", "/config/backup.yaml"]
     networks:
       - events
       - backup-outbound
@@ -130,31 +125,32 @@ services:
     <<: *service-defaults
     image: *product-image
     profiles: ["maintenance"]
+    restart: "no"
     entrypoint: ["/usr/local/bin/vaultwarden-less-backup"]
+    command: ["repo", "snapshots", "--target", "primary", "--config", "/config/backup.yaml"]
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
-    command: ["repo", "snapshots", "--target", "primary", "--config", "/config/backup.yaml"]
     volumes:
       - type: bind
-        source: ./cache
+        source: ${DEPLOY_ROOT:-.}/cache
         target: /cache
         bind:
           create_host_path: false
       - type: bind
-        source: ./config/backup.yaml
-        target: /config/backup.yaml
+        source: ${DEPLOY_ROOT:-.}/config
+        target: /config
         read_only: true
         bind:
           create_host_path: false
       - type: bind
-        source: ./credentials/common
+        source: ${DEPLOY_ROOT:-.}/credentials/common
         target: /run/credentials/common
         read_only: true
         bind:
           create_host_path: false
       - type: bind
-        source: ./credentials/maintenance
+        source: ${DEPLOY_ROOT:-.}/credentials/maintenance
         target: /run/credentials/role
         read_only: true
         bind:
@@ -167,36 +163,37 @@ services:
     <<: *service-defaults
     image: *product-image
     profiles: ["restore"]
+    restart: "no"
     entrypoint: ["/usr/local/bin/vaultwarden-less-backup"]
+    command: ["restore", "--target", "primary", "--output", "/restore/prepared", "--config", "/config/backup.yaml"]
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
-    command: ["restore", "--target", "primary", "--output", "/restore/prepared", "--config", "/config/backup.yaml"]
     volumes:
       - type: bind
-        source: ./restore
+        source: ${DEPLOY_ROOT:-.}/restore
         target: /restore
         bind:
           create_host_path: false
       - type: bind
-        source: ./cache
+        source: ${DEPLOY_ROOT:-.}/cache
         target: /cache
         bind:
           create_host_path: false
       - type: bind
-        source: ./config/backup.yaml
-        target: /config/backup.yaml
+        source: ${DEPLOY_ROOT:-.}/config
+        target: /config
         read_only: true
         bind:
           create_host_path: false
       - type: bind
-        source: ./credentials/common
+        source: ${DEPLOY_ROOT:-.}/credentials/common
         target: /run/credentials/common
         read_only: true
         bind:
           create_host_path: false
       - type: bind
-        source: ./credentials/maintenance
+        source: ${DEPLOY_ROOT:-.}/credentials/maintenance
         target: /run/credentials/role
         read_only: true
         bind:

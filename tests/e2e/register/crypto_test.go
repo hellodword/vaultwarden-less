@@ -39,10 +39,10 @@ func TestRegistrationUsesCurrentRegistrationShape(t *testing.T) {
 		t.Fatal(err)
 	}
 	if registration.KDFType != KDFPBKDF2 || registration.KDFIterations != PBKDF2SHA256 {
-		t.Fatalf("KDF = %#v", registration)
+		t.Fatalf("KDF = %d/%d", registration.KDFType, registration.KDFIterations)
 	}
 	if !strings.HasPrefix(registration.Key, "2.") || registration.MasterPasswordHash == "" {
-		t.Fatalf("registration crypto fields = %#v", registration)
+		t.Fatal("registration crypto fields are missing or malformed")
 	}
 	data, err := registration.JSON()
 	if err != nil {
@@ -54,12 +54,12 @@ func TestRegistrationUsesCurrentRegistrationShape(t *testing.T) {
 	}
 	for _, name := range []string{"email", "kdfType", "kdfIterations", "key", "masterPasswordHash", "name"} {
 		if _, ok := fields[name]; !ok {
-			t.Fatalf("registration omitted %q: %s", name, data)
+			t.Fatalf("registration omitted %q", name)
 		}
 	}
 	keys, ok := fields["userAsymmetricKeys"].(map[string]any)
 	if !ok || !strings.HasPrefix(stringValue(keys["encryptedPrivateKey"]), "2.") || stringValue(keys["publicKey"]) == "" {
-		t.Fatalf("registration asymmetric keys = %#v", fields["userAsymmetricKeys"])
+		t.Fatal("registration asymmetric keys are missing or malformed")
 	}
 }
 
@@ -82,7 +82,7 @@ func TestRegistrationCanCarryVerificationToken(t *testing.T) {
 		t.Fatal(err)
 	}
 	if fields["emailVerificationToken"] != "verification-token" {
-		t.Fatalf("verification token = %#v", fields["emailVerificationToken"])
+		t.Fatal("registration verification token was not preserved")
 	}
 }
 

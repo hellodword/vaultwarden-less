@@ -6,230 +6,208 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
-	"fmt"
 	"io"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/hellodword/vaultwarden-less/internal/config"
-	"github.com/hellodword/vaultwarden-less/internal/snapshot"
 )
 
 func recoveryEvent(id string) Event {
-	return NewRecoveryEvent(id, "2026-08-23T12:00:00.000Z", RecoveryPoint{ContentID: "sha256:" + strings.Repeat("a", 64), Status: snapshot.Complete}, nil)
+	return NewRecoveryEvent(
+		id,
+		"2026-08-23T12:00:00Z",
+		"sha256:"+strings.Repeat("a", 64),
+		[]TargetStatus{
+			{Name: "primary", State: "created"},
+			{Name: "cold", State: "failed", ErrorCode: "command_failed"},
+		},
+	)
 }
 
-func TestQueueBoundsSuccessesAndCoalescesTargetState(t *testing.T) {
-	dir := privateNotificationDir(t)
-	store, err := OpenQueueStore(dir, []string{"ops"})
-	if err != nil {
-		t.Fatal(err)
+func TestEventContractAlwaysUsesTargetArraysAndContainsNoSecrets(t *testing.T) {
+	t.Parallel()
+	events := []Event{
+		recoveryEvent("recovery"),
+		NewSourceEvent("source", "source_degraded", "2026-08-23T12:00:00Z", "source_check_failed"),
+		NewTargetEvent("target", "target_recovered", "2026-08-23T12:00:00Z", TargetStatus{Name: "primary", State: "healthy"}),
 	}
-	for i := 0; i < 101; i++ {
-		event := recoveryEvent("recovery-" + strings.Repeat("x", i%8) + string(rune('A'+i%26)))
-		if err := store.EnqueueAll([]string{"ops"}, event, "success", event.ID); err != nil {
+	for _, event := range events {
+		if err := event.Validate(); err != nil {
 			t.Fatal(err)
 		}
-	}
-	queue := store.state.Notifiers["ops"]
-	if len(queue.Items) != 1 || queue.Availability != "unavailable" || queue.Items[0].Event.MergedSuccesses != 100 || queue.Items[0].Event.ID != "recovery-xxxxW" {
-		t.Fatalf("queue length/merged = %d/%d", len(queue.Items), queue.Items[len(queue.Items)-1].Event.MergedSuccesses)
-	}
-	if err := store.Ack("ops", queue.Items[0].Event.ID); err != nil {
-		t.Fatal(err)
-	}
-	event := recoveryEvent("new-success")
-	if err := store.EnqueueAll([]string{"ops"}, event, "success", event.ID); err != nil {
-		t.Fatal(err)
-	}
-	queue = store.state.Notifiers["ops"]
-	if len(queue.Items) != 1 || queue.Items[0].Event.MergedSuccesses != 0 || queue.Items[0].Event.ID != "new-success" || queue.Availability != "available" {
-		t.Fatalf("merged success was not retained for delivery: %#v", queue)
-	}
-	degraded := NewTargetEvent("degraded", "target_degraded", "2026-08-23T12:00:00.000Z", TargetStatus{Name: "primary", State: "degraded", ErrorCode: "backup_failed"})
-	recovered := NewTargetEvent("recovered", "target_recovered", "2026-08-23T12:01:00.000Z", TargetStatus{Name: "primary", State: "healthy"})
-	if err := store.EnqueueAll([]string{"ops"}, degraded, "state", "primary"); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.EnqueueAll([]string{"ops"}, recovered, "state", "primary"); err != nil {
-		t.Fatal(err)
-	}
-	queue = store.state.Notifiers["ops"]
-	stateCount := 0
-	for _, item := range queue.Items {
-		if item.Kind == "state" {
-			stateCount++
-			if item.Event.Type != "target_recovered" {
-				t.Fatalf("state event was not replaced: %#v", item)
+		data, err := json.Marshal(event)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(data), `"targets":null`) {
+			t.Fatalf("null targets in %s", data)
+		}
+		for _, forbidden := range []string{"repository", "password", "webhook", "private_key", "AWS_SECRET"} {
+			if strings.Contains(string(data), forbidden) {
+				t.Fatalf("notification contains forbidden field %q: %s", forbidden, data)
 			}
 		}
 	}
-	if stateCount != 1 {
-		t.Fatalf("state item count = %d", stateCount)
-	}
-	if queue.Items[0].Kind != "state" {
-		t.Fatal("target state change was queued behind ordinary successes")
-	}
-	if _, err := OpenQueueStore(dir, []string{"ops"}); err != nil {
-		t.Fatalf("persistent queue did not reopen: %v", err)
-	}
 }
 
-func TestSuccessMergeCountIsIndependentPerNotifier(t *testing.T) {
+func TestRecoveryMessageListsEveryTargetOutcome(t *testing.T) {
 	t.Parallel()
-	store, err := OpenQueueStore(privateNotificationDir(t), []string{"full", "room"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	for i := 0; i < maxSuccessItems; i++ {
-		event := recoveryEvent(fmt.Sprintf("queued-%d", i))
-		if err := store.EnqueueAll([]string{"full"}, event, "success", event.ID); err != nil {
-			t.Fatal(err)
+	event := NewRecoveryEvent(
+		"recovery",
+		"2026-08-23T12:00:00Z",
+		"sha256:"+strings.Repeat("a", 64),
+		[]TargetStatus{
+			{Name: "primary", State: "created"},
+			{Name: "archive", State: "synced"},
+			{Name: "cold", State: "failed", ErrorCode: "command_failed"},
+		},
+	)
+	message := event.Message()
+	for _, expected := range []string{"created=[primary]", "synced=[archive]", "failed=[cold]"} {
+		if !strings.Contains(message, expected) {
+			t.Fatalf("recovery message %q does not contain %q", message, expected)
 		}
 	}
-	latest := recoveryEvent("latest")
-	if err := store.EnqueueAll([]string{"full", "room"}, latest, "success", latest.ID); err != nil {
-		t.Fatal(err)
-	}
-	full := store.state.Notifiers["full"].Items
-	room := store.state.Notifiers["room"].Items
-	if len(full) != 1 || full[0].Event.MergedSuccesses != 100 {
-		t.Fatalf("full queue merged count = %d", full[len(full)-1].Event.MergedSuccesses)
-	}
-	if len(room) != 1 || room[0].Event.ID != latest.ID || room[0].Event.MergedSuccesses != 0 {
-		t.Fatalf("room queue inherited another notifier's merge count: %#v", room)
-	}
 }
 
-func TestIncompleteRecoveryUsesReplaceablePriorityState(t *testing.T) {
-	t.Parallel()
-	store, err := OpenQueueStore(privateNotificationDir(t), []string{"ops"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	for i := 0; i < maxSuccessItems; i++ {
-		event := recoveryEvent(fmt.Sprintf("success-%d", i))
-		if err := store.EnqueueAll([]string{"ops"}, event, "success", event.ID); err != nil {
-			t.Fatal(err)
+type countingSender struct {
+	name      string
+	failUntil int64
+	calls     atomic.Int64
+	reached   chan int64
+}
+
+func (sender *countingSender) Name() string { return sender.name }
+
+func (sender *countingSender) Send(context.Context, Event) error {
+	calls := sender.calls.Add(1)
+	if sender.reached != nil {
+		select {
+		case sender.reached <- calls:
+		default:
 		}
 	}
-	incomplete := NewRecoveryEvent("incomplete", "2026-08-23T12:01:00.000Z", RecoveryPoint{ContentID: "sha256:" + strings.Repeat("b", 64), Status: snapshot.Incomplete}, nil)
-	if err := store.EnqueueAll([]string{"ops"}, incomplete, "state", "source-integrity"); err != nil {
-		t.Fatal(err)
+	if calls <= sender.failUntil {
+		return io.ErrUnexpectedEOF
 	}
-	queue := store.state.Notifiers["ops"]
-	if len(queue.Items) != maxSuccessItems+1 || queue.Items[0].Event.ID != "incomplete" || queue.Items[len(queue.Items)-1].Event.MergedSuccesses != 0 {
-		t.Fatalf("incomplete recovery was not retained with priority: %#v", queue.Items[:1])
+	return nil
+}
+
+func TestManagerAttemptsEachNotificationAtMostThreeTimes(t *testing.T) {
+	sender := &countingSender{name: "operations", failUntil: 99, reached: make(chan int64, 3)}
+	manager := newManagerWithSenders([]Sender{sender}, nil, []time.Duration{0, 0, 0})
+	ctx, cancel := context.WithCancel(context.Background())
+	manager.Start(ctx)
+	manager.Enqueue(recoveryEvent("three-attempts"))
+	for {
+		select {
+		case calls := <-sender.reached:
+			if calls == 3 {
+				cancel()
+				manager.Wait()
+				if sender.calls.Load() != 3 {
+					t.Fatalf("calls = %d", sender.calls.Load())
+				}
+				return
+			}
+		case <-time.After(time.Second):
+			cancel()
+			manager.Wait()
+			t.Fatal("notification attempts did not finish")
+		}
 	}
 }
 
-func TestCompleteRecoveryRetainsPendingIncompleteState(t *testing.T) {
-	t.Parallel()
-	store, err := OpenQueueStore(privateNotificationDir(t), []string{"ops"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	incomplete := NewRecoveryEvent("incomplete", "2026-08-23T12:00:00.000Z", RecoveryPoint{ContentID: "sha256:" + strings.Repeat("b", 64), Status: snapshot.Incomplete}, nil)
-	if err := store.EnqueueAll([]string{"ops"}, incomplete, "state", "source-integrity"); err != nil {
-		t.Fatal(err)
-	}
-	complete := recoveryEvent("complete")
-	if err := store.EnqueueAll([]string{"ops"}, complete, "success", complete.ID); err != nil {
-		t.Fatal(err)
-	}
-	queue := store.state.Notifiers["ops"]
-	if len(queue.Items) != 2 || queue.Items[0].Kind != "state" || queue.Items[0].Event.ID != "incomplete" || queue.Items[1].Kind != "success" || queue.Items[1].Event.ID != "complete" {
-		t.Fatalf("complete recovery did not retain state transition: %#v", queue.Items)
-	}
-}
-
-func TestNotificationStateReconcilesRemovedNotifiers(t *testing.T) {
-	t.Parallel()
-	dir := privateNotificationDir(t)
-	store, err := OpenQueueStore(dir, []string{"removed"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := store.EnqueueAll([]string{"removed"}, recoveryEvent("old"), "success", "old"); err != nil {
-		t.Fatal(err)
-	}
-	reopened, err := OpenQueueStore(dir, []string{"current"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, exists := reopened.state.Notifiers["removed"]; exists {
-		t.Fatal("removed notifier queue remained active")
-	}
-	if queue, exists := reopened.state.Notifiers["current"]; !exists || len(queue.Items) != 0 {
-		t.Fatalf("current notifier queue was not initialized: %#v", reopened.state.Notifiers)
+func TestManagerStopsRetryingAfterSuccess(t *testing.T) {
+	sender := &countingSender{name: "operations", failUntil: 1, reached: make(chan int64, 3)}
+	manager := newManagerWithSenders([]Sender{sender}, nil, []time.Duration{0, 0, 0})
+	ctx, cancel := context.WithCancel(context.Background())
+	manager.Start(ctx)
+	manager.Enqueue(recoveryEvent("eventual-success"))
+	for {
+		select {
+		case calls := <-sender.reached:
+			if calls == 2 {
+				cancel()
+				manager.Wait()
+				if sender.calls.Load() != 2 {
+					t.Fatalf("calls = %d", sender.calls.Load())
+				}
+				return
+			}
+		case <-time.After(time.Second):
+			cancel()
+			manager.Wait()
+			t.Fatal("notification success did not finish")
+		}
 	}
 }
 
-func TestNotificationStateRebuildsSafeInvalidFile(t *testing.T) {
+func TestManagerQueueIsBoundedAndNonblocking(t *testing.T) {
 	t.Parallel()
-	dir := privateNotificationDir(t)
-	path := filepath.Join(dir, "notifications.json")
-	if err := os.WriteFile(path, []byte("{\"schema_version\":1,\"unknown\":true}\n"), 0o600); err != nil {
-		t.Fatal(err)
+	sender := &countingSender{name: "operations"}
+	manager := newManagerWithSenders([]Sender{sender}, nil, []time.Duration{0})
+	for index := 0; index < notifierQueueCapacity+20; index++ {
+		manager.Enqueue(recoveryEvent("bounded-" + string(rune('a'+index%26))))
 	}
-	store, err := OpenQueueStore(dir, []string{"ops"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !store.Rebuilt() || store.state.Notifiers["ops"].Items == nil {
-		t.Fatalf("invalid notification state was not rebuilt: %#v", store.state)
-	}
-	if err := os.WriteFile(path, []byte("keep\n"), 0o640); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(path, 0o640); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := OpenQueueStore(dir, []string{"ops"}); err == nil {
-		t.Fatal("insecure notification state was rebuilt")
+	if queued := len(manager.workers[0].queue); queued != notifierQueueCapacity {
+		t.Fatalf("queued = %d", queued)
 	}
 }
 
-func TestManagerDefersBrokenNotifierMaterialWithoutBlockingBackupSetup(t *testing.T) {
+func TestManagerPreservesEmptyTargetArray(t *testing.T) {
 	t.Parallel()
-	manager, err := NewManager(privateNotificationDir(t), []config.Notifier{{
-		Name: "bark", Type: "bark", Timeout: config.Duration{Duration: time.Second},
-		DeviceToken: "invalid", AuthKey: "invalid", KeyID: "KEY123", TeamID: "TEAM123", Topic: "me.fin.bark",
-	}}, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	if err != nil {
-		t.Fatalf("notification material blocked manager setup: %v", err)
+	sender := &countingSender{name: "operations"}
+	manager := newManagerWithSenders([]Sender{sender}, nil, []time.Duration{0})
+	manager.Enqueue(NewSourceEvent("source", "source_degraded", "2026-08-23T12:00:00Z", "source_check_failed"))
+	queued := <-manager.workers[0].queue
+	if queued.Targets == nil || len(queued.Targets) != 0 {
+		t.Fatalf("queued targets = %#v, want a non-nil empty array", queued.Targets)
 	}
-	if err := manager.EnqueueSuccess(recoveryEvent("deferred-secret")); err != nil {
-		t.Fatalf("notification event was not persisted: %v", err)
+}
+
+func TestCancellationDropsPendingRetries(t *testing.T) {
+	sender := &countingSender{name: "operations", failUntil: 99, reached: make(chan int64, 1)}
+	manager := newManagerWithSenders([]Sender{sender}, nil, []time.Duration{0, time.Hour, time.Hour})
+	ctx, cancel := context.WithCancel(context.Background())
+	manager.Start(ctx)
+	manager.Enqueue(recoveryEvent("cancel"))
+	select {
+	case <-sender.reached:
+		cancel()
+		manager.Wait()
+	case <-time.After(time.Second):
+		cancel()
+		manager.Wait()
+		t.Fatal("first attempt did not start")
 	}
-	if err := manager.senders[0].Send(context.Background(), recoveryEvent("deferred-secret")); err == nil {
-		t.Fatal("broken deferred notifier material was accepted")
+	if sender.calls.Load() != 1 {
+		t.Fatalf("calls = %d", sender.calls.Load())
 	}
 }
 
 func TestWechatChecksHTTPAndErrcode(t *testing.T) {
-	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
+	server := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		body, _ := io.ReadAll(request.Body)
 		if !strings.Contains(string(body), `"msgtype":"text"`) {
 			t.Errorf("unexpected WeChat payload: %s", body)
 		}
-		w.Header().Set("Content-Type", "application/json")
-		switch r.URL.Path {
+		writer.Header().Set("Content-Type", "application/json")
+		switch request.URL.Path {
 		case "/http-error":
-			w.WriteHeader(http.StatusBadGateway)
-			_, _ = io.WriteString(w, `{"errcode":0}`)
+			writer.WriteHeader(http.StatusBadGateway)
+			_, _ = io.WriteString(writer, `{"errcode":0}`)
 		case "/api-error":
-			_, _ = io.WriteString(w, `{"errcode":40001}`)
+			_, _ = io.WriteString(writer, `{"errcode":40001}`)
 		default:
-			_, _ = io.WriteString(w, `{"errcode":0}`)
+			_, _ = io.WriteString(writer, `{"errcode":0}`)
 		}
 	}))
 	defer server.Close()
@@ -248,13 +226,13 @@ func TestWechatChecksHTTPAndErrcode(t *testing.T) {
 func TestNotificationHTTPClientRefusesRedirects(t *testing.T) {
 	t.Parallel()
 	var redirected atomic.Int64
-	destination := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	destination := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 		redirected.Add(1)
-		w.WriteHeader(http.StatusNoContent)
+		writer.WriteHeader(http.StatusNoContent)
 	}))
 	defer destination.Close()
-	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, destination.URL, http.StatusTemporaryRedirect)
+	origin := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		http.Redirect(writer, request, destination.URL, http.StatusTemporaryRedirect)
 	}))
 	defer origin.Close()
 	response, err := strictClient(time.Second).Get(origin.URL)
@@ -267,94 +245,21 @@ func TestNotificationHTTPClientRefusesRedirects(t *testing.T) {
 	}
 }
 
-type gatedSender struct {
-	name    string
-	started chan<- string
-	release <-chan struct{}
-}
-
-func (s *gatedSender) Name() string { return s.name }
-
-func (s *gatedSender) Send(ctx context.Context, _ Event) error {
-	s.started <- s.name
-	select {
-	case <-s.release:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-
-func TestNotifierDeliveryRunsIndependentlyPerNotifier(t *testing.T) {
-	t.Parallel()
-	names := []string{"first", "second"}
-	store, err := OpenQueueStore(privateNotificationDir(t), names)
-	if err != nil {
-		t.Fatal(err)
-	}
-	started := make(chan string, len(names))
-	release := make(chan struct{})
-	manager := &Manager{
-		store: store, names: names, log: slog.New(slog.NewTextHandler(io.Discard, nil)),
-		senders: []Sender{
-			&gatedSender{name: names[0], started: started, release: release},
-			&gatedSender{name: names[1], started: started, release: release},
-		},
-	}
-	if err := manager.EnqueueSuccess(recoveryEvent("parallel")); err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	manager.Start(ctx)
-	seen := map[string]bool{}
-	for range names {
-		select {
-		case name := <-started:
-			seen[name] = true
-		case <-time.After(time.Second):
-			cancel()
-			close(release)
-			manager.Wait()
-			t.Fatal("notifiers did not start independently")
-		}
-	}
-	if len(seen) != len(names) {
-		t.Fatalf("notifier starts = %#v", seen)
-	}
-	close(release)
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		if _, first := store.Peek(names[0]); !first {
-			if _, second := store.Peek(names[1]); !second {
-				break
-			}
-		}
-		time.Sleep(time.Millisecond)
-	}
-	cancel()
-	manager.Wait()
-	for _, name := range names {
-		if _, pending := store.Peek(name); pending {
-			t.Fatalf("notifier %s did not acknowledge delivery", name)
-		}
-	}
-}
-
 func TestBarkUsesHTTP2JWTAndChecksAPNsReason(t *testing.T) {
 	var fail atomic.Bool
-	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.ProtoMajor != 2 {
-			t.Errorf("APNs request did not use HTTP/2: %s", r.Proto)
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.ProtoMajor != 2 {
+			t.Errorf("APNs request did not use HTTP/2: %s", request.Proto)
 		}
-		if !strings.HasPrefix(r.Header.Get("authorization"), "bearer ") || r.Header.Get("apns-topic") != "me.fin.bark" {
-			t.Errorf("missing APNs headers: %#v", r.Header)
+		if !strings.HasPrefix(request.Header.Get("authorization"), "bearer ") || request.Header.Get("apns-topic") != "me.fin.bark" {
+			t.Errorf("missing APNs headers: %#v", request.Header)
 		}
 		if fail.Load() {
-			w.WriteHeader(http.StatusGone)
-			_, _ = io.WriteString(w, `{"reason":"Unregistered"}`)
+			writer.WriteHeader(http.StatusGone)
+			_, _ = io.WriteString(writer, `{"reason":"Unregistered"}`)
 			return
 		}
-		w.WriteHeader(http.StatusOK)
+		writer.WriteHeader(http.StatusOK)
 	}))
 	server.EnableHTTP2 = true
 	server.StartTLS()
@@ -368,7 +273,7 @@ func TestBarkUsesHTTP2JWTAndChecksAPNsReason(t *testing.T) {
 		t.Fatal(err)
 	}
 	senderRaw, err := newBarkSender(config.Notifier{
-		Name: "bark", Type: "bark", Timeout: config.Duration{Duration: time.Second},
+		Name: "bark", Type: "bark",
 		DeviceToken: strings.Repeat("a", 64), AuthKey: string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: encoded})),
 		KeyID: "KEY123", TeamID: "TEAM123", Topic: "me.fin.bark",
 	})
@@ -382,7 +287,7 @@ func TestBarkUsesHTTP2JWTAndChecksAPNsReason(t *testing.T) {
 	if err := sender.Send(context.Background(), recoveryEvent("bark-ok")); err != nil {
 		t.Fatal(err)
 	}
-	http1 := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }))
+	http1 := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) { writer.WriteHeader(http.StatusOK) }))
 	sender.endpoint = http1.URL
 	sender.client = http1.Client()
 	if err := sender.Send(context.Background(), recoveryEvent("bark-http1")); err == nil || !strings.Contains(err.Error(), "HTTP/2") {
@@ -396,13 +301,4 @@ func TestBarkUsesHTTP2JWTAndChecksAPNsReason(t *testing.T) {
 	if err := sender.Send(context.Background(), recoveryEvent("bark-fail")); err == nil || !strings.Contains(err.Error(), "Unregistered") {
 		t.Fatalf("APNs failure was not checked: %v", err)
 	}
-}
-
-func privateNotificationDir(t *testing.T) string {
-	t.Helper()
-	dir := t.TempDir()
-	if err := os.Chmod(dir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	return dir
 }

@@ -43,7 +43,7 @@ func TestValidatePrivateDirectoryDoesNotMutateMountRoot(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
 	path := filepath.Join(root, "mounted")
-	if err := os.Mkdir(path, 0o500); err != nil {
+	if err := os.Mkdir(path, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	if err := ValidatePrivateDirectory(path); err != nil {
@@ -53,13 +53,13 @@ func TestValidatePrivateDirectoryDoesNotMutateMountRoot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm() != 0o500 {
+	if info.Mode().Perm() != 0o700 {
 		t.Fatalf("validation changed mode to %04o", info.Mode().Perm())
 	}
-	if err := os.Chmod(path, 0o750); err != nil {
+	if err := os.Chmod(path, 0o500); err != nil {
 		t.Fatal(err)
 	}
 	if err := ValidatePrivateDirectory(path); err == nil {
-		t.Fatal("accepted group-accessible directory")
+		t.Fatal("accepted a private directory with the wrong exact mode")
 	}
 }

@@ -1,152 +1,364 @@
 package worker
 
 import (
+	"context"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strings"
-	"sync/atomic"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/hellodword/vaultwarden-less/internal/config"
-	"github.com/hellodword/vaultwarden-less/internal/state"
+	"github.com/hellodword/vaultwarden-less/internal/notify"
+	"github.com/hellodword/vaultwarden-less/internal/restic"
+	"github.com/hellodword/vaultwarden-less/internal/snapshot"
 )
 
-func schedulerConfig() *config.Backup {
-	return &config.Backup{
-		Debounce: config.Duration{Duration: 30 * time.Second}, MaxWait: config.Duration{Duration: 2 * time.Minute},
-		MinInterval: config.Duration{Duration: 5 * time.Minute}, SampleInterval: config.Duration{Duration: 15 * time.Minute},
-		EventMaxBytes: 1024, EventRatePerSecond: 10, EventBurst: 20, ListenAddress: "127.0.0.1:9090",
+func TestSchedulerQuietMaximumMinimumFallbackAndRetry(t *testing.T) {
+	t.Parallel()
+	base := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
+	var state schedule
+	state.demand(base)
+	assertSchedule(t, &state, base.Add(30*time.Second), triggerDemand)
+
+	state.demand(base.Add(20 * time.Second))
+	assertSchedule(t, &state, base.Add(50*time.Second), triggerDemand)
+	state.demand(base.Add(110 * time.Second))
+	assertSchedule(t, &state, base.Add(2*time.Minute), triggerDemand)
+
+	state.begin(base)
+	state.demand(base.Add(time.Second))
+	assertSchedule(t, &state, base.Add(5*time.Minute), triggerDemand)
+
+	state.begin(base.Add(5 * time.Minute))
+	state.complete(base.Add(5*time.Minute+10*time.Second), false)
+	assertSchedule(t, &state, base.Add(12*time.Hour+5*time.Minute+10*time.Second), triggerFallback)
+
+	state.begin(base.Add(13 * time.Hour))
+	state.complete(base.Add(13*time.Hour+10*time.Second), true)
+	assertSchedule(t, &state, base.Add(13*time.Hour+5*time.Minute+10*time.Second), triggerRetry)
+}
+
+func TestSchedulerDemandDuringCheckIsRetained(t *testing.T) {
+	t.Parallel()
+	base := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
+	state := schedule{}
+	state.demand(base)
+	state.begin(base.Add(config.QuietWindow))
+	state.demand(base.Add(config.QuietWindow + time.Second))
+	state.complete(base.Add(config.QuietWindow+2*time.Second), false)
+	assertSchedule(t, &state, base.Add(config.QuietWindow+config.MinimumCheckInterval), triggerDemand)
+}
+
+func assertSchedule(t *testing.T, state *schedule, want time.Time, wantKind triggerKind) {
+	t.Helper()
+	got, kind, ok := state.next()
+	if !ok || !got.Equal(want) || kind != wantKind {
+		t.Fatalf("next schedule = %s/%s/%t, want %s/%s/true", got, kind, ok, want, wantKind)
 	}
 }
 
-func TestSchedulerDebounceMaxWaitMinimumAndPeriodicSample(t *testing.T) {
-	t.Parallel()
-	cfg := schedulerConfig()
-	base := time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC)
-	if got := nextSnapshotAt(state.State{}, cfg, base); !got.Equal(base) {
-		t.Fatalf("startup = %s", got)
-	}
-	current := state.State{
-		Dirty: true, FirstDirtyAt: state.FormatTime(base), LastDirtyAt: state.FormatTime(base.Add(110 * time.Second)),
-		LastSampleAt: state.FormatTime(base),
-	}
-	if got, want := nextSnapshotAt(current, cfg, base), base.Add(2*time.Minute); !got.Equal(want) {
-		t.Fatalf("max wait = %s, want %s", got, want)
-	}
-	current.FirstDirtyAt = state.FormatTime(base.Add(4 * time.Minute))
-	current.LastDirtyAt = current.FirstDirtyAt
-	current.LastSnapshotAt = state.FormatTime(base)
-	if got, want := nextSnapshotAt(current, cfg, base), base.Add(5*time.Minute); !got.Equal(want) {
-		t.Fatalf("minimum interval = %s, want %s", got, want)
-	}
-	current.Dirty = false
-	if got, want := nextSnapshotAt(current, cfg, base), base.Add(15*time.Minute); !got.Equal(want) {
-		t.Fatalf("periodic sample = %s, want %s", got, want)
-	}
-	current.Source = state.Source{State: "degraded", NextRetryAt: state.FormatTime(base.Add(time.Minute))}
-	if got, want := nextSnapshotAt(current, cfg, base), base.Add(time.Minute); !got.Equal(want) {
-		t.Fatalf("source retry = %s, want %s", got, want)
-	}
-	current.Source.NextRetryAt = state.FormatTime(base.Add(-time.Second))
-	if got, want := nextSnapshotAt(current, cfg, base), base; !got.Equal(want) {
-		t.Fatalf("overdue source retry = %s, want %s", got, want)
-	}
+type fakeClock struct {
+	mu      sync.Mutex
+	now     time.Time
+	timers  []*fakeTimer
+	created chan time.Duration
 }
 
-func TestTargetBackoffIsBoundedAndJitteredWithinContract(t *testing.T) {
-	t.Parallel()
-	coordinator := &Coordinator{randomInt: func(max int64) (int64, error) { return max - 1, nil }}
-	for failures := 1; failures <= 20; failures++ {
-		delay := coordinator.targetBackoff(failures)
-		if delay < time.Minute || delay > 15*time.Minute {
-			t.Fatalf("failures %d delay %s outside contract", failures, delay)
+type fakeTimer struct {
+	clock   *fakeClock
+	due     time.Time
+	channel chan time.Time
+	stopped bool
+	fired   bool
+}
+
+func newFakeClock(now time.Time) *fakeClock {
+	return &fakeClock{now: now.UTC(), created: make(chan time.Duration, 32)}
+}
+
+func (clock *fakeClock) Now() time.Time {
+	clock.mu.Lock()
+	defer clock.mu.Unlock()
+	return clock.now
+}
+
+func (clock *fakeClock) NewTimer(duration time.Duration) timer {
+	clock.mu.Lock()
+	timer := &fakeTimer{clock: clock, due: clock.now.Add(duration), channel: make(chan time.Time, 1)}
+	clock.timers = append(clock.timers, timer)
+	clock.mu.Unlock()
+	clock.created <- duration
+	return timer
+}
+
+func (clock *fakeClock) Advance(duration time.Duration) {
+	clock.mu.Lock()
+	clock.now = clock.now.Add(duration)
+	now := clock.now
+	ready := make([]*fakeTimer, 0)
+	for _, timer := range clock.timers {
+		if !timer.stopped && !timer.fired && !timer.due.After(now) {
+			timer.fired = true
+			ready = append(ready, timer)
 		}
 	}
+	clock.mu.Unlock()
+	for _, timer := range ready {
+		timer.channel <- now
+	}
 }
 
-func TestSourceBackoffUsesFixedSchedule(t *testing.T) {
-	t.Parallel()
-	want := map[int]time.Duration{1: time.Minute, 5: 15 * time.Minute, 8: 6 * time.Hour, 20: 6 * time.Hour}
-	for failures, expected := range want {
-		if got := sourceBackoff(failures); got != expected {
-			t.Fatalf("failures %d backoff = %s, want %s", failures, got, expected)
+func (timer *fakeTimer) C() <-chan time.Time { return timer.channel }
+
+func (timer *fakeTimer) Stop() bool {
+	timer.clock.mu.Lock()
+	defer timer.clock.mu.Unlock()
+	if timer.stopped || timer.fired {
+		return false
+	}
+	timer.stopped = true
+	return true
+}
+
+type fixedSource struct {
+	manifest snapshot.Manifest
+	err      error
+	calls    int
+	called   chan struct{}
+}
+
+func (source *fixedSource) Build(context.Context) (snapshot.Result, error) {
+	source.calls++
+	if source.called != nil {
+		select {
+		case source.called <- struct{}{}:
+		default:
 		}
 	}
+	if source.err != nil {
+		return snapshot.Result{}, source.err
+	}
+	return snapshot.Result{Path: config.RecoveryPointPath, Manifest: source.manifest}, nil
 }
 
-func TestMarkDirtyRefreshesDebounceButCoalescesDuringBackup(t *testing.T) {
-	t.Parallel()
-	dir := filepath.Join(t.TempDir(), "state")
-	if err := os.Mkdir(dir, 0o700); err != nil {
-		t.Fatal(err)
+type orderedRepository struct {
+	mu      sync.Mutex
+	order   []string
+	results map[string]restic.SyncResult
+	errors  map[string]error
+	started chan struct{}
+	release chan struct{}
+}
+
+func (repository *orderedRepository) Ensure(ctx context.Context, target config.Target, manifest snapshot.Manifest) (restic.SyncResult, error) {
+	repository.mu.Lock()
+	repository.order = append(repository.order, target.Name)
+	repository.mu.Unlock()
+	if repository.started != nil {
+		select {
+		case repository.started <- struct{}{}:
+		default:
+		}
 	}
-	store, err := state.Open(dir, nil)
+	if repository.release != nil {
+		select {
+		case <-repository.release:
+		case <-ctx.Done():
+			return restic.SyncResult{}, ctx.Err()
+		}
+	}
+	if err := repository.errors[target.Name]; err != nil {
+		return restic.SyncResult{}, err
+	}
+	result := repository.results[target.Name]
+	if result.ContentID == "" {
+		result.ContentID = manifest.ContentID
+	}
+	return result, nil
+}
+
+type eventCollector struct {
+	mu     sync.Mutex
+	events []notify.Event
+}
+
+func (collector *eventCollector) Enqueue(event notify.Event) {
+	collector.mu.Lock()
+	defer collector.mu.Unlock()
+	collector.events = append(collector.events, event)
+}
+
+func (collector *eventCollector) snapshot() []notify.Event {
+	collector.mu.Lock()
+	defer collector.mu.Unlock()
+	return append([]notify.Event(nil), collector.events...)
+}
+
+func TestSchedulerRunRetainsDemandArrivingDuringCheck(t *testing.T) {
+	base := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
+	clock := newFakeClock(base)
+	manifest := workerManifest(t)
+	source := &fixedSource{manifest: manifest, called: make(chan struct{}, 1)}
+	repository := &orderedRepository{
+		results: map[string]restic.SyncResult{"primary": syncResult('a', manifest.ContentID, true)},
+		errors:  map[string]error{}, started: make(chan struct{}, 1), release: make(chan struct{}),
+	}
+	worker := newWithClock(workerConfig("primary"), source, repository, nil, discardLogger(), clock)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); worker.Run(ctx) }()
+
+	if got := <-clock.created; got != config.QuietWindow {
+		t.Fatalf("startup delay = %s", got)
+	}
+	clock.Advance(config.QuietWindow)
+	<-repository.started
+	worker.Request()
+	worker.Request()
+	close(repository.release)
+	if got := <-clock.created; got != config.MinimumCheckInterval {
+		t.Fatalf("retained demand delay = %s, want %s", got, config.MinimumCheckInterval)
+	}
+	status := worker.Status()
+	if status.State != "debouncing" || status.LastCheck == nil || status.LastCheck.Result != "created" {
+		t.Fatalf("status after first check = %#v", status)
+	}
+	cancel()
+	<-done
+}
+
+func TestWorkerConsistencyFailureRetriesEveryThirtySeconds(t *testing.T) {
+	base := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
+	clock := newFakeClock(base)
+	manifest := workerManifest(t)
+	source := &fixedSource{manifest: manifest, err: &snapshot.ConsistencyError{Path: "data/attachments/x/y", Reason: "not_found"}}
+	repository := &orderedRepository{results: map[string]restic.SyncResult{"primary": syncResult('a', manifest.ContentID, false)}, errors: map[string]error{}}
+	worker := newWithClock(workerConfig("primary"), source, repository, nil, discardLogger(), clock)
+	done := make(chan checkOutcome, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { done <- worker.check(ctx, base) }()
+	if got := <-clock.created; got != config.ConsistencyRetry {
+		t.Fatalf("consistency retry = %s", got)
+	}
+	source.err = nil
+	clock.Advance(config.ConsistencyRetry)
+	outcome := <-done
+	if outcome.result != "unchanged" || outcome.retry || source.calls != 2 {
+		t.Fatalf("outcome/calls = %#v/%d", outcome, source.calls)
+	}
+}
+
+func TestWorkerTargetsAreSerialAndPartialResultRetries(t *testing.T) {
+	t.Parallel()
+	manifest := workerManifest(t)
+	repository := &orderedRepository{
+		results: map[string]restic.SyncResult{"primary": syncResult('a', manifest.ContentID, true)},
+		errors:  map[string]error{"secondary": &restic.OperationError{Code: "backup_failed"}},
+	}
+	collector := &eventCollector{}
+	worker := New(workerConfig("primary", "secondary"), &fixedSource{manifest: manifest}, repository, collector, discardLogger())
+	outcome := worker.check(context.Background(), time.Now().UTC())
+	if outcome.result != "partial" || !outcome.retry || outcome.errorCode != "target_failed" {
+		t.Fatalf("partial outcome = %#v", outcome)
+	}
+	if got := strings.Join(repository.order, ","); got != "primary,secondary" {
+		t.Fatalf("target order = %s", got)
+	}
+	events := collector.snapshot()
+	if len(events) != 1 || events[0].Type != "recovery_point_created" || len(events[0].Targets) != 2 || events[0].Targets[1].State != "failed" {
+		t.Fatalf("recovery event = %#v", events)
+	}
+}
+
+func TestWorkerDegradedTransitionsOccurOnceAndRecoverOnce(t *testing.T) {
+	t.Parallel()
+	base := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
+	collector := &eventCollector{}
+	worker := New(workerConfig("primary"), &fixedSource{}, &orderedRepository{}, collector, discardLogger())
+	worker.targetFailed(0, base, "backup_failed")
+	worker.targetFailed(0, base.Add(config.DegradedAfter-time.Second), "backup_failed")
+	if got := len(collector.snapshot()); got != 0 {
+		t.Fatalf("events before degraded threshold = %d", got)
+	}
+	worker.targetFailed(0, base.Add(config.DegradedAfter), "backup_failed")
+	worker.targetFailed(0, base.Add(config.DegradedAfter+time.Minute), "backup_failed")
+	worker.targetSucceeded(0, base.Add(config.DegradedAfter+2*time.Minute), syncResult('a', strings.Repeat("b", 71), false))
+	worker.targetSucceeded(0, base.Add(config.DegradedAfter+3*time.Minute), syncResult('a', strings.Repeat("b", 71), false))
+	events := collector.snapshot()
+	if len(events) != 2 || events[0].Type != "target_degraded" || events[1].Type != "target_recovered" {
+		t.Fatalf("transition events = %#v", events)
+	}
+}
+
+func TestWorkerInitialStatusHasNullHistoryAndArrayTargets(t *testing.T) {
+	t.Parallel()
+	worker := New(workerConfig("primary"), &fixedSource{}, &orderedRepository{}, nil, discardLogger())
+	status := worker.Status()
+	if status.State != "idle" || status.NextCheckAt != nil || status.LastCheck != nil || status.Targets == nil || len(status.Targets) != 1 {
+		t.Fatalf("initial status = %#v", status)
+	}
+	if status.Targets[0].State != "unknown" || status.Targets[0].LastAttemptAt != nil || status.Targets[0].SnapshotID != nil {
+		t.Fatalf("initial target = %#v", status.Targets[0])
+	}
+}
+
+func TestWorkerHTTPContract(t *testing.T) {
+	t.Parallel()
+	worker := New(workerConfig("primary"), &fixedSource{}, &orderedRepository{}, nil, discardLogger())
+	handler := Handler(worker)
+
+	assertHTTP(t, handler, http.MethodGet, HealthPath, "", "", http.StatusNoContent, "")
+	assertHTTP(t, handler, http.MethodPost, EventsPath, "application/json", `{"schema_version":1}`, http.StatusNoContent, "")
+	assertHTTP(t, handler, http.MethodPost, CheckPath, "application/json", `{"schema_version":1}`, http.StatusAccepted, "{\"schema_version\":1,\"accepted\":true}\n")
+	assertHTTP(t, handler, http.MethodPost, EventsPath, "application/json", `{"schema_version":1,"extra":true}`, http.StatusBadRequest, "")
+	assertHTTP(t, handler, http.MethodPost, EventsPath, "", `{"schema_version":1}`, http.StatusUnsupportedMediaType, "")
+	assertHTTP(t, handler, http.MethodPost, EventsPath, "application/json; charset=utf-8", `{"schema_version":1}`, http.StatusUnsupportedMediaType, "")
+	assertHTTP(t, handler, http.MethodPost, EventsPath, "application/json", strings.Repeat(" ", config.EventMaxBytes+1), http.StatusRequestEntityTooLarge, "")
+	assertHTTP(t, handler, http.MethodGet, EventsPath, "", "", http.StatusMethodNotAllowed, "")
+	assertHTTP(t, handler, http.MethodGet, StatusPath+"?extra=1", "", "", http.StatusBadRequest, "")
+	assertHTTP(t, handler, http.MethodGet, "/missing", "", "", http.StatusNotFound, "")
+}
+
+func assertHTTP(t *testing.T, handler http.Handler, method, path, contentType, body string, wantStatus int, wantBody string) {
+	t.Helper()
+	request := httptest.NewRequest(method, path, strings.NewReader(body))
+	if contentType != "" {
+		request.Header.Set("Content-Type", contentType)
+	}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != wantStatus {
+		t.Fatalf("%s %s status = %d, body = %s", method, path, response.Code, response.Body.String())
+	}
+	if wantBody != "" && response.Body.String() != wantBody {
+		t.Fatalf("%s %s body = %q, want %q", method, path, response.Body.String(), wantBody)
+	}
+}
+
+func workerManifest(t *testing.T) snapshot.Manifest {
+	t.Helper()
+	manifest, err := snapshot.NewManifest([]snapshot.File{{Path: "data/db.sqlite3", Size: 1, SHA256: strings.Repeat("0", 64)}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	coordinator := &Coordinator{
-		cfg:   &config.Backup{Targets: []config.Target{{Name: "primary"}}},
-		store: store, wake: make(chan struct{}, 1),
-	}
-	base := time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC)
-	if err := coordinator.MarkDirty(base); err != nil {
-		t.Fatal(err)
-	}
-	if err := coordinator.MarkDirty(base.Add(20 * time.Second)); err != nil {
-		t.Fatal(err)
-	}
-	current := store.Snapshot()
-	if current.DirtyGeneration != 1 || current.FirstDirtyAt != state.FormatTime(base) || current.LastDirtyAt != state.FormatTime(base.Add(20*time.Second)) {
-		t.Fatalf("waiting dirty state = %#v", current)
-	}
-	if err := store.Update(func(next *state.State) error {
-		next.BackupInProgress = true
-		next.RunningGeneration = next.DirtyGeneration
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if err := coordinator.MarkDirty(base.Add(30 * time.Second)); err != nil {
-		t.Fatal(err)
-	}
-	if err := coordinator.MarkDirty(base.Add(40 * time.Second)); err != nil {
-		t.Fatal(err)
-	}
-	current = store.Snapshot()
-	if current.DirtyGeneration != 2 || current.LastDirtyAt != state.FormatTime(base.Add(30*time.Second)) {
-		t.Fatalf("in-progress dirty state did not coalesce = %#v", current)
-	}
+	return manifest
 }
 
-type eventSink struct{ count atomic.Int64 }
-
-func (s *eventSink) MarkDirty(time.Time) error { s.count.Add(1); return nil }
-
-func TestEventEndpointStrictBodyAndContentType(t *testing.T) {
-	t.Parallel()
-	sink := &eventSink{}
-	server := NewEventServer(schedulerConfig(), sink)
-	request := httptest.NewRequest(http.MethodPost, EventsPath, strings.NewReader(`{"schema_version":1}`))
-	request.Header.Set("Content-Type", "application/json")
-	response := httptest.NewRecorder()
-	server.http.Handler.ServeHTTP(response, request)
-	if response.Code != http.StatusNoContent || sink.count.Load() != 1 {
-		t.Fatalf("valid event status/count = %d/%d", response.Code, sink.count.Load())
+func workerConfig(names ...string) *config.Backup {
+	targets := make([]config.Target, 0, len(names))
+	for _, name := range names {
+		targets = append(targets, config.Target{Name: name})
 	}
-	request = httptest.NewRequest(http.MethodPost, EventsPath, strings.NewReader(`{"schema_version":1,"extra":true}`))
-	request.Header.Set("Content-Type", "application/json")
-	response = httptest.NewRecorder()
-	server.http.Handler.ServeHTTP(response, request)
-	if response.Code != http.StatusBadRequest {
-		t.Fatalf("unknown field status = %d", response.Code)
-	}
-	request = httptest.NewRequest(http.MethodPost, EventsPath, strings.NewReader(`{"schema_version":1}`))
-	response = httptest.NewRecorder()
-	server.http.Handler.ServeHTTP(response, request)
-	if response.Code != http.StatusUnsupportedMediaType {
-		t.Fatalf("missing content type status = %d", response.Code)
-	}
+	return &config.Backup{SchemaVersion: 1, Targets: targets}
 }
+
+func syncResult(character byte, contentID string, created bool) restic.SyncResult {
+	return restic.SyncResult{SnapshotID: strings.Repeat(string(character), 64), ContentID: contentID, Created: created}
+}
+
+func discardLogger() *slog.Logger { return slog.New(slog.NewJSONHandler(io.Discard, nil)) }
