@@ -1,20 +1,29 @@
 # Configuration
 
-All product configuration and credential documents use strict schema version 2.
-Unknown fields, duplicate or additional YAML documents, unsupported fields, and
-implicit environment credentials are rejected. Private files must be
-non-symlink regular files with mode 0600 under a real mode-0700 directory owned
-by the service UID.
+Deployment configuration uses strict schema 1. Product and credential
+documents use strict schema 2. Unknown fields, duplicate keys, additional YAML
+documents, and implicit credential fallback are rejected. Every private file
+must be a non-symlink regular file with mode 0600 under real mode-0700
+directories owned by the configured runtime identity.
 
-Run `nix run .#just -- init` once to create the layout. The initializer uses
-exclusive creation, validates anything already present, and never replaces
-content.
+Create the layout with explicit numeric ownership:
+
+```sh
+nix run .#just -- init <runtime-uid> <runtime-gid>
+```
+
+The command exclusively creates missing content, validates anything already
+present, and never replaces a secret or changes an established identity. It is
+safe to repeat with the same UID/GID. UID or GID 0 is supported only when an
+operator deliberately chooses root; there is no hidden default identity. The
+invoking account must be allowed to `chown` new files when the selected numeric
+identity differs from its own.
 
 ## Deployment layout
 
 ```text
-.env
 config/
+  deployment.yaml
   backup/backup.yaml
   vaultwarden/vaultwarden.env
 credentials/
@@ -28,8 +37,42 @@ cache/
 restore/
 ```
 
-The directories and private files are ignored by Git. `deploy/` contains only
-public templates and topology.
+Runtime directories are ignored by Git. `deploy/` contains only public
+templates. There is no root `.env`, image registry setting, or project-private
+environment-variable protocol.
+
+## Deployment configuration
+
+`config/deployment.yaml` has exactly these fields:
+
+```yaml
+schema_version: 1
+runtime_uid: 1000
+runtime_gid: 1000
+listen_port: 8080
+drill_port: 8081
+```
+
+- `schema_version` is the integer 1, not a quoted value or boolean.
+- UID/GID are integers from 0 through 4294967294.
+- ports are integers from 0 through 65535; 0 asks Docker for an ephemeral
+  loopback port.
+- equal nonzero production and drill ports are rejected.
+
+The renderer reads product/image identity from `VERSION` and `UPSTREAMS.toml`,
+not from this file. It accepts only the declared `@@...@@` template tokens and
+rejects unresolved tokens or Compose `${...}` interpolation. Compose is always
+called with `/dev/null` as its environment file, an explicit project name,
+the deployment root as project directory, and rendered YAML on stdin.
+The production and drill project names are fixed, so one Docker daemon supports
+one vaultwarden-less deployment; use a separate daemon or VM for another
+instance.
+
+Docker subprocesses receive only `PATH`, `TMPDIR`, an isolated credential-free
+Docker config, and these optional standard client inputs when the caller
+supplied them: `DOCKER_HOST`, `DOCKER_TLS_VERIFY`, `DOCKER_CERT_PATH`, and
+`DOCKER_API_VERSION`. SSH is used for ordinary port forwarding, not as a hidden
+Docker transport contract.
 
 ## Backup configuration
 
@@ -49,32 +92,21 @@ targets:
 notifiers:
   - name: operations
     type: wechat
-  - name: phone
-    type: bark
 ```
 
-At least one target is required. Target and notifier names are unique lowercase
-identifiers. A repository must be a credential-free
-`s3:http[s]://host/bucket/path` locator. User information, query strings,
-fragments, empty path components, and traversal components are rejected.
-Plaintext HTTP is intended only for isolated local testing and produces a
-warning.
+At least one target is required. Names are unique lowercase identifiers. A
+repository is a credential-free `s3:http[s]://host/bucket/path` locator.
+User information, query strings, fragments, empty/traversal components, and
+unknown Restic options are rejected. Plain HTTP is test-only and warns.
 
-Only these Restic options are accepted:
+Only `s3.bucket-lookup` (`auto`, `dns`, or `path`) and a constrained
+`s3.region` are configurable. Scheduling, retries, retention, paths, Restic
+identity, and supported upstream tuples remain product constants.
 
-- `s3.bucket-lookup`: `auto`, `dns`, or `path`;
-- `s3.region`: a constrained non-empty region identifier.
+## Role credentials and Restic passwords
 
-Scheduling, retry intervals, timeouts, retention, filesystem locations, Restic
-identity, and supported upstream tuples are product constants, not
-configuration.
-
-## Role credentials
-
-The resident worker reads `credentials/backup/credentials.yaml`. One-shot
-repository maintenance and restore read
-`credentials/maintenance/credentials.yaml`. Both documents have the same
-shape:
+The worker reads `credentials/backup/credentials.yaml`; one-shot maintenance
+and restore read `credentials/maintenance/credentials.yaml`:
 
 ```yaml
 schema_version: 2
@@ -85,93 +117,39 @@ targets:
 ```
 
 The target key set must exactly match `backup.yaml`. Each entry accepts exactly
-the two keys shown. Session tokens, extra keys, and ambient AWS environment
-variables are unsupported.
+the two shown keys. Restic receives exactly those two variables plus
+`TMPDIR=/tmp`; ambient AWS, Restic, HOME, PATH, and session variables are not
+forwarded.
 
-Compose never mounts the maintenance role into the resident worker and never
-mounts the backup role into maintenance or restore.
+Each target also has a distinct 0600 password file, for example
+`credentials/restic/primary`. There is no shared-password or environment
+fallback. Back up credential and password files separately from repositories.
 
-## Restic passwords
+## Notifiers and Vaultwarden
 
-Each target has a distinct 0600 password file named exactly after the target:
+`credentials/notifiers/credentials.yaml` has exactly one entry per notifier
+reference and no extras. WeChat accepts one HTTPS `webhook_url`. Bark requires
+its device token, PKCS#8 P-256 key, key/team IDs, topic, and optional sound.
+Notifier credentials are mounted only into the resident worker.
 
-```text
-credentials/restic/primary
-credentials/restic/cold
-```
+`config/vaultwarden/vaultwarden.env` starts from
+`deploy/vaultwarden.env.template` and is passed only to Vaultwarden. The
+template disables signup, invitation, admin, web-vault, push, icon download,
+and outbound features. It and regenerated RSA state are outside recovery.
 
-The file contains one non-empty secret with an optional final line ending.
-Target names cannot contain path separators, and the containing directory is
-validated before use. There is no shared-password fallback and no
-`RESTIC_PASSWORD` environment fallback.
-
-A new repository must be initialized with the password that will remain
-associated with that target. Back up these files separately from the Restic
-repositories.
-
-## Notifier credentials
-
-`credentials/notifiers/credentials.yaml` has an exact key for every notifier
-reference and no extra keys:
-
-```yaml
-schema_version: 2
-notifiers:
-  operations:
-    webhook_url: https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=replace-me
-  phone:
-    device_token: 64-lowercase-hex
-    auth_key: |
-      -----BEGIN PRIVATE KEY-----
-      ...
-      -----END PRIVATE KEY-----
-    key_id: ABC123
-    team_id: TEAM123
-    topic: me.fin.bark
-    sound: "1107"
-```
-
-A WeChat notifier accepts only an HTTPS `webhook_url`. A Bark notifier uses
-direct APNs delivery and requires the device token, PKCS#8 P-256 private key,
-key ID, team ID, and topic; `sound` is optional.
-
-Notifier credentials are mounted only into the resident worker. Maintenance and
-restore cannot read them. When `notifiers: []`, no notifier credential entry
-is required.
-
-## Vaultwarden settings
-
-`config/vaultwarden/vaultwarden.env` is copied from
-`deploy/vaultwarden.env.template`. It is passed only to Vaultwarden. The
-template disables signup, invitation, admin access, web-vault serving, push,
-icon download, and outbound features by default; review every change against
-the pinned Vaultwarden release.
-
-This file and Vaultwarden's regenerated RSA material are outside the recovery
-point. Preserve the application settings separately. Do not add a real secret
-to the tracked template.
-
-## Generated Compose environment
-
-The ignored root `.env` contains:
-
-- deployment UID/GID and absolute bind root;
-- local image tags;
-- the private Vaultwarden environment path;
-- loopback ports; and
-- the selected verified-restore path for a drill.
-
-It is machine-specific configuration, not an image registry file. All runtime
-services use the recorded UID/GID. With a remote Docker daemon, those IDs and
-paths describe the Docker host, not the machine invoking Just.
-
-## Validation
+## Validation and remote daemons
 
 ```sh
 nix run .#just -- config-validate
 ```
 
-This validates `backup.yaml`, every target password, the backup-role exact key
-set, notifier credential resolution, and notifier protocol fields without
-contacting a repository. Each maintenance or restore command separately
-validates the maintenance role before invoking Restic.
+This validates product configuration, target passwords, role key sets, and
+notifier fields without contacting repositories. Maintenance commands validate
+the maintenance role again before invoking Restic.
+
+Relative Compose binds are intentionally rooted at the source/deployment tree.
+With a remote Docker daemon, that exact absolute tree and ownership must exist
+on the Docker host. For real deployment, run Just through SSH on that host.
+Using `DOCKER_HOST` from a different machine is appropriate for image loading
+and isolated verification when ports are forwarded, but it does not copy or
+initialize the host filesystem.

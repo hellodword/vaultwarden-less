@@ -10,11 +10,11 @@ a second set of release commands.
 ```text
 generate-check   verify generated upstream constants
 fmt / fmt-check  format or check Go, Nix, and Python
-test             run Go and initializer tests
+test             run Go and deployment-script tests
 race             run Go tests with the race detector
 vet               run go vet
 lint              run golangci-lint and Ruff
-compose-check     render production plus E2E Compose
+compose-check     render every production Compose profile
 check             normal local gate plus nix flake check
 security          run govulncheck
 build             build binaries, patched Restic, and all local images
@@ -50,9 +50,9 @@ loopback ports. The fixed ports are a test transport detail, never production
 service exposure.
 
 The E2E deliberately uses the production 30-second quiet window and five-minute
-minimum check-start interval. Its four recovery points therefore take roughly
-20–30 minutes on a healthy machine; a shorter run would not exercise the
-shipped scheduler policy.
+minimum check-start interval. It must publish exactly two recovery points and
+therefore takes several minutes even with cached images. The complete assertion
+matrix and no-skip proof are in [Verification](verification.md).
 
 ## Offline image transfer
 
@@ -107,9 +107,9 @@ available in advance. The same load boundary can be inspected directly with
 `bundle-verify`. The image archive avoids all product compilation; it does not
 include Nix inputs or a Docker daemon.
 
-A bundle never contains `.env`, application settings, credentials, passwords,
-volumes, databases, staging, or restored data. Transfer and back up those
-separately.
+A bundle never contains deployment configuration, application settings,
+credentials, passwords, volumes, databases, staging, or restored data.
+Transfer and back up those separately.
 
 ## Initial deployment
 
@@ -117,12 +117,13 @@ Use the source tree from the same commit recorded in `bundle.json` (the bundle
 also contains `source.tar`). On the deployment host filesystem:
 
 ```sh
-nix run .#just -- init
+nix run .#just -- init <runtime-uid> <runtime-gid>
 ```
 
 Edit:
 
 ```text
+config/deployment.yaml
 config/vaultwarden/vaultwarden.env
 config/backup/backup.yaml
 credentials/backup/credentials.yaml
@@ -141,14 +142,18 @@ nix run .#just -- ps
 nix run .#just -- logs
 ```
 
-`init` is safe to repeat but intentionally refuses wrong ownership, modes,
-symlinks, and existing non-private files. It does not update an old layout.
+`init` is safe to repeat with the same explicit identity but intentionally
+refuses wrong ownership, modes, symlinks, existing non-private files, and a
+different UID/GID. UID/GID 0 is supported only when explicitly chosen. It does
+not update an old layout. Run the recipe from an account that can `chown` the
+new layout when the selected identity differs from the invoking account.
 
-The Compose bind paths in `.env` refer to the Docker host. If a Docker client
-uses `DOCKER_HOST` to reach another machine, image loading can be remote, but
-`init` still changes the local filesystem. For a real bind-mounted deployment,
-run initialization and operations on the deployment host (for example through
-SSH) or otherwise provision the exact remote paths and ownership explicitly.
+Compose bind paths are relative to the explicit deployment project directory
+and resolve to absolute paths for the Docker daemon. If a client uses
+`DOCKER_HOST` to reach another machine, image loading can be remote, but `init`
+still changes the local filesystem. For a real bind-mounted deployment, run
+initialization and operations on the deployment host through SSH, or provision
+the exact same absolute paths and ownership there.
 
 Only the proxy is published, at `127.0.0.1:8080` by default. Terminate TLS at a
 trusted edge, remove any external path prefix, discard untrusted forwarding
@@ -200,8 +205,8 @@ intermediate point.
 Restore publishes only a verified absent output:
 
 ```sh
-nix run .#just -- restore primary /restore/prepared
-nix run .#just -- restore-snapshot <full-64-hex-id> primary /restore/older
+nix run .#just -- restore primary prepared
+nix run .#just -- restore-snapshot <full-64-hex-id> primary older
 ```
 
 The default resolves the latest product-v2 snapshot. If that snapshot is
@@ -216,18 +221,22 @@ restore data.
 
 ## Recovery drill
 
-Point `DRILL_RECOVERY_PATH` in `.env` at a verified restore directory and
-run:
+Pass the validated restore output name created beneath `restore/`:
 
 ```sh
-nix run .#just -- drill-up
+nix run .#just -- drill-up prepared
 nix run .#just -- drill-status
 nix run .#just -- drill-down
 ```
 
 Each `drill-up` resets only the separate drill Compose project's disposable
-copy volume, copies verified `data` from the read-only restore, and starts the
-same pinned Vaultwarden image on isolated networks and a loopback port.
+copy volume, uses a root-only one-shot copy service to populate and chown that
+volume to the explicitly configured runtime identity, and starts the same
+pinned Vaultwarden image as that identity on isolated networks and a loopback
+port. The copy service has no network and receives only the `CHOWN`,
+`DAC_OVERRIDE`, and `FOWNER` capabilities needed to read the private restore
+and prepare the disposable volume. No long-running product image has a hidden
+default user.
 `drill-down` deletes only that disposable volume. It does not change or delete
 the verified restore.
 

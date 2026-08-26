@@ -1,5 +1,3 @@
-//go:build systemtest
-
 package restore_test
 
 import (
@@ -11,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"os"
 	"os/exec"
@@ -31,14 +30,18 @@ import (
 var motoServerImage = "vaultwarden-less-moto:" + upstream.MotoVersion
 
 var (
-	motoHostPort      = flag.Int("moto-host-port", 0, "fixed host port for Moto; zero asks Docker for an ephemeral port")
-	motoPublishedHost = flag.String("published-host", defaultPublishedHost(), "host through which this test reaches Docker-published ports")
+	runMotoIntegration = flag.Bool("run-moto-integration", false, "run the real Moto and Restic integration test")
+	motoHostPort       = flag.Int("moto-host-port", 0, "fixed host port for Moto; zero asks Docker for an ephemeral port")
+	motoPublishedHost  = flag.String("published-host", "127.0.0.1", "host through which this test reaches Docker-published ports")
 )
 
-// TestMotoResticRoundTrip exercises the real Restic/S3 command boundary. All
+// TestMotoResticIntegration exercises the real Restic/S3 command boundary. All
 // filesystem data is owned by testing.T and the exact Moto container is
 // removed even when the test fails.
-func TestMotoResticRoundTrip(t *testing.T) {
+func TestMotoResticIntegration(t *testing.T) {
+	if !*runMotoIntegration {
+		t.Skip("pass -run-moto-integration to run the real external integration")
+	}
 	publishedHost := validatePublishedHost(t, *motoPublishedHost)
 	if *motoHostPort != 0 && (*motoHostPort < 1024 || *motoHostPort > 65535) {
 		t.Fatalf("invalid -moto-host-port %d", *motoHostPort)
@@ -49,27 +52,28 @@ func TestMotoResticRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("restic is required in the integration shell: %v", err)
 	}
-	if _, err := runDocker(ctx, "info"); err != nil {
+	docker := newDockerClient(t)
+	if _, err := docker.run(ctx, "info"); err != nil {
 		t.Fatalf("Docker daemon is required for the integration test: %v", err)
 	}
-	loadMotoImage(ctx, t)
+	loadMotoImage(ctx, t, docker)
 
 	containerName := fmt.Sprintf("vaultwarden-less-moto-%d-%d", os.Getpid(), time.Now().UnixNano())
-	publish := "0.0.0.0::5000"
+	publish := "127.0.0.1::5000"
 	if *motoHostPort != 0 {
-		publish = "0.0.0.0:" + strconv.Itoa(*motoHostPort) + ":5000"
+		publish = "127.0.0.1:" + strconv.Itoa(*motoHostPort) + ":5000"
 	}
-	if output, err := runDocker(ctx, "run", "--detach", "--name", containerName, "--publish", publish, motoServerImage, "-H", "0.0.0.0"); err != nil {
+	if output, err := docker.run(ctx, "run", "--detach", "--name", containerName, "--publish", publish, motoServerImage, "-H", "0.0.0.0"); err != nil {
 		t.Fatalf("start Moto: %v (%s)", err, output)
 	}
 	t.Cleanup(func() {
 		cleanupContext, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 		defer cleanupCancel()
-		_, _ = runDocker(cleanupContext, "rm", "--force", containerName)
+		_, _ = docker.run(cleanupContext, "rm", "--force", containerName)
 	})
 
-	endpointPort := waitForPublishedPort(ctx, t, containerName, publishedHost)
-	createMotoBucket(ctx, t, containerName)
+	endpointPort := waitForPublishedPort(ctx, t, docker, containerName, publishedHost)
+	createMotoBucket(ctx, t, docker, containerName)
 
 	root := t.TempDir()
 	dataDir := privateDirectory(t, root, "data")
@@ -102,81 +106,152 @@ func TestMotoResticRoundTrip(t *testing.T) {
 	if err := runner.Init(ctx, target); err != nil {
 		t.Fatal(err)
 	}
-	firstSync, err := runner.Ensure(ctx, target, first.Manifest)
-	if err != nil || !firstSync.Created {
-		t.Fatalf("first sync = %#v/%v", firstSync, err)
-	}
-	unchanged, err := runner.Ensure(ctx, target, first.Manifest)
-	if err != nil || unchanged.Created || unchanged.SnapshotID != firstSync.SnapshotID {
-		t.Fatalf("unchanged sync = %#v/%v", unchanged, err)
+
+	if !t.Run("backup_deduplicate_check_unlock_and_restore", func(t *testing.T) {
+		firstSync, err := runner.Ensure(ctx, target, first.Manifest)
+		if err != nil || !firstSync.Created {
+			t.Fatalf("first sync = %#v/%v", firstSync, err)
+		}
+		unchanged, err := runner.Ensure(ctx, target, first.Manifest)
+		if err != nil || unchanged.Created || unchanged.SnapshotID != firstSync.SnapshotID {
+			t.Fatalf("unchanged sync = %#v/%v", unchanged, err)
+		}
+
+		mutateSyntheticDatabase(t, filepath.Join(dataDir, "db.sqlite3"))
+		second, err := (snapshot.Builder{DataDir: dataDir, StagingDir: stagingDir}).Build(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if second.Manifest.ContentID == first.Manifest.ContentID {
+			t.Fatal("source mutation did not change content ID")
+		}
+		secondSync, err := runner.Ensure(ctx, target, second.Manifest)
+		if err != nil || !secondSync.Created || secondSync.SnapshotID == firstSync.SnapshotID {
+			t.Fatalf("second sync = %#v/%v", secondSync, err)
+		}
+		listed, truncated, err := runner.Snapshots(ctx, target, 100)
+		if err != nil || truncated || len(listed) != 2 {
+			t.Fatalf("snapshots = %#v/%v", listed, err)
+		}
+		if err := runner.Check(ctx, target, ""); err != nil {
+			t.Fatal(err)
+		}
+		if err := runner.Unlock(ctx, target); err != nil {
+			t.Fatal(err)
+		}
+
+		latestOutput := filepath.Join(restoreRoot, "latest")
+		latest, err := restoretool.Run(ctx, runner, restoretool.Request{Target: target, Output: latestOutput, RestoreRoot: restoreRoot})
+		if err != nil || latest.SnapshotID != secondSync.SnapshotID || latest.ContentID != second.Manifest.ContentID {
+			t.Fatalf("latest restore = %#v/%v", latest, err)
+		}
+		if _, err := snapshot.Verify(ctx, latestOutput); err != nil {
+			t.Fatal(err)
+		}
+		explicitOutput := filepath.Join(restoreRoot, "explicit-old")
+		explicit, err := restoretool.Run(ctx, runner, restoretool.Request{Target: target, SnapshotID: firstSync.SnapshotID, Output: explicitOutput, RestoreRoot: restoreRoot})
+		if err != nil || explicit.ContentID != first.Manifest.ContentID {
+			t.Fatalf("explicit restore = %#v/%v", explicit, err)
+		}
+		if _, err := restoretool.Run(ctx, runner, restoretool.Request{Target: target, SnapshotID: firstSync.SnapshotID, Output: explicitOutput, RestoreRoot: restoreRoot}); err == nil {
+			t.Fatal("restore unexpectedly overwrote an existing output")
+		}
+
+		if err := os.RemoveAll(second.Path); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(second.Path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(second.Path, "manifest.json"), []byte("{\"schema_version\":1}\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		invalidContent := strings.Repeat("c", 64)
+		invalidID, err := rawResticBackup(ctx, resticBinary, cacheDir, passwordFile, second.Path, target, invalidContent)
+		if err != nil {
+			t.Fatal(err)
+		}
+		invalidOutput := filepath.Join(restoreRoot, "invalid-latest")
+		if _, err := restoretool.Run(ctx, runner, restoretool.Request{Target: target, Output: invalidOutput, RestoreRoot: restoreRoot}); err == nil {
+			t.Fatal("invalid latest snapshot was silently skipped")
+		}
+		if _, err := os.Lstat(invalidOutput); !os.IsNotExist(err) {
+			t.Fatalf("failed restore published output: %v", err)
+		}
+		oldAgain := filepath.Join(restoreRoot, "explicit-after-invalid")
+		if restored, err := restoretool.Run(ctx, runner, restoretool.Request{Target: target, SnapshotID: firstSync.SnapshotID, Output: oldAgain, RestoreRoot: restoreRoot}); err != nil || restored.SnapshotID == invalidID {
+			t.Fatalf("explicit old restore after invalid latest = %#v/%v", restored, err)
+		}
+	}) {
+		return
 	}
 
-	mutateSyntheticDatabase(t, filepath.Join(dataDir, "db.sqlite3"))
-	second, err := (snapshot.Builder{DataDir: dataDir, StagingDir: stagingDir}).Build(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if second.Manifest.ContentID == first.Manifest.ContentID {
-		t.Fatal("source mutation did not change content ID")
-	}
-	secondSync, err := runner.Ensure(ctx, target, second.Manifest)
-	if err != nil || !secondSync.Created || secondSync.SnapshotID == firstSync.SnapshotID {
-		t.Fatalf("second sync = %#v/%v", secondSync, err)
-	}
-	listed, truncated, err := runner.Snapshots(ctx, target, 100)
-	if err != nil || truncated || len(listed) != 2 {
-		t.Fatalf("snapshots = %#v/%v", listed, err)
-	}
-	if err := runner.Check(ctx, target, ""); err != nil {
-		t.Fatal(err)
-	}
-	prune, err := runner.Prune(ctx, target, false)
-	if err != nil || prune.Applied {
-		t.Fatalf("dry-run prune = %#v/%v", prune, err)
-	}
+	t.Run("prune_dry_run_and_apply_exact_scope", func(t *testing.T) {
+		baseTime := time.Now().UTC().AddDate(-10, 0, 0).Truncate(time.Hour)
+		historical := make([]string, 0, 4)
+		for index := 0; index < 4; index++ {
+			id, err := rawResticBackupAt(
+				ctx, resticBinary, cacheDir, passwordFile, first.Path, target,
+				fmt.Sprintf("%064x", index+1), restic.SnapshotHost,
+				baseTime.Add(time.Duration(index)*time.Second),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			historical = append(historical, id)
+		}
+		outOfScopeID, err := rawResticBackupAt(
+			ctx, resticBinary, cacheDir, passwordFile, first.Path, target,
+			strings.Repeat("e", 64), "outside-vaultwarden-less",
+			baseTime.Add(10*time.Second),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
 
-	latestOutput := filepath.Join(restoreRoot, "latest")
-	latest, err := restoretool.Run(ctx, runner, restoretool.Request{Target: target, Output: latestOutput, RestoreRoot: restoreRoot})
-	if err != nil || latest.SnapshotID != secondSync.SnapshotID || latest.ContentID != second.Manifest.ContentID {
-		t.Fatalf("latest restore = %#v/%v", latest, err)
-	}
-	if _, err := snapshot.Verify(ctx, latestOutput); err != nil {
-		t.Fatal(err)
-	}
-	explicitOutput := filepath.Join(restoreRoot, "explicit-old")
-	explicit, err := restoretool.Run(ctx, runner, restoretool.Request{Target: target, SnapshotID: firstSync.SnapshotID, Output: explicitOutput, RestoreRoot: restoreRoot})
-	if err != nil || explicit.ContentID != first.Manifest.ContentID {
-		t.Fatalf("explicit restore = %#v/%v", explicit, err)
-	}
-	if _, err := restoretool.Run(ctx, runner, restoretool.Request{Target: target, SnapshotID: firstSync.SnapshotID, Output: explicitOutput, RestoreRoot: restoreRoot}); err == nil {
-		t.Fatal("restore unexpectedly overwrote an existing output")
-	}
+		dryRun, err := runner.Prune(ctx, target, false)
+		if err != nil || dryRun.Applied {
+			t.Fatalf("dry-run prune = %#v/%v", dryRun, err)
+		}
+		dryRemove := pruneRemovalSet(t, dryRun)
+		if len(dryRemove) != 2 {
+			t.Fatalf("controlled retention remove set = %#v, want exactly two", dryRemove)
+		}
+		historicalSet := map[string]bool{}
+		for _, id := range historical {
+			historicalSet[id] = true
+		}
+		for id := range dryRemove {
+			if !historicalSet[id] || id == outOfScopeID {
+				t.Fatalf("dry-run selected an out-of-scope snapshot: %s", id)
+			}
+		}
+		applied, err := runner.Prune(ctx, target, true)
+		if err != nil || !applied.Applied {
+			t.Fatalf("applied prune = %#v/%v", applied, err)
+		}
+		appliedRemove := pruneRemovalSet(t, applied)
+		if !maps.Equal(appliedRemove, dryRemove) {
+			t.Fatalf("applied remove set = %#v, dry-run = %#v", appliedRemove, dryRemove)
+		}
 
-	if err := os.RemoveAll(second.Path); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Mkdir(second.Path, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(second.Path, "manifest.json"), []byte("{\"schema_version\":1}\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	invalidContent := strings.Repeat("c", 64)
-	invalidID, err := rawResticBackup(ctx, resticBinary, cacheDir, passwordFile, second.Path, target, invalidContent)
-	if err != nil {
-		t.Fatal(err)
-	}
-	invalidOutput := filepath.Join(restoreRoot, "invalid-latest")
-	if _, err := restoretool.Run(ctx, runner, restoretool.Request{Target: target, Output: invalidOutput, RestoreRoot: restoreRoot}); err == nil {
-		t.Fatal("invalid latest snapshot was silently skipped")
-	}
-	if _, err := os.Lstat(invalidOutput); !os.IsNotExist(err) {
-		t.Fatalf("failed restore published output: %v", err)
-	}
-	oldAgain := filepath.Join(restoreRoot, "explicit-after-invalid")
-	if restored, err := restoretool.Run(ctx, runner, restoretool.Request{Target: target, SnapshotID: firstSync.SnapshotID, Output: oldAgain, RestoreRoot: restoreRoot}); err != nil || restored.SnapshotID == invalidID {
-		t.Fatalf("explicit old restore after invalid latest = %#v/%v", restored, err)
-	}
+		remaining, err := rawResticSnapshotIDs(ctx, resticBinary, cacheDir, passwordFile, target)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, id := range historical {
+			wantPresent := !dryRemove[id]
+			if remaining[id] != wantPresent {
+				t.Fatalf("historical snapshot %s has wrong post-prune presence", id)
+			}
+		}
+		if !remaining[outOfScopeID] {
+			t.Fatalf("prune removed out-of-scope snapshot %s", outOfScopeID)
+		}
+		if err := runner.Check(ctx, target, ""); err != nil {
+			t.Fatal(err)
+		}
+	})
 }
 
 func privateDirectory(t *testing.T, parent, name string) string {
@@ -211,12 +286,12 @@ func mutateSyntheticDatabase(t *testing.T, path string) {
 	}
 }
 
-func createMotoBucket(ctx context.Context, t *testing.T, containerName string) {
+func createMotoBucket(ctx context.Context, t *testing.T, docker *dockerClient, containerName string) {
 	t.Helper()
 	command := []string{"exec", containerName, "python", "-c", "import boto3; boto3.client('s3', endpoint_url='http://127.0.0.1:5000', aws_access_key_id='test', aws_secret_access_key='test', region_name='us-east-1').create_bucket(Bucket='vaultwarden-less-test')"}
 	var lastError error
 	for attempt := 0; attempt < 60; attempt++ {
-		if _, lastError = runDocker(ctx, command...); lastError == nil {
+		if _, lastError = docker.run(ctx, command...); lastError == nil {
 			return
 		}
 		select {
@@ -228,11 +303,11 @@ func createMotoBucket(ctx context.Context, t *testing.T, containerName string) {
 	t.Fatalf("create Moto bucket: %v", lastError)
 }
 
-func waitForPublishedPort(ctx context.Context, t *testing.T, name, publishedHost string) int {
+func waitForPublishedPort(ctx context.Context, t *testing.T, docker *dockerClient, name, publishedHost string) int {
 	t.Helper()
 	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
-		output, err := runDocker(ctx, "port", name, "5000/tcp")
+		output, err := docker.run(ctx, "port", name, "5000/tcp")
 		if err == nil {
 			fields := strings.Fields(strings.TrimSpace(output))
 			if len(fields) > 0 {
@@ -258,6 +333,19 @@ func waitForPublishedPort(ctx context.Context, t *testing.T, name, publishedHost
 }
 
 func rawResticBackup(ctx context.Context, binary, cacheDir, passwordFile, recoveryPath string, target config.Target, contentHex string) (string, error) {
+	return rawResticBackupAt(
+		ctx, binary, cacheDir, passwordFile, recoveryPath, target,
+		contentHex, restic.SnapshotHost, time.Time{},
+	)
+}
+
+func rawResticBackupAt(
+	ctx context.Context,
+	binary, cacheDir, passwordFile, recoveryPath string,
+	target config.Target,
+	contentHex, host string,
+	when time.Time,
+) (string, error) {
 	arguments := []string{
 		"--repo", target.Repository,
 		"--password-file", passwordFile,
@@ -265,16 +353,23 @@ func rawResticBackup(ctx context.Context, binary, cacheDir, passwordFile, recove
 		"--option", "s3.bucket-lookup=path",
 		"--option", "s3.region=us-east-1",
 		"backup", "--json",
-		"--host", restic.SnapshotHost,
+		"--host", host,
 		"--tag", restic.SnapshotTag,
 		"--tag", "content-id=" + contentHex,
-		"--", recoveryPath,
 	}
+	if !when.IsZero() {
+		arguments = append(arguments, "--time", when.Format("2006-01-02 15:04:05"))
+	}
+	arguments = append(arguments, "--", recoveryPath)
 	command := exec.CommandContext(ctx, binary, arguments...)
 	command.Env = testResticEnvironment()
-	output, err := command.Output()
+	output, err := command.CombinedOutput()
 	if err != nil {
-		return "", fmt.Errorf("plant invalid snapshot: %w", err)
+		diagnostics := strings.TrimSpace(string(output))
+		if len(diagnostics) > 2000 {
+			diagnostics = diagnostics[:2000] + "..."
+		}
+		return "", fmt.Errorf("plant raw snapshot: %w: %s", err, diagnostics)
 	}
 	scanner := bufio.NewScanner(strings.NewReader(string(output)))
 	for scanner.Scan() {
@@ -296,14 +391,60 @@ func rawResticBackup(ctx context.Context, binary, cacheDir, passwordFile, recove
 }
 
 func testResticEnvironment() []string {
-	environment := make([]string, 0, len(os.Environ())+3)
-	for _, value := range os.Environ() {
-		name, _, ok := strings.Cut(value, "=")
-		if ok && !strings.HasPrefix(name, "AWS_") && !strings.HasPrefix(name, "RESTIC_") && name != "TMPDIR" {
-			environment = append(environment, value)
+	return []string{
+		"TMPDIR=/tmp",
+		"AWS_ACCESS_KEY_ID=test",
+		"AWS_SECRET_ACCESS_KEY=test",
+	}
+}
+
+func rawResticSnapshotIDs(
+	ctx context.Context,
+	binary, cacheDir, passwordFile string,
+	target config.Target,
+) (map[string]bool, error) {
+	arguments := []string{
+		"--repo", target.Repository,
+		"--password-file", passwordFile,
+		"--cache-dir", filepath.Join(cacheDir, target.Name),
+		"--option", "s3.bucket-lookup=path",
+		"--option", "s3.region=us-east-1",
+		"snapshots", "--json",
+	}
+	command := exec.CommandContext(ctx, binary, arguments...)
+	command.Env = testResticEnvironment()
+	output, err := command.Output()
+	if err != nil {
+		return nil, fmt.Errorf("list all raw snapshots: %w", err)
+	}
+	var snapshots []struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(output, &snapshots); err != nil {
+		return nil, err
+	}
+	ids := make(map[string]bool, len(snapshots))
+	for _, item := range snapshots {
+		if len(item.ID) != 64 {
+			return nil, fmt.Errorf("raw snapshot has invalid ID")
+		}
+		ids[item.ID] = true
+	}
+	return ids, nil
+}
+
+func pruneRemovalSet(t *testing.T, result restic.PruneResult) map[string]bool {
+	t.Helper()
+	got := map[string]bool{}
+	for _, group := range result.Groups {
+		for _, id := range group.RemoveSnapshotIDs {
+			if got[id] {
+				t.Fatalf("prune reported duplicate removal %s", id)
+			}
+			got[id] = true
 		}
 	}
-	return append(environment, "AWS_ACCESS_KEY_ID=test", "AWS_SECRET_ACCESS_KEY=test", "TMPDIR=/tmp")
+	return got
 }
 
 func validatePublishedHost(t *testing.T, host string) string {
@@ -314,14 +455,7 @@ func validatePublishedHost(t *testing.T, host string) string {
 	return host
 }
 
-func defaultPublishedHost() string {
-	if value := strings.TrimSpace(os.Getenv("VWLESS_E2E_PUBLISHED_HOST")); value != "" {
-		return value
-	}
-	return "127.0.0.1"
-}
-
-func loadMotoImage(ctx context.Context, t *testing.T) {
+func loadMotoImage(ctx context.Context, t *testing.T, docker *dockerClient) {
 	t.Helper()
 	repository := filepath.Clean(filepath.Join("..", ".."))
 	command := exec.CommandContext(
@@ -340,13 +474,51 @@ func loadMotoImage(ctx context.Context, t *testing.T) {
 	if err != nil || len(paths) != 1 {
 		t.Fatalf("build local Moto image: %v: %s", err, diagnostics.String())
 	}
-	if output, err := runDocker(ctx, "load", "--input", paths[0]); err != nil {
+	if output, err := docker.run(ctx, "load", "--input", paths[0]); err != nil {
 		t.Fatalf("load local Moto image: %v: %s", err, output)
 	}
 }
 
-func runDocker(ctx context.Context, arguments ...string) (string, error) {
-	command := exec.CommandContext(ctx, "docker", arguments...)
+type dockerClient struct {
+	binary      string
+	config      string
+	environment []string
+}
+
+func newDockerClient(t *testing.T) *dockerClient {
+	t.Helper()
+	binary, err := exec.LookPath("docker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := filepath.Join(t.TempDir(), "docker-config")
+	if err := os.Mkdir(config, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(config, "config.json"),
+		[]byte("{\"auths\":{\"https://index.docker.io/v1/\":{}}}\n"),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	environment := []string{
+		"PATH=" + os.Getenv("PATH"),
+		"TMPDIR=/tmp",
+		"DOCKER_CONFIG=" + config,
+	}
+	for _, name := range []string{"DOCKER_HOST", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH", "DOCKER_API_VERSION"} {
+		if value, ok := os.LookupEnv(name); ok {
+			environment = append(environment, name+"="+value)
+		}
+	}
+	return &dockerClient{binary: binary, config: config, environment: environment}
+}
+
+func (client *dockerClient) run(ctx context.Context, arguments ...string) (string, error) {
+	arguments = append([]string{"--config", client.config}, arguments...)
+	command := exec.CommandContext(ctx, client.binary, arguments...)
+	command.Env = client.environment
 	output, err := command.CombinedOutput()
 	return strings.TrimSpace(string(output)), err
 }

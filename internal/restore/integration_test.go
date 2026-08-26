@@ -1,5 +1,3 @@
-//go:build systemtest
-
 package restore_test
 
 import (

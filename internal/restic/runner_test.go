@@ -175,11 +175,12 @@ func assertExactCredentialEnvironment(t *testing.T, environment []string) {
 	found := map[string]string{}
 	for _, value := range environment {
 		name, content, ok := strings.Cut(value, "=")
-		if ok && (strings.HasPrefix(name, "AWS_") || strings.HasPrefix(name, "RESTIC_")) {
+		if ok {
 			found[name] = content
 		}
 	}
 	want := map[string]string{
+		"TMPDIR":                "/tmp",
 		"AWS_ACCESS_KEY_ID":     "synthetic-access",
 		"AWS_SECRET_ACCESS_KEY": "synthetic-secret",
 	}

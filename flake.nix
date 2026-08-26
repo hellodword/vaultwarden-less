@@ -52,7 +52,7 @@
           packages
           upstreams
           ;
-        inherit (toolchain) go treefmt;
+        inherit (toolchain) go python treefmt;
         source = ./.;
       };
 

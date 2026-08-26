@@ -2,6 +2,7 @@
   inputs,
   pkgs,
   go,
+  python,
   treefmt,
   packages,
   source,
@@ -17,7 +18,7 @@
     pkgs.runCommand "vaultwarden-less-generated-upstreams"
       {
         nativeBuildInputs = [
-          pkgs.python3
+          python
           go
         ];
       }
@@ -44,7 +45,7 @@
   script-tests =
     pkgs.runCommand "vaultwarden-less-script-tests"
       {
-        nativeBuildInputs = [ pkgs.python3 ];
+        nativeBuildInputs = [ python ];
       }
       ''
         cd ${source}
@@ -64,7 +65,7 @@
           pkgs.govulncheck
           pkgs.trivy
           pkgs.syft
-          pkgs.python3
+          python
           pkgs.ruff
           pkgs.bitwarden-cli
         ];

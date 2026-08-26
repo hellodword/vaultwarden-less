@@ -1,15 +1,11 @@
 /data/
-/state/
 /staging/
 /cache/
 /restore/
 /credentials/
 /config/
-/log/
 /dist/
 /tmp/
-
-.env
 
 AGENTS.md
 .agents/

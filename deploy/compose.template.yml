@@ -1,9 +1,7 @@
-name: vaultwarden-less
-
 x-service-defaults: &service-defaults
   platform: linux/amd64
   restart: unless-stopped
-  user: "${DEPLOY_UID:?set DEPLOY_UID}:${DEPLOY_GID:?set DEPLOY_GID}"
+  user: "@@USER_UID@@:@@USER_GID@@"
   logging:
     driver: local
     options:
@@ -22,15 +20,15 @@ x-runtime-fs: &runtime-fs
 services:
   vaultwarden:
     <<: [*service-defaults, *runtime-fs]
-    image: ${VAULTWARDEN_IMAGE:?set VAULTWARDEN_IMAGE}
+    image: @@IMAGE_VAULTWARDEN@@
     pull_policy: never
     hostname: vaultwarden
     env_file:
-      - path: ${VAULTWARDEN_ENV_FILE:?set VAULTWARDEN_ENV_FILE}
+      - path: ./config/vaultwarden/vaultwarden.env
         required: true
     volumes:
       - type: bind
-        source: ${DEPLOY_ROOT:?set DEPLOY_ROOT}/data
+        source: ./data
         target: /data
         bind:
           create_host_path: false
@@ -45,7 +43,7 @@ services:
 
   proxy:
     <<: [*service-defaults, *runtime-fs]
-    image: ${PROXY_IMAGE:?set PROXY_IMAGE}
+    image: @@IMAGE_PROXY@@
     pull_policy: never
     hostname: proxy
     entrypoint: ["/bin/vaultwarden-less-proxy"]
@@ -54,7 +52,7 @@ services:
       vaultwarden:
         condition: service_healthy
     ports:
-      - "127.0.0.1:${LISTEN_PORT:-8080}:8080"
+      - "127.0.0.1:@@PORT_PROXY@@:8080"
     networks: [app, events, proxy-ingress]
     stop_grace_period: 2m10s
     healthcheck:
@@ -65,48 +63,48 @@ services:
 
   backup:
     <<: [*service-defaults, *runtime-fs]
-    image: ${BACKUP_IMAGE:?set BACKUP_IMAGE}
+    image: @@IMAGE_BACKUP@@
     pull_policy: never
     hostname: backup
     entrypoint: ["/bin/vaultwarden-less-backup"]
     command: ["serve", "--config", "/config/backup.yaml"]
     volumes:
       - type: bind
-        source: ${DEPLOY_ROOT:?set DEPLOY_ROOT}/data
+        source: ./data
         target: /data
         read_only: true
         bind:
           create_host_path: false
       - type: bind
-        source: ${DEPLOY_ROOT:?set DEPLOY_ROOT}/staging
+        source: ./staging
         target: /staging
         bind:
           create_host_path: false
       - type: bind
-        source: ${DEPLOY_ROOT:?set DEPLOY_ROOT}/cache
+        source: ./cache
         target: /cache
         bind:
           create_host_path: false
       - type: bind
-        source: ${DEPLOY_ROOT:?set DEPLOY_ROOT}/config/backup
+        source: ./config/backup
         target: /config
         read_only: true
         bind:
           create_host_path: false
       - type: bind
-        source: ${DEPLOY_ROOT:?set DEPLOY_ROOT}/credentials/backup
+        source: ./credentials/backup
         target: /run/credentials/role
         read_only: true
         bind:
           create_host_path: false
       - type: bind
-        source: ${DEPLOY_ROOT:?set DEPLOY_ROOT}/credentials/restic
+        source: ./credentials/restic
         target: /run/credentials/restic
         read_only: true
         bind:
           create_host_path: false
       - type: bind
-        source: ${DEPLOY_ROOT:?set DEPLOY_ROOT}/credentials/notifiers
+        source: ./credentials/notifiers
         target: /run/credentials/notifiers
         read_only: true
         bind:
@@ -121,7 +119,7 @@ services:
 
   maintenance:
     <<: [*service-defaults, *runtime-fs]
-    image: ${BACKUP_IMAGE:?set BACKUP_IMAGE}
+    image: @@IMAGE_BACKUP@@
     pull_policy: never
     profiles: ["maintenance"]
     restart: "no"
@@ -129,24 +127,24 @@ services:
     command: ["repo", "snapshots", "--target", "primary", "--config", "/config/backup.yaml"]
     volumes:
       - type: bind
-        source: ${DEPLOY_ROOT:?set DEPLOY_ROOT}/cache
+        source: ./cache
         target: /cache
         bind:
           create_host_path: false
       - type: bind
-        source: ${DEPLOY_ROOT:?set DEPLOY_ROOT}/config/backup
+        source: ./config/backup
         target: /config
         read_only: true
         bind:
           create_host_path: false
       - type: bind
-        source: ${DEPLOY_ROOT:?set DEPLOY_ROOT}/credentials/maintenance
+        source: ./credentials/maintenance
         target: /run/credentials/role
         read_only: true
         bind:
           create_host_path: false
       - type: bind
-        source: ${DEPLOY_ROOT:?set DEPLOY_ROOT}/credentials/restic
+        source: ./credentials/restic
         target: /run/credentials/restic
         read_only: true
         bind:
@@ -156,7 +154,7 @@ services:
 
   restore:
     <<: [*service-defaults, *runtime-fs]
-    image: ${BACKUP_IMAGE:?set BACKUP_IMAGE}
+    image: @@IMAGE_BACKUP@@
     pull_policy: never
     profiles: ["restore"]
     restart: "no"
@@ -164,29 +162,29 @@ services:
     command: ["restore", "--target", "primary", "--output", "/restore/prepared", "--config", "/config/backup.yaml"]
     volumes:
       - type: bind
-        source: ${DEPLOY_ROOT:?set DEPLOY_ROOT}/restore
+        source: ./restore
         target: /restore
         bind:
           create_host_path: false
       - type: bind
-        source: ${DEPLOY_ROOT:?set DEPLOY_ROOT}/cache
+        source: ./cache
         target: /cache
         bind:
           create_host_path: false
       - type: bind
-        source: ${DEPLOY_ROOT:?set DEPLOY_ROOT}/config/backup
+        source: ./config/backup
         target: /config
         read_only: true
         bind:
           create_host_path: false
       - type: bind
-        source: ${DEPLOY_ROOT:?set DEPLOY_ROOT}/credentials/maintenance
+        source: ./credentials/maintenance
         target: /run/credentials/role
         read_only: true
         bind:
           create_host_path: false
       - type: bind
-        source: ${DEPLOY_ROOT:?set DEPLOY_ROOT}/credentials/restic
+        source: ./credentials/restic
         target: /run/credentials/restic
         read_only: true
         bind:
@@ -196,23 +194,30 @@ services:
 
   drill-copy:
     <<: [*service-defaults, *runtime-fs]
-    image: ${VAULTWARDEN_IMAGE:?set VAULTWARDEN_IMAGE}
+    image: @@IMAGE_VAULTWARDEN@@
     pull_policy: never
     profiles: ["drill"]
     restart: "no"
+    user: "0:0"
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
     entrypoint: ["/bin/sh", "-eu", "-c"]
-    environment:
-      DRILL_RECOVERY_NAME: ${DRILL_RECOVERY_NAME:-.}
     command:
       - |
-        source_path="/source/$$DRILL_RECOVERY_NAME"
+        source_path="/source/$$1"
         test -f "$$source_path/manifest.json"
         test -d "$$source_path/data"
         test -z "$$(ls -A /drill-data)"
         cp -a "$$source_path/data/." /drill-data/
+        chown -R "@@USER_UID@@:@@USER_GID@@" /drill-data
+      - drill-copy
+      - "@@RESTORE_NAME_DRILL@@"
+    network_mode: none
     volumes:
       - type: bind
-        source: ${DRILL_RECOVERY_PATH:?set DRILL_RECOVERY_PATH}
+        source: ./restore
         target: /source
         read_only: true
         bind:
@@ -220,11 +225,10 @@ services:
       - type: volume
         source: drill-data
         target: /drill-data
-    networks: [drill]
 
   drill-vaultwarden:
     <<: [*service-defaults, *runtime-fs]
-    image: ${VAULTWARDEN_IMAGE:?set VAULTWARDEN_IMAGE}
+    image: @@IMAGE_VAULTWARDEN@@
     pull_policy: never
     profiles: ["drill"]
     restart: "no"
@@ -232,7 +236,7 @@ services:
       drill-copy:
         condition: service_completed_successfully
     environment:
-      DOMAIN: ${DRILL_DOMAIN:-http://127.0.0.1:8081}
+      DOMAIN: http://127.0.0.1:@@PORT_DRILL@@
       DATA_FOLDER: /data
       DATABASE_URL: sqlite:///data/db.sqlite3
       RSA_KEY_FILENAME: /data/rsa_key
@@ -249,7 +253,7 @@ services:
         source: drill-data
         target: /data
     ports:
-      - "127.0.0.1:${DRILL_PORT:-8081}:80"
+      - "127.0.0.1:@@PORT_DRILL@@:80"
     networks: [drill, drill-ingress]
     stop_grace_period: 2m
     healthcheck:

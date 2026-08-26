@@ -1,5 +1,3 @@
-//go:build systemtest
-
 package e2e_test
 
 import (
@@ -18,9 +16,9 @@ import (
 	"github.com/hellodword/vaultwarden-less/tests/e2e/register"
 )
 
-// registerAccount is the only protocol fixture in the E2E because the
+// registerAccount is the first of two narrow protocol fixtures because the
 // official Bitwarden CLI deliberately does not expose account registration.
-// Every vault operation after this point uses the Nix-provided official bw.
+// Every ordinary vault operation uses the Nix-provided official bw.
 func registerAccount(ctx context.Context, t *testing.T, server, email, password string) register.Registration {
 	t.Helper()
 	post := func(path string, body []byte) (int, []byte) {

@@ -8,6 +8,24 @@ no historical deployment or database migration layer.
 A future breaking change must increment the specific contract it changes. Do
 not reuse one global version constant for unrelated formats.
 
+## Deployment surface
+
+The supported outer interface is `nix run .#just -- <recipe>`. Nix selects all
+Go, Python, formatting, Docker, Bitwarden CLI, and Restic tools. Direct host
+tooling and alternate release scripts are not supported.
+
+Production and drill use fixed, separate Compose project names. The supported
+deployment cardinality is one vaultwarden-less instance per Docker daemon.
+
+`config/deployment.yaml` is strict schema 1 with exactly `runtime_uid`,
+`runtime_gid`, `listen_port`, and `drill_port` in addition to its schema field.
+The renderer accepts no unknown/duplicate keys, booleans as integers, extra
+documents, undeclared template tokens, or Compose environment interpolation.
+
+Restore and drill public names match
+`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$` and map beneath `/restore`; callers do not
+provide arbitrary container paths. Restore never overwrites an existing name.
+
 ## CLI
 
 The backup binary exposes:
@@ -208,5 +226,6 @@ digest. Loading first verifies the SHA-256, uses `docker load`, and then
 compares every loaded image ID with metadata.
 
 The bundle contains images and review evidence only. It never contains
-deployment `.env`, Vaultwarden settings, role credentials, Restic passwords,
-notifier credentials, volumes, databases, restore outputs, or user data.
+deployment configuration, Vaultwarden settings, role credentials, Restic
+passwords, notifier credentials, volumes, databases, restore outputs, or user
+data.

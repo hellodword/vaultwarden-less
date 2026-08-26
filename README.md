@@ -21,8 +21,9 @@ The repository is designed to be understandable before it is upgradeable:
 - [`internal/upstream/vaultwarden-schema.json`](internal/upstream/vaultwarden-schema.json)
   is the complete accepted SQLite schema.
 - [`Justfile`](Justfile) is the operator and developer command index.
-- [`deploy/compose.yml`](deploy/compose.yml) is the only shipped deployment
-  topology.
+- [`deploy/compose.template.yml`](deploy/compose.template.yml) is the only
+  shipped deployment topology; `scripts/deploy.py` renders its small declared
+  token set from strict deployment YAML and audited metadata.
 - [`docs/upstream-maintenance.md`](docs/upstream-maintenance.md) is the
   one-upstream-at-a-time review procedure.
 
@@ -68,7 +69,7 @@ copy it to the target, and load it there:
 ```sh
 nix run .#just -- bundle
 nix run .#just -- bundle-load dist/vaultwarden-less-<version>-linux-amd64
-nix run .#just -- init
+nix run .#just -- init <runtime-uid> <runtime-gid>
 ```
 
 The bundle is a checked `docker save` archive. The deployment device performs
@@ -95,5 +96,6 @@ to that proxy. The worker API remains on a private Compose network.
 - [Configuration](docs/configuration.md)
 - [Contracts](docs/contracts.md)
 - [Operations and recovery](docs/operations.md)
+- [Verification evidence and acceptance](docs/verification.md)
 - [Upstream review and upgrade strategy](docs/upstream-maintenance.md)
 - [Licensing and provenance](NOTICE.md)

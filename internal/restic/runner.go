@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
@@ -361,15 +360,7 @@ func (r Runner) targetCommand(target config.Target) ([]string, []string, error) 
 }
 
 func sanitizedEnvironment(credentials map[string]string) []string {
-	environment := make([]string, 0, len(os.Environ())+3)
-	for _, value := range os.Environ() {
-		name, _, ok := strings.Cut(value, "=")
-		if !ok || strings.HasPrefix(name, "AWS_") || strings.HasPrefix(name, "RESTIC_") || name == "TMPDIR" {
-			continue
-		}
-		environment = append(environment, value)
-	}
-	environment = append(environment, "TMPDIR=/tmp")
+	environment := []string{"TMPDIR=/tmp"}
 	for _, name := range []string{"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"} {
 		if value, ok := credentials[name]; ok {
 			environment = append(environment, name+"="+value)

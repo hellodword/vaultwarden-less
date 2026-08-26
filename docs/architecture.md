@@ -105,7 +105,8 @@ embeds the complete object list rather than accepting a migration number alone.
 locally built patched Restic executable:
 
 - every target has a distinct password file and credential entry;
-- ambient `AWS_*` and `RESTIC_*` variables are removed;
+- Restic receives exactly `TMPDIR=/tmp` and the selected target's two AWS
+  credential variables; no ambient process environment is inherited;
 - repository, password, and cache values are structured process arguments;
 - snapshots are restricted by fixed host, path, and product-v2 tag;
 - a content-ID tag is the equality boundary;
@@ -136,6 +137,11 @@ only the disposable copy volume.
 
 ## Compose isolation
 
+`scripts/deploy.py` validates `config/deployment.yaml`, derives local image
+tags from the same metadata used by bundle/generation tools, and renders the
+single production template. The rendered document is not persisted. There is
+no `.env` merge or private environment-variable vocabulary to remember.
+
 - `app`: private proxy-to-Vaultwarden data plane.
 - `events`: private proxy-to-worker control plane.
 - `proxy-ingress`: loopback-only production publication.
@@ -164,9 +170,9 @@ role. Notifier credentials are mounted only into the resident worker.
 | `internal/privatefs` | Private-file checks and Linux atomic rename primitives |
 | `internal/upstream` | Generated pins and embedded Vaultwarden schema |
 | `nix/` | Toolchain, products, local images, checks, and the Restic patch |
-| `deploy/` | Production Compose topology and Vaultwarden template |
+| `deploy/` | Production Compose and Vaultwarden public templates |
 | `tests/e2e/` | Real Vaultwarden/Bitwarden/Restic/Moto lifecycle |
-| `scripts/` | Durable generation, initialization, bundle, drill, and audit tools |
+| `scripts/` | Deployment, verification, generation, bundle, and audit tools |
 
 There are no checked-out upstream trees, release scripts, hosted CI workflows,
 or registry-specific files.

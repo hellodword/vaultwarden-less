@@ -8,19 +8,26 @@ import json
 import os
 import platform
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
 import tomllib
+from project_metadata import load_project_metadata
 
 VERSION_PATTERN = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
 IMAGE_ID_PATTERN = re.compile(r"sha256:[0-9a-f]{64}")
 LOCAL_TAG_PATTERN = re.compile(
     r"vaultwarden-less-(backup|proxy|vaultwarden):[a-z0-9][a-z0-9._-]{0,127}"
 )
+DOCKER_INPUTS = (
+    "DOCKER_HOST",
+    "DOCKER_TLS_VERIFY",
+    "DOCKER_CERT_PATH",
+    "DOCKER_API_VERSION",
+)
+ANONYMOUS_DOCKER_CONFIG = '{"auths":{"https://index.docker.io/v1/":{}}}\n'
 
 
 def parser() -> argparse.ArgumentParser:
@@ -62,11 +69,24 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def read_version(path: Path) -> str:
-    value = path.read_text(encoding="utf-8").strip()
-    if not VERSION_PATTERN.fullmatch(value):
-        raise ValueError("VERSION must contain one MAJOR.MINOR.PATCH value")
-    return value
+def docker_environment(config_directory: Path) -> dict[str, str]:
+    path = os.environ.get("PATH")
+    if not path:
+        raise ValueError("PATH is required to locate Nix-provided Docker tools")
+    environment = {
+        "PATH": path,
+        "TMPDIR": os.environ.get("TMPDIR", "/tmp"),
+        "DOCKER_CONFIG": os.fspath(config_directory),
+    }
+    for name in DOCKER_INPUTS:
+        value = os.environ.get(name)
+        if value is not None:
+            environment[name] = value
+    return environment
+
+
+def docker_arguments(environment: dict[str, str], *arguments: str) -> list[str]:
+    return ["docker", "--config", environment["DOCKER_CONFIG"], *arguments]
 
 
 def clean_commit() -> str:
@@ -82,8 +102,14 @@ def clean_commit() -> str:
     return commit
 
 
-def inspect_image(tag: str) -> dict[str, object]:
-    documents = json.loads(run(["docker", "image", "inspect", tag], capture=True))
+def inspect_image(tag: str, environment: dict[str, str]) -> dict[str, object]:
+    documents = json.loads(
+        run(
+            docker_arguments(environment, "image", "inspect", tag),
+            capture=True,
+            environment=environment,
+        )
+    )
     if len(documents) != 1:
         raise ValueError(f"Docker returned an invalid inspection for {tag}")
     document = documents[0]
@@ -95,17 +121,24 @@ def inspect_image(tag: str) -> dict[str, object]:
     return document
 
 
-def load_nix_image(attribute: str) -> None:
+def load_nix_image(attribute: str, environment: dict[str, str]) -> None:
     paths = run(
         ["nix", "build", "--no-link", "--print-out-paths", f".#{attribute}"],
         capture=True,
     ).splitlines()
     if len(paths) != 1:
         raise ValueError(f"Nix returned an invalid output for {attribute}")
-    run(["docker", "load", "--input", paths[0]])
+    run(
+        docker_arguments(environment, "load", "--input", paths[0]),
+        environment=environment,
+    )
 
 
-def write_sboms(directory: Path, images: list[dict[str, str]]) -> None:
+def write_sboms(
+    directory: Path,
+    images: list[dict[str, str]],
+    environment: dict[str, str],
+) -> None:
     sbom_directory = directory / "sbom"
     sbom_directory.mkdir()
     licenses: dict[str, list[str]] = {}
@@ -120,7 +153,8 @@ def write_sboms(directory: Path, images: list[dict[str, str]]) -> None:
                 f"docker:{image['tag']}",
                 "--output",
                 f"cyclonedx-json={destination}",
-            ]
+            ],
+            environment=environment,
         )
         document = json.loads(destination.read_text(encoding="utf-8"))
         identifiers: set[str] = set()
@@ -138,61 +172,47 @@ def write_sboms(directory: Path, images: list[dict[str, str]]) -> None:
     )
 
 
-def create_bundle(args: argparse.Namespace) -> None:
+def create_bundle(args: argparse.Namespace, environment: dict[str, str]) -> None:
     if platform.machine() != "x86_64":
         raise ValueError("bundle creation currently supports only x86_64 builders")
-    version = read_version(args.version_file)
+    project = load_project_metadata(args.version_file, args.upstreams)
+    version = project.product_version
     commit = clean_commit()
-    upstreams = tomllib.loads(args.upstreams.read_text(encoding="utf-8"))
-    vaultwarden = upstreams["vaultwarden"]
-    digest = vaultwarden["image_digest"]
-    if not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
-        raise ValueError("UPSTREAMS.toml has an invalid Vaultwarden image digest")
-    original = f"{vaultwarden['image_repository']}:{vaultwarden['version']}@{digest}"
-    vaultwarden_tag = (
-        "vaultwarden-less-vaultwarden:"
-        f"{vaultwarden['version']}-{digest.removeprefix('sha256:')[:12]}"
-    )
     image_tags = [
-        {"role": "backup", "tag": f"vaultwarden-less-backup:{version}"},
-        {"role": "proxy", "tag": f"vaultwarden-less-proxy:{version}"},
+        {"role": "backup", "tag": project.backup_image},
+        {"role": "proxy", "tag": project.proxy_image},
         {
             "role": "vaultwarden",
-            "tag": vaultwarden_tag,
-            "source_digest": digest,
+            "tag": project.vaultwarden_image,
+            "source_digest": project.vaultwarden_digest,
         },
     ]
 
-    load_nix_image("backup-image")
-    load_nix_image("proxy-image")
-    with tempfile.TemporaryDirectory(
-        prefix="vaultwarden-less-docker-config."
-    ) as docker_config_name:
-        docker_config = Path(docker_config_name)
-        config = docker_config / "config.json"
-        config.write_text("{}\n", encoding="utf-8", newline="\n")
-        config.chmod(0o600)
-        docker_environment = os.environ.copy()
-        docker_environment["DOCKER_CONFIG"] = os.fspath(docker_config)
-        docker_path = shutil.which("docker")
-        if docker_path is None:
-            raise ValueError("Docker CLI is unavailable")
-        docker_environment["PATH"] = os.fspath(Path(docker_path).parent)
-        run(
-            [docker_path, "--config", os.fspath(docker_config), "pull", original],
-            environment=docker_environment,
-        )
-    pulled = inspect_image(original)
+    load_nix_image("backup-image", environment)
+    load_nix_image("proxy-image", environment)
+    run(
+        docker_arguments(environment, "pull", project.vaultwarden_source),
+        environment=environment,
+    )
+    pulled = inspect_image(project.vaultwarden_source, environment)
     repo_digests = pulled.get("RepoDigests", [])
     if not isinstance(repo_digests, list) or not any(
-        isinstance(value, str) and value.endswith("@" + digest)
+        isinstance(value, str) and value.endswith("@" + project.vaultwarden_digest)
         for value in repo_digests
     ):
         raise ValueError("pulled Vaultwarden image does not expose the pinned digest")
-    run(["docker", "tag", original, vaultwarden_tag])
+    run(
+        docker_arguments(
+            environment,
+            "tag",
+            project.vaultwarden_source,
+            project.vaultwarden_image,
+        ),
+        environment=environment,
+    )
 
     for image in image_tags:
-        inspected = inspect_image(image["tag"])
+        inspected = inspect_image(image["tag"], environment)
         image["id"] = str(inspected["Id"])
 
     destination = args.output_root / f"vaultwarden-less-{version}-linux-amd64"
@@ -205,13 +225,14 @@ def create_bundle(args: argparse.Namespace) -> None:
         temporary = Path(temporary_name)
         images_tar = temporary / "images.tar"
         run(
-            [
-                "docker",
+            docker_arguments(
+                environment,
                 "save",
                 "--output",
                 os.fspath(images_tar),
                 *(image["tag"] for image in image_tags),
-            ]
+            ),
+            environment=environment,
         )
         checksum = sha256_file(images_tar)
         (temporary / "images.tar.sha256").write_text(
@@ -223,7 +244,7 @@ def create_bundle(args: argparse.Namespace) -> None:
             "git_commit": commit,
             "flake_lock_sha256": "sha256:" + sha256_file(Path("flake.lock")),
             "platform": "linux/amd64",
-            "upstreams": upstreams,
+            "upstreams": project.upstreams,
             "images": image_tags,
         }
         (temporary / "bundle.json").write_text(
@@ -252,7 +273,7 @@ def create_bundle(args: argparse.Namespace) -> None:
                 "licenses",
             ]
         )
-        write_sboms(temporary, image_tags)
+        write_sboms(temporary, image_tags, environment)
         os.rename(temporary, destination)
     print(destination)
 
@@ -323,33 +344,46 @@ def verify_checksum(path: Path) -> None:
         raise ValueError("images.tar checksum mismatch")
 
 
-def verify_loaded(path: Path) -> None:
+def verify_loaded(path: Path, environment: dict[str, str]) -> None:
     metadata = read_bundle(path)
     verify_checksum(path)
     for image in metadata["images"]:
         tag = image.get("tag")
         expected_id = image.get("id")
-        inspected = inspect_image(tag)
+        inspected = inspect_image(tag, environment)
         if inspected["Id"] != expected_id:
             raise ValueError(f"loaded image ID does not match bundle: {tag}")
 
 
-def load_bundle(path: Path) -> None:
+def load_bundle(path: Path, environment: dict[str, str]) -> None:
     read_bundle(path)
     verify_checksum(path)
-    run(["docker", "load", "--input", os.fspath(path / "images.tar")])
-    verify_loaded(path)
+    run(
+        docker_arguments(
+            environment, "load", "--input", os.fspath(path / "images.tar")
+        ),
+        environment=environment,
+    )
+    verify_loaded(path, environment)
 
 
 def main() -> int:
     args = parser().parse_args()
     try:
-        if args.command == "create":
-            create_bundle(args)
-        elif args.command == "load":
-            load_bundle(args.bundle)
-        else:
-            verify_loaded(args.bundle)
+        with tempfile.TemporaryDirectory(
+            prefix="vaultwarden-less-docker-config."
+        ) as docker_config_name:
+            docker_config = Path(docker_config_name)
+            config = docker_config / "config.json"
+            config.write_text(ANONYMOUS_DOCKER_CONFIG, encoding="utf-8", newline="\n")
+            config.chmod(0o600)
+            environment = docker_environment(docker_config)
+            if args.command == "create":
+                create_bundle(args, environment)
+            elif args.command == "load":
+                load_bundle(args.bundle, environment)
+            else:
+                verify_loaded(args.bundle, environment)
     except (
         json.JSONDecodeError,
         KeyError,

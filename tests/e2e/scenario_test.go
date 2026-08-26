@@ -1,5 +1,3 @@
-//go:build systemtest
-
 package e2e_test
 
 import (
@@ -8,11 +6,15 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
 
 func TestVaultwardenBackupRestoreE2E(t *testing.T) {
+	if !*runVaultwardenE2E {
+		t.Skip("pass -run-vaultwarden-e2e to run the real external lifecycle")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Minute)
 	defer cancel()
 	harness := newE2EHarness(t, ctx)
@@ -41,8 +43,16 @@ func TestVaultwardenBackupRestoreE2E(t *testing.T) {
 	)
 	firstClient.sync(ctx)
 	initialCollection := firstClient.collectionByName(ctx, organizationID, initialCollectionName)
+	initialCollectionID := stringValue(initialCollection["id"])
+	if initialCollectionID == "" {
+		t.Fatal("initial organization collection has no ID")
+	}
 	if stringValue(firstClient.getOrganization(ctx, organizationID)["name"]) != organizationName {
 		t.Fatal("created organization was not readable through the official CLI")
+	}
+	members := firstClient.organizationMembers(ctx, organizationID)
+	if len(members) != 1 || !strings.EqualFold(stringValue(members[0]["email"]), firstEmail) {
+		t.Fatalf("official CLI organization owner membership = %#v", members)
 	}
 	collectionName := "Audited Recovery Collection"
 	collectionID := firstClient.createOrganizationCollection(ctx, organizationID, collectionName)
@@ -53,7 +63,7 @@ func TestVaultwardenBackupRestoreE2E(t *testing.T) {
 		organizationID,
 		collectionID,
 	)
-	if stringValue(initialCollection["id"]) == collectionID {
+	if initialCollectionID == collectionID {
 		t.Fatal("organization collection creation reused the initial collection")
 	}
 
@@ -69,15 +79,13 @@ func TestVaultwardenBackupRestoreE2E(t *testing.T) {
 	sendPath := privateTestPath(t, harness.localRoot, "send.bin", sendData)
 	sendID := firstClient.createFileSend(ctx, sendPath, "Vaultwarden-less Recovery Send")
 
-	// Exercise the real two-stage persistence boundary. Both database rows now
-	// exist, but the test-owned source payloads are briefly unavailable. The
+	// Exercise the real two-stage persistence boundary. The database row exists,
+	// but its test-owned Send payload is briefly unavailable. The
 	// worker must keep retrying without publishing any partial Restic snapshot.
 	sendRelative := harness.singleFileIn("data/sends/" + sendID)
-	restoreAttachment := harness.holdDataFile("data/attachments/" + itemID + "/" + attachmentID)
 	restoreSend := harness.holdDataFile(sendRelative)
 	harness.startBackup()
 	harness.waitWorkerState("checking", 2*time.Minute)
-	restoreAttachment()
 	harness.assertSnapshotCountFor(0, 35*time.Second)
 	restoreSend()
 
@@ -89,24 +97,50 @@ func TestVaultwardenBackupRestoreE2E(t *testing.T) {
 		t.Fatalf("first snapshot lacks identity: %#v", firstSnapshot)
 	}
 
+	// Keep the first Send unavailable while every second-state mutation occurs.
+	// This closes the race in which the worker could publish an intermediate
+	// item edit or unconsumed access-limited Send as an extra recovery point.
+	restoreSecondWindow := harness.holdDataFile(sendRelative)
 	updated := firstClient.getItem(ctx, itemID)
 	setItemPassword(t, updated, newItemPassword)
 	firstClient.editItem(ctx, itemID, updated)
-	secondSnapshots := harness.waitSnapshotCount(2, 7*time.Minute)
-	secondSnapshot := secondSnapshots.Snapshots[0]
-	if secondSnapshot.ContentID == firstSnapshot.ContentID {
-		t.Fatal("item mutation did not change the recovery content ID")
-	}
-
 	limitedData := []byte("access-limited Send payload\n")
 	limitedPath := privateTestPath(t, harness.localRoot, "limited-send.bin", limitedData)
 	limitedSendID := firstClient.createFileSendWithLimit(ctx, limitedPath, "Access Count Recovery Send", 1)
-	harness.waitSnapshotCount(3, 7*time.Minute)
 	limitedDownload := filepath.Join(harness.localRoot, "limited-send-download.bin")
 	firstClient.getFileSend(ctx, limitedSendID, limitedDownload)
 	assertFileContent(t, limitedDownload, limitedData)
-	accessSnapshots := harness.waitSnapshotCount(4, 7*time.Minute)
-	latestSnapshot := accessSnapshots.Snapshots[0]
+	firstClient.waitFileSendAccessCount(ctx, limitedSendID, 1, 30*time.Second)
+	firstClient.expectFileSendAccessFailure(ctx, limitedSendID)
+	harness.assertSnapshotCountFor(1, 20*time.Second)
+	restoreSecondWindow()
+	secondSnapshots := harness.waitSnapshotCount(2, 7*time.Minute)
+	latestSnapshot := secondSnapshots.Snapshots[0]
+	if latestSnapshot.ContentID == firstSnapshot.ContentID {
+		t.Fatal("second state did not change the recovery content ID")
+	}
+
+	harness.repositoryCheck()
+	for _, apply := range []bool{false, true} {
+		pruned := harness.prune(apply)
+		kept := map[string]bool{}
+		for _, group := range pruned.Groups {
+			if len(group.RemoveSnapshotIDs) != 0 {
+				t.Fatalf("two current recovery points were selected for removal: %#v", pruned)
+			}
+			for _, id := range group.KeepSnapshotIDs {
+				kept[id] = true
+			}
+		}
+		if len(kept) != 2 || !kept[firstSnapshot.ID] || !kept[latestSnapshot.ID] {
+			t.Fatalf("prune did not report the exact retained set: %#v", pruned)
+		}
+		if snapshots := harness.waitSnapshotCount(2, 2*time.Minute); len(snapshots.Snapshots) != 2 ||
+			snapshots.Snapshots[0].ID != latestSnapshot.ID ||
+			snapshots.Snapshots[1].ID != firstSnapshot.ID {
+			t.Fatalf("prune changed the exact two-snapshot set: %#v", snapshots)
+		}
+	}
 
 	// Restart intentionally erases all scheduler history. The startup check is
 	// the product's recovery mechanism and must not create a duplicate snapshot
@@ -115,7 +149,7 @@ func TestVaultwardenBackupRestoreE2E(t *testing.T) {
 	harness.waitHealthy("backup", 2*time.Minute)
 	harness.waitUnchangedCheck("", 2*time.Minute)
 	afterUnchanged, err := harness.snapshots()
-	if err != nil || len(afterUnchanged.Snapshots) != 4 {
+	if err != nil || len(afterUnchanged.Snapshots) != 2 {
 		t.Fatalf("unchanged startup check changed snapshot count: %#v/%v", afterUnchanged, err)
 	}
 
@@ -131,6 +165,14 @@ func TestVaultwardenBackupRestoreE2E(t *testing.T) {
 	restoredFirst.login(ctx)
 	if stringValue(restoredFirst.getOrganization(ctx, organizationID)["name"]) != organizationName {
 		t.Fatal("organization did not survive restore")
+	}
+	restoredMembers := restoredFirst.organizationMembers(ctx, organizationID)
+	if len(restoredMembers) != 1 ||
+		!strings.EqualFold(stringValue(restoredMembers[0]["email"]), firstEmail) {
+		t.Fatalf("restored organization owner membership = %#v", restoredMembers)
+	}
+	if stringValue(restoredFirst.collectionByName(ctx, organizationID, initialCollectionName)["id"]) != initialCollectionID {
+		t.Fatal("initial organization collection did not survive restore")
 	}
 	if stringValue(restoredFirst.collectionByName(ctx, organizationID, collectionName)["id"]) != collectionID {
 		t.Fatal("organization collection did not survive restore")

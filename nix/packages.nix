@@ -91,7 +91,6 @@ let
     );
 
   commonImageConfig = {
-    User = "65532:65532";
     WorkingDir = "/";
   };
 

@@ -31,6 +31,8 @@ let
     '';
   };
 
+  python = pkgs.python3.withPackages (pythonPackages: [ pythonPackages.pyyaml ]);
+
   treefmt = treefmt-nix.lib.evalModule pkgs {
     projectRootFile = "flake.nix";
     programs.gofmt.enable = true;
@@ -48,7 +50,7 @@ let
   };
 in
 {
-  inherit go treefmt;
+  inherit go python treefmt;
 
   justApp = {
     type = "app";
@@ -56,26 +58,26 @@ in
     meta.description = "Run the project Justfile with the pinned Just binary";
   };
 
-  devPackages = with pkgs; [
+  devPackages = [
     go
-    gcc
-    docker
-    docker-compose
+    pkgs.gcc
+    pkgs.docker
+    pkgs.docker-compose
     treefmt.config.build.wrapper
-    golangci-lint
-    govulncheck
-    trivy
-    syft
-    ruff
-    python3
-    bitwarden-cli
-    git
-    zstd
+    pkgs.golangci-lint
+    pkgs.govulncheck
+    pkgs.trivy
+    pkgs.syft
+    pkgs.ruff
+    python
+    pkgs.bitwarden-cli
+    pkgs.git
+    pkgs.zstd
   ];
 
-  deployPackages = with pkgs; [
-    docker
-    docker-compose
-    python3
+  deployPackages = [
+    pkgs.docker
+    pkgs.docker-compose
+    python
   ];
 }

@@ -5,12 +5,15 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/hellodword/vaultwarden-less/internal/upstream"
 	_ "github.com/mattn/go-sqlite3"
@@ -180,6 +183,172 @@ func TestBuilderCreatesAndVerifiesExactRecoverySet(t *testing.T) {
 	}
 	if second.Manifest.ContentID != result.Manifest.ContentID {
 		t.Fatal("unchanged source produced a different content ID")
+	}
+}
+
+func TestOnlineBackupCapturesOneConsistentWALTransactionDuringWrites(t *testing.T) {
+	data := syntheticData(t, true)
+	largePayload := strings.Repeat("x", 34<<20)
+	if _, err := data.database.Exec(
+		"UPDATE ciphers SET data = ?, name = 'generation-0' WHERE uuid = ?",
+		largePayload,
+		testCipherID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	secondCipherID := "55555555-5555-4555-8555-555555555555"
+	if _, err := data.database.Exec(
+		`INSERT INTO ciphers(
+			uuid, created_at, updated_at, atype, name, data
+		) VALUES (?, '2026-05-05', '2026-05-05', 2, 'generation-0', '{}')`,
+		secondCipherID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.database.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+		t.Fatal(err)
+	}
+	databasePath := filepath.Join(data.dataDir, "db.sqlite3")
+	if info, err := os.Stat(databasePath); err != nil || info.Size() < 32<<20 {
+		t.Fatalf("WAL source database is smaller than 32 MiB: %v/%v", info, err)
+	}
+
+	startWriter := make(chan struct{})
+	writerDone := make(chan error, 1)
+	commitTimes := make(chan time.Time, 12)
+	var committed atomic.Int64
+	go func() {
+		defer close(commitTimes)
+		<-startWriter
+		time.Sleep(10 * time.Millisecond)
+		for generation := int64(1); generation <= 12; generation++ {
+			transaction, err := data.database.Begin()
+			if err != nil {
+				writerDone <- err
+				return
+			}
+			marker := fmt.Sprintf("generation-%d", generation)
+			if _, err := transaction.Exec(
+				"UPDATE ciphers SET name = ?, notes = ? WHERE uuid = ?",
+				marker, marker, testCipherID,
+			); err != nil {
+				_ = transaction.Rollback()
+				writerDone <- err
+				return
+			}
+			time.Sleep(200 * time.Microsecond)
+			if _, err := transaction.Exec(
+				"UPDATE ciphers SET name = ?, notes = ? WHERE uuid = ?",
+				marker, marker, secondCipherID,
+			); err != nil {
+				_ = transaction.Rollback()
+				writerDone <- err
+				return
+			}
+			if err := transaction.Commit(); err != nil {
+				writerDone <- err
+				return
+			}
+			commitTimes <- time.Now()
+			committed.Add(1)
+			time.Sleep(5 * time.Millisecond)
+		}
+		writerDone <- nil
+	}()
+	close(startWriter)
+	deadline := time.Now().Add(2 * time.Second)
+	for committed.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if committed.Load() == 0 {
+		if writerError := <-writerDone; writerError != nil {
+			t.Fatal(writerError)
+		}
+		t.Fatal("concurrent WAL writer did not establish an initial marker")
+	}
+	buildStarted := time.Now()
+	result, err := (Builder{
+		DataDir: data.dataDir, StagingDir: privateDirectory(t, "staging"),
+	}).Build(context.Background())
+	buildFinished := time.Now()
+	writerError := <-writerDone
+	if writerError != nil {
+		t.Fatal(writerError)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	overlapped := false
+	for committedAt := range commitTimes {
+		if !committedAt.Before(buildStarted) && !committedAt.After(buildFinished) {
+			overlapped = true
+		}
+	}
+	if !overlapped {
+		t.Fatal("concurrent WAL writer did not commit during online backup")
+	}
+
+	recoveryDatabase := filepath.Join(result.Path, "data", "db.sqlite3")
+	if info, err := os.Stat(recoveryDatabase); err != nil || info.Size() < 32<<20 {
+		t.Fatalf("recovery database is smaller than 32 MiB: %v/%v", info, err)
+	}
+	validation, err := validateDatabase(context.Background(), recoveryDatabase)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if validation.Migration != upstream.VaultwardenMigration ||
+		validation.SchemaFingerprint != upstream.VaultwardenSchemaFingerprint {
+		t.Fatalf("recovery database contract = %#v", validation)
+	}
+	recovered, err := sql.Open("sqlite3", sqliteURI(recoveryDatabase, "ro"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = recovered.Close() }()
+	rows, err := recovered.Query(
+		"SELECT name, notes FROM ciphers WHERE uuid IN (?, ?) ORDER BY uuid",
+		testCipherID,
+		secondCipherID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	markers := make([][2]string, 0, 2)
+	for rows.Next() {
+		var marker [2]string
+		if err := rows.Scan(&marker[0], &marker[1]); err != nil {
+			t.Fatal(err)
+		}
+		markers = append(markers, marker)
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if len(markers) != 2 || markers[0][0] != markers[1][0] ||
+		markers[0][0] != markers[0][1] || markers[1][0] != markers[1][1] {
+		t.Fatalf("online backup captured a torn marker transaction: %#v", markers)
+	}
+	var journalMode, integrity string
+	if err := recovered.QueryRow("PRAGMA journal_mode").Scan(&journalMode); err != nil {
+		t.Fatal(err)
+	}
+	if err := recovered.QueryRow("PRAGMA integrity_check").Scan(&integrity); err != nil {
+		t.Fatal(err)
+	}
+	if journalMode != "delete" || integrity != "ok" {
+		t.Fatalf("recovery journal/integrity = %q/%q", journalMode, integrity)
+	}
+	var foreignKeyViolations int
+	if err := recovered.QueryRow("SELECT count(*) FROM pragma_foreign_key_check").Scan(&foreignKeyViolations); err != nil {
+		t.Fatal(err)
+	}
+	if foreignKeyViolations != 0 {
+		t.Fatalf("recovery has %d foreign-key violations", foreignKeyViolations)
+	}
+	for _, suffix := range []string{"-wal", "-shm", "-journal"} {
+		if _, err := os.Lstat(recoveryDatabase + suffix); !os.IsNotExist(err) {
+			t.Fatalf("recovery retained SQLite sidecar %s: %v", suffix, err)
+		}
 	}
 }
 

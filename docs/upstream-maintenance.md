@@ -109,6 +109,10 @@ CLI. The fixtures are not a general client implementation.
 The official CLI is a test oracle, not a runtime dependency. Review:
 
 - CLI release notes and authentication/session changes;
+- anonymous Send access-token issuance, persistence, expiry, and reuse (the
+  current CLI caches a recipient token, so access-count assertions must use a
+  fresh appdata directory for each recipient and explicitly configure its
+  server before token issuance);
 - create/edit/read behavior used by `tests/e2e`;
 - item, folder, attachment, Send, organization, and collection JSON shapes;
 - KDF, registration, user/org key generation, EncString, RSA encapsulation,
