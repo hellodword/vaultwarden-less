@@ -97,15 +97,14 @@ func copyStableFile(ctx context.Context, dataDir, destinationRoot string, ref re
 		return File{}, fmt.Errorf("close destination file: %w", err)
 	}
 	keep = true
-	return File{Path: ref.Path, Size: written, SHA256: hex.EncodeToString(hash.Sum(nil))}, nil
+	return File{Path: ref.Path, Size: written, SHA256: "sha256:" + hex.EncodeToString(hash.Sum(nil))}, nil
 }
 
 func openSourceFile(dataDir, relative string) (*os.File, error) {
-	if !validManifestPath(relative) || !strings.HasPrefix(relative, "data/") {
+	if !validReferencedPath(relative) {
 		return nil, fmt.Errorf("invalid source path")
 	}
-	cleanRelative := strings.TrimPrefix(relative, "data/")
-	parts := strings.Split(cleanRelative, "/")
+	parts := strings.Split(relative, "/")
 	directoryFD, err := syscall.Open(dataDir, syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		return nil, err
@@ -176,5 +175,5 @@ func hashRegularFile(ctx context.Context, path string) (File, error) {
 	if err != nil {
 		return File{}, err
 	}
-	return File{Size: size, SHA256: hex.EncodeToString(hash.Sum(nil))}, nil
+	return File{Size: size, SHA256: "sha256:" + hex.EncodeToString(hash.Sum(nil))}, nil
 }

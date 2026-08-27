@@ -85,7 +85,12 @@ func testRunner(t *testing.T, execute executeFunc) (Runner, config.Target, *[]re
 
 func manifestWithContent(t *testing.T, hash string) snapshot.Manifest {
 	t.Helper()
-	manifest, err := snapshot.NewManifest([]snapshot.File{{Path: "data/db.sqlite3", Size: 1, SHA256: hash}})
+	manifest, err := snapshot.NewManifest(
+		firstCommit,
+		"sha256:"+hash,
+		firstArchiveID,
+		[]snapshot.File{{Path: "db.sqlite3", Size: 1, SHA256: "sha256:" + strings.Repeat("0", 64)}},
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,11 +142,29 @@ func TestEnsureSkipsBackupWhenLatestContentMatches(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Created || result.SnapshotID != firstSnapshotID || result.ContentID != manifest.ContentID {
+	if result.Created || result.SnapshotID != firstSnapshotID || result.ContentID != manifest.ContentID || result.ArchiveID != firstArchiveID {
 		t.Fatalf("result = %#v", result)
 	}
 	if len(*calls) != 1 {
 		t.Fatalf("calls = %d", len(*calls))
+	}
+}
+
+func TestEnsureDeduplicatesByContentButRetainsTargetArchiveIdentity(t *testing.T) {
+	manifest := manifestWithContent(t, strings.Repeat("c", 64))
+	manifest.ArchiveID = "sha256:" + strings.Repeat("9", 64)
+	runner, target, calls := testRunner(t, func(_ context.Context, _ string, arguments, _ []string, _ string) ([]byte, error) {
+		if operation(arguments) != "snapshots" {
+			t.Fatalf("unexpected operation: %#v", arguments)
+		}
+		return encodedSnapshots(t, rawRecoverySnapshot(firstSnapshotID, manifest.ContentID, "2026-08-25T12:00:00Z")), nil
+	})
+	result, err := runner.Ensure(context.Background(), target, manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Created || result.ContentID != manifest.ContentID || result.ArchiveID != firstArchiveID || len(*calls) != 1 {
+		t.Fatalf("deduplicated result/calls = %#v/%d", result, len(*calls))
 	}
 }
 
@@ -165,7 +188,7 @@ func TestEnsureBacksUpDifferentContentOnceWithFixedIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !result.Created || result.SnapshotID != secondSnapshotID || result.ContentID != manifest.ContentID {
+	if !result.Created || result.SnapshotID != secondSnapshotID || result.ContentID != manifest.ContentID || result.ArchiveID != manifest.ArchiveID {
 		t.Fatalf("result = %#v", result)
 	}
 	if len(*calls) != 2 {
@@ -180,7 +203,9 @@ func TestEnsureBacksUpDifferentContentOnceWithFixedIdentity(t *testing.T) {
 		"backup", "--json",
 		"--host", SnapshotHost,
 		"--tag", SnapshotSchemaTag,
+		"--tag", "project_commit=" + manifest.ProjectCommit,
 		"--tag", "content_id=" + manifest.ContentID,
+		"--tag", "archive_id=" + manifest.ArchiveID,
 		"--", config.RecoveryPointPath,
 	}
 	if arguments := (*calls)[1].arguments; !slices.Equal(arguments, wantArguments) {

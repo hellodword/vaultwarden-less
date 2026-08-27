@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"sync"
 
+	"github.com/hellodword/vaultwarden-less/internal/buildinfo"
 	"github.com/hellodword/vaultwarden-less/internal/config"
 	"github.com/hellodword/vaultwarden-less/internal/notify"
 	"github.com/hellodword/vaultwarden-less/internal/snapshot"
@@ -52,7 +53,10 @@ func serveCommand(configPath *string, environment commandEnvironment) *cobra.Com
 			}
 			ctx, cancel := context.WithCancel(cmd.Context())
 			defer cancel()
-			builder := snapshot.Builder{DataDir: environment.dataDir, StagingDir: environment.stagingDir}
+			builder := snapshot.Builder{
+				DataDir: environment.dataDir, StagingDir: environment.stagingDir,
+				ProjectCommit: buildinfo.ProjectCommit,
+			}
 			backupWorker := worker.New(cfg, builder.Build, repository.Ensure, notifications.Enqueue, logger)
 			server := worker.NewHTTPServer(backupWorker)
 			serverError := make(chan error, 1)

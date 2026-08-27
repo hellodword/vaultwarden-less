@@ -236,7 +236,7 @@ func TestWorkerConsistencyFailureRetriesEveryThirtySeconds(t *testing.T) {
 	base := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
 	clock := newFakeClock(base)
 	manifest := workerManifest(t)
-	source := &fixedSource{manifest: manifest, err: &snapshot.ConsistencyError{Path: "data/attachments/x/y", Reason: "not_found"}}
+	source := &fixedSource{manifest: manifest, err: &snapshot.ConsistencyError{Path: "attachments/x/y", Reason: "not_found"}}
 	repository := &orderedRepository{results: map[string]restic.SyncResult{"primary": syncResult('a', manifest.ContentID, false)}, errors: map[string]error{}}
 	worker := newWithClock(workerConfig("primary"), source.Build, repository.Ensure, nil, discardLogger(), clock)
 	done := make(chan checkOutcome, 1)
@@ -274,6 +274,31 @@ func TestWorkerTargetsAreSerialAndPartialResultRetries(t *testing.T) {
 	events := collector.snapshot()
 	if len(events) != 1 || events[0].Type != "recovery_point_created" || len(events[0].Targets) != 2 || events[0].Targets[1].State != "failed" {
 		t.Fatalf("recovery event = %#v", events)
+	}
+}
+
+func TestWorkerReportsObservedSourceArchiveWhenTargetContentIsUnchanged(t *testing.T) {
+	t.Parallel()
+	manifest := workerManifest(t)
+	targetArchive := "sha256:" + strings.Repeat("4", 64)
+	result := syncResult('a', manifest.ContentID, false)
+	result.ArchiveID = targetArchive
+	repository := &orderedRepository{
+		results: map[string]restic.SyncResult{"primary": result}, errors: map[string]error{},
+	}
+	worker := New(workerConfig("primary"), (&fixedSource{manifest: manifest}).Build, repository.Ensure, nil, discardLogger())
+	outcome := worker.check(context.Background())
+	if outcome.result != "unchanged" || outcome.archiveID != manifest.ArchiveID {
+		t.Fatalf("unchanged outcome = %#v", outcome)
+	}
+	now := time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC)
+	worker.finishCheck(now, now, outcome)
+	status := worker.Status()
+	if status.LastCheck == nil || status.LastCheck.ArchiveID == nil || *status.LastCheck.ArchiveID != manifest.ArchiveID {
+		t.Fatalf("last check = %#v", status.LastCheck)
+	}
+	if status.Targets[0].ArchiveID == nil || *status.Targets[0].ArchiveID != targetArchive {
+		t.Fatalf("target status = %#v", status.Targets[0])
 	}
 }
 
@@ -400,7 +425,12 @@ func assertHTTP(t *testing.T, handler http.Handler, method, path, contentType, b
 
 func workerManifest(t *testing.T) snapshot.Manifest {
 	t.Helper()
-	manifest, err := snapshot.NewManifest([]snapshot.File{{Path: "data/db.sqlite3", Size: 1, SHA256: strings.Repeat("0", 64)}})
+	manifest, err := snapshot.NewManifest(
+		strings.Repeat("1", 40),
+		"sha256:"+strings.Repeat("2", 64),
+		"sha256:"+strings.Repeat("3", 64),
+		[]snapshot.File{{Path: "db.sqlite3", Size: 1, SHA256: "sha256:" + strings.Repeat("0", 64)}},
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -416,7 +446,10 @@ func workerConfig(names ...string) *config.Backup {
 }
 
 func syncResult(character byte, contentID string, created bool) restic.SyncResult {
-	return restic.SyncResult{SnapshotID: strings.Repeat(string(character), 64), ContentID: contentID, Created: created}
+	return restic.SyncResult{
+		SnapshotID: strings.Repeat(string(character), 64), ContentID: contentID,
+		ArchiveID: "sha256:" + strings.Repeat("3", 64), Created: created,
+	}
 }
 
 func discardLogger() *slog.Logger { return slog.New(slog.NewJSONHandler(io.Discard, nil)) }

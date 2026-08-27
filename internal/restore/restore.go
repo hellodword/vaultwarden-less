@@ -32,7 +32,9 @@ type Result struct {
 	SchemaVersion int    `json:"schema_version"`
 	Target        string `json:"target"`
 	SnapshotID    string `json:"snapshot_id"`
+	ProjectCommit string `json:"project_commit"`
 	ContentID     string `json:"content_id"`
+	ArchiveID     string `json:"archive_id"`
 	Output        string `json:"output"`
 }
 
@@ -66,8 +68,8 @@ func Run(ctx context.Context, repository Repository, request Request) (_ Result,
 	if err != nil {
 		return Result{}, fmt.Errorf("verify restored recovery point: %w", err)
 	}
-	if manifest.ContentID != selected.ContentID {
-		return Result{}, fmt.Errorf("restored manifest does not match snapshot content tag")
+	if manifest.ProjectCommit != selected.ProjectCommit || manifest.ContentID != selected.ContentID || manifest.ArchiveID != selected.ArchiveID {
+		return Result{}, fmt.Errorf("restored manifest does not match snapshot identity tags")
 	}
 	if err := privatefs.RenameNoReplace(temporary, request.Output); err != nil {
 		return Result{}, fmt.Errorf("publish verified restore directory: %w", err)
@@ -80,7 +82,9 @@ func Run(ctx context.Context, repository Repository, request Request) (_ Result,
 		SchemaVersion: ResultSchemaVersion,
 		Target:        request.Target.Name,
 		SnapshotID:    selected.ID,
+		ProjectCommit: manifest.ProjectCommit,
 		ContentID:     manifest.ContentID,
+		ArchiveID:     manifest.ArchiveID,
 		Output:        request.Output,
 	}, nil
 }

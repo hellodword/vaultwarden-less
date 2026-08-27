@@ -15,6 +15,7 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/hellodword/vaultwarden-less/internal/upstream"
 	"github.com/mattn/go-sqlite3"
@@ -265,6 +266,9 @@ func validateDatabase(ctx context.Context, path string) (databaseValidation, err
 	if schemaFingerprint != contract.Fingerprint {
 		return databaseValidation{}, fmt.Errorf("database schema fingerprint mismatch")
 	}
+	if err := validateProjectionSchema(ctx, database, contract); err != nil {
+		return databaseValidation{}, err
+	}
 	var migration sql.NullString
 	if err := database.QueryRowContext(ctx, "SELECT max(version) FROM __diesel_schema_migrations").Scan(&migration); err != nil {
 		return databaseValidation{}, fmt.Errorf("read database migration: %w", err)
@@ -273,6 +277,57 @@ func validateDatabase(ctx context.Context, path string) (databaseValidation, err
 		return databaseValidation{}, fmt.Errorf("unsupported database migration")
 	}
 	return databaseValidation{Migration: migration.String, SchemaFingerprint: schemaFingerprint}, nil
+}
+
+func validateProjectionSchema(ctx context.Context, database *sql.DB, contract upstream.SchemaContract) error {
+	projection, err := upstream.VaultwardenRecoveryProjection()
+	if err != nil {
+		return err
+	}
+	tables := make(map[string]struct{})
+	for _, object := range contract.Objects {
+		if object.Type == "table" {
+			tables[object.Name] = struct{}{}
+		}
+	}
+	if len(tables) != len(projection.Tables) {
+		return fmt.Errorf("recovery projection table set does not match schema")
+	}
+	for _, table := range projection.Tables {
+		if _, exists := tables[table.Name]; !exists {
+			return fmt.Errorf("recovery projection contains an unknown table")
+		}
+		rows, err := database.QueryContext(ctx, "PRAGMA table_info("+quoteIdentifier(table.Name)+")")
+		if err != nil {
+			return fmt.Errorf("read projected table %s: %w", table.Name, err)
+		}
+		columns := make([]string, 0, len(table.Columns))
+		for rows.Next() {
+			var sequence, notNull, primaryKey int
+			var name, declaredType string
+			var defaultValue any
+			if err := rows.Scan(&sequence, &name, &declaredType, &notNull, &defaultValue, &primaryKey); err != nil {
+				_ = rows.Close()
+				return fmt.Errorf("read projected column for %s: %w", table.Name, err)
+			}
+			if sequence != len(columns) {
+				_ = rows.Close()
+				return fmt.Errorf("projected columns for %s are not in schema order", table.Name)
+			}
+			columns = append(columns, name)
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("iterate projected columns for %s: %w", table.Name, err)
+		}
+		if err := rows.Close(); err != nil {
+			return fmt.Errorf("close projected columns for %s: %w", table.Name, err)
+		}
+		if !slices.Equal(columns, table.Columns) {
+			return fmt.Errorf("recovery projection columns do not match schema for %s", table.Name)
+		}
+	}
+	return nil
 }
 
 func referencedFiles(ctx context.Context, path string) ([]referencedFile, error) {
@@ -300,7 +355,7 @@ func referencedFiles(ctx context.Context, path string) ([]referencedFile, error)
 			_ = rows.Close()
 			return nil, fmt.Errorf("database contains an unsafe attachment reference")
 		}
-		refs = append(refs, referencedFile{Path: "data/attachments/" + cipherID + "/" + attachmentID, ExpectedSize: size})
+		refs = append(refs, referencedFile{Path: "attachments/" + cipherID + "/" + attachmentID, ExpectedSize: size})
 	}
 	if err := rows.Err(); err != nil {
 		_ = rows.Close()
@@ -325,7 +380,7 @@ func referencedFiles(ctx context.Context, path string) ([]referencedFile, error)
 			_ = rows.Close()
 			return nil, fmt.Errorf("database contains an unsafe file Send reference")
 		}
-		refs = append(refs, referencedFile{Path: "data/sends/" + sendID + "/" + fileID, ExpectedSize: size})
+		refs = append(refs, referencedFile{Path: "sends/" + sendID + "/" + fileID, ExpectedSize: size})
 	}
 	if err := rows.Err(); err != nil {
 		_ = rows.Close()
@@ -347,20 +402,28 @@ func referencedFiles(ctx context.Context, path string) ([]referencedFile, error)
 }
 
 func decodeSendFileData(data string) (string, int64, error) {
+	if !utf8.ValidString(data) || rejectDuplicateJSONKeys([]byte(data)) != nil {
+		return "", 0, fmt.Errorf("invalid file Send data")
+	}
+	type sendFileData struct {
+		ID       string          `json:"id"`
+		Size     json.RawMessage `json:"size"`
+		FileName *string         `json:"fileName"`
+	}
 	decoder := json.NewDecoder(strings.NewReader(data))
-	var object map[string]json.RawMessage
-	if err := decoder.Decode(&object); err != nil || object == nil {
+	decoder.DisallowUnknownFields()
+	var object sendFileData
+	if err := decoder.Decode(&object); err != nil || object.FileName == nil {
 		return "", 0, fmt.Errorf("invalid file Send data")
 	}
 	var extra any
 	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
 		return "", 0, fmt.Errorf("invalid file Send data")
 	}
-	var fileID string
-	if err := json.Unmarshal(object["id"], &fileID); err != nil {
+	if object.ID == "" {
 		return "", 0, fmt.Errorf("invalid file Send ID")
 	}
-	rawSize := bytes.TrimSpace(object["size"])
+	rawSize := bytes.TrimSpace(object.Size)
 	if !unsignedIntegerPattern.Match(rawSize) {
 		return "", 0, fmt.Errorf("invalid file Send size")
 	}
@@ -368,5 +431,5 @@ func decodeSendFileData(data string) (string, int64, error) {
 	if err != nil {
 		return "", 0, fmt.Errorf("invalid file Send size")
 	}
-	return fileID, size, nil
+	return object.ID, size, nil
 }

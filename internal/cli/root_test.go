@@ -215,10 +215,15 @@ func TestRepositoryCommandsAndRestoreGolden(t *testing.T) {
 	}
 
 	restore := func(_ context.Context, _ restoretool.Repository, request restoretool.Request) (restoretool.Result, error) {
-		return restoretool.Result{SchemaVersion: restoretool.ResultSchemaVersion, Target: request.Target.Name, SnapshotID: snapshotID, ContentID: contentID, Output: request.Output}, nil
+		return restoretool.Result{
+			SchemaVersion: restoretool.ResultSchemaVersion, Target: request.Target.Name,
+			SnapshotID: snapshotID, ProjectCommit: commit, ContentID: contentID,
+			ArchiveID: archiveID, Output: request.Output,
+		}, nil
 	}
 	stdout, stderr, code = executeCommand(testEnvironment(&fakeRepository{}, nil, restore), "restore", "--target", "primary", "--output", "drill")
-	if code != 0 || stderr != "" || !strings.Contains(stdout, `"output":"/restore/drill"`) {
+	wantRestore := `{"schema_version":1,"target":"primary","snapshot_id":"` + snapshotID + `","project_commit":"` + commit + `","content_id":"` + contentID + `","archive_id":"` + archiveID + `","output":"/restore/drill"}` + "\n"
+	if code != 0 || stderr != "" || stdout != wantRestore {
 		t.Fatalf("restore = %d/%q/%q", code, stdout, stderr)
 	}
 }

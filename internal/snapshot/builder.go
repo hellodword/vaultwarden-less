@@ -17,8 +17,9 @@ import (
 const spaceReserve = int64(64 << 20)
 
 type Builder struct {
-	DataDir    string
-	StagingDir string
+	DataDir       string
+	StagingDir    string
+	ProjectCommit string
 
 	beforeCopy func(string)
 	afterCopy  func(string)
@@ -27,6 +28,9 @@ type Builder struct {
 // Build constructs and verifies a complete recovery point, then publishes it
 // as StagingDir/point. A failed build leaves any prior point untouched.
 func (b Builder) Build(ctx context.Context) (_ Manifest, err error) {
+	if !validCommit(b.ProjectCommit) {
+		return Manifest{}, fmt.Errorf("build recovery identity is invalid")
+	}
 	if err := validateOwnedDirectory(b.DataDir); err != nil {
 		return Manifest{}, fmt.Errorf("validate data directory: %w", err)
 	}
@@ -51,7 +55,7 @@ func (b Builder) Build(ctx context.Context) (_ Manifest, err error) {
 		}
 	}()
 
-	databasePath := filepath.Join(buildDir, "data", "db.sqlite3")
+	databasePath := filepath.Join(buildDir, "db.sqlite3")
 	databaseRequired, err := checkedSizeSum(estimatedDatabaseBytes(b.DataDir), spaceReserve)
 	if err != nil {
 		return Manifest{}, err
@@ -90,7 +94,7 @@ func (b Builder) Build(ctx context.Context) (_ Manifest, err error) {
 	if err != nil {
 		return Manifest{}, fmt.Errorf("hash recovery database: %w", err)
 	}
-	databaseFile.Path = "data/db.sqlite3"
+	databaseFile.Path = "db.sqlite3"
 	files := []File{databaseFile}
 	for _, ref := range refs {
 		if b.beforeCopy != nil {
@@ -107,7 +111,15 @@ func (b Builder) Build(ctx context.Context) (_ Manifest, err error) {
 		files = append(files, file)
 	}
 
-	manifest, err := NewManifest(files)
+	contentID, err := calculateContentID(ctx, databasePath, b.ProjectCommit, files)
+	if err != nil {
+		return Manifest{}, fmt.Errorf("calculate logical recovery identity: %w", err)
+	}
+	archiveID, err := calculateArchiveID(ctx, buildDir, files)
+	if err != nil {
+		return Manifest{}, fmt.Errorf("calculate archive recovery identity: %w", err)
+	}
+	manifest, err := NewManifest(b.ProjectCommit, contentID, archiveID, files)
 	if err != nil {
 		return Manifest{}, err
 	}
@@ -232,8 +244,8 @@ func validateOwnedDirectory(path string) error {
 		return err
 	}
 	stat, ownerKnown := info.Sys().(*syscall.Stat_t)
-	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || !ownerKnown || stat.Uid != uint32(os.Geteuid()) || info.Mode().Perm() != 0o700 {
-		return fmt.Errorf("path must be a real 0700 directory owned by effective UID %d", os.Geteuid())
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || !ownerKnown || stat.Uid != uint32(os.Geteuid()) || stat.Gid != uint32(os.Getegid()) || info.Mode().Perm() != 0o700 {
+		return fmt.Errorf("path must be a real 0700 directory owned by effective UID/GID")
 	}
 	return nil
 }

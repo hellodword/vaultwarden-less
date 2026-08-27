@@ -28,6 +28,8 @@ import (
 
 const motoServerImage = "vaultwarden-less-moto:local"
 
+const motoProjectCommit = "1111111111111111111111111111111111111111"
+
 var (
 	runMotoIntegration = flag.Bool("run-moto-integration", false, "run the real Moto and Restic integration test")
 	motoHostPort       = flag.Int("moto-host-port", 0, "fixed host port for Moto; zero asks Docker for an ephemeral port")
@@ -83,7 +85,7 @@ func TestMotoResticIntegration(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	first, err := (snapshot.Builder{DataDir: dataDir, StagingDir: stagingDir}).Build(ctx)
+	first, err := (snapshot.Builder{DataDir: dataDir, StagingDir: stagingDir, ProjectCommit: motoProjectCommit}).Build(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,7 +121,7 @@ func TestMotoResticIntegration(t *testing.T) {
 		}
 
 		mutateSyntheticDatabase(t, filepath.Join(dataDir, "db.sqlite3"))
-		second, err := (snapshot.Builder{DataDir: dataDir, StagingDir: stagingDir}).Build(ctx)
+		second, err := (snapshot.Builder{DataDir: dataDir, StagingDir: stagingDir, ProjectCommit: motoProjectCommit}).Build(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -356,7 +358,7 @@ func rawResticBackupAt(
 		"backup", "--json",
 		"--host", host,
 		"--tag", restic.SnapshotSchemaTag,
-		"--tag", "project_commit=" + strings.Repeat("1", 40),
+		"--tag", "project_commit=" + motoProjectCommit,
 		"--tag", "content_id=sha256:" + contentHex,
 		"--tag", "archive_id=sha256:" + strings.Repeat("2", 64),
 	}

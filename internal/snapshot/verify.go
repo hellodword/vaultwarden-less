@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"unicode/utf8"
 )
 
 const maxManifestBytes = 64 << 20
@@ -18,6 +19,12 @@ const maxManifestBytes = 64 << 20
 func DecodeManifest(data []byte) (Manifest, error) {
 	if int64(len(data)) > maxManifestBytes {
 		return Manifest{}, fmt.Errorf("manifest exceeds size limit")
+	}
+	if !utf8.Valid(data) {
+		return Manifest{}, fmt.Errorf("manifest is not valid UTF-8")
+	}
+	if err := rejectDuplicateJSONKeys(data); err != nil {
+		return Manifest{}, fmt.Errorf("manifest JSON is invalid: %w", err)
 	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
@@ -29,13 +36,70 @@ func DecodeManifest(data []byte) (Manifest, error) {
 	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
 		return Manifest{}, fmt.Errorf("manifest contains multiple JSON values")
 	}
-	if len(manifest.Files) > 1_000_000 {
-		return Manifest{}, fmt.Errorf("manifest contains too many entries")
-	}
 	if err := manifest.Validate(); err != nil {
 		return Manifest{}, err
 	}
 	return manifest, nil
+}
+
+func rejectDuplicateJSONKeys(data []byte) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	if err := walkJSONValue(decoder); err != nil {
+		return err
+	}
+	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return fmt.Errorf("document contains trailing JSON")
+		}
+		return err
+	}
+	return nil
+}
+
+func walkJSONValue(decoder *json.Decoder) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	delimiter, composite := token.(json.Delim)
+	if !composite {
+		return nil
+	}
+	switch delimiter {
+	case '{':
+		seen := make(map[string]struct{})
+		for decoder.More() {
+			nameToken, err := decoder.Token()
+			if err != nil {
+				return err
+			}
+			name, ok := nameToken.(string)
+			if !ok {
+				return fmt.Errorf("object key is not a string")
+			}
+			if _, duplicate := seen[name]; duplicate {
+				return fmt.Errorf("duplicate object key %q", name)
+			}
+			seen[name] = struct{}{}
+			if err := walkJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+	case '[':
+		for decoder.More() {
+			if err := walkJSONValue(decoder); err != nil {
+				return err
+			}
+		}
+	default:
+		return fmt.Errorf("unexpected JSON delimiter")
+	}
+	closing, err := decoder.Token()
+	if err != nil || closing != json.Delim(map[json.Delim]json.Delim{'{': '}', '[': ']'}[delimiter]) {
+		return fmt.Errorf("invalid JSON composite")
+	}
+	return nil
 }
 
 func Verify(ctx context.Context, root string) (Manifest, error) {
@@ -74,16 +138,9 @@ func Verify(ctx context.Context, root string) (Manifest, error) {
 		return Manifest{}, err
 	}
 
-	databasePath := filepath.Join(root, "data", "db.sqlite3")
-	database, err := validateDatabase(ctx, databasePath)
-	if err != nil {
+	databasePath := filepath.Join(root, "db.sqlite3")
+	if _, err := validateDatabase(ctx, databasePath); err != nil {
 		return Manifest{}, fmt.Errorf("validate restored database: %w", err)
-	}
-	if database.Migration != manifest.Vaultwarden.DatabaseMigration {
-		return Manifest{}, fmt.Errorf("restored database migration does not match manifest")
-	}
-	if database.SchemaFingerprint != manifest.Vaultwarden.DatabaseSchemaFingerprint {
-		return Manifest{}, fmt.Errorf("restored database schema does not match manifest")
 	}
 	refs, err := referencedFiles(ctx, databasePath)
 	if err != nil {
@@ -92,13 +149,27 @@ func Verify(ctx context.Context, root string) (Manifest, error) {
 	if err := validateManifestReferences(manifest, refs); err != nil {
 		return Manifest{}, err
 	}
+	contentID, err := calculateContentID(ctx, databasePath, manifest.ProjectCommit, manifest.Files)
+	if err != nil {
+		return Manifest{}, fmt.Errorf("recalculate logical recovery identity: %w", err)
+	}
+	if contentID != manifest.ContentID {
+		return Manifest{}, fmt.Errorf("manifest content_id mismatch")
+	}
+	archiveID, err := calculateArchiveID(ctx, root, manifest.Files)
+	if err != nil {
+		return Manifest{}, fmt.Errorf("recalculate archive recovery identity: %w", err)
+	}
+	if archiveID != manifest.ArchiveID {
+		return Manifest{}, fmt.Errorf("manifest archive_id mismatch")
+	}
 	return manifest, nil
 }
 
 func validateManifestReferences(manifest Manifest, refs []referencedFile) error {
 	files := make(map[string]File, len(manifest.Files))
 	for _, file := range manifest.Files {
-		if file.Path != "data/db.sqlite3" {
+		if file.Path != "db.sqlite3" {
 			files[file.Path] = file
 		}
 	}
@@ -125,7 +196,7 @@ func walkRecoveryTree(root string, expectedFiles map[string]File, allowedDirecto
 			return err
 		}
 		stat, ownerKnown := info.Sys().(*syscall.Stat_t)
-		if info.Mode()&os.ModeSymlink != 0 || !ownerKnown || stat.Uid != uint32(os.Geteuid()) {
+		if info.Mode()&os.ModeSymlink != 0 || !ownerKnown || stat.Uid != uint32(os.Geteuid()) || stat.Gid != uint32(os.Getegid()) {
 			return fmt.Errorf("recovery tree contains an unsafe entry")
 		}
 		if info.IsDir() {

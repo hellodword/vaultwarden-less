@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strings"
 	"sync"
 )
 
@@ -61,6 +62,9 @@ func validateProjection(projection RecoveryProjection) error {
 			return fmt.Errorf("embedded recovery projection contains a duplicate table")
 		}
 		seenTables[table.Name] = struct{}{}
+		if index > 0 && strings.Compare(projection.Tables[index-1].Name, table.Name) >= 0 {
+			return fmt.Errorf("embedded recovery projection tables are not strictly sorted")
+		}
 		if table.Disposition != "included" && table.Disposition != "excluded" && table.Disposition != "validate_only" {
 			return fmt.Errorf("embedded recovery projection table %s has an invalid disposition", table.Name)
 		}
@@ -77,6 +81,18 @@ func validateProjection(projection RecoveryProjection) error {
 		for _, column := range append(slices.Clone(table.RowKey), table.ExcludedColumns...) {
 			if _, exists := columns[column]; !exists {
 				return fmt.Errorf("embedded recovery projection table %s references an unknown column", table.Name)
+			}
+		}
+		rowKeys := make(map[string]struct{}, len(table.RowKey))
+		for _, column := range table.RowKey {
+			if _, duplicate := rowKeys[column]; duplicate {
+				return fmt.Errorf("embedded recovery projection table %s has a duplicate row key", table.Name)
+			}
+			rowKeys[column] = struct{}{}
+		}
+		for _, column := range table.ExcludedColumns {
+			if _, rowKey := rowKeys[column]; rowKey {
+				return fmt.Errorf("embedded recovery projection table %s excludes a row key", table.Name)
 			}
 		}
 		if table.Disposition != "included" && len(table.ExcludedColumns) != 0 {

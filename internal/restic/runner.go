@@ -130,7 +130,9 @@ func (r Runner) Ensure(ctx context.Context, target config.Target, manifest snaps
 		"backup", "--json",
 		"--host", SnapshotHost,
 		"--tag", SnapshotSchemaTag,
+		"--tag", "project_commit="+manifest.ProjectCommit,
 		"--tag", "content_id=sha256:"+contentHex,
+		"--tag", "archive_id="+manifest.ArchiveID,
 		"--", r.recoveryPath,
 	)
 	output, err := r.runTargetCommand(ctx, target, "backup", arguments, environment, "")
@@ -141,7 +143,10 @@ func (r Runner) Ensure(ctx context.Context, target config.Target, manifest snaps
 	if err != nil {
 		return SyncResult{}, &OperationError{Code: "backup_result_invalid", ExitCode: -1}
 	}
-	result := SyncResult{SnapshotID: snapshotID, ContentID: manifest.ContentID, Created: true}
+	result := SyncResult{
+		SnapshotID: snapshotID, ContentID: manifest.ContentID,
+		ArchiveID: manifest.ArchiveID, Created: true,
+	}
 	if r.Logger != nil {
 		r.Logger.Info(
 			"restic recovery snapshot synchronized",

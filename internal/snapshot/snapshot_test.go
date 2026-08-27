@@ -1,8 +1,10 @@
 package snapshot
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,9 +23,10 @@ import (
 )
 
 const (
-	testCipherID     = "11111111-1111-4111-8111-111111111111"
-	testAttachmentID = "0123456789abcdefabcd"
-	testSendID       = "22222222-2222-4222-8222-222222222222"
+	testCipherID      = "11111111-1111-4111-8111-111111111111"
+	testAttachmentID  = "0123456789abcdefabcd"
+	testSendID        = "22222222-2222-4222-8222-222222222222"
+	testProjectCommit = "0123456789abcdef0123456789abcdef01234567"
 )
 
 var testSendFileID = strings.Repeat("b", 64)
@@ -130,10 +133,95 @@ func privateDirectory(t *testing.T) string {
 	return path
 }
 
+func emptyCurrentData(t *testing.T) string {
+	t.Helper()
+	dataDir := filepath.Join(t.TempDir(), "data")
+	if err := os.Mkdir(dataDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	database, err := sql.Open("sqlite3", filepath.Join(dataDir, "db.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	contract, err := upstream.VaultwardenSchemaContract()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range append([]string{"PRAGMA journal_mode=WAL", "PRAGMA foreign_keys=ON"}, objectSQL(contract.Objects)...) {
+		if _, err := database.Exec(statement); err != nil {
+			_ = database.Close()
+			t.Fatal(err)
+		}
+	}
+	if _, err := database.Exec("INSERT INTO __diesel_schema_migrations(version, run_on) VALUES (?, '2026-05-05')", contract.DatabaseMigration); err != nil {
+		_ = database.Close()
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return dataDir
+}
+
+func objectSQL(objects []upstream.SchemaObject) []string {
+	statements := make([]string, 0, len(objects))
+	for _, object := range objects {
+		statements = append(statements, object.SQL)
+	}
+	return statements
+}
+
+func buildFixture(t *testing.T, dataDir string) (Manifest, string) {
+	t.Helper()
+	stagingDir := privateDirectory(t)
+	manifest, err := (Builder{
+		DataDir: dataDir, StagingDir: stagingDir, ProjectCommit: testProjectCommit,
+	}).Build(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return manifest, filepath.Join(stagingDir, "point")
+}
+
+func rewriteManifest(t *testing.T, point string, mutate func(*Manifest)) {
+	t.Helper()
+	path := filepath.Join(point, "manifest.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := DecodeManifest(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutate(&manifest)
+	data, err = json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, append(data, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func insertProjectionExclusionFixture(t *testing.T, database *sql.DB) {
+	t.Helper()
+	const userID = "66666666-6666-4666-8666-666666666666"
+	if _, err := database.Exec(`INSERT INTO users(
+		uuid, created_at, updated_at, email, name, password_hash, salt,
+		password_iterations, akey, security_stamp, equivalent_domains, excluded_globals
+	) VALUES (?, '2026-05-05', '2026-05-05', 'user@example.test', 'user', x'01', x'02', 100000, 'key', 'stamp', '[]', '[]')`, userID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec("INSERT INTO twofactor(uuid, user_uuid, atype, enabled, data, last_used) VALUES ('77777777-7777-4777-8777-777777777777', ?, 1, 1, 'secret', 0)", userID); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestBuilderCreatesAndVerifiesExactRecoverySet(t *testing.T) {
 	data := syntheticData(t, true)
 	stagingDir := privateDirectory(t)
-	manifest, err := (Builder{DataDir: data.dataDir, StagingDir: stagingDir}).Build(context.Background())
+	manifest, err := (Builder{DataDir: data.dataDir, StagingDir: stagingDir, ProjectCommit: testProjectCommit}).Build(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,9 +235,9 @@ func TestBuilderCreatesAndVerifiesExactRecoverySet(t *testing.T) {
 		paths = append(paths, file.Path)
 	}
 	want := []string{
-		"data/attachments/" + testCipherID + "/" + testAttachmentID,
-		"data/db.sqlite3",
-		"data/sends/" + testSendID + "/" + testSendFileID,
+		"attachments/" + testCipherID + "/" + testAttachmentID,
+		"db.sqlite3",
+		"sends/" + testSendID + "/" + testSendFileID,
 	}
 	if !slices.Equal(paths, want) {
 		t.Fatalf("recovery paths = %#v", paths)
@@ -161,12 +249,145 @@ func TestBuilderCreatesAndVerifiesExactRecoverySet(t *testing.T) {
 			}
 		}
 	}
-	second, err := (Builder{DataDir: data.dataDir, StagingDir: stagingDir}).Build(context.Background())
+	second, err := (Builder{DataDir: data.dataDir, StagingDir: stagingDir, ProjectCommit: testProjectCommit}).Build(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 	if second.ContentID != manifest.ContentID {
 		t.Fatal("unchanged source produced a different content ID")
+	}
+}
+
+func TestBuilderAcceptsEmptyCurrentSchema(t *testing.T) {
+	manifest, point := buildFixture(t, emptyCurrentData(t))
+	if len(manifest.Files) != 1 || manifest.Files[0].Path != "db.sqlite3" {
+		t.Fatalf("empty recovery files = %#v", manifest.Files)
+	}
+	if _, err := Verify(context.Background(), point); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCanonicalIdentityExcludesSessionStateAndReviewedColumns(t *testing.T) {
+	data := syntheticData(t, true)
+	insertProjectionExclusionFixture(t, data.database)
+	first, _ := buildFixture(t, data.dataDir)
+	if _, err := data.database.Exec(`UPDATE users SET
+		updated_at = '2030-01-01', last_verifying_at = '2030-01-01',
+		login_verify_count = 9, stamp_exception = 'temporary'
+		WHERE email = 'user@example.test'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.database.Exec("UPDATE twofactor SET last_used = 99"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := data.database.Exec("INSERT INTO event(uuid, event_type, event_date) VALUES ('88888888-8888-4888-8888-888888888888', 1, '2030-01-01')"); err != nil {
+		t.Fatal(err)
+	}
+	second, _ := buildFixture(t, data.dataDir)
+	if second.ContentID != first.ContentID {
+		t.Fatalf("excluded/session mutation changed content ID: %s != %s", second.ContentID, first.ContentID)
+	}
+	if second.ArchiveID == first.ArchiveID {
+		t.Fatal("raw database mutation did not change archive ID")
+	}
+	if _, err := data.database.Exec("UPDATE users SET name = 'durable-change' WHERE email = 'user@example.test'"); err != nil {
+		t.Fatal(err)
+	}
+	third, _ := buildFixture(t, data.dataDir)
+	if third.ContentID == second.ContentID {
+		t.Fatal("included durable mutation did not change content ID")
+	}
+	writeFixture(t, data.attachmentPath, []byte("encrypted-attachmenU"))
+	if _, err := data.database.Exec("UPDATE attachments SET file_size = ? WHERE id = ?", len("encrypted-attachmenU"), testAttachmentID); err != nil {
+		t.Fatal(err)
+	}
+	fourth, _ := buildFixture(t, data.dataDir)
+	if fourth.ContentID == third.ContentID {
+		t.Fatal("referenced file mutation did not change content ID")
+	}
+}
+
+func TestCanonicalIdentityIgnoresInsertionOrderPageLayoutAndVacuum(t *testing.T) {
+	firstData := syntheticData(t, true)
+	secondData := syntheticData(t, true)
+	rows := [][2]string{
+		{"99999999-9999-4999-8999-999999999991", "alpha"},
+		{"99999999-9999-4999-8999-999999999992", "omega"},
+	}
+	insertCipher := func(t *testing.T, database *sql.DB, row [2]string) {
+		t.Helper()
+		if _, err := database.Exec(`INSERT INTO ciphers(
+			uuid, created_at, updated_at, atype, name, data
+		) VALUES (?, '2026-05-05', '2026-05-05', 2, ?, '{}')`, row[0], row[1]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	insertCipher(t, firstData.database, rows[0])
+	insertCipher(t, firstData.database, rows[1])
+	insertCipher(t, secondData.database, rows[1])
+	insertCipher(t, secondData.database, rows[0])
+	first, _ := buildFixture(t, firstData.dataDir)
+	if _, err := secondData.database.Exec("PRAGMA journal_mode=DELETE"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := secondData.database.Exec("PRAGMA page_size=8192"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := secondData.database.Exec("VACUUM"); err != nil {
+		t.Fatal(err)
+	}
+	var pageSize int
+	if err := secondData.database.QueryRow("PRAGMA page_size").Scan(&pageSize); err != nil || pageSize != 8192 {
+		t.Fatalf("second database page size = %d/%v", pageSize, err)
+	}
+	second, _ := buildFixture(t, secondData.dataDir)
+	if second.ContentID != first.ContentID {
+		t.Fatalf("physical layout changed content ID: %s != %s", second.ContentID, first.ContentID)
+	}
+	if second.ArchiveID == first.ArchiveID {
+		t.Fatal("different SQLite page layouts produced the same archive ID")
+	}
+	if _, err := secondData.database.Exec("VACUUM"); err != nil {
+		t.Fatal(err)
+	}
+	afterVacuum, _ := buildFixture(t, secondData.dataDir)
+	if afterVacuum.ContentID != second.ContentID {
+		t.Fatal("VACUUM changed logical content ID")
+	}
+}
+
+func TestCanonicalPrimitiveEncodingGoldenBytes(t *testing.T) {
+	t.Parallel()
+	var encoded bytes.Buffer
+	for _, operation := range []func() error{
+		func() error { return writeFrame(&encoded, []byte("A")) },
+		func() error { return writeSQLiteValue(&encoded, "null", nil) },
+		func() error { return writeSQLiteValue(&encoded, "integer", int64(-2)) },
+		func() error { return writeSQLiteValue(&encoded, "real", 1.5) },
+		func() error { return writeSQLiteValue(&encoded, "text", []byte("x")) },
+		func() error { return writeSQLiteValue(&encoded, "blob", []byte{0, 0xff}) },
+	} {
+		if err := operation(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want := "00000000000000014100" +
+		"01fffffffffffffffe" +
+		"023ff8000000000000" +
+		"03000000000000000178" +
+		"04000000000000000200ff"
+	if got := hex.EncodeToString(encoded.Bytes()); got != want {
+		t.Fatalf("canonical bytes = %s, want %s", got, want)
+	}
+}
+
+func TestCanonicalFullStreamGoldenDigest(t *testing.T) {
+	data := syntheticData(t, true)
+	manifest, _ := buildFixture(t, data.dataDir)
+	const want = "sha256:751c650470c5321e122e5057090fb028ed1763b7bc1aa974662df9c34516afc0"
+	if manifest.ContentID != want {
+		t.Fatalf("canonical content ID = %s, want %s", manifest.ContentID, want)
 	}
 }
 
@@ -253,7 +474,7 @@ func TestOnlineBackupCapturesOneConsistentWALTransactionDuringWrites(t *testing.
 	buildStarted := time.Now()
 	stagingDir := privateDirectory(t)
 	_, err := (Builder{
-		DataDir: data.dataDir, StagingDir: stagingDir,
+		DataDir: data.dataDir, StagingDir: stagingDir, ProjectCommit: testProjectCommit,
 	}).Build(context.Background())
 	buildFinished := time.Now()
 	writerError := <-writerDone
@@ -273,7 +494,7 @@ func TestOnlineBackupCapturesOneConsistentWALTransactionDuringWrites(t *testing.
 		t.Fatal("concurrent WAL writer did not commit during online backup")
 	}
 
-	recoveryDatabase := filepath.Join(stagingDir, "point", "data", "db.sqlite3")
+	recoveryDatabase := filepath.Join(stagingDir, "point", "db.sqlite3")
 	if info, err := os.Stat(recoveryDatabase); err != nil || info.Size() < 32<<20 {
 		t.Fatalf("recovery database is smaller than 32 MiB: %v/%v", info, err)
 	}
@@ -351,7 +572,7 @@ func TestBuilderRejectsMissingAttachmentAndSendWithoutPublishing(t *testing.T) {
 				writeFixture(t, data.sendPath, data.sendData)
 			}
 			stagingDir := privateDirectory(t)
-			_, err := (Builder{DataDir: data.dataDir, StagingDir: stagingDir}).Build(context.Background())
+			_, err := (Builder{DataDir: data.dataDir, StagingDir: stagingDir, ProjectCommit: testProjectCommit}).Build(context.Background())
 			var consistency *ConsistencyError
 			if !errors.As(err, &consistency) || consistency.Reason != "not_found" {
 				t.Fatalf("error = %v", err)
@@ -370,7 +591,7 @@ func TestBuilderRejectsMissingAttachmentAndSendWithoutPublishing(t *testing.T) {
 func TestTwoStageSendWindowPreservesPreviousPoint(t *testing.T) {
 	data := syntheticData(t, true)
 	stagingDir := privateDirectory(t)
-	builder := Builder{DataDir: data.dataDir, StagingDir: stagingDir}
+	builder := Builder{DataDir: data.dataDir, StagingDir: stagingDir, ProjectCommit: testProjectCommit}
 	first, err := builder.Build(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -426,6 +647,19 @@ func TestBuilderRejectsSizeDeletionSymlinkAndChangedRaces(t *testing.T) {
 				}
 			},
 		},
+		"symlink ancestor": {
+			before: func(t *testing.T, data fixture) {
+				cipherDirectory := filepath.Dir(data.attachmentPath)
+				external := filepath.Join(t.TempDir(), "external")
+				writeFixture(t, filepath.Join(external, testAttachmentID), data.attachmentData)
+				if err := os.RemoveAll(cipherDirectory); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(external, cipherDirectory); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
 		"changed during copy": {
 			after: func(t *testing.T, data fixture) {
 				changed := slices.Clone(data.attachmentData)
@@ -438,17 +672,17 @@ func TestBuilderRejectsSizeDeletionSymlinkAndChangedRaces(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			data := syntheticData(t, true)
 			stagingDir := privateDirectory(t)
-			builder := Builder{DataDir: data.dataDir, StagingDir: stagingDir}
+			builder := Builder{DataDir: data.dataDir, StagingDir: stagingDir, ProjectCommit: testProjectCommit}
 			runBefore := true
 			runAfter := true
 			builder.beforeCopy = func(path string) {
-				if runBefore && path == "data/attachments/"+testCipherID+"/"+testAttachmentID && test.before != nil {
+				if runBefore && path == "attachments/"+testCipherID+"/"+testAttachmentID && test.before != nil {
 					runBefore = false
 					test.before(t, data)
 				}
 			}
 			builder.afterCopy = func(path string) {
-				if runAfter && path == "data/attachments/"+testCipherID+"/"+testAttachmentID && test.after != nil {
+				if runAfter && path == "attachments/"+testCipherID+"/"+testAttachmentID && test.after != nil {
 					runAfter = false
 					test.after(t, data)
 				}
@@ -472,54 +706,72 @@ func TestBuilderRejectsUnsupportedMigrationAndUnsafeReferences(t *testing.T) {
 		if _, err := data.database.Exec("INSERT INTO __diesel_schema_migrations(version, run_on) VALUES ('20260505120001', 'future')"); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := (Builder{DataDir: data.dataDir, StagingDir: privateDirectory(t)}).Build(context.Background()); err == nil {
+		if _, err := (Builder{DataDir: data.dataDir, StagingDir: privateDirectory(t), ProjectCommit: testProjectCommit}).Build(context.Background()); err == nil {
 			t.Fatal("unsupported migration was accepted")
 		}
 	})
 	for name, value := range map[string]string{
-		"send id":   `{"id":"short","size":1}`,
-		"send size": `{"id":"` + testSendFileID + `","size":"18"}`,
-		"send JSON": `{invalid`,
+		"send id":            `{"id":"short","size":1,"fileName":"x"}`,
+		"send size":          `{"id":"` + testSendFileID + `","size":"18","fileName":"x"}`,
+		"send JSON":          `{invalid`,
+		"send unknown field": `{"id":"` + testSendFileID + `","size":18,"fileName":"x","extra":true}`,
+		"send duplicate key": `{"id":"` + testSendFileID + `","id":"` + testSendFileID + `","size":18,"fileName":"x"}`,
+		"send missing name":  `{"id":"` + testSendFileID + `","size":18}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			data := syntheticData(t, true)
 			if _, err := data.database.Exec("UPDATE sends SET data = ? WHERE uuid = ?", value, testSendID); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := (Builder{DataDir: data.dataDir, StagingDir: privateDirectory(t)}).Build(context.Background()); err == nil {
+			if _, err := (Builder{DataDir: data.dataDir, StagingDir: privateDirectory(t), ProjectCommit: testProjectCommit}).Build(context.Background()); err == nil {
 				t.Fatal("unsafe file Send reference was accepted")
 			}
 		})
 	}
+	t.Run("path escape", func(t *testing.T) {
+		data := syntheticData(t, true)
+		if _, err := data.database.Exec("UPDATE sends SET uuid = '../escape' WHERE uuid = ?", testSendID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := (Builder{DataDir: data.dataDir, StagingDir: privateDirectory(t), ProjectCommit: testProjectCommit}).Build(context.Background()); err == nil {
+			t.Fatal("path-escaping Send reference was accepted")
+		}
+	})
 }
 
 func TestBuilderRejectsSchemaDriftAtTheSameMigration(t *testing.T) {
-	t.Parallel()
-	data := syntheticData(t, true)
-	if _, err := data.database.Exec("CREATE TABLE unexpected_history_residue (id TEXT PRIMARY KEY)"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := (Builder{DataDir: data.dataDir, StagingDir: privateDirectory(t)}).Build(context.Background()); err == nil {
-		t.Fatal("database schema drift was accepted")
+	for name, statement := range map[string]string{
+		"unknown table":  "CREATE TABLE unexpected_history_residue (id TEXT PRIMARY KEY)",
+		"unknown column": "ALTER TABLE ciphers ADD COLUMN unexpected_history_residue TEXT",
+	} {
+		t.Run(name, func(t *testing.T) {
+			data := syntheticData(t, true)
+			if _, err := data.database.Exec(statement); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := (Builder{DataDir: data.dataDir, StagingDir: privateDirectory(t), ProjectCommit: testProjectCommit}).Build(context.Background()); err == nil {
+				t.Fatal("database schema drift was accepted")
+			}
+		})
 	}
 }
 
 func TestVerifyRejectsEveryTreeMismatch(t *testing.T) {
 	tests := map[string]func(t *testing.T, point string){
 		"extra file": func(t *testing.T, point string) {
-			writeFixture(t, filepath.Join(point, "data", "attachments", testCipherID, strings.Repeat("e", 20)), []byte("extra"))
+			writeFixture(t, filepath.Join(point, "attachments", testCipherID, strings.Repeat("e", 20)), []byte("extra"))
 		},
 		"missing file": func(t *testing.T, point string) {
-			if err := os.Remove(filepath.Join(point, "data", "sends", testSendID, testSendFileID)); err != nil {
+			if err := os.Remove(filepath.Join(point, "sends", testSendID, testSendFileID)); err != nil {
 				t.Fatal(err)
 			}
 		},
 		"changed file": func(t *testing.T, point string) {
-			path := filepath.Join(point, "data", "attachments", testCipherID, testAttachmentID)
+			path := filepath.Join(point, "attachments", testCipherID, testAttachmentID)
 			writeFixture(t, path, []byte("tampered-attachment"))
 		},
 		"extra directory": func(t *testing.T, point string) {
-			if err := os.Mkdir(filepath.Join(point, "data", "unexpected"), 0o700); err != nil {
+			if err := os.Mkdir(filepath.Join(point, "unexpected"), 0o700); err != nil {
 				t.Fatal(err)
 			}
 		},
@@ -528,7 +780,7 @@ func TestVerifyRejectsEveryTreeMismatch(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			data := syntheticData(t, true)
 			stagingDir := privateDirectory(t)
-			_, err := (Builder{DataDir: data.dataDir, StagingDir: stagingDir}).Build(context.Background())
+			_, err := (Builder{DataDir: data.dataDir, StagingDir: stagingDir, ProjectCommit: testProjectCommit}).Build(context.Background())
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -541,51 +793,36 @@ func TestVerifyRejectsEveryTreeMismatch(t *testing.T) {
 	}
 }
 
-func TestManifestContentIDUsesCanonicalTupleAndFilesOnly(t *testing.T) {
+func TestManifestSchemaOneSortsAndValidatesExactFields(t *testing.T) {
 	t.Parallel()
 	files := []File{
-		{Path: "data/sends/" + testSendID + "/" + testSendFileID, Size: 1, SHA256: strings.Repeat("a", 64)},
-		{Path: "data/db.sqlite3", Size: 2, SHA256: strings.Repeat("b", 64)},
+		{Path: "sends/" + testSendID + "/" + testSendFileID, Size: 1, SHA256: "sha256:" + strings.Repeat("a", 64)},
+		{Path: "db.sqlite3", Size: 2, SHA256: "sha256:" + strings.Repeat("b", 64)},
 	}
-	first, err := NewManifest(files)
+	contentID := "sha256:" + strings.Repeat("c", 64)
+	archiveID := "sha256:" + strings.Repeat("d", 64)
+	first, err := NewManifest(testProjectCommit, contentID, archiveID, files)
 	if err != nil {
 		t.Fatal(err)
 	}
 	slices.Reverse(files)
-	second, err := NewManifest(files)
+	second, err := NewManifest(testProjectCommit, contentID, archiveID, files)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if first.ContentID != second.ContentID {
-		t.Fatal("file declaration order changed canonical content ID")
-	}
-	second.CreatorVersion = "different-creator"
-	creatorID, err := second.CalculateContentID()
-	if err != nil || creatorID != first.ContentID {
-		t.Fatal("creator version changed content ID")
-	}
-	second.Vaultwarden.DatabaseMigration = "20260505120001"
-	migrationID, err := second.CalculateContentID()
-	if err != nil || migrationID == first.ContentID {
-		t.Fatal("migration did not change content ID")
-	}
-	second = first
-	second.Vaultwarden.Image += "-changed"
-	imageID, err := second.CalculateContentID()
-	if err != nil || imageID == first.ContentID {
-		t.Fatal("image digest did not change content ID")
-	}
-	second = first
-	second.Files[0].SHA256 = strings.Repeat("c", 64)
-	fileID, err := second.CalculateContentID()
-	if err != nil || fileID == first.ContentID {
-		t.Fatal("file content did not change content ID")
+	if !slices.Equal(first.Files, second.Files) || first.SchemaVersion != 1 || first.ProjectCommit != testProjectCommit || first.ContentID != contentID || first.ArchiveID != archiveID {
+		t.Fatalf("manifest = %#v", first)
 	}
 }
 
-func TestManifestStrictlyRejectsUnknownFieldsAndUnsupportedTuple(t *testing.T) {
+func TestManifestStrictlyRejectsMalformedJSONAndIdentity(t *testing.T) {
 	t.Parallel()
-	manifest, err := NewManifest([]File{{Path: "data/db.sqlite3", Size: 1, SHA256: strings.Repeat("a", 64)}})
+	manifest, err := NewManifest(
+		testProjectCommit,
+		"sha256:"+strings.Repeat("b", 64),
+		"sha256:"+strings.Repeat("c", 64),
+		[]File{{Path: "db.sqlite3", Size: 1, SHA256: "sha256:" + strings.Repeat("a", 64)}},
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -593,42 +830,72 @@ func TestManifestStrictlyRejectsUnknownFieldsAndUnsupportedTuple(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	withUnknown := strings.Replace(string(data), `"schema_version":2`, `"schema_version":2,"unknown":true`, 1)
+	withUnknown := strings.Replace(string(data), `"schema_version":1`, `"schema_version":1,"unknown":true`, 1)
 	if _, err := DecodeManifest([]byte(withUnknown)); err == nil {
 		t.Fatal("unknown manifest field was accepted")
 	}
-	manifest.Vaultwarden.Version = "1.37.3"
-	manifest.ContentID, err = manifest.CalculateContentID()
-	if err != nil {
-		t.Fatal(err)
+	duplicate := strings.Replace(string(data), `"schema_version":1`, `"schema_version":1,"schema_version":1`, 1)
+	for name, malformed := range map[string][]byte{
+		"duplicate":    []byte(duplicate),
+		"invalid utf8": append(slices.Clone(data), 0xff),
+		"trailing":     append(slices.Clone(data), []byte(` {}`)...),
+	} {
+		if _, err := DecodeManifest(malformed); err == nil {
+			t.Fatalf("%s manifest was accepted", name)
+		}
 	}
-	data, err = json.Marshal(manifest)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := DecodeManifest(data); err == nil {
-		t.Fatal("unsupported Vaultwarden tuple was accepted")
+}
+
+func TestVerifyRejectsEveryManifestIdentityAndFileTamper(t *testing.T) {
+	for name, mutate := range map[string]func(*Manifest){
+		"schema": func(manifest *Manifest) { manifest.SchemaVersion = 2 },
+		"project commit": func(manifest *Manifest) {
+			manifest.ProjectCommit = strings.Repeat("f", 40)
+		},
+		"content ID": func(manifest *Manifest) {
+			manifest.ContentID = "sha256:" + strings.Repeat("e", 64)
+		},
+		"archive ID": func(manifest *Manifest) {
+			manifest.ArchiveID = "sha256:" + strings.Repeat("d", 64)
+		},
+		"file size": func(manifest *Manifest) { manifest.Files[0].Size++ },
+		"file digest": func(manifest *Manifest) {
+			manifest.Files[0].SHA256 = "sha256:" + strings.Repeat("c", 64)
+		},
+		"file set": func(manifest *Manifest) {
+			manifest.Files = manifest.Files[:len(manifest.Files)-1]
+		},
+		"file order": func(manifest *Manifest) { slices.Reverse(manifest.Files) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			data := syntheticData(t, true)
+			_, point := buildFixture(t, data.dataDir)
+			rewriteManifest(t, point, mutate)
+			if _, err := Verify(context.Background(), point); err == nil {
+				t.Fatal("tampered manifest was accepted")
+			}
+		})
 	}
 }
 
 func TestExactAttachmentAndSendPathConstraints(t *testing.T) {
 	t.Parallel()
 	for _, path := range []string{
-		"data/db.sqlite3",
-		"data/attachments/" + testCipherID + "/" + testAttachmentID,
-		"data/sends/" + testSendID + "/" + testSendFileID,
+		"db.sqlite3",
+		"attachments/" + testCipherID + "/" + testAttachmentID,
+		"sends/" + testSendID + "/" + testSendFileID,
 	} {
 		if !validManifestPath(path) {
 			t.Fatalf("valid path rejected: %s", path)
 		}
 	}
 	for _, path := range []string{
-		"data/rsa_key.pem",
-		"data/attachments/" + testCipherID + "/Attachment-ID-001",
-		"data/attachments/AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA/" + testAttachmentID,
-		"data/sends/" + testSendID + "/short",
-		"data/sends/" + testSendID + "/" + strings.ToUpper(testSendFileID),
-		"../data/db.sqlite3",
+		"rsa_key.pem",
+		"attachments/" + testCipherID + "/Attachment-ID-001",
+		"attachments/AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA/" + testAttachmentID,
+		"sends/" + testSendID + "/short",
+		"sends/" + testSendID + "/" + strings.ToUpper(testSendFileID),
+		"../db.sqlite3",
 	} {
 		if validManifestPath(path) {
 			t.Fatalf("unsafe path accepted: %s", path)

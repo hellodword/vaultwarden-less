@@ -2,10 +2,7 @@ package restore
 
 import (
 	"context"
-	"crypto/sha256"
 	"database/sql"
-	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -57,12 +54,13 @@ func (repository *fakeRepository) Restore(ctx context.Context, _ config.Target, 
 
 func recoveryTemplate(t *testing.T) (string, snapshot.Manifest) {
 	t.Helper()
-	root := filepath.Join(t.TempDir(), "point")
-	if err := os.Mkdir(root, 0o700); err != nil {
+	root := t.TempDir()
+	data := filepath.Join(root, "data")
+	staging := filepath.Join(root, "staging")
+	if err := os.Mkdir(data, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	data := filepath.Join(root, "data")
-	if err := os.Mkdir(data, 0o700); err != nil {
+	if err := os.Mkdir(staging, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	databasePath := filepath.Join(data, "db.sqlite3")
@@ -91,29 +89,25 @@ func recoveryTemplate(t *testing.T) (string, snapshot.Manifest) {
 	if err := os.Chmod(databasePath, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	databaseBytes, err := os.ReadFile(databasePath)
+	manifest, err := (snapshot.Builder{
+		DataDir: data, StagingDir: staging,
+		ProjectCommit: "0123456789abcdef0123456789abcdef01234567",
+	}).Build(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	digest := sha256.Sum256(databaseBytes)
-	manifest, err := snapshot.NewManifest([]snapshot.File{{
-		Path: "data/db.sqlite3", Size: int64(len(databaseBytes)), SHA256: hex.EncodeToString(digest[:]),
-	}})
-	if err != nil {
+	point := filepath.Join(staging, "point")
+	if _, err := snapshot.Verify(context.Background(), point); err != nil {
 		t.Fatal(err)
 	}
-	manifestBytes, err := json.MarshalIndent(manifest, "", "  ")
-	if err != nil {
-		t.Fatal(err)
+	return point, manifest
+}
+
+func selectedSnapshot(id string, manifest snapshot.Manifest) restic.Snapshot {
+	return restic.Snapshot{
+		ID: id, ProjectCommit: manifest.ProjectCommit,
+		ContentID: manifest.ContentID, ArchiveID: manifest.ArchiveID,
 	}
-	manifestBytes = append(manifestBytes, '\n')
-	if err := os.WriteFile(filepath.Join(root, "manifest.json"), manifestBytes, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := snapshot.Verify(context.Background(), root); err != nil {
-		t.Fatal(err)
-	}
-	return root, manifest
 }
 
 func copyTree(source, destination string) error {
@@ -155,9 +149,7 @@ func TestRunPublishesOneVerifiedDirectory(t *testing.T) {
 	output := filepath.Join(restoreRoot, "prepared")
 	repository := &fakeRepository{
 		template: template,
-		selected: restic.Snapshot{
-			ID: strings.Repeat("a", 64), ContentID: manifest.ContentID,
-		},
+		selected: selectedSnapshot(strings.Repeat("a", 64), manifest),
 	}
 	result, err := Run(context.Background(), repository, Request{
 		Target: config.Target{Name: "primary"}, Output: output, RestoreRoot: restoreRoot,
@@ -165,7 +157,7 @@ func TestRunPublishesOneVerifiedDirectory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.SchemaVersion != ResultSchemaVersion || result.Target != "primary" || result.SnapshotID != repository.selected.ID || result.ContentID != manifest.ContentID || result.Output != output {
+	if result.SchemaVersion != ResultSchemaVersion || result.Target != "primary" || result.SnapshotID != repository.selected.ID || result.ProjectCommit != manifest.ProjectCommit || result.ContentID != manifest.ContentID || result.ArchiveID != manifest.ArchiveID || result.Output != output {
 		t.Fatalf("result = %#v", result)
 	}
 	if repository.resolveCalls != 1 || repository.restoreCalls != 1 || repository.resolvedWith != "" {
@@ -183,7 +175,7 @@ func TestExplicitSnapshotIsPassedWithoutFallback(t *testing.T) {
 	requested := strings.Repeat("b", 64)
 	repository := &fakeRepository{
 		template: template,
-		selected: restic.Snapshot{ID: requested, ContentID: manifest.ContentID},
+		selected: selectedSnapshot(requested, manifest),
 	}
 	if _, err := Run(context.Background(), repository, Request{
 		Target: config.Target{Name: "primary"}, SnapshotID: requested,
@@ -198,14 +190,14 @@ func TestExplicitSnapshotIsPassedWithoutFallback(t *testing.T) {
 
 func TestLatestVerificationFailureDoesNotFallbackOrPublish(t *testing.T) {
 	template, manifest := recoveryTemplate(t)
-	if err := os.WriteFile(filepath.Join(template, "data", "db.sqlite3"), []byte("corrupt"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(template, "db.sqlite3"), []byte("corrupt"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	restoreRoot := privateRestoreRoot(t)
 	output := filepath.Join(restoreRoot, "prepared")
 	repository := &fakeRepository{
 		template: template,
-		selected: restic.Snapshot{ID: strings.Repeat("c", 64), ContentID: manifest.ContentID},
+		selected: selectedSnapshot(strings.Repeat("c", 64), manifest),
 	}
 	if _, err := Run(context.Background(), repository, Request{
 		Target: config.Target{Name: "primary"}, Output: output, RestoreRoot: restoreRoot,
@@ -229,13 +221,19 @@ func TestEveryFailureLeavesFinalPathAbsent(t *testing.T) {
 		"content tag": func(repository *fakeRepository) {
 			repository.selected.ContentID = "sha256:" + strings.Repeat("f", 64)
 		},
+		"archive tag": func(repository *fakeRepository) {
+			repository.selected.ArchiveID = "sha256:" + strings.Repeat("e", 64)
+		},
+		"project tag": func(repository *fakeRepository) {
+			repository.selected.ProjectCommit = strings.Repeat("d", 40)
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			restoreRoot := privateRestoreRoot(t)
 			output := filepath.Join(restoreRoot, "prepared")
 			repository := &fakeRepository{
 				template: template,
-				selected: restic.Snapshot{ID: strings.Repeat("d", 64), ContentID: manifest.ContentID},
+				selected: selectedSnapshot(strings.Repeat("d", 64), manifest),
 			}
 			configure(repository)
 			if _, err := Run(context.Background(), repository, Request{

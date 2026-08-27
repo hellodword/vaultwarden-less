@@ -245,7 +245,7 @@ func (worker *Worker) check(ctx context.Context) checkOutcome {
 		targetContext, cancel := context.WithTimeout(ctx, config.TargetTimeout)
 		result, err := worker.ensure(targetContext, target, built)
 		cancel()
-		if err == nil && !validSyncResult(result, built.ContentID) {
+		if err == nil && !validSyncResult(result, built) {
 			err = fmt.Errorf("invalid target sync result")
 		}
 		if err != nil {
@@ -276,12 +276,12 @@ func (worker *Worker) check(ctx context.Context) checkOutcome {
 		if created > 0 {
 			result = "created"
 		}
-		return checkOutcome{result: result, contentID: built.ContentID}
+		return checkOutcome{result: result, contentID: built.ContentID, archiveID: built.ArchiveID}
 	}
 	if succeeded > 0 {
-		return checkOutcome{result: "partial", contentID: built.ContentID, errorCode: "target_failed", retry: true}
+		return checkOutcome{result: "partial", contentID: built.ContentID, archiveID: built.ArchiveID, errorCode: "target_failed", retry: true}
 	}
-	return checkOutcome{result: "failed", contentID: built.ContentID, errorCode: "all_targets_failed", retry: true}
+	return checkOutcome{result: "failed", contentID: built.ContentID, archiveID: built.ArchiveID, errorCode: "all_targets_failed", retry: true}
 }
 
 func (worker *Worker) sourceFailed(now time.Time, code string) {
@@ -431,8 +431,11 @@ func targetErrorCode(err error) string {
 	return "target_backup_failed"
 }
 
-func validSyncResult(result restic.SyncResult, contentID string) bool {
-	return validHexID(result.SnapshotID) && result.ContentID == contentID
+func validSyncResult(result restic.SyncResult, manifest snapshot.Manifest) bool {
+	if !validHexID(result.SnapshotID) || result.ContentID != manifest.ContentID || !snapshot.IsContentID(result.ArchiveID) {
+		return false
+	}
+	return !result.Created || result.ArchiveID == manifest.ArchiveID
 }
 
 func validHexID(value string) bool {

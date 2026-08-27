@@ -23,21 +23,25 @@ func validManifestPath(path string) bool {
 	if path == "" || filepath.IsAbs(path) || filepath.Clean(path) != path || filepath.ToSlash(path) != path {
 		return false
 	}
-	if path == "data/db.sqlite3" {
+	if path == "db.sqlite3" {
 		return true
 	}
 	parts := strings.Split(path, "/")
-	if len(parts) != 4 || parts[0] != "data" {
+	if len(parts) != 3 {
 		return false
 	}
-	switch parts[1] {
+	switch parts[0] {
 	case "attachments":
-		return validUUID(parts[2]) && validAttachmentID(parts[3])
+		return validUUID(parts[1]) && validAttachmentID(parts[2])
 	case "sends":
-		return validUUID(parts[2]) && validSendFileID(parts[3])
+		return validUUID(parts[1]) && validSendFileID(parts[2])
 	default:
 		return false
 	}
+}
+
+func validReferencedPath(path string) bool {
+	return path != "db.sqlite3" && validManifestPath(path)
 }
 
 func secureJoin(base, relative string) (string, error) {
