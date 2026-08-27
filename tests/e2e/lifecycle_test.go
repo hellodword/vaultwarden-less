@@ -3,11 +3,18 @@ package e2e_test
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
 	"encoding/pem"
 	"flag"
 	"fmt"
 	"io"
+	"maps"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -18,6 +25,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,6 +33,7 @@ import (
 	"time"
 
 	productcli "github.com/hellodword/vaultwarden-less/internal/cli"
+	productworker "github.com/hellodword/vaultwarden-less/internal/worker"
 )
 
 const (
@@ -37,6 +46,7 @@ const (
 
 var (
 	lowerHex64Pattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	lowerHex40Pattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
 	contentIDPattern  = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 )
 
@@ -54,23 +64,35 @@ type e2eHarness struct {
 	dockerEnv         []string
 	productionCompose string
 	testCompose       string
+	targets           []string
 	publicHTTP        string
 	publicTLS         string
 	tlsCAFile         string
 	tlsServer         *httptest.Server
+	notifierCAFile    string
+	notifierWebhook   string
+	notifierServer    *httptest.Server
 
 	backendMu sync.RWMutex
 	backend   *url.URL
+
+	notificationMu sync.Mutex
+	notifications  []string
 }
 
 var (
-	runVaultwardenE2E = flag.Bool("run-vaultwarden-e2e", false, "run the real Vaultwarden lifecycle test")
+	runBackupE2E      = flag.Bool("run-backup-e2e", false, "run the real Vaultwarden backup/restore lifecycle")
+	runMultiTargetE2E = flag.Bool("run-multitarget-e2e", false, "run the real multi-target degradation lifecycle")
 	proxyPort         = flag.Int("proxy-host-port", 0, "fixed proxy host port; zero asks Docker for an ephemeral port")
 	drillPort         = flag.Int("drill-host-port", 0, "fixed drill host port; zero asks Docker for an ephemeral port")
+	preloadedImages   = flag.Bool("preloaded-images", false, "use already loaded local test images")
 )
 
-func newE2EHarness(t *testing.T, ctx context.Context) *e2eHarness {
+func newE2EHarness(t *testing.T, ctx context.Context, targets ...string) *e2eHarness {
 	t.Helper()
+	if len(targets) == 0 {
+		targets = []string{"primary"}
+	}
 	repository := repositoryRoot(t)
 	localRoot := t.TempDir()
 	dockerConfig := filepath.Join(localRoot, "docker-config")
@@ -87,6 +109,9 @@ func newE2EHarness(t *testing.T, ctx context.Context) *e2eHarness {
 	}
 	validateOptionalPort(t, "-proxy-host-port", *proxyPort)
 	validateOptionalPort(t, "-drill-host-port", *drillPort)
+	if *proxyPort != 0 && *proxyPort == *drillPort {
+		t.Fatal("explicit proxy and drill ports must differ")
+	}
 	dockerPath, err := exec.LookPath("docker")
 	if err != nil {
 		t.Fatalf("the Nix-provided Docker CLI is required: %v", err)
@@ -103,18 +128,22 @@ func newE2EHarness(t *testing.T, ctx context.Context) *e2eHarness {
 		dockerConfig:  dockerConfig,
 		dockerPath:    dockerPath,
 		dockerEnv:     isolatedDockerEnvironment(dockerConfig),
+		targets:       slices.Clone(targets),
 	}
-	harness.productionCompose = filepath.Join(localRoot, "compose.yml")
-	harness.testCompose = filepath.Join(localRoot, "compose.e2e.yml")
+	harness.productionCompose = filepath.Join(repository, "compose.yml")
+	harness.testCompose = filepath.Join(repository, "tests", "e2e", "compose.override.yml")
 	t.Cleanup(harness.cleanup)
 	if output, err := harness.docker("info"); err != nil {
 		t.Fatalf("Docker daemon is required: %v: %s", err, truncateDiagnostic(output, 2000))
 	}
 
-	harness.prepareImages()
 	harness.startTLSProxy()
-	harness.writeComposeFiles("prepared")
-	harness.seedVolumes()
+	harness.startNotifierReceiver()
+	harness.prepareDeployment()
+	harness.validateComposeModel()
+	if !*preloadedImages {
+		harness.prepareImages()
+	}
 	return harness
 }
 
@@ -125,7 +154,7 @@ func repositoryRoot(t *testing.T) string {
 		t.Fatal(err)
 	}
 	for {
-		if _, err := os.Stat(filepath.Join(current, "deploy", "compose.template.yml")); err == nil {
+		if _, err := os.Stat(filepath.Join(current, "compose.yml")); err == nil {
 			if _, err := os.Stat(filepath.Join(current, "flake.nix")); err == nil {
 				return current
 			}
@@ -192,6 +221,89 @@ func (h *e2eHarness) startTLSProxy() {
 	writePrivateFile(h.t, h.tlsCAFile, string(encoded))
 }
 
+func (h *e2eHarness) startNotifierReceiver() {
+	h.t.Helper()
+	certificatePEM, keyPEM := testServerCertificate(h.t, "e2e-host")
+	certificate, err := tls.X509KeyPair(certificatePEM, keyPEM)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	listener, err := net.Listen("tcp", "0.0.0.0:0")
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost || request.Header.Get("Content-Type") != "application/json" {
+			http.Error(writer, "invalid request", http.StatusBadRequest)
+			return
+		}
+		body, readError := io.ReadAll(io.LimitReader(request.Body, 64<<10+1))
+		if readError != nil || len(body) > 64<<10 {
+			http.Error(writer, "invalid body", http.StatusBadRequest)
+			return
+		}
+		var payload struct {
+			MessageType string `json:"msgtype"`
+			Text        struct {
+				Content string `json:"content"`
+			} `json:"text"`
+		}
+		if decodeExactJSON(string(body), &payload) != nil || payload.MessageType != "text" || payload.Text.Content == "" {
+			http.Error(writer, "invalid payload", http.StatusBadRequest)
+			return
+		}
+		h.notificationMu.Lock()
+		h.notifications = append(h.notifications, payload.Text.Content)
+		h.notificationMu.Unlock()
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(writer, "{\"errcode\":0}\n")
+	}))
+	_ = server.Listener.Close()
+	server.Listener = listener
+	server.TLS = &tls.Config{Certificates: []tls.Certificate{certificate}, MinVersion: tls.VersionTLS12}
+	server.StartTLS()
+	h.notifierServer = server
+	h.notifierCAFile = filepath.Join(h.localRoot, "notifier-ca.pem")
+	writePrivateFile(h.t, h.notifierCAFile, string(certificatePEM))
+	port := listener.Addr().(*net.TCPAddr).Port
+	h.notifierWebhook = "https://e2e-host:" + strconv.Itoa(port) + "/wechat"
+}
+
+func testServerCertificate(t *testing.T, dnsName string) ([]byte, []byte) {
+	t.Helper()
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serialLimit := new(big.Int).Lsh(big.NewInt(1), 128)
+	serial, err := rand.Int(rand.Reader, serialLimit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	template := x509.Certificate{
+		SerialNumber:          serial,
+		Subject:               pkix.Name{CommonName: dnsName},
+		NotBefore:             now.Add(-time.Minute),
+		NotAfter:              now.Add(2 * time.Hour),
+		DNSNames:              []string{dnsName},
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, &template, &template, &privateKey.PublicKey, privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certificatePEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(privateKey)})
+	if certificatePEM == nil || keyPEM == nil {
+		t.Fatal("encode notifier TLS certificate")
+	}
+	return certificatePEM, keyPEM
+}
+
 func (h *e2eHarness) setBackend(endpoint string) {
 	parsed, err := url.Parse(endpoint)
 	if err != nil || parsed.Scheme != "http" || parsed.Host == "" {
@@ -203,57 +315,170 @@ func (h *e2eHarness) setBackend(endpoint string) {
 	h.publicHTTP = endpoint
 }
 
-func (h *e2eHarness) writeComposeFiles(drillName string) {
-	if !regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`).MatchString(drillName) {
-		h.t.Fatalf("unsafe drill restore name %q", drillName)
+func (h *e2eHarness) prepareDeployment() {
+	h.t.Helper()
+	if os.Geteuid() == 0 || os.Getegid() == 0 {
+		h.t.Fatal("E2E harness must run as an unprivileged identity")
 	}
-	production := renderTestTemplate(
+	for _, relative := range []string{
+		"config", "credentials", "credentials/restic", "cache", "data", "restore", "staging", "state",
+	} {
+		path := filepath.Join(h.localRoot, relative)
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			h.t.Fatal(err)
+		}
+		if err := os.Chmod(path, 0o700); err != nil {
+			h.t.Fatal(err)
+		}
+	}
+
+	deployment := readTrackedExample(h.t, filepath.Join(h.repository, ".env.example"))
+	deployment = strings.Replace(deployment, "RUNTIME_UID=1000", "RUNTIME_UID="+strconv.Itoa(os.Geteuid()), 1)
+	deployment = strings.Replace(deployment, "RUNTIME_GID=1000", "RUNTIME_GID="+strconv.Itoa(os.Getegid()), 1)
+	deployment = strings.Replace(deployment, "LISTEN_PORT=8080", "LISTEN_PORT=18080", 1)
+	deployment = strings.Replace(deployment, "DRILL_PORT=8081", "DRILL_PORT=18081", 1)
+	writePrivateFile(h.t, filepath.Join(h.localRoot, ".env"), deployment)
+
+	vaultwarden := readTrackedExample(h.t, filepath.Join(h.repository, "config", "vaultwarden.example.env"))
+	vaultwarden = strings.Replace(vaultwarden, "DOMAIN=https://vaultwarden.example.test", "DOMAIN="+h.publicTLS, 1)
+	vaultwarden = strings.Replace(vaultwarden, "SIGNUPS_ALLOWED=false", "SIGNUPS_ALLOWED=true", 1)
+	vaultwarden = strings.Replace(vaultwarden, "INVITATIONS_ALLOWED=false", "INVITATIONS_ALLOWED=true", 1)
+	writePrivateFile(h.t, filepath.Join(h.localRoot, "config", "vaultwarden.env"), vaultwarden)
+
+	backupExample := readTrackedExample(h.t, filepath.Join(h.repository, "config", "backup.example.yaml"))
+	writePrivateFile(h.t, filepath.Join(h.localRoot, "config", "backup.yaml"), renderBackupExample(h.t, backupExample, h.targets))
+	for _, role := range []string{"backup", "maintenance"} {
+		example := readTrackedExample(h.t, filepath.Join(h.repository, "credentials", role+".example.yaml"))
+		writePrivateFile(h.t, filepath.Join(h.localRoot, "credentials", role+".yaml"), renderRoleExample(h.t, example, h.targets))
+	}
+	notifierExample := readTrackedExample(h.t, filepath.Join(h.repository, "credentials", "notifiers.example.yaml"))
+	if !strings.Contains(notifierExample, "schema_version: 1") {
+		h.t.Fatal("notifier example is not schema 1")
+	}
+	writePrivateFile(
 		h.t,
-		filepath.Join(h.repository, "deploy", "compose.template.yml"),
-		map[string]string{
-			"@@USER_UID@@":           "10000",
-			"@@USER_GID@@":           "10000",
-			"@@IMAGE_BACKUP@@":       "vaultwarden-less-backup:local",
-			"@@IMAGE_PROXY@@":        "vaultwarden-less-proxy:local",
-			"@@IMAGE_VAULTWARDEN@@":  "vaultwarden-less-vaultwarden:local",
-			"@@PORT_PROXY@@":         "0",
-			"@@PORT_DRILL@@":         "0",
-			"@@RESTORE_NAME_DRILL@@": drillName,
-		},
+		filepath.Join(h.localRoot, "credentials", "notifiers.yaml"),
+		"schema_version: 1\nnotifiers:\n  e2e:\n    webhook_url: "+h.notifierWebhook+"\n",
 	)
-	overlay := renderTestTemplate(
-		h.t,
-		filepath.Join(h.repository, "tests", "e2e", "compose.template.yml"),
-		map[string]string{
-			"@@IMAGE_VAULTWARDEN@@": "vaultwarden-less-vaultwarden:local",
-			"@@IMAGE_MOTO@@":        "vaultwarden-less-moto:local",
-			"@@E2E_DOMAIN@@":        h.publicTLS,
-			"@@PORT_PROXY_E2E@@":    strconv.Itoa(h.proxyHostPort),
-			"@@PORT_DRILL_E2E@@":    strconv.Itoa(h.drillHostPort),
-		},
+	passwordExample := strings.TrimSuffix(readTrackedExample(h.t, filepath.Join(h.repository, "credentials", "restic", "primary.example")), "\n")
+	if passwordExample != "replace-me" {
+		h.t.Fatal("restic password example changed unexpectedly")
+	}
+	for _, target := range h.targets {
+		writePrivateFile(h.t, filepath.Join(h.localRoot, "credentials", "restic", target), "e2e-"+target+"-restic-password\n")
+	}
+
+	h.dockerEnv = append(
+		h.dockerEnv,
+		"E2E_PROXY_PORT="+composePublishedPort(h.proxyHostPort),
+		"E2E_DRILL_PORT="+composePublishedPort(h.drillHostPort),
+		"E2E_SOURCE_PORT=",
+		"E2E_DOMAIN="+h.publicTLS,
+		"E2E_DRILL_SOURCE="+filepath.Join(h.localRoot, "restore", "drill"),
+		"E2E_NOTIFIER_CA="+h.notifierCAFile,
 	)
-	writePrivateFile(h.t, h.productionCompose, production)
-	writePrivateFile(h.t, h.testCompose, overlay)
 }
 
-func renderTestTemplate(t *testing.T, filename string, replacements map[string]string) string {
+func (h *e2eHarness) validateComposeModel() {
+	h.t.Helper()
+	output := h.compose("--profile", "drill", "config", "--format", "json")
+	var model struct {
+		Services map[string]struct {
+			User        string            `json:"user"`
+			Environment map[string]string `json:"environment"`
+			CapAdd      []string          `json:"cap_add"`
+			Ports       []struct {
+				HostIP    string `json:"host_ip"`
+				Target    int    `json:"target"`
+				Published string `json:"published"`
+			} `json:"ports"`
+			Volumes []struct {
+				Type     string `json:"type"`
+				Source   string `json:"source"`
+				Target   string `json:"target"`
+				ReadOnly bool   `json:"read_only"`
+			} `json:"volumes"`
+		} `json:"services"`
+	}
+	if err := json.Unmarshal([]byte(output), &model); err != nil {
+		h.t.Fatalf("decode Compose model: %v: %s", err, harnessDiagnostics(output))
+	}
+	for _, expected := range []struct {
+		service   string
+		target    int
+		published int
+	}{
+		{"vaultwarden", 80, 0},
+		{"proxy", 8080, h.proxyHostPort},
+		{"drill-vaultwarden", 80, h.drillHostPort},
+	} {
+		ports := model.Services[expected.service].Ports
+		if len(ports) != 1 || ports[0].HostIP != "127.0.0.1" || ports[0].Target != expected.target ||
+			ports[0].Published != composePublishedPort(expected.published) {
+			h.t.Fatalf("Compose model has invalid %s test port: %#v", expected.service, ports)
+		}
+	}
+	deploymentMount := false
+	for _, volume := range model.Services["backup"].Volumes {
+		if volume.Type == "bind" && filepath.Clean(volume.Source) == filepath.Join(h.localRoot, ".env") &&
+			volume.Target == "/deployment/.env" && volume.ReadOnly {
+			deploymentMount = true
+			break
+		}
+	}
+	if !deploymentMount {
+		h.t.Fatal("Compose model does not mount the deployment environment read-only for backup serve")
+	}
+	drillCopy := model.Services["drill-copy"]
+	if drillCopy.User != "0:0" ||
+		!slices.Equal(drillCopy.CapAdd, []string{"CHOWN", "DAC_OVERRIDE", "FOWNER"}) ||
+		!maps.Equal(drillCopy.Environment, map[string]string{
+			"RUNTIME_UID": strconv.Itoa(os.Geteuid()),
+			"RUNTIME_GID": strconv.Itoa(os.Getegid()),
+		}) {
+		h.t.Fatalf("Compose model has invalid root-only drill copy identity: user=%q caps=%v environment=%v", drillCopy.User, drillCopy.CapAdd, drillCopy.Environment)
+	}
+}
+
+func readTrackedExample(t *testing.T, path string) string {
 	t.Helper()
-	data, err := os.ReadFile(filename)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	result := string(data)
-	for token, value := range replacements {
-		if !strings.Contains(result, token) {
-			t.Fatalf("test Compose template is missing %s", token)
-		}
-		result = strings.ReplaceAll(result, token, value)
+	if len(data) == 0 || data[len(data)-1] != '\n' {
+		t.Fatalf("tracked example %s is not newline terminated", filepath.Base(path))
 	}
-	if unresolved := regexp.MustCompile(`@@[A-Z0-9_]+@@`).FindAllString(result, -1); len(unresolved) != 0 {
-		t.Fatalf("unresolved test Compose tokens: %v", unresolved)
+	return string(data)
+}
+
+func renderBackupExample(t *testing.T, example string, targets []string) string {
+	t.Helper()
+	if !slices.Equal(targets, []string{"primary"}) && !slices.Equal(targets, []string{"primary", "secondary"}) {
+		t.Fatalf("unsupported E2E targets: %v", targets)
 	}
-	if strings.Contains(result, "${") {
-		t.Fatal("test Compose must not use environment interpolation")
+	result := strings.Replace(example, "s3:https://objects.example.test/bucket/vaultwarden", "s3:http://moto-primary:5000/vaultwarden-less-e2e-primary/repository", 1)
+	result = strings.Replace(result, "      - name: s3.bucket-lookup\n        value: path", "      - name: s3.bucket-lookup\n        value: path\n      - name: s3.region\n        value: us-east-1", 1)
+	result = strings.Replace(result, "notifiers:\n  - name: operations\n    type: wechat", "notifiers:\n  - name: e2e\n    type: wechat", 1)
+	if len(targets) == 2 {
+		result = strings.Replace(result, "upgrade_verification_targets:\n  - primary", "upgrade_verification_targets:\n  - primary\n  - secondary", 1)
+		secondary := "  - name: secondary\n    repository: s3:http://moto-secondary:5000/vaultwarden-less-e2e-secondary/repository\n    options:\n      - name: s3.bucket-lookup\n        value: path\n      - name: s3.region\n        value: us-east-1\n"
+		result = strings.Replace(result, "notifiers:\n  - name: e2e", secondary+"notifiers:\n  - name: e2e", 1)
+	}
+	if strings.Contains(result, "example.test") || strings.Contains(result, "replace-me") {
+		t.Fatal("backup example customization is incomplete")
+	}
+	return result
+}
+
+func renderRoleExample(t *testing.T, example string, targets []string) string {
+	t.Helper()
+	if !strings.Contains(example, "schema_version: 1") || !strings.Contains(example, "primary:") {
+		t.Fatal("role credential example changed unexpectedly")
+	}
+	result := strings.ReplaceAll(example, "replace-me", "test")
+	if len(targets) == 2 {
+		result += "  secondary:\n    environment:\n      AWS_ACCESS_KEY_ID: test\n      AWS_SECRET_ACCESS_KEY: test\n"
 	}
 	return result
 }
@@ -265,6 +490,13 @@ func validateOptionalPort(t *testing.T, name string, port int) {
 	}
 }
 
+func composePublishedPort(port int) string {
+	if port == 0 {
+		return ""
+	}
+	return strconv.Itoa(port)
+}
+
 func writePrivateFile(t *testing.T, filename, content string) {
 	t.Helper()
 	if err := os.WriteFile(filename, []byte(content), 0o600); err != nil {
@@ -273,10 +505,6 @@ func writePrivateFile(t *testing.T, filename, content string) {
 	if err := os.Chmod(filename, 0o600); err != nil {
 		t.Fatal(err)
 	}
-}
-
-func (h *e2eHarness) seedVolumes() {
-	h.compose("--profile", "seed", "run", "--rm", "--no-deps", "seed")
 }
 
 func (h *e2eHarness) compose(arguments ...string) string {
@@ -292,7 +520,7 @@ func (h *e2eHarness) tryCompose(ctx context.Context, arguments ...string) (strin
 	base := []string{
 		"compose",
 		"--env-file",
-		"/dev/null",
+		filepath.Join(h.localRoot, ".env"),
 		"--project-directory",
 		h.localRoot,
 		"--project-name",
@@ -307,22 +535,40 @@ func (h *e2eHarness) tryCompose(ctx context.Context, arguments ...string) (strin
 }
 
 func (h *e2eHarness) startMotoAndRepository() {
-	h.compose("up", "--detach", "moto")
+	services := make([]string, 0, len(h.targets)+2)
+	services = append(services, "up", "--detach")
+	for _, target := range h.targets {
+		services = append(services, "moto-"+target)
+	}
+	h.compose(services...)
+	for _, target := range h.targets {
+		h.createMotoBucket(target)
+		h.initRepository(target)
+	}
+}
+
+func (h *e2eHarness) initRepository(target string) {
+	h.t.Helper()
+	h.compose(
+		"--profile", "maintenance", "run", "--rm", "--no-deps", "maintenance",
+		"repo", "init", "--target", target, "--config", "/config/backup.yaml",
+	)
+}
+
+func (h *e2eHarness) createMotoBucket(target string) {
+	h.t.Helper()
+	service := "moto-" + target
+	bucket := "vaultwarden-less-e2e-" + target
 	deadline := time.Now().Add(90 * time.Second)
-	created := false
 	for time.Now().Before(deadline) {
 		_, err := h.tryCompose(
 			h.ctx,
-			"exec",
-			"--no-TTY",
-			"moto",
-			"python",
-			"-c",
-			"import boto3; boto3.client('s3', endpoint_url='http://127.0.0.1:5000', aws_access_key_id='test', aws_secret_access_key='test', region_name='us-east-1').create_bucket(Bucket='vaultwarden-less-e2e')",
+			"exec", "--no-TTY", service, "python", "-c",
+			"import boto3,sys; boto3.client('s3', endpoint_url='http://127.0.0.1:5000', aws_access_key_id='test', aws_secret_access_key='test', region_name='us-east-1').create_bucket(Bucket=sys.argv[1])",
+			bucket,
 		)
 		if err == nil {
-			created = true
-			break
+			return
 		}
 		select {
 		case <-h.ctx.Done():
@@ -330,28 +576,18 @@ func (h *e2eHarness) startMotoAndRepository() {
 		case <-time.After(500 * time.Millisecond):
 		}
 	}
-	if !created {
-		h.t.Fatal("Moto did not accept bucket creation")
-	}
-	h.compose(
-		"--profile",
-		"maintenance",
-		"run",
-		"--rm",
-		"--no-deps",
-		"maintenance",
-		"repo",
-		"init",
-		"--target",
-		"primary",
-		"--config",
-		"/config/backup.yaml",
-	)
+	h.t.Fatalf("Moto target %s did not accept bucket creation", target)
 }
 
-func (h *e2eHarness) startVaultwardenAndProxy() {
-	h.compose("up", "--detach", "vaultwarden", "proxy")
+func (h *e2eHarness) startVaultwarden() {
+	h.compose("up", "--detach", "vaultwarden")
 	h.waitHealthy("vaultwarden", 3*time.Minute)
+	h.setBackend(h.mappedEndpoint("vaultwarden", 80))
+	h.waitHTTP(h.publicHTTP+"/alive", http.StatusOK, time.Minute)
+}
+
+func (h *e2eHarness) startProxy() {
+	h.compose("up", "--detach", "proxy")
 	h.waitHealthy("proxy", 3*time.Minute)
 	h.setBackend(h.mappedEndpoint("proxy", 8080))
 	h.waitHTTP(h.publicHTTP+"/.vaultwarden-less/healthz", http.StatusNoContent, 2*time.Minute)
@@ -363,18 +599,28 @@ func (h *e2eHarness) startBackup() {
 }
 
 func (h *e2eHarness) mappedEndpoint(service string, containerPort int) string {
-	output := h.compose("port", service, strconv.Itoa(containerPort))
-	lines := strings.Fields(output)
-	if len(lines) != 1 {
-		h.t.Fatalf("invalid published port for %s: %q", service, output)
+	container := strings.TrimSpace(h.compose("ps", "--quiet", service))
+	if !lowerHex64Pattern.MatchString(container) {
+		h.t.Fatalf("invalid container ID for %s: %q", service, container)
 	}
-	_, rawPort, err := net.SplitHostPort(lines[0])
+	output, err := h.docker("inspect", "--format", "{{json .NetworkSettings.Ports}}", container)
 	if err != nil {
-		h.t.Fatalf("invalid published port for %s: %q", service, output)
+		h.t.Fatalf("inspect published port for %s: %v: %s", service, err, harnessDiagnostics(output))
 	}
-	port, err := strconv.Atoi(rawPort)
+	var ports map[string][]struct {
+		HostIP   string `json:"HostIp"`
+		HostPort string `json:"HostPort"`
+	}
+	if err := decodeExactJSON(output, &ports); err != nil {
+		h.t.Fatalf("decode published ports for %s: %v: %s", service, err, harnessDiagnostics(output))
+	}
+	bindings := ports[strconv.Itoa(containerPort)+"/tcp"]
+	if len(bindings) != 1 || bindings[0].HostIP != "127.0.0.1" {
+		h.t.Fatalf("invalid loopback binding for %s: %s", service, harnessDiagnostics(output))
+	}
+	port, err := strconv.Atoi(bindings[0].HostPort)
 	if err != nil || port < 1 || port > 65535 {
-		h.t.Fatalf("invalid published TCP port for %s: %q", service, rawPort)
+		h.t.Fatalf("invalid published TCP port for %s: %q", service, bindings[0].HostPort)
 	}
 	return "http://" + net.JoinHostPort(h.publishedHost, strconv.Itoa(port))
 }
@@ -382,15 +628,19 @@ func (h *e2eHarness) mappedEndpoint(service string, containerPort int) string {
 func (h *e2eHarness) waitHealthy(service string, timeout time.Duration) {
 	h.t.Helper()
 	deadline := time.Now().Add(timeout)
+	var lastContainer string
+	var lastState string
 	for time.Now().Before(deadline) {
 		container, err := h.tryCompose(h.ctx, "ps", "--quiet", service)
 		if err == nil && strings.TrimSpace(container) != "" {
+			lastContainer = strings.TrimSpace(container)
 			output, inspectError := h.docker(
 				"inspect",
 				"--format",
 				"{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}",
-				strings.TrimSpace(container),
+				lastContainer,
 			)
+			lastState = output
 			fields := strings.Fields(output)
 			if inspectError == nil && len(fields) >= 2 && fields[0] == "running" && fields[1] == "healthy" {
 				return
@@ -405,7 +655,16 @@ func (h *e2eHarness) waitHealthy(service string, timeout time.Duration) {
 		case <-time.After(time.Second):
 		}
 	}
-	h.t.Fatalf("service %s did not become healthy", service)
+	logs := ""
+	if lastContainer != "" {
+		logs, _ = h.docker("logs", "--tail", "100", lastContainer)
+	}
+	h.t.Fatalf(
+		"service %s did not become healthy: state=%s logs=%s",
+		service,
+		harnessDiagnostics(lastState),
+		harnessDiagnostics(logs),
+	)
 }
 
 func (h *e2eHarness) waitHTTP(endpoint string, status int, timeout time.Duration) {
@@ -442,9 +701,11 @@ type snapshotList struct {
 	Limit         int    `json:"limit"`
 	Truncated     bool   `json:"truncated"`
 	Snapshots     []struct {
-		ID        string `json:"id"`
-		Time      string `json:"time"`
-		ContentID string `json:"content_id"`
+		ID            string `json:"id"`
+		Time          string `json:"time"`
+		ProjectCommit string `json:"project_commit"`
+		ContentID     string `json:"content_id"`
+		ArchiveID     string `json:"archive_id"`
 	} `json:"snapshots"`
 }
 
@@ -462,9 +723,13 @@ type pruneOutput struct {
 }
 
 func (h *e2eHarness) repositoryCheck() {
+	h.repositoryCheckTarget("primary")
+}
+
+func (h *e2eHarness) repositoryCheckTarget(target string) {
 	output := h.compose(
 		"--profile", "maintenance", "run", "--rm", "--no-deps", "maintenance",
-		"repo", "check", "--target", "primary", "--read-data-subset", "1/12",
+		"repo", "check", "--target", target,
 		"--config", "/config/backup.yaml",
 	)
 	var result struct {
@@ -475,7 +740,7 @@ func (h *e2eHarness) repositoryCheck() {
 	}
 	if decodeExactJSON(output, &result) != nil ||
 		result.SchemaVersion != productcli.ResultSchemaVersion || result.Operation != "check" ||
-		result.Target != "primary" || !result.Success {
+		result.Target != target || !result.Success {
 		h.t.Fatalf("invalid repository check result: %s", harnessDiagnostics(output))
 	}
 }
@@ -499,6 +764,10 @@ func (h *e2eHarness) prune(apply bool) pruneOutput {
 }
 
 func (h *e2eHarness) snapshots() (snapshotList, error) {
+	return h.targetSnapshots("primary")
+}
+
+func (h *e2eHarness) targetSnapshots(target string) (snapshotList, error) {
 	output, err := h.tryCompose(
 		h.ctx,
 		"exec",
@@ -508,7 +777,7 @@ func (h *e2eHarness) snapshots() (snapshotList, error) {
 		"repo",
 		"snapshots",
 		"--target",
-		"primary",
+		target,
 		"--limit",
 		"100",
 		"--config",
@@ -520,7 +789,7 @@ func (h *e2eHarness) snapshots() (snapshotList, error) {
 	var result snapshotList
 	if err := decodeExactJSON(output, &result); err != nil ||
 		result.SchemaVersion != productcli.ResultSchemaVersion ||
-		result.Target != "primary" || result.Limit != 100 ||
+		result.Target != target || result.Limit != 100 ||
 		result.Snapshots == nil || result.Truncated {
 		return snapshotList{}, fmt.Errorf("invalid snapshots response")
 	}
@@ -529,7 +798,9 @@ func (h *e2eHarness) snapshots() (snapshotList, error) {
 	for index, item := range result.Snapshots {
 		parsed, err := time.Parse(time.RFC3339, item.Time)
 		if err != nil || !lowerHex64Pattern.MatchString(item.ID) ||
-			!contentIDPattern.MatchString(item.ContentID) || seen[item.ID] ||
+			!lowerHex40Pattern.MatchString(item.ProjectCommit) ||
+			!contentIDPattern.MatchString(item.ContentID) ||
+			!contentIDPattern.MatchString(item.ArchiveID) || seen[item.ID] ||
 			(index > 0 && parsed.After(previous)) {
 			return snapshotList{}, fmt.Errorf("invalid snapshot identity or ordering")
 		}
@@ -537,6 +808,48 @@ func (h *e2eHarness) snapshots() (snapshotList, error) {
 		previous = parsed
 	}
 	return result, nil
+}
+
+func (h *e2eHarness) status() productworker.Status {
+	h.t.Helper()
+	output := h.compose("exec", "--no-TTY", "backup", "/bin/vaultwarden-less-backup", "status")
+	var status productworker.Status
+	if err := decodeExactJSON(output, &status); err != nil ||
+		status.SchemaVersion != productworker.SchemaVersion || status.Targets == nil {
+		h.t.Fatalf("invalid worker status: %v: %s", err, harnessDiagnostics(output))
+	}
+	return status
+}
+
+func (h *e2eHarness) requestBackup() {
+	h.t.Helper()
+	output := h.compose("exec", "--no-TTY", "backup", "/bin/vaultwarden-less-backup", "request-backup")
+	var result struct {
+		SchemaVersion int  `json:"schema_version"`
+		Accepted      bool `json:"accepted"`
+	}
+	if err := decodeExactJSON(output, &result); err != nil ||
+		result.SchemaVersion != productworker.SchemaVersion || !result.Accepted {
+		h.t.Fatalf("invalid backup request result: %v: %s", err, harnessDiagnostics(output))
+	}
+}
+
+func (h *e2eHarness) waitCheckAfter(previousFinished, result string, timeout time.Duration) productworker.Status {
+	h.t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		status := h.status()
+		if status.LastCheck != nil && status.LastCheck.FinishedAt != previousFinished && status.LastCheck.Result == result {
+			return status
+		}
+		select {
+		case <-h.ctx.Done():
+			h.t.Fatal(h.ctx.Err())
+		case <-time.After(2 * time.Second):
+		}
+	}
+	h.t.Fatalf("worker did not complete a new %s check", result)
+	return productworker.Status{}
 }
 
 func (h *e2eHarness) waitSnapshotCount(count int, timeout time.Duration) snapshotList {
@@ -612,39 +925,22 @@ func (h *e2eHarness) waitWorkerState(want string, timeout time.Duration) {
 	h.t.Fatalf("worker state did not become %s", want)
 }
 
-func (h *e2eHarness) vaultwardenContainer() string {
-	container := strings.TrimSpace(h.compose("ps", "--quiet", "vaultwarden"))
-	if !regexp.MustCompile(`^[0-9a-f]{64}$`).MatchString(container) {
-		h.t.Fatalf("invalid Vaultwarden container ID %q", container)
-	}
-	return container
-}
-
 func (h *e2eHarness) singleFileIn(relativeDirectory string) string {
 	h.t.Helper()
 	relativeDirectory = cleanTestRelative(h.t, relativeDirectory)
-	output, err := h.docker(
-		"exec",
-		h.vaultwardenContainer(),
-		"find",
-		"/"+relativeDirectory,
-		"-mindepth",
-		"1",
-		"-maxdepth",
-		"1",
-		"-type",
-		"f",
-		"-printf",
-		"%f\n",
-	)
+	directory := filepath.Join(h.localRoot, filepath.FromSlash(relativeDirectory))
+	entries, err := os.ReadDir(directory)
 	if err != nil {
-		h.t.Fatalf("list file Send data: %v: %s", err, harnessDiagnostics(output))
+		h.t.Fatalf("list file Send data: %v", err)
 	}
-	names := strings.Fields(output)
-	if len(names) != 1 || !lowerHex64Pattern.MatchString(names[0]) {
-		h.t.Fatalf("file Send directory contains unexpected entries: %q", names)
+	if len(entries) != 1 || !lowerHex64Pattern.MatchString(entries[0].Name()) {
+		h.t.Fatalf("file Send directory contains unexpected entries: %#v", entries)
 	}
-	return relativeDirectory + "/" + names[0]
+	info, err := entries[0].Info()
+	if err != nil || !info.Mode().IsRegular() {
+		h.t.Fatalf("file Send entry is not a regular file: %v", err)
+	}
+	return relativeDirectory + "/" + entries[0].Name()
 }
 
 func (h *e2eHarness) holdDataFile(relative string) func() {
@@ -653,33 +949,25 @@ func (h *e2eHarness) holdDataFile(relative string) func() {
 	if !strings.HasPrefix(relative, "data/") {
 		h.t.Fatalf("refusing to hold a non-data test path %q", relative)
 	}
-	source := "/" + relative
-	held := "/data/.e2e-held-" + strings.ReplaceAll(strings.TrimPrefix(relative, "data/"), "/", "-")
+	source := filepath.Join(h.localRoot, filepath.FromSlash(relative))
+	held := filepath.Join(h.localRoot, "data", ".e2e-held-"+strings.ReplaceAll(strings.TrimPrefix(relative, "data/"), "/", "-"))
 	restored := false
-	h.renameContainerFile(source, held)
+	h.renameDataFile(source, held)
 	restore := func() {
 		if restored {
 			return
 		}
-		h.renameContainerFile(held, source)
+		h.renameDataFile(held, source)
 		restored = true
 	}
 	h.t.Cleanup(restore)
 	return restore
 }
 
-func (h *e2eHarness) renameContainerFile(from, to string) {
+func (h *e2eHarness) renameDataFile(from, to string) {
 	h.t.Helper()
-	output, err := h.docker(
-		"exec",
-		h.vaultwardenContainer(),
-		"mv",
-		"--",
-		from,
-		to,
-	)
-	if err != nil {
-		h.t.Fatalf("rename E2E data file: %v: %s", err, harnessDiagnostics(output))
+	if err := os.Rename(from, to); err != nil {
+		h.t.Fatalf("rename E2E data file: %v", err)
 	}
 }
 
@@ -731,11 +1019,17 @@ type restoreOutput struct {
 	SchemaVersion int    `json:"schema_version"`
 	Target        string `json:"target"`
 	SnapshotID    string `json:"snapshot_id"`
+	ProjectCommit string `json:"project_commit"`
 	ContentID     string `json:"content_id"`
+	ArchiveID     string `json:"archive_id"`
 	Output        string `json:"output"`
 }
 
 func (h *e2eHarness) restore(snapshotID, outputName string) restoreOutput {
+	return h.restoreTarget("primary", snapshotID, outputName)
+}
+
+func (h *e2eHarness) restoreTarget(target, snapshotID, outputName string) restoreOutput {
 	if !regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`).MatchString(outputName) {
 		h.t.Fatalf("unsafe restore output name %q", outputName)
 	}
@@ -748,9 +1042,9 @@ func (h *e2eHarness) restore(snapshotID, outputName string) restoreOutput {
 		"restore",
 		"restore",
 		"--target",
-		"primary",
+		target,
 		"--output",
-		"/restore/" + outputName,
+		outputName,
 		"--config",
 		"/config/backup.yaml",
 	}
@@ -761,7 +1055,11 @@ func (h *e2eHarness) restore(snapshotID, outputName string) restoreOutput {
 	var result restoreOutput
 	if err := decodeExactJSON(output, &result); err != nil ||
 		result.SchemaVersion != productcli.ResultSchemaVersion ||
-		result.Target != "primary" || result.Output != "/restore/"+outputName {
+		result.Target != target || result.Output != "/restore/"+outputName ||
+		!lowerHex64Pattern.MatchString(result.SnapshotID) ||
+		!lowerHex40Pattern.MatchString(result.ProjectCommit) ||
+		!contentIDPattern.MatchString(result.ContentID) ||
+		!contentIDPattern.MatchString(result.ArchiveID) {
 		h.t.Fatalf("invalid restore output: %v: %s", err, harnessDiagnostics(output))
 	}
 	return result
@@ -821,9 +1119,9 @@ func (h *e2eHarness) startDrill(recoveryName string) {
 		"drill-vaultwarden",
 		"drill-copy",
 	)
-	volume := h.project + "_e2e-drill-data"
+	volume := h.project + "_drill-data"
 	_, _ = h.docker("volume", "rm", volume)
-	h.writeComposeFiles(recoveryName)
+	h.setDockerEnvironment("E2E_DRILL_SOURCE", filepath.Join(h.localRoot, "restore", recoveryName))
 	h.compose("--profile", "drill", "up", "--detach", "drill-vaultwarden")
 	h.waitHealthy("drill-vaultwarden", 3*time.Minute)
 	h.setBackend(h.mappedEndpoint("drill-vaultwarden", 80))
@@ -856,7 +1154,9 @@ func (h *e2eHarness) cleanup() {
 			"--profile",
 			"maintenance",
 			"--profile",
-			"seed",
+			"upgrade",
+			"--profile",
+			"rollback",
 			"down",
 			"--volumes",
 			"--remove-orphans",
@@ -864,6 +1164,9 @@ func (h *e2eHarness) cleanup() {
 	}
 	if h.tlsServer != nil {
 		h.tlsServer.Close()
+	}
+	if h.notifierServer != nil {
+		h.notifierServer.Close()
 	}
 	if h.project != "" {
 		containers, _ := h.dockerContext(
@@ -898,6 +1201,46 @@ func (h *e2eHarness) cleanup() {
 
 func (h *e2eHarness) docker(arguments ...string) (string, error) {
 	return h.dockerContext(h.ctx, arguments...)
+}
+
+func (h *e2eHarness) setDockerEnvironment(name, value string) {
+	prefix := name + "="
+	for index, entry := range h.dockerEnv {
+		if strings.HasPrefix(entry, prefix) {
+			h.dockerEnv[index] = prefix + value
+			return
+		}
+	}
+	h.dockerEnv = append(h.dockerEnv, prefix+value)
+}
+
+func (h *e2eHarness) waitNotificationContains(timeout time.Duration, fragments ...string) string {
+	h.t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		h.notificationMu.Lock()
+		messages := slices.Clone(h.notifications)
+		h.notificationMu.Unlock()
+		for _, message := range messages {
+			matched := true
+			for _, fragment := range fragments {
+				if !strings.Contains(message, fragment) {
+					matched = false
+					break
+				}
+			}
+			if matched {
+				return message
+			}
+		}
+		select {
+		case <-h.ctx.Done():
+			h.t.Fatal(h.ctx.Err())
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
+	h.t.Fatalf("notification did not contain %q", fragments)
+	return ""
 }
 
 func (h *e2eHarness) dockerContext(ctx context.Context, arguments ...string) (string, error) {

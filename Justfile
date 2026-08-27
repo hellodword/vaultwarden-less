@@ -50,6 +50,17 @@ security:
 integration moto_host_port="0":
     nix develop --command python3 scripts/verify_go_test.py --require github.com/hellodword/vaultwarden-less/internal/restore:TestMotoResticIntegration -- go test -json ./internal/restore -run '^TestMotoResticIntegration$' -count=1 -timeout=20m -args -run-moto-integration -moto-host-port "$1"
 
+# Run the real one-target backup, restore, and drill lifecycle.
+e2e-backup proxy_host_port="0" drill_host_port="0" preloaded_images="false":
+    extra=(); if [[ "$3" == "true" ]]; then extra=(-preloaded-images); elif [[ "$3" != "false" ]]; then echo "preloaded_images must be true or false" >&2; exit 2; fi; nix develop --command python3 scripts/verify_go_test.py --require github.com/hellodword/vaultwarden-less/tests/e2e:TestBackupRestoreLifecycle -- go test -json ./tests/e2e -run '^TestBackupRestoreLifecycle$' -count=1 -timeout=55m -args -run-backup-e2e -proxy-host-port "$1" -drill-host-port "$2" "${extra[@]}"
+
+# Run the real two-repository degradation and catch-up lifecycle.
+e2e-multitarget proxy_host_port="0" drill_host_port="0" preloaded_images="false":
+    extra=(); if [[ "$3" == "true" ]]; then extra=(-preloaded-images); elif [[ "$3" != "false" ]]; then echo "preloaded_images must be true or false" >&2; exit 2; fi; nix develop --command python3 scripts/verify_go_test.py --require github.com/hellodword/vaultwarden-less/tests/e2e:TestMultiTargetDegradationAndCatchUp -- go test -json ./tests/e2e -run '^TestMultiTargetDegradationAndCatchUp$' -count=1 -timeout=75m -args -run-multitarget-e2e -proxy-host-port "$1" -drill-host-port "$2" "${extra[@]}"
+
+# Run every fast, security, image, integration, and non-upgrade real gate.
+check-full: check security build integration e2e-backup e2e-multitarget
+
 # Create the exact two-file image release from a clean commit.
 release output_root:
     nix run .#release -- --output-root "$1"
@@ -98,10 +109,6 @@ repo-snapshots target limit="100": config-validate
 # Check repository metadata without reading pack data.
 repo-check target: config-validate
     {{compose}} --profile maintenance run --rm --no-deps maintenance repo check --target "$1"
-
-# Check repository metadata and one explicit monthly pack subset.
-repo-check-subset target subset: config-validate
-    {{compose}} --profile maintenance run --rm --no-deps maintenance repo check --target "$1" --read-data-subset "$2"
 
 # Remove a stale repository lock using the maintenance role.
 repo-unlock target: config-validate

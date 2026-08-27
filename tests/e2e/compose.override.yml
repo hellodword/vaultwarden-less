@@ -1,0 +1,72 @@
+services:
+  moto-primary:
+    image: vaultwarden-less-moto:local
+    pull_policy: never
+    platform: linux/amd64
+    restart: "no"
+    command: ["-H", "0.0.0.0"]
+    networks:
+      backup-outbound:
+        aliases: [moto-primary]
+      maintenance-outbound:
+        aliases: [moto-primary]
+
+  moto-secondary:
+    image: vaultwarden-less-moto:local
+    pull_policy: never
+    platform: linux/amd64
+    restart: "no"
+    command: ["-H", "0.0.0.0"]
+    networks:
+      backup-outbound:
+        aliases: [moto-secondary]
+      maintenance-outbound:
+        aliases: [moto-secondary]
+
+  vaultwarden:
+    networks:
+      source-ingress: {}
+    ports: !override
+      - "127.0.0.1:${E2E_SOURCE_PORT-}:80"
+
+  backup:
+    environment:
+      SSL_CERT_FILE: /run/e2e-notifier-ca.pem
+    extra_hosts:
+      - "e2e-host:host-gateway"
+    volumes:
+      - type: bind
+        source: ${E2E_NOTIFIER_CA:?E2E_NOTIFIER_CA is required}
+        target: /run/e2e-notifier-ca.pem
+        read_only: true
+        bind:
+          create_host_path: false
+
+  proxy:
+    ports: !override
+      - "127.0.0.1:${E2E_PROXY_PORT-}:8080"
+
+  drill-copy:
+    volumes: !override
+      - type: bind
+        source: ${E2E_DRILL_SOURCE:?E2E_DRILL_SOURCE is required}
+        target: /source
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: volume
+        source: drill-data
+        target: /drill-data
+
+  drill-vaultwarden:
+    environment:
+      DOMAIN: ${E2E_DOMAIN:?E2E_DOMAIN is required}
+    ports: !override
+      - "127.0.0.1:${E2E_DRILL_PORT-}:80"
+
+networks:
+  source-ingress: {}
+  proxy-ingress:
+    driver_opts: !reset {}
+  drill-ingress:
+    driver_opts: !reset {}

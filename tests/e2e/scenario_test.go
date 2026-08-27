@@ -11,15 +11,15 @@ import (
 	"time"
 )
 
-func TestVaultwardenBackupRestoreE2E(t *testing.T) {
-	if !*runVaultwardenE2E {
-		t.Skip("pass -run-vaultwarden-e2e to run the real external lifecycle")
+func TestBackupRestoreLifecycle(t *testing.T) {
+	if !*runBackupE2E {
+		t.Skip("pass -run-backup-e2e to run the real backup/restore lifecycle")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Minute)
 	defer cancel()
 	harness := newE2EHarness(t, ctx)
 	harness.startMotoAndRepository()
-	harness.startVaultwardenAndProxy()
+	harness.startVaultwarden()
 
 	unique := time.Now().UnixNano()
 	firstEmail := fmt.Sprintf("vaultwarden-less-e2e-one-%d@example.com", unique)
@@ -96,6 +96,7 @@ func TestVaultwardenBackupRestoreE2E(t *testing.T) {
 	if firstSnapshot.ID == "" || firstSnapshot.ContentID == "" {
 		t.Fatalf("first snapshot lacks identity: %#v", firstSnapshot)
 	}
+	harness.startProxy()
 
 	// Keep the first Send unavailable while every second-state mutation occurs.
 	// This closes the race in which the worker could publish an intermediate
@@ -118,6 +119,29 @@ func TestVaultwardenBackupRestoreE2E(t *testing.T) {
 	latestSnapshot := secondSnapshots.Snapshots[0]
 	if latestSnapshot.ContentID == firstSnapshot.ContentID {
 		t.Fatal("second state did not change the recovery content ID")
+	}
+
+	// A new device login is session/token-only activity. It must traverse the
+	// proxy event boundary and produce a fresh observed raw archive without
+	// publishing a third logical recovery point.
+	beforeSession := harness.status()
+	if beforeSession.LastCheck == nil || beforeSession.LastCheck.ArchiveID == nil || beforeSession.LastCheck.ContentID == nil {
+		t.Fatalf("second recovery check lacks identity: %#v", beforeSession.LastCheck)
+	}
+	sessionClient := newBitwardenCLI(t, filepath.Join(harness.localRoot, "bw-session-only"), harness.publicTLS, harness.tlsCAFile, firstEmail)
+	sessionClient.login(ctx)
+	afterSession := harness.waitCheckAfter(beforeSession.LastCheck.FinishedAt, "unchanged", 7*time.Minute)
+	if afterSession.LastCheck == nil || afterSession.LastCheck.ArchiveID == nil || afterSession.LastCheck.ContentID == nil {
+		t.Fatalf("session-only check lacks identity: %#v", afterSession.LastCheck)
+	}
+	if *afterSession.LastCheck.ContentID != latestSnapshot.ContentID {
+		t.Fatalf("session-only content ID = %q, want %q", *afterSession.LastCheck.ContentID, latestSnapshot.ContentID)
+	}
+	if *afterSession.LastCheck.ArchiveID == *beforeSession.LastCheck.ArchiveID {
+		t.Fatal("session-only activity did not change the observed archive ID")
+	}
+	if snapshots := harness.waitSnapshotCount(2, 2*time.Minute); len(snapshots.Snapshots) != 2 {
+		t.Fatalf("session-only activity changed snapshot count: %#v", snapshots)
 	}
 
 	harness.repositoryCheck()
@@ -154,7 +178,8 @@ func TestVaultwardenBackupRestoreE2E(t *testing.T) {
 	}
 
 	latest := harness.restore("", "drill")
-	if latest.SnapshotID != latestSnapshot.ID || latest.ContentID != latestSnapshot.ContentID {
+	if latest.SnapshotID != latestSnapshot.ID || latest.ProjectCommit != latestSnapshot.ProjectCommit ||
+		latest.ContentID != latestSnapshot.ContentID || latest.ArchiveID != latestSnapshot.ArchiveID {
 		t.Fatalf("latest restore = %#v, want snapshot %s", latest, latestSnapshot.ID)
 	}
 	harness.stopProduction()
@@ -203,7 +228,8 @@ func TestVaultwardenBackupRestoreE2E(t *testing.T) {
 
 	harness.stopDrill()
 	earlier := harness.restore(firstSnapshot.ID, "earlier")
-	if earlier.SnapshotID != firstSnapshot.ID || earlier.ContentID != firstSnapshot.ContentID {
+	if earlier.SnapshotID != firstSnapshot.ID || earlier.ProjectCommit != firstSnapshot.ProjectCommit ||
+		earlier.ContentID != firstSnapshot.ContentID || earlier.ArchiveID != firstSnapshot.ArchiveID {
 		t.Fatalf("explicit earlier restore = %#v", earlier)
 	}
 	harness.startDrill("earlier")
