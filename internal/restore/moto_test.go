@@ -32,7 +32,6 @@ var motoServerImage = "vaultwarden-less-moto:" + upstream.MotoVersion
 var (
 	runMotoIntegration = flag.Bool("run-moto-integration", false, "run the real Moto and Restic integration test")
 	motoHostPort       = flag.Int("moto-host-port", 0, "fixed host port for Moto; zero asks Docker for an ephemeral port")
-	motoPublishedHost  = flag.String("published-host", "127.0.0.1", "host through which this test reaches Docker-published ports")
 )
 
 // TestMotoResticIntegration exercises the real Restic/S3 command boundary. All
@@ -42,7 +41,7 @@ func TestMotoResticIntegration(t *testing.T) {
 	if !*runMotoIntegration {
 		t.Skip("pass -run-moto-integration to run the real external integration")
 	}
-	publishedHost := validatePublishedHost(t, *motoPublishedHost)
+	const publishedHost = "127.0.0.1"
 	if *motoHostPort != 0 && (*motoHostPort < 1024 || *motoHostPort > 65535) {
 		t.Fatalf("invalid -moto-host-port %d", *motoHostPort)
 	}
@@ -446,14 +445,6 @@ func pruneRemovalSet(t *testing.T, result restic.PruneResult) map[string]bool {
 		}
 	}
 	return got
-}
-
-func validatePublishedHost(t *testing.T, host string) string {
-	t.Helper()
-	if host == "" || strings.TrimSpace(host) != host || strings.ContainsAny(host, "/?#@") {
-		t.Fatalf("invalid -published-host %q", host)
-	}
-	return host
 }
 
 func loadMotoImage(ctx context.Context, t *testing.T, docker *dockerClient) {
