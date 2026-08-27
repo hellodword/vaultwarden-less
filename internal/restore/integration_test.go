@@ -53,7 +53,7 @@ func createSyntheticVaultwarden(t *testing.T, dataDir string) *sql.DB {
 	if _, err := database.Exec(`INSERT INTO sends(
 		uuid, name, atype, data, akey, access_count, creation_date,
 		revision_date, deletion_date, disabled
-	) VALUES (?, 'file send', 1, ?, 'key', 0, '2026-05-05', '2026-05-05', '2026-06-05', 0)`, sendID, fmt.Sprintf(`{"id":%q,"size":%d,"fileName":"encrypted"}`, sendFileID, len(sendData))); err != nil {
+	) VALUES (?, 'file send', 1, ?, 'key', 0, '2026-05-05', '2026-05-05', '2026-06-05', 0)`, sendID, fmt.Sprintf(`{"id":%q,"size":%d,"sizeName":"synthetic","fileName":"encrypted"}`, sendFileID, len(sendData))); err != nil {
 		t.Fatal(err)
 	}
 	writeDataFile(t, filepath.Join(dataDir, "attachments", cipherID, attachmentID), attachment)

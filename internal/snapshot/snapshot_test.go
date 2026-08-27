@@ -77,7 +77,7 @@ func syntheticData(t *testing.T, includeFiles bool) fixture {
 		{`INSERT INTO sends(
 			uuid, name, atype, data, akey, access_count, creation_date,
 			revision_date, deletion_date, disabled
-		) VALUES (?, 'file send', 1, ?, 'key', 0, '2026-05-05', '2026-05-05', '2026-06-05', 0)`, []any{testSendID, `{"id":"` + testSendFileID + `","size":` + strconv.Itoa(len(sendData)) + `,"fileName":"encrypted"}`}},
+		) VALUES (?, 'file send', 1, ?, 'key', 0, '2026-05-05', '2026-05-05', '2026-06-05', 0)`, []any{testSendID, `{"id":"` + testSendFileID + `","size":` + strconv.Itoa(len(sendData)) + `,"sizeName":"18 Bytes","fileName":"encrypted"}`}},
 		{`INSERT INTO sends(
 			uuid, name, atype, data, akey, access_count, creation_date,
 			revision_date, deletion_date, disabled
@@ -385,7 +385,7 @@ func TestCanonicalPrimitiveEncodingGoldenBytes(t *testing.T) {
 func TestCanonicalFullStreamGoldenDigest(t *testing.T) {
 	data := syntheticData(t, true)
 	manifest, _ := buildFixture(t, data.dataDir)
-	const want = "sha256:751c650470c5321e122e5057090fb028ed1763b7bc1aa974662df9c34516afc0"
+	const want = "sha256:f4a5a4e76917a13093955755102b68438c8fc797955dd3730d966631491fbe5e"
 	if manifest.ContentID != want {
 		t.Fatalf("canonical content ID = %s, want %s", manifest.ContentID, want)
 	}
@@ -711,12 +711,14 @@ func TestBuilderRejectsUnsupportedMigrationAndUnsafeReferences(t *testing.T) {
 		}
 	})
 	for name, value := range map[string]string{
-		"send id":            `{"id":"short","size":1,"fileName":"x"}`,
-		"send size":          `{"id":"` + testSendFileID + `","size":"18","fileName":"x"}`,
-		"send JSON":          `{invalid`,
-		"send unknown field": `{"id":"` + testSendFileID + `","size":18,"fileName":"x","extra":true}`,
-		"send duplicate key": `{"id":"` + testSendFileID + `","id":"` + testSendFileID + `","size":18,"fileName":"x"}`,
-		"send missing name":  `{"id":"` + testSendFileID + `","size":18}`,
+		"send id":                `{"id":"short","size":1,"sizeName":"1 Byte","fileName":"x"}`,
+		"send size":              `{"id":"` + testSendFileID + `","size":"18","sizeName":"18 Bytes","fileName":"x"}`,
+		"send JSON":              `{invalid`,
+		"send unknown field":     `{"id":"` + testSendFileID + `","size":18,"sizeName":"18 Bytes","fileName":"x","extra":true}`,
+		"send duplicate key":     `{"id":"` + testSendFileID + `","id":"` + testSendFileID + `","size":18,"sizeName":"18 Bytes","fileName":"x"}`,
+		"send missing name":      `{"id":"` + testSendFileID + `","size":18,"sizeName":"18 Bytes"}`,
+		"send missing size name": `{"id":"` + testSendFileID + `","size":18,"fileName":"x"}`,
+		"send size name type":    `{"id":"` + testSendFileID + `","size":18,"sizeName":18,"fileName":"x"}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			data := syntheticData(t, true)

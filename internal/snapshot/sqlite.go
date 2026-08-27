@@ -426,11 +426,12 @@ func decodeSendFileData(data string) (string, int64, error) {
 		ID       string          `json:"id"`
 		Size     json.RawMessage `json:"size"`
 		FileName *string         `json:"fileName"`
+		SizeName *string         `json:"sizeName"`
 	}
 	decoder := json.NewDecoder(strings.NewReader(data))
 	decoder.DisallowUnknownFields()
 	var object sendFileData
-	if err := decoder.Decode(&object); err != nil || object.FileName == nil {
+	if err := decoder.Decode(&object); err != nil || object.FileName == nil || object.SizeName == nil {
 		return "", 0, fmt.Errorf("invalid file Send data")
 	}
 	var extra any
