@@ -16,8 +16,6 @@ type routeRule struct {
 // These routes change authentication, device, telemetry, or discovery state,
 // not the durable user vault that a recovery point is intended to preserve.
 var ignoredRoutes = []routeRule{
-	// src/api/identity.rs:59 — token issuance is session state, not vault content.
-	{http.MethodPost, "/identity/connect/token", "src/api/identity.rs:59", "token issuance"},
 	// src/api/identity.rs:1026 — prelogin derives parameters without changing vault content.
 	{http.MethodPost, "/identity/accounts/prelogin", "src/api/identity.rs:1026", "prelogin lookup"},
 	// src/api/identity.rs:1031 — password prelogin derives parameters without changing vault content.

@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
@@ -15,9 +14,7 @@ func main() {
 	command := cli.New(os.Stdout, os.Stderr)
 	command.SetContext(ctx)
 	err := cli.Execute(command, os.Args[1:])
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-	}
+	cli.WriteError(os.Stderr, err)
 	stop()
 	os.Exit(cli.ExitCode(err))
 }

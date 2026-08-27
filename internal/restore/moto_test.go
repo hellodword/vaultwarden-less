@@ -91,12 +91,14 @@ func TestMotoResticIntegration(t *testing.T) {
 	credentialsDir := privateDirectory(t, root, "credentials")
 	passwordFile := writeSecret(t, credentialsDir, "moto", "moto-restic-password")
 	target := config.Target{
-		Name:          "moto",
-		Repository:    "s3:http://" + net.JoinHostPort(publishedHost, strconv.Itoa(endpointPort)) + "/vaultwarden-less-test/repository",
-		ResticOptions: map[string]string{"s3.bucket-lookup": "path", "s3.region": "us-east-1"},
+		Name:       "moto",
+		Repository: "s3:http://" + net.JoinHostPort(publishedHost, strconv.Itoa(endpointPort)) + "/vaultwarden-less-test/repository",
+		Options: []config.Option{
+			{Name: "s3.bucket-lookup", Value: "path"}, {Name: "s3.region", Value: "us-east-1"},
+		},
 	}
-	credentials := &config.RoleCredentials{SchemaVersion: config.SchemaVersion, Targets: map[string]config.S3Credentials{
-		"moto": {AccessKeyID: "test", SecretAccessKey: "test"},
+	credentials := &config.RoleCredentials{SchemaVersion: config.SchemaVersion, Targets: map[string]config.RoleTarget{
+		"moto": {Environment: map[string]string{"AWS_ACCESS_KEY_ID": "test", "AWS_SECRET_ACCESS_KEY": "test"}},
 	}}
 	runner := restic.NewRunner(resticBinary, cacheDir, credentialsDir, recoveryPath, credentials, nil)
 	if err := runner.VerifyVersion(ctx); err != nil {
@@ -353,8 +355,10 @@ func rawResticBackupAt(
 		"--option", "s3.region=us-east-1",
 		"backup", "--json",
 		"--host", host,
-		"--tag", restic.SnapshotTag,
-		"--tag", "content-id=" + contentHex,
+		"--tag", restic.SnapshotSchemaTag,
+		"--tag", "project_commit=" + strings.Repeat("1", 40),
+		"--tag", "content_id=sha256:" + contentHex,
+		"--tag", "archive_id=sha256:" + strings.Repeat("2", 64),
 	}
 	if !when.IsZero() {
 		arguments = append(arguments, "--time", when.Format("2006-01-02 15:04:05"))

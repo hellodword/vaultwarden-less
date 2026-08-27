@@ -5,12 +5,15 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/hellodword/vaultwarden-less/internal/config"
 	"github.com/hellodword/vaultwarden-less/internal/snapshot"
@@ -19,8 +22,10 @@ import (
 var (
 	firstSnapshotID  = strings.Repeat("a", 64)
 	secondSnapshotID = strings.Repeat("b", 64)
+	firstCommit      = strings.Repeat("1", 40)
 	firstContentID   = "sha256:" + strings.Repeat("c", 64)
 	secondContentID  = "sha256:" + strings.Repeat("d", 64)
+	firstArchiveID   = "sha256:" + strings.Repeat("e", 64)
 )
 
 type recordedCall struct {
@@ -47,15 +52,17 @@ func testRunner(t *testing.T, execute executeFunc) (Runner, config.Target, *[]re
 	target := config.Target{
 		Name:       "primary",
 		Repository: "s3:https://objects.example.test/bucket/repository",
-		ResticOptions: map[string]string{
-			"s3.bucket-lookup": "path",
-			"s3.region":        "ap-singapore",
+		Options: []config.Option{
+			{Name: "s3.region", Value: "ap-singapore"},
+			{Name: "s3.bucket-lookup", Value: "path"},
 		},
 	}
 	credentials := &config.RoleCredentials{
 		SchemaVersion: config.SchemaVersion,
-		Targets: map[string]config.S3Credentials{
-			"primary": {AccessKeyID: "synthetic-access", SecretAccessKey: "synthetic-secret"},
+		Targets: map[string]config.RoleTarget{
+			"primary": {Environment: map[string]string{
+				"AWS_ACCESS_KEY_ID": "synthetic-access", "AWS_SECRET_ACCESS_KEY": "synthetic-secret",
+			}},
 		},
 	}
 	calls := []recordedCall{}
@@ -99,8 +106,13 @@ func rawRecoverySnapshot(id, content, when string) rawSnapshot {
 		ID:       id,
 		Time:     when,
 		Hostname: SnapshotHost,
-		Tags:     []string{SnapshotTag, "content-id=" + strings.TrimPrefix(content, "sha256:")},
-		Paths:    []string{config.RecoveryPointPath},
+		Tags: []string{
+			SnapshotSchemaTag,
+			"project_commit=" + firstCommit,
+			"content_id=" + content,
+			"archive_id=" + firstArchiveID,
+		},
+		Paths: []string{config.RecoveryPointPath},
 	}
 }
 
@@ -163,12 +175,12 @@ func TestEnsureBacksUpDifferentContentOnceWithFixedIdentity(t *testing.T) {
 		"--repo", target.Repository,
 		"--password-file", filepath.Join(runner.PasswordRoot, target.Name),
 		"--cache-dir", filepath.Join(runner.CacheDir, target.Name),
-		"--option", "s3.bucket-lookup=path",
 		"--option", "s3.region=ap-singapore",
+		"--option", "s3.bucket-lookup=path",
 		"backup", "--json",
 		"--host", SnapshotHost,
-		"--tag", SnapshotTag,
-		"--tag", "content-id=" + strings.TrimPrefix(manifest.ContentID, "sha256:"),
+		"--tag", SnapshotSchemaTag,
+		"--tag", "content_id=" + manifest.ContentID,
 		"--", config.RecoveryPointPath,
 	}
 	if arguments := (*calls)[1].arguments; !slices.Equal(arguments, wantArguments) {
@@ -186,6 +198,8 @@ func assertExactCredentialEnvironment(t *testing.T, environment []string) {
 		}
 	}
 	want := map[string]string{
+		"HOME":                  "/nonexistent",
+		"SSL_CERT_FILE":         "/etc/ssl/certs/ca-bundle.crt",
 		"TMPDIR":                "/tmp",
 		"AWS_ACCESS_KEY_ID":     "synthetic-access",
 		"AWS_SECRET_ACCESS_KEY": "synthetic-secret",
@@ -242,7 +256,7 @@ func TestSnapshotsBoundNormalizesTimesAndReportsTruncation(t *testing.T) {
 	if !truncated || len(items) != 2 || items[0].ID != thirdSnapshotID || items[1].ID != secondSnapshotID {
 		t.Fatalf("bounded snapshots = %#v, truncated=%t", items, truncated)
 	}
-	if items[0].Time != "2026-08-25T12:00:00Z" || items[1].Time != "2026-08-25T12:00:00Z" {
+	if items[0].Time != "2026-08-25T12:00:00.000Z" || items[1].Time != "2026-08-25T12:00:00.000Z" {
 		t.Fatalf("snapshot times were not normalized: %#v", items)
 	}
 	arguments := (*calls)[0].arguments
@@ -285,19 +299,24 @@ func TestPruneIsOneForgetCallWithFixedRetention(t *testing.T) {
 	for _, apply := range []bool{false, true} {
 		t.Run(map[bool]string{false: "dry-run", true: "apply"}[apply], func(t *testing.T) {
 			runner, target, calls := testRunner(t, func(_ context.Context, _ string, arguments, _ []string, _ string) ([]byte, error) {
-				if operation(arguments) != "forget" {
+				switch operation(arguments) {
+				case "snapshots":
+					return []byte("[]\n"), nil
+				case "forget":
+					return []byte(`[{"host":"` + SnapshotHost + `","paths":["` + config.RecoveryPointPath + `"],"keep":[{"id":"` + firstSnapshotID + `"}],"remove":[{"id":"` + secondSnapshotID + `"}]}]`), nil
+				default:
 					t.Fatalf("unexpected operation: %#v", arguments)
+					return nil, nil
 				}
-				return []byte(`[{"host":"` + SnapshotHost + `","paths":["` + config.RecoveryPointPath + `"],"keep":[{"id":"` + firstSnapshotID + `"}],"remove":[{"id":"` + secondSnapshotID + `"}]}]`), nil
 			})
 			result, err := runner.Prune(context.Background(), target, apply)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(*calls) != 1 || result.Applied != apply || len(result.Groups) != 1 {
+			if len(*calls) != 2 || result.Applied != apply || len(result.Groups) != 1 {
 				t.Fatalf("calls/result = %d/%#v", len(*calls), result)
 			}
-			arguments := (*calls)[0].arguments
+			arguments := (*calls)[1].arguments
 			for _, required := range []string{"--prune", "--group-by", "host,paths", "--keep-within", "24h", "--keep-hourly", "48", "--keep-daily", "14", "--keep-weekly", "8", "--keep-monthly", "12", "--keep-yearly", "3"} {
 				if !slices.Contains(arguments, required) {
 					t.Fatalf("missing retention argument %q", required)
@@ -307,6 +326,21 @@ func TestPruneIsOneForgetCallWithFixedRetention(t *testing.T) {
 				t.Fatalf("dry-run mismatch: %#v", arguments)
 			}
 		})
+	}
+}
+
+func TestPruneRejectsMalformedIdentityBeforeForget(t *testing.T) {
+	runner, target, calls := testRunner(t, func(_ context.Context, _ string, arguments, _ []string, _ string) ([]byte, error) {
+		if operation(arguments) != "snapshots" {
+			t.Fatalf("mutating operation ran after malformed preflight: %#v", arguments)
+		}
+		return []byte(`[{"id":"` + firstSnapshotID + `","time":"2026-08-27T12:00:00Z","hostname":"` + SnapshotHost + `","paths":["` + config.RecoveryPointPath + `"],"tags":["` + SnapshotSchemaTag + `"]}]`), nil
+	})
+	if _, err := runner.Prune(context.Background(), target, true); err == nil {
+		t.Fatal("malformed schema-1 snapshot identity was accepted")
+	}
+	if len(*calls) != 1 || operation((*calls)[0].arguments) != "snapshots" {
+		t.Fatalf("preflight calls = %#v", *calls)
 	}
 }
 
@@ -320,7 +354,7 @@ func TestRestoreUsesExactSnapshotSubfolderAndCallerContext(t *testing.T) {
 		if operation(arguments) != "restore" {
 			t.Fatalf("unexpected operation: %#v", arguments)
 		}
-		return []byte(`{}`), nil
+		return []byte(`{"message_type":"summary","total_files":1,"files_restored":1,"total_bytes":1,"bytes_restored":1}` + "\n"), nil
 	})
 	destination := privateResticDirectory(t, "restore")
 	ctx := context.WithValue(context.Background(), key, "kept")
@@ -354,7 +388,7 @@ func TestMalformedMetadataAndNonzeroExitFailWithoutGuessingStderr(t *testing.T) 
 
 func TestStructuredResticLogsExcludeArgumentsAndCredentials(t *testing.T) {
 	runner, target, _ := testRunner(t, func(_ context.Context, _ string, _ []string, _ []string, _ string) ([]byte, error) {
-		return []byte(`{}`), nil
+		return []byte(`{"message_type":"initialized","id":"` + firstSnapshotID + `","repository":"redacted"}` + "\n"), nil
 	})
 	var output bytes.Buffer
 	runner.Logger = slog.New(slog.NewJSONHandler(&output, nil))
@@ -371,6 +405,129 @@ func TestStructuredResticLogsExcludeArgumentsAndCredentials(t *testing.T) {
 		if strings.Contains(log, forbidden) {
 			t.Fatalf("structured log exposed %q: %s", forbidden, log)
 		}
+	}
+}
+
+func TestCommandParsersBoundFramesAndPreserveForwardCompatibility(t *testing.T) {
+	t.Parallel()
+	valid := []byte(
+		`{"message_type":"future_progress","unknown":{"value":1}}` + "\n" +
+			`{"message_type":"status","percent_done":0.5,"new_field":true}` + "\n" +
+			`{"message_type":"summary","snapshot_id":"` + firstSnapshotID + `","unknown":"allowed"}` + "\n",
+	)
+	if id, err := parseBackupSnapshotID(valid); err != nil || id != firstSnapshotID {
+		t.Fatalf("forward-compatible backup output = %q/%v", id, err)
+	}
+	invalid := map[string][]byte{
+		"truncated":       []byte(`{"message_type":"summary"`),
+		"duplicate field": []byte(`{"message_type":"summary","snapshot_id":"` + firstSnapshotID + `","snapshot_id":"` + secondSnapshotID + `"}`),
+		"summary reordered": []byte(
+			`{"message_type":"summary","snapshot_id":"` + firstSnapshotID + `"}` + "\n" + `{"message_type":"status"}` + "\n",
+		),
+		"duplicate summary": []byte(
+			`{"message_type":"summary","snapshot_id":"` + firstSnapshotID + `"}` + "\n" +
+				`{"message_type":"summary","snapshot_id":"` + secondSnapshotID + `"}` + "\n",
+		),
+		"invalid UTF-8": {0xff, '\n'},
+		"oversized frame": append(
+			append([]byte(`{"message_type":"status","padding":"`), bytes.Repeat([]byte{'x'}, maxJSONFrame)...),
+			[]byte(`"}`)...,
+		),
+	}
+	for name, data := range invalid {
+		name, data := name, data
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if _, err := parseBackupSnapshotID(data); err == nil {
+				t.Fatal("invalid framed output was accepted")
+			}
+		})
+	}
+}
+
+func TestSummaryParsersRejectIncompleteOrErrorResults(t *testing.T) {
+	t.Parallel()
+	for name, data := range map[string]string{
+		"missing":   `{"message_type":"status"}` + "\n",
+		"error":     `{"message_type":"error","message":"unsafe raw diagnostic"}` + "\n",
+		"check":     `{"message_type":"summary","num_errors":1}` + "\n",
+		"restore":   `{"message_type":"summary","total_files":2,"files_restored":1,"total_bytes":2,"bytes_restored":1}` + "\n",
+		"after":     `{"message_type":"summary","num_errors":0}` + "\n" + `{"message_type":"future"}` + "\n",
+		"wrongtype": `{"message_type":"summary","num_errors":"0"}` + "\n",
+	} {
+		name, data := name, data
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			operation := "check"
+			if name == "restore" {
+				operation = "restore"
+			}
+			if err := parseFinalSummary([]byte(data), operation); err == nil {
+				t.Fatal("invalid command summary was accepted")
+			}
+		})
+	}
+}
+
+func TestSubprocessBoundsStderrTimeoutCancellationAndRedaction(t *testing.T) {
+	runner := Runner{}
+	runHelper := func(ctx context.Context, mode string) ([]byte, error) {
+		return runner.run(ctx, os.Args[0], []string{"-test.run=TestResticHelperProcess", "--", mode}, []string{"GO_WANT_RESTIC_HELPER=1"}, "")
+	}
+
+	_, err := runHelper(context.Background(), "stderr-secret")
+	var operationError *OperationError
+	if !errors.As(err, &operationError) || operationError.Code != "command_failed" || strings.Contains(err.Error(), "sensitive-diagnostic") {
+		t.Fatalf("stderr failure was not safely classified: %#v", err)
+	}
+
+	_, err = runHelper(context.Background(), "stderr-limit")
+	if !errors.As(err, &operationError) || operationError.Code != "output_limit" || strings.Contains(err.Error(), "sensitive-diagnostic") {
+		t.Fatalf("stderr limit was not safely classified: %#v", err)
+	}
+
+	timeoutContext, timeoutCancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer timeoutCancel()
+	started := time.Now()
+	_, err = runHelper(timeoutContext, "wait")
+	if !errors.As(err, &operationError) || operationError.Code != "timeout" || time.Since(started) > 3*time.Second {
+		t.Fatalf("timeout = %#v after %s", err, time.Since(started))
+	}
+
+	cancelContext, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		cancel()
+	}()
+	_, err = runHelper(cancelContext, "wait-with-child")
+	if !errors.As(err, &operationError) || operationError.Code != "cancelled" {
+		t.Fatalf("cancellation = %#v", err)
+	}
+}
+
+func TestResticHelperProcess(t *testing.T) {
+	if os.Getenv("GO_WANT_RESTIC_HELPER") != "1" {
+		return
+	}
+	mode := os.Args[len(os.Args)-1]
+	switch mode {
+	case "stderr-secret":
+		_, _ = fmt.Fprint(os.Stderr, "sensitive-diagnostic")
+		os.Exit(7)
+	case "stderr-limit":
+		_, _ = os.Stderr.Write(bytes.Repeat([]byte("sensitive-diagnostic"), 8192))
+		os.Exit(7)
+	case "wait":
+		time.Sleep(30 * time.Second)
+	case "wait-with-child":
+		child := exec.Command(os.Args[0], "-test.run=TestResticHelperProcess", "--", "wait")
+		child.Env = []string{"GO_WANT_RESTIC_HELPER=1"}
+		if err := child.Start(); err != nil {
+			os.Exit(8)
+		}
+		_ = child.Wait()
+	default:
+		os.Exit(9)
 	}
 }
 

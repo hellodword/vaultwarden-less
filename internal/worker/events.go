@@ -5,19 +5,19 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"mime"
 	"net/http"
 	"time"
+	"unicode/utf8"
 
 	"github.com/hellodword/vaultwarden-less/internal/config"
 )
 
 const (
-	SchemaVersion = 2
+	SchemaVersion = 1
 
 	HealthPath = "/healthz"
 	EventsPath = "/v1/events"
-	CheckPath  = "/v1/check"
+	CheckPath  = "/v1/checks"
 	StatusPath = "/v1/status"
 )
 
@@ -31,7 +31,8 @@ type acceptedResponse struct {
 }
 
 type errorResponse struct {
-	Error struct {
+	SchemaVersion int `json:"schema_version"`
+	Error         struct {
 		Code    string `json:"code"`
 		Message string `json:"message"`
 	} `json:"error"`
@@ -46,7 +47,7 @@ type requestFailure struct {
 func Handler(worker *Worker) http.Handler {
 	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if request.URL.RawQuery != "" {
-			writeError(writer, http.StatusBadRequest, "invalid_request", "Query parameters are not supported.")
+			writeError(writer, http.StatusBadRequest, "usage_error", "Query parameters are not supported")
 			return
 		}
 		switch request.URL.Path {
@@ -56,7 +57,7 @@ func Handler(worker *Worker) http.Handler {
 				return
 			}
 			if !emptyRequestBody(request) {
-				writeError(writer, http.StatusBadRequest, "invalid_request", "GET requests must have an empty body.")
+				writeError(writer, http.StatusBadRequest, "usage_error", "GET requests must have an empty body")
 				return
 			}
 			if request.URL.Path == HealthPath {
@@ -80,7 +81,7 @@ func Handler(worker *Worker) http.Handler {
 			}
 			writeJSON(writer, http.StatusAccepted, acceptedResponse{SchemaVersion: SchemaVersion, Accepted: true})
 		default:
-			writeError(writer, http.StatusNotFound, "not_found", "Endpoint not found.")
+			writeError(writer, http.StatusNotFound, "usage_error", "Endpoint not found")
 		}
 	})
 }
@@ -98,39 +99,60 @@ func NewHTTPServer(worker *Worker) *http.Server {
 }
 
 func decodeEventRequest(writer http.ResponseWriter, request *http.Request) *requestFailure {
-	mediaType, parameters, err := mime.ParseMediaType(request.Header.Get("Content-Type"))
-	if err != nil || mediaType != "application/json" || len(parameters) != 0 {
+	if request.Header.Get("Content-Type") != "application/json" {
 		return &requestFailure{
-			status: http.StatusUnsupportedMediaType, code: "unsupported_media_type",
-			message: "Content-Type must be exactly application/json.",
+			status: http.StatusBadRequest, code: "usage_error",
+			message: "Content-Type must be exactly application/json",
 		}
 	}
 	if request.ContentLength > config.EventMaxBytes {
-		return &requestFailure{status: http.StatusRequestEntityTooLarge, code: "request_too_large", message: "Request body is too large."}
+		return &requestFailure{status: http.StatusBadRequest, code: "usage_error", message: "Request body is too large"}
 	}
 	request.Body = http.MaxBytesReader(writer, request.Body, config.EventMaxBytes)
-	decoder := json.NewDecoder(request.Body)
-	decoder.DisallowUnknownFields()
-	var body eventRequest
-	if err := decoder.Decode(&body); err != nil {
+	data, err := io.ReadAll(request.Body)
+	if err != nil {
 		var tooLarge *http.MaxBytesError
 		if errors.As(err, &tooLarge) {
-			return &requestFailure{status: http.StatusRequestEntityTooLarge, code: "request_too_large", message: "Request body is too large."}
+			return &requestFailure{status: http.StatusBadRequest, code: "usage_error", message: "Request body is too large"}
 		}
-		return &requestFailure{status: http.StatusBadRequest, code: "invalid_request", message: "Request must be strict schema v2 JSON."}
+		return &requestFailure{status: http.StatusBadRequest, code: "usage_error", message: "Request body is invalid"}
+	}
+	if !utf8.Valid(data) {
+		return &requestFailure{status: http.StatusBadRequest, code: "usage_error", message: "Request body is invalid"}
+	}
+	body, err := decodeStrictEventRequest(data)
+	if err != nil {
+		return &requestFailure{status: http.StatusBadRequest, code: "usage_error", message: "Request must contain only schema_version"}
 	}
 	if body.SchemaVersion != SchemaVersion {
-		return &requestFailure{status: http.StatusBadRequest, code: "invalid_request", message: "Request must be strict schema v2 JSON."}
+		return &requestFailure{status: http.StatusBadRequest, code: "unsupported_schema", message: "Request schema_version is unsupported"}
+	}
+	return nil
+}
+
+func decodeStrictEventRequest(data []byte) (eventRequest, error) {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	token, err := decoder.Token()
+	if err != nil || token != json.Delim('{') || !decoder.More() {
+		return eventRequest{}, errors.New("invalid request object")
+	}
+	key, err := decoder.Token()
+	if err != nil || key != "schema_version" {
+		return eventRequest{}, errors.New("invalid request key")
+	}
+	var result eventRequest
+	if err := decoder.Decode(&result.SchemaVersion); err != nil || decoder.More() {
+		return eventRequest{}, errors.New("invalid request value")
+	}
+	closing, err := decoder.Token()
+	if err != nil || closing != json.Delim('}') {
+		return eventRequest{}, errors.New("invalid request object")
 	}
 	var extra any
 	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
-		var tooLarge *http.MaxBytesError
-		if errors.As(err, &tooLarge) {
-			return &requestFailure{status: http.StatusRequestEntityTooLarge, code: "request_too_large", message: "Request body is too large."}
-		}
-		return &requestFailure{status: http.StatusBadRequest, code: "invalid_request", message: "Request must be strict schema v2 JSON."}
+		return eventRequest{}, errors.New("trailing request value")
 	}
-	return nil
+	return result, nil
 }
 
 func emptyRequestBody(request *http.Request) bool {
@@ -147,11 +169,11 @@ func emptyRequestBody(request *http.Request) bool {
 
 func methodNotAllowed(writer http.ResponseWriter, allowed string) {
 	writer.Header().Set("Allow", allowed)
-	writeError(writer, http.StatusMethodNotAllowed, "method_not_allowed", "Method not allowed.")
+	writeError(writer, http.StatusMethodNotAllowed, "usage_error", "Method not allowed")
 }
 
 func writeError(writer http.ResponseWriter, status int, code, message string) {
-	response := errorResponse{}
+	response := errorResponse{SchemaVersion: SchemaVersion}
 	response.Error.Code = code
 	response.Error.Message = message
 	writeJSON(writer, status, response)

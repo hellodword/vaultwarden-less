@@ -310,3 +310,33 @@ func TestEventFailureCannotChangeUpstreamResponse(t *testing.T) {
 		t.Fatalf("event failure changed response = %d/%q/%q", response.Code, response.Header().Get("X-Exact"), response.Body.String())
 	}
 }
+
+func TestBackupMarkRequiresCompleteResponseBody(t *testing.T) {
+	t.Parallel()
+	var marked atomic.Int64
+	incomplete := &completeResponseBody{ReadCloser: io.NopCloser(strings.NewReader("partial")), complete: func() { marked.Add(1) }}
+	buffer := make([]byte, 1)
+	if _, err := incomplete.Read(buffer); err != nil {
+		t.Fatal(err)
+	}
+	if err := incomplete.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if marked.Load() != 0 {
+		t.Fatal("incomplete response triggered a backup mark")
+	}
+
+	complete := &completeResponseBody{ReadCloser: io.NopCloser(strings.NewReader("complete")), complete: func() { marked.Add(1) }}
+	if _, err := io.ReadAll(complete); err != nil {
+		t.Fatal(err)
+	}
+	if err := complete.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := complete.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if marked.Load() != 1 {
+		t.Fatalf("complete response marks = %d", marked.Load())
+	}
+}

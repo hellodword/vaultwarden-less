@@ -65,6 +65,7 @@ func TestRoutePolicyOnlySuccessfulWritesTrigger(t *testing.T) {
 		{http.MethodPost, "/api/ciphers", 404, false},
 		{http.MethodPost, "/api/ciphers", 500, false},
 		{http.MethodPost, "/api/accounts/prelogin", 200, false},
+		{http.MethodPost, "/identity/connect/token", 200, true},
 		{http.MethodPost, "/api/uncommon-read-like-operation", 200, true},
 	} {
 		if got := shouldRequestBackup(test.method, test.path, test.status); got != test.want {

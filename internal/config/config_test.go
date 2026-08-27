@@ -1,6 +1,12 @@
 package config
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"encoding/pem"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -9,54 +15,73 @@ import (
 	"time"
 )
 
-const minimalBackupYAML = `schema_version: 2
+const minimalBackupYAML = `schema_version: 1
+upgrade_verification_targets:
+  - primary
 targets:
   - name: primary
-    repository: s3:https://objects.example.test/bucket/repository
+    repository: rest:https://repository.example.test/vaultwarden
+    options: []
+notifiers: []
 `
 
-func TestBackupSchemaPreservesTargetOrderAndRequiresTargets(t *testing.T) {
+func TestBackupSchemaPreservesSemanticOrder(t *testing.T) {
 	t.Parallel()
-	document := `schema_version: 2
+	document := `schema_version: 1
+upgrade_verification_targets: [cold, primary]
 targets:
   - name: cold
-    repository: s3:https://objects.example.test/cold/restic
+    repository: /srv/cold
+    options:
+      - name: first
+        value: "1"
+      - name: second
+        value: ""
   - name: primary
-    repository: s3:https://objects.example.test/primary/restic
+    repository: b2:bucket:path
+    options: []
+notifiers: []
 `
 	cfg, err := DecodeBackup([]byte(document))
 	if err != nil {
 		t.Fatal(err)
 	}
-	names := []string{cfg.Targets[0].Name, cfg.Targets[1].Name}
-	if !slices.Equal(names, []string{"cold", "primary"}) {
+	if names := []string{cfg.Targets[0].Name, cfg.Targets[1].Name}; !slices.Equal(names, []string{"cold", "primary"}) {
 		t.Fatalf("target order = %#v", names)
 	}
-	for _, invalid := range []string{
-		"schema_version: 2\ntargets: []\n",
-		"schema_version: 2\n",
-		minimalBackupYAML + "  - name: primary\n    repository: s3:https://objects.example.test/other/repository\n",
-	} {
-		if _, err := DecodeBackup([]byte(invalid)); err == nil {
-			t.Fatal("invalid target list was accepted")
-		}
+	if !slices.Equal(cfg.UpgradeVerificationTargets, []string{"cold", "primary"}) {
+		t.Fatalf("verification order = %#v", cfg.UpgradeVerificationTargets)
+	}
+	if got := cfg.Targets[0].Options; len(got) != 2 || got[0].Name != "first" || got[1].Name != "second" {
+		t.Fatalf("option order = %#v", got)
 	}
 }
 
-func TestBackupRejectsUnknownFieldsDurationsAndUnsafeRepositories(t *testing.T) {
+func TestBackupRejectsEveryStrictYAMLAndShapeViolation(t *testing.T) {
 	t.Parallel()
-	for name, document := range map[string]string{
-		"unknown field":      minimalBackupYAML + "state_dir: /elsewhere\n",
-		"duration":           minimalBackupYAML + "target_timeout: 30m\n",
-		"duplicate key":      minimalBackupYAML + "schema_version: 2\n",
-		"multiple documents": minimalBackupYAML + "---\nschema_version: 2\n",
-		"local repository":   "schema_version: 2\ntargets:\n  - name: local\n    repository: /srv/restic\n",
-		"REST repository":    "schema_version: 2\ntargets:\n  - name: rest\n    repository: rest:https://example.test/repo\n",
-		"S3 user info":       "schema_version: 2\ntargets:\n  - name: s3\n    repository: s3:https://user:secret@example.test/bucket/repo\n",
-		"S3 query":           "schema_version: 2\ntargets:\n  - name: s3\n    repository: s3:https://example.test/bucket/repo?secret=value\n",
-		"S3 no bucket":       "schema_version: 2\ntargets:\n  - name: s3\n    repository: s3:https://example.test\n",
-		"S3 fragment":        "schema_version: 2\ntargets:\n  - name: s3\n    repository: s3:https://example.test/bucket/repo#fragment\n",
-	} {
+	tests := map[string]string{
+		"empty targets":          strings.Replace(minimalBackupYAML, "  - name: primary\n    repository: rest:https://repository.example.test/vaultwarden\n    options: []\n", "", 1),
+		"missing verification":   strings.Replace(minimalBackupYAML, "upgrade_verification_targets:\n  - primary\n", "", 1),
+		"unknown verification":   strings.Replace(minimalBackupYAML, "  - primary\n", "  - missing\n", 1),
+		"missing options":        strings.Replace(minimalBackupYAML, "    options: []\n", "", 1),
+		"missing notifiers":      strings.Replace(minimalBackupYAML, "notifiers: []\n", "", 1),
+		"unknown field":          minimalBackupYAML + "state_dir: /elsewhere\n",
+		"duplicate key":          minimalBackupYAML + "schema_version: 1\n",
+		"multiple documents":     minimalBackupYAML + "---\nschema_version: 1\n",
+		"quoted schema":          strings.Replace(minimalBackupYAML, "schema_version: 1", `schema_version: "1"`, 1),
+		"boolean string":         strings.Replace(minimalBackupYAML, "repository: rest:", "repository: true # rest:", 1),
+		"numeric option value":   strings.Replace(minimalBackupYAML, "options: []", "options: [{name: connections, value: 3}]", 1),
+		"anchor":                 strings.Replace(minimalBackupYAML, "repository: rest:", "repository: &repository rest:", 1),
+		"alias":                  strings.Replace(minimalBackupYAML, "notifiers: []", "notifiers: *repository", 1),
+		"tag":                    strings.Replace(minimalBackupYAML, "repository: rest:", "repository: !!str rest:", 1),
+		"merge":                  minimalBackupYAML + "extra: &extra {name: x}\nmerge: {<<: *extra}\n",
+		"duplicate option":       strings.Replace(minimalBackupYAML, "options: []", "options: [{name: x, value: a}, {name: x, value: b}]", 1),
+		"option equals":          strings.Replace(minimalBackupYAML, "options: []", "options: [{name: x=y, value: a}]", 1),
+		"repository newline":     strings.Replace(minimalBackupYAML, "repository: rest:https://repository.example.test/vaultwarden", "repository: |\n      bad\n      value", 1),
+		"duplicate target":       strings.Replace(minimalBackupYAML, "notifiers: []", "  - name: primary\n    repository: other\n    options: []\nnotifiers: []", 1),
+		"duplicate verification": strings.Replace(minimalBackupYAML, "  - primary\n", "  - primary\n  - primary\n", 1),
+	}
+	for name, document := range tests {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			if _, err := DecodeBackup([]byte(document)); err == nil {
@@ -75,165 +100,232 @@ func TestYAMLErrorsDoNotEchoSecretValues(t *testing.T) {
 	}
 }
 
-func TestHTTPRepositoryWarnsAndS3OptionsAreNarrow(t *testing.T) {
-	t.Parallel()
-	cfg, err := DecodeBackup([]byte("schema_version: 2\ntargets:\n  - name: primary\n    repository: s3:http://objects.example.test/bucket/repo\n"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if warnings := cfg.Targets[0].Warnings(); !slices.Equal(warnings, []string{"plaintext_s3_endpoint"}) {
-		t.Fatalf("warnings = %#v", warnings)
-	}
-	for _, option := range []string{
-		"s3.bucket-lookup: command injection",
-		"s3.region: region with spaces",
-		"s3.connections: '99'",
-	} {
-		document := minimalBackupYAML + "    restic_options:\n      " + option + "\n"
-		if _, err := DecodeBackup([]byte(document)); err == nil {
-			t.Fatalf("invalid S3 option was accepted: %s", option)
-		}
-	}
-}
-
-func TestNotifierFieldsAreStrictForEachType(t *testing.T) {
-	t.Parallel()
-	backup := minimalBackupYAML + `notifiers:
-  - name: operations
-    type: wechat
-  - name: phone
-    type: bark
-`
-	cfg, err := DecodeBackup([]byte(backup))
-	if err != nil {
-		t.Fatal(err)
-	}
-	validCredentials := `schema_version: 2
-notifiers:
-  operations:
-    webhook_url: https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=placeholder
-  phone:
-    device_token: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-    auth_key: |
-      -----BEGIN PRIVATE KEY-----
-      placeholder
-      -----END PRIVATE KEY-----
-    key_id: KEY123
-    team_id: TEAM123
-    topic: me.fin.bark
-`
-	resolved, err := LoadNotifierCredentials(writePrivateFile(t, validCredentials), cfg)
-	if err != nil || len(resolved) != 2 || resolved[0].WebhookURL == "" || resolved[1].DeviceToken == "" {
-		t.Fatalf("resolved notifier credentials = %#v/%v", resolved, err)
-	}
-	if _, err := DecodeBackup([]byte(minimalBackupYAML + "notifiers:\n  - name: operations\n    type: wechat\n    webhook_url: https://example.test/hook\n")); err == nil {
-		t.Fatal("secret notifier field was accepted in backup.yaml")
-	}
-	if _, err := DecodeBackup([]byte(minimalBackupYAML + "notifiers:\n  - name: generic\n    type: webhook\n")); err == nil {
-		t.Fatal("unsupported notifier type was accepted")
-	}
-	for _, credentials := range []string{
-		strings.Replace(validCredentials, "https://qyapi.weixin.qq.com", "http://example.test", 1),
-		strings.Replace(validCredentials, "  phone:\n", "  unexpected:\n", 1),
-		validCredentials + "unknown_root_field: forbidden\n",
-	} {
-		if _, err := LoadNotifierCredentials(writePrivateFile(t, credentials), cfg); err == nil {
-			t.Fatal("invalid notifier credentials were accepted")
-		}
-	}
-	emptyCfg, err := DecodeBackup([]byte(minimalBackupYAML))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resolved, err := LoadNotifierCredentials("/not-mounted", emptyCfg); err != nil || len(resolved) != 0 {
-		t.Fatalf("empty notifier list required credentials: %#v/%v", resolved, err)
-	}
-}
-
-func TestRoleCredentialsRequireExactTargetsAndFields(t *testing.T) {
+func TestRoleCredentialsRequireExactTargetsAndCleanEnvironment(t *testing.T) {
 	t.Parallel()
 	cfg, err := DecodeBackup([]byte(minimalBackupYAML))
 	if err != nil {
 		t.Fatal(err)
 	}
-	valid := `schema_version: 2
+	valid := `schema_version: 1
 targets:
   primary:
-    AWS_ACCESS_KEY_ID: synthetic-access
-    AWS_SECRET_ACCESS_KEY: synthetic-secret
+    environment:
+      AWS_ACCESS_KEY_ID: synthetic-access
+      AWS_SECRET_ACCESS_KEY: synthetic-secret
+      MULTILINE: |-
+        line one
+        line two
 `
 	credentials, err := LoadRoleCredentials(writePrivateFile(t, valid), cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	environment, err := credentials.Environment(cfg.Targets[0])
+	if err != nil || environment["MULTILINE"] != "line one\nline two" {
+		t.Fatalf("environment = %#v/%v", environment, err)
+	}
+	environment["AWS_ACCESS_KEY_ID"] = "changed"
+	again, _ := credentials.Environment(cfg.Targets[0])
+	if again["AWS_ACCESS_KEY_ID"] != "synthetic-access" {
+		t.Fatal("environment map escaped by reference")
+	}
+
+	for name, invalid := range map[string]string{
+		"extra target":    valid + "  extra:\n    environment: {}\n",
+		"unknown field":   strings.Replace(valid, "    environment:", "    other: value\n    environment:", 1),
+		"reserved restic": strings.Replace(valid, "      AWS_ACCESS_KEY_ID:", "      RESTIC_PASSWORD: forbidden\n      AWS_ACCESS_KEY_ID:", 1),
+		"reserved home":   strings.Replace(valid, "      AWS_ACCESS_KEY_ID:", "      HOME: forbidden\n      AWS_ACCESS_KEY_ID:", 1),
+		"bad name":        strings.Replace(valid, "      AWS_ACCESS_KEY_ID:", "      lowercase: forbidden\n      AWS_ACCESS_KEY_ID:", 1),
+		"empty value":     strings.Replace(valid, "synthetic-access", `""`, 1),
+		"implicit value":  strings.Replace(valid, "synthetic-access", "123", 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if _, err := LoadRoleCredentials(writePrivateFile(t, invalid), cfg); err == nil {
+				t.Fatal("invalid role credentials were accepted")
+			}
+		})
+	}
+}
+
+func TestNotifierFieldsAndBarkKeyAreStrict(t *testing.T) {
+	t.Parallel()
+	backup := strings.Replace(minimalBackupYAML, "notifiers: []", `notifiers:
+  - name: operations
+    type: wechat
+  - name: phone
+    type: bark`, 1)
+	cfg, err := DecodeBackup([]byte(backup))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(environment) != 2 || environment["AWS_ACCESS_KEY_ID"] != "synthetic-access" || environment["AWS_SECRET_ACCESS_KEY"] != "synthetic-secret" {
-		t.Fatalf("environment = %#v", environment)
+	key := p256PKCS8(t)
+	validCredentials := `schema_version: 1
+notifiers:
+  operations:
+    webhook_url: https://example.test/hooks/send?key=placeholder
+  phone:
+    device_token: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    auth_key: |
+` + indent(key, 6) + `    key_id: KEY123
+    team_id: TEAM123
+    topic: me.example.app
+`
+	resolved, err := LoadNotifierCredentials(writePrivateFile(t, validCredentials), cfg)
+	if err != nil || len(resolved) != 2 || resolved[0].WebhookURL == "" || resolved[1].Sound != "1107" {
+		t.Fatalf("resolved notifier credentials = %#v/%v", resolved, err)
 	}
-
-	for _, invalid := range []string{
-		`schema_version: 2
-targets:
-  primary:
-    AWS_ACCESS_KEY_ID: synthetic-access
-`,
-		valid + "  removed-target:\n    AWS_ACCESS_KEY_ID: other\n    AWS_SECRET_ACCESS_KEY: other\n",
-		`schema_version: 2
-targets:
-  primary:
-    AWS_ACCESS_KEY_ID: synthetic-access
-    AWS_SECRET_ACCESS_KEY: synthetic-secret
-    AWS_SESSION_TOKEN: forbidden
-`,
-		valid + "unknown_root_field: forbidden\n",
+	for name, credentials := range map[string]string{
+		"http webhook":   strings.Replace(validCredentials, "https://", "http://", 1),
+		"wrong key":      strings.Replace(validCredentials, "-----BEGIN PRIVATE KEY-----", "not-a-key", 1),
+		"trailing PEM":   strings.Replace(validCredentials, "    key_id:", "      extra\n    key_id:", 1),
+		"wechat extra":   strings.Replace(validCredentials, "    webhook_url:", "    sound: chime\n    webhook_url:", 1),
+		"bark missing":   strings.Replace(validCredentials, "    topic: me.example.app\n", "", 1),
+		"extra notifier": validCredentials + "  unexpected:\n    webhook_url: https://example.test/hook\n",
 	} {
-		if _, err := LoadRoleCredentials(writePrivateFile(t, invalid), cfg); err == nil {
-			t.Fatal("invalid role credentials were accepted")
-		}
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if _, err := LoadNotifierCredentials(writePrivateFile(t, credentials), cfg); err == nil {
+				t.Fatal("invalid notifier credentials were accepted")
+			}
+		})
 	}
 }
 
-func TestPrivateConfigAndCredentialParentsMustBe0700(t *testing.T) {
+func TestEmptyNotifierSetStillRequiresStrictCredentialFile(t *testing.T) {
 	t.Parallel()
-	directory := filepath.Join(t.TempDir(), "config")
-	if err := os.Mkdir(directory, 0o700); err != nil {
+	cfg, err := DecodeBackup([]byte(minimalBackupYAML))
+	if err != nil {
 		t.Fatal(err)
 	}
+	resolved, err := LoadNotifierCredentials(writePrivateFile(t, "schema_version: 1\nnotifiers: {}\n"), cfg)
+	if err != nil || resolved == nil || len(resolved) != 0 {
+		t.Fatalf("empty notifier credentials = %#v/%v", resolved, err)
+	}
+	if _, err := LoadNotifierCredentials(writePrivateFile(t, "schema_version: 1\nnotifiers: {}\nunknown: value\n"), cfg); err == nil {
+		t.Fatal("invalid empty notifier credential file was accepted")
+	}
+}
+
+func TestPasswordDirectoryRequiresExactSetAndOnePrivateLine(t *testing.T) {
+	t.Parallel()
+	cfg, err := DecodeBackup([]byte(minimalBackupYAML))
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory := privateDirectory(t)
+	writeModeFile(t, filepath.Join(directory, "primary.example"), "template\n", 0o644)
+	writeModeFile(t, filepath.Join(directory, "primary"), "password\n", 0o600)
+	if err := ValidatePasswordDirectory(directory, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if password, err := ReadPassword(directory, "primary"); err != nil || password != "password" {
+		t.Fatalf("password = %q/%v", password, err)
+	}
+	for name, value := range map[string]string{"empty": "", "two lines": "one\ntwo", "CR": "one\r\n", "NUL": "one\x00"} {
+		t.Run(name, func(t *testing.T) {
+			directory := privateDirectory(t)
+			writeModeFile(t, filepath.Join(directory, "primary"), value, 0o600)
+			if err := ValidatePasswordDirectory(directory, cfg); err == nil {
+				t.Fatal("invalid password was accepted")
+			}
+		})
+	}
+	writeModeFile(t, filepath.Join(directory, "unexpected"), "password", 0o600)
+	if err := ValidatePasswordDirectory(directory, cfg); err == nil {
+		t.Fatal("unexpected password file was accepted")
+	}
+}
+
+func TestDeploymentEnvIsExactCanonicalAndOwned(t *testing.T) {
+	t.Parallel()
+	valid := fmt.Sprintf("DEPLOYMENT_SCHEMA_VERSION=1\nRUNTIME_UID=%d\nRUNTIME_GID=%d\nLISTEN_PORT=8080\nDRILL_PORT=8081\n", os.Geteuid(), os.Getegid())
+	path := writePrivateFile(t, valid)
+	deployment, err := LoadDeployment(path)
+	if err != nil || deployment.ListenPort != 8080 || deployment.DrillPort != 8081 {
+		t.Fatalf("deployment = %#v/%v", deployment, err)
+	}
+	for name, invalid := range map[string]string{
+		"blank":        valid + "\n",
+		"duplicate":    valid + "LISTEN_PORT=8082\n",
+		"unknown":      strings.Replace(valid, "LISTEN_PORT", "OTHER_PORT", 1),
+		"quote":        strings.Replace(valid, "8080", `"8080"`, 1),
+		"leading zero": strings.Replace(valid, "8080", "08080", 1),
+		"same ports":   strings.Replace(valid, "8081", "8080", 1),
+		"low port":     strings.Replace(valid, "8080", "80", 1),
+		"CR":           strings.Replace(valid, "\n", "\r\n", 1),
+		"comment":      valid + "# comment\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if _, err := LoadDeployment(writePrivateFile(t, invalid)); err == nil {
+				t.Fatal("invalid deployment environment was accepted")
+			}
+		})
+	}
+}
+
+func TestPrivateConfigFileAndFixedPolicy(t *testing.T) {
+	t.Parallel()
+	directory := privateDirectory(t)
 	path := filepath.Join(directory, "backup.yaml")
-	if err := os.WriteFile(path, []byte(minimalBackupYAML), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	writeModeFile(t, path, minimalBackupYAML, 0o600)
 	if _, err := LoadBackup(path); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chmod(directory, 0o755); err != nil {
+	if err := os.Chmod(path, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := LoadBackup(path); err == nil {
-		t.Fatal("public config parent was accepted")
+		t.Fatal("public config file was accepted")
+	}
+	if QuietWindow != 30*time.Second || MaximumQuietWindow != 2*time.Minute || MinimumCheckInterval != 5*time.Minute ||
+		FallbackCheckInterval != 12*time.Hour || ConsistencyRetry != 30*time.Second || FailureRetry != 5*time.Minute ||
+		DegradedAfter != 30*time.Minute || EventRetry != 30*time.Second || TargetTimeout != 2*time.Hour ||
+		MaintenanceTimeout != 24*time.Hour || NotifierTimeout != 10*time.Second || ShutdownTimeout != 2*time.Minute {
+		t.Fatal("fixed runtime policy changed")
 	}
 }
 
-func TestFixedRuntimePolicy(t *testing.T) {
-	t.Parallel()
-	if QuietWindow != 30*time.Second || MaximumQuietWindow != 2*time.Minute || MinimumCheckInterval != 5*time.Minute ||
-		FallbackCheckInterval != 12*time.Hour || ConsistencyRetry != 30*time.Second || FailureRetry != 5*time.Minute || DegradedAfter != 30*time.Minute {
-		t.Fatal("fixed scheduler policy changed")
+func p256PKCS8(t *testing.T) string {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
 	}
+	der, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}))
+}
+
+func indent(value string, spaces int) string {
+	prefix := strings.Repeat(" ", spaces)
+	value = strings.TrimSuffix(value, "\n")
+	return prefix + strings.ReplaceAll(value, "\n", "\n"+prefix) + "\n"
+}
+
+func privateDirectory(t *testing.T) string {
+	t.Helper()
+	directory := filepath.Join(t.TempDir(), "private")
+	if err := os.Mkdir(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return directory
 }
 
 func writePrivateFile(t *testing.T, contents string) string {
 	t.Helper()
-	directory := filepath.Join(t.TempDir(), "credentials")
-	if err := os.Mkdir(directory, 0o700); err != nil {
-		t.Fatal(err)
-	}
+	directory := privateDirectory(t)
 	path := filepath.Join(directory, "private.yaml")
-	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+	writeModeFile(t, path, contents, 0o600)
+	return path
+}
+
+func writeModeFile(t *testing.T, path, contents string, mode os.FileMode) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(contents), mode); err != nil {
 		t.Fatal(err)
 	}
-	return path
 }

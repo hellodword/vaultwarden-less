@@ -2,29 +2,17 @@ package cli
 
 import (
 	"fmt"
-	"path/filepath"
-	"strings"
 
 	"github.com/hellodword/vaultwarden-less/internal/notify"
 	"github.com/spf13/cobra"
 )
 
 type configValidationResult struct {
-	SchemaVersion int              `json:"schema_version"`
-	Valid         bool             `json:"valid"`
-	Warnings      []string         `json:"warnings"`
-	Targets       []configTarget   `json:"targets"`
-	Notifiers     []configNotifier `json:"notifiers"`
-}
-
-type configTarget struct {
-	Name    string `json:"name"`
-	Backend string `json:"backend"`
-}
-
-type configNotifier struct {
-	Name string `json:"name"`
-	Type string `json:"type"`
+	SchemaVersion int      `json:"schema_version"`
+	Valid         bool     `json:"valid"`
+	Role          string   `json:"role"`
+	Targets       []string `json:"targets"`
+	Warnings      []string `json:"warnings"`
 }
 
 func configCommand(configPath *string, environment commandEnvironment) *cobra.Command {
@@ -33,55 +21,74 @@ func configCommand(configPath *string, environment commandEnvironment) *cobra.Co
 		Short: "Validate private deployment configuration",
 		Args:  noArguments,
 		RunE: func(_ *cobra.Command, _ []string) error {
-			return usageError("a config subcommand is required")
+			return usageError("A config subcommand is required")
 		},
 	}
-	command.AddCommand(&cobra.Command{
+	var role string
+	validate := &cobra.Command{
 		Use:   "validate",
-		Short: "Validate backup.yaml, role credentials, password, and notifier material",
+		Short: "Validate deployment, role, password, and notifier material without repository access",
 		Args:  noArguments,
+		PreRunE: func(_ *cobra.Command, _ []string) error {
+			if role != "backup" && role != "maintenance" {
+				return usageError("--role must be backup or maintenance")
+			}
+			return nil
+		},
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if environment.loadDeployment == nil {
+				return commandFailure(codeInternal, "Deployment validation is unavailable", nil)
+			}
+			if _, err := environment.loadDeployment(environment.deploymentPath); err != nil {
+				return commandFailure(codeInvalidConfig, "The deployment environment is invalid", err)
+			}
 			cfg, err := environment.backup(*configPath)
 			if err != nil {
-				return err
+				return commandFailure(codeInvalidConfig, "The backup configuration is invalid", err)
+			}
+			if environment.loadCredentials == nil {
+				return commandFailure(codeInternal, "Role credential validation is unavailable", nil)
 			}
 			if _, err := environment.loadCredentials(environment.credentialsPath, cfg); err != nil {
-				return err
+				return commandFailure(codeInvalidCredentials, "The selected role credentials are invalid", err)
 			}
-			for _, target := range cfg.Targets {
-				password, err := environment.readSecret(filepath.Join(environment.passwordRoot, target.Name))
+			if environment.validatePasswords == nil {
+				return commandFailure(codeInternal, "Password validation is unavailable", nil)
+			}
+			if err := environment.validatePasswords(environment.passwordRoot, cfg); err != nil {
+				return commandFailure(codeInvalidCredentials, "The Restic password set is invalid", err)
+			}
+			if environment.validateDirectory == nil {
+				return commandFailure(codeInternal, "Private directory validation is unavailable", nil)
+			}
+			for _, path := range []string{environment.dataDir, environment.stagingDir, environment.cacheDir, environment.restoreRoot, environment.stateDir} {
+				if err := environment.validateDirectory(path); err != nil {
+					return commandFailure(codeUnsafePath, fmt.Sprintf("A required private directory is unsafe: %s", path), err)
+				}
+			}
+			if role == "backup" {
+				notifiers, err := environment.notifiersFor(cfg)
 				if err != nil {
-					return fmt.Errorf("read Restic password for target %s: %w", target.Name, err)
+					return commandFailure(codeInvalidCredentials, "Notifier credentials are invalid", err)
 				}
-				if strings.ContainsAny(password, "\r\n\x00") {
-					return fmt.Errorf("restic password for target %s contains a forbidden character", target.Name)
+				if _, err := notify.NewManager(notifiers, nil); err != nil {
+					return commandFailure(codeInvalidCredentials, "Notifier credentials are invalid", err)
 				}
 			}
-			notifiers, err := environment.notifiersFor(cfg)
-			if err != nil {
-				return err
+			targets := make([]string, 0, len(cfg.Targets))
+			for _, target := range cfg.Targets {
+				targets = append(targets, target.Name)
 			}
-			if _, err := notify.NewManager(notifiers, nil); err != nil {
-				return err
-			}
-			result := configValidationResult{
+			return writeJSON(cmd.OutOrStdout(), configValidationResult{
 				SchemaVersion: ResultSchemaVersion,
 				Valid:         true,
+				Role:          role,
+				Targets:       targets,
 				Warnings:      []string{},
-				Targets:       make([]configTarget, 0, len(cfg.Targets)),
-				Notifiers:     make([]configNotifier, 0, len(notifiers)),
-			}
-			for _, target := range cfg.Targets {
-				result.Targets = append(result.Targets, configTarget{Name: target.Name, Backend: "s3"})
-				for _, warning := range target.Warnings() {
-					result.Warnings = append(result.Warnings, target.Name+":"+warning)
-				}
-			}
-			for _, notifier := range notifiers {
-				result.Notifiers = append(result.Notifiers, configNotifier{Name: notifier.Name, Type: notifier.Type})
-			}
-			return writeJSON(cmd.OutOrStdout(), result)
+			})
 		},
-	})
+	}
+	validate.Flags().StringVar(&role, "role", "", "credential role: backup or maintenance")
+	command.AddCommand(validate)
 	return command
 }

@@ -2,8 +2,6 @@ package cli
 
 import (
 	"context"
-	"strconv"
-	"strings"
 
 	"github.com/hellodword/vaultwarden-less/internal/config"
 	"github.com/hellodword/vaultwarden-less/internal/restic"
@@ -42,7 +40,7 @@ func repoCommand(configPath *string, environment commandEnvironment) *cobra.Comm
 		Short: "Run explicit thin Restic repository operations",
 		Args:  noArguments,
 		RunE: func(_ *cobra.Command, _ []string) error {
-			return usageError("a repo subcommand is required")
+			return usageError("A repo subcommand is required")
 		},
 	}
 	command.PersistentFlags().StringVar(&targetName, "target", "", "configured target name")
@@ -55,7 +53,7 @@ func repoCommand(configPath *string, environment commandEnvironment) *cobra.Comm
 				}
 				cfg, err := environment.backup(*configPath)
 				if err != nil {
-					return err
+					return commandFailure(codeInvalidConfig, "The backup configuration is invalid", err)
 				}
 				target, err := findTarget(cfg, targetName)
 				if err != nil {
@@ -63,16 +61,19 @@ func repoCommand(configPath *string, environment commandEnvironment) *cobra.Comm
 				}
 				repository, err := environment.repositoryFor(cfg)
 				if err != nil {
-					return err
-				}
-				if err := repository.VerifyVersion(cmd.Context()); err != nil {
-					return err
+					return commandFailure(codeInvalidCredentials, "Maintenance credentials are invalid", err)
 				}
 				ctx, cancel := context.WithTimeout(cmd.Context(), config.MaintenanceTimeout)
 				defer cancel()
+				if err := repository.VerifyVersion(ctx); err != nil {
+					return commandFailure(codeRepositoryFailure, "Restic version verification failed", err)
+				}
 				result, err := action(ctx, repository, target)
 				if err != nil {
-					return err
+					if classified := classifyError(err); classified.Code == codeTimeout {
+						return classified
+					}
+					return commandFailure(codeRepositoryFailure, "The repository operation failed", err)
 				}
 				return writeJSON(cmd.OutOrStdout(), result)
 			},
@@ -109,20 +110,12 @@ func repoCommand(configPath *string, environment commandEnvironment) *cobra.Comm
 		}
 		return nil
 	}
-	var subset string
-	checkCommand := operation("check", "Check repository metadata and optional one-twelfth data subset", func(ctx context.Context, repository repository, target config.Target) (any, error) {
-		if err := repository.Check(ctx, target, subset); err != nil {
+	checkCommand := operation("check", "Check repository metadata", func(ctx context.Context, repository repository, target config.Target) (any, error) {
+		if err := repository.Check(ctx, target, ""); err != nil {
 			return nil, err
 		}
 		return successfulOperation("check", target.Name), nil
 	})
-	checkCommand.Flags().StringVar(&subset, "read-data-subset", "", "optional n/12 data subset")
-	checkCommand.PreRunE = func(_ *cobra.Command, _ []string) error {
-		if !validSubset(subset) {
-			return usageError("--read-data-subset must be n/12 where n is 1 through 12")
-		}
-		return nil
-	}
 	unlockCommand := operation("unlock", "Remove stale Restic repository locks", func(ctx context.Context, repository repository, target config.Target) (any, error) {
 		if err := repository.Unlock(ctx, target); err != nil {
 			return nil, err
@@ -153,16 +146,4 @@ func repoCommand(configPath *string, environment commandEnvironment) *cobra.Comm
 
 func successfulOperation(operation, target string) operationResult {
 	return operationResult{SchemaVersion: ResultSchemaVersion, Operation: operation, Target: target, Success: true}
-}
-
-func validSubset(value string) bool {
-	if value == "" {
-		return true
-	}
-	left, right, ok := strings.Cut(value, "/")
-	if !ok || right != "12" || strings.Contains(left, "+") {
-		return false
-	}
-	part, err := strconv.Atoi(left)
-	return err == nil && part >= 1 && part <= 12 && strconv.Itoa(part) == left
 }

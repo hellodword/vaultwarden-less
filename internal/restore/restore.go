@@ -14,7 +14,7 @@ import (
 	"github.com/hellodword/vaultwarden-less/internal/snapshot"
 )
 
-const ResultSchemaVersion = 2
+const ResultSchemaVersion = 1
 
 type Repository interface {
 	ResolveSnapshot(context.Context, config.Target, string) (restic.Snapshot, error)

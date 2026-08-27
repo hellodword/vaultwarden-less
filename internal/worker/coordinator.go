@@ -21,6 +21,7 @@ type LastCheck struct {
 	FinishedAt string  `json:"finished_at"`
 	Result     string  `json:"result"`
 	ContentID  *string `json:"content_id"`
+	ArchiveID  *string `json:"archive_id"`
 	ErrorCode  *string `json:"error_code"`
 }
 
@@ -31,6 +32,7 @@ type TargetStatus struct {
 	LastSuccessAt *string `json:"last_success_at"`
 	SnapshotID    *string `json:"snapshot_id"`
 	ContentID     *string `json:"content_id"`
+	ArchiveID     *string `json:"archive_id"`
 	ErrorCode     *string `json:"error_code"`
 }
 
@@ -118,6 +120,7 @@ func (worker *Worker) Status() Status {
 	if worker.status.LastCheck != nil {
 		last := *worker.status.LastCheck
 		last.ContentID = cloneString(last.ContentID)
+		last.ArchiveID = cloneString(last.ArchiveID)
 		last.ErrorCode = cloneString(last.ErrorCode)
 		result.LastCheck = &last
 	}
@@ -127,6 +130,7 @@ func (worker *Worker) Status() Status {
 		target.LastSuccessAt = cloneString(target.LastSuccessAt)
 		target.SnapshotID = cloneString(target.SnapshotID)
 		target.ContentID = cloneString(target.ContentID)
+		target.ArchiveID = cloneString(target.ArchiveID)
 		target.ErrorCode = cloneString(target.ErrorCode)
 		result.Targets[index] = target
 	}
@@ -194,6 +198,7 @@ func (worker *Worker) Run(ctx context.Context) {
 type checkOutcome struct {
 	result    string
 	contentID string
+	archiveID string
 	errorCode string
 	retry     bool
 	cancelled bool
@@ -338,6 +343,11 @@ func (worker *Worker) targetSucceeded(index int, now time.Time, result restic.Sy
 	target.LastSuccessAt = &when
 	target.SnapshotID = new(result.SnapshotID)
 	target.ContentID = new(result.ContentID)
+	if result.ArchiveID == "" {
+		target.ArchiveID = nil
+	} else {
+		target.ArchiveID = new(result.ArchiveID)
+	}
 	target.ErrorCode = nil
 	worker.mu.Unlock()
 }
@@ -377,11 +387,26 @@ func (worker *Worker) finishCheck(started, finished time.Time, outcome checkOutc
 	if outcome.contentID != "" {
 		last.ContentID = new(outcome.contentID)
 	}
+	if outcome.archiveID != "" {
+		last.ArchiveID = new(outcome.archiveID)
+	}
 	if outcome.errorCode != "" {
 		last.ErrorCode = new(outcome.errorCode)
 	}
 	worker.mu.Lock()
 	worker.status.State = "idle"
+	if outcome.result == "partial" {
+		worker.status.State = "partial"
+	}
+	if worker.sourceFailure.degraded {
+		worker.status.State = "degraded"
+	}
+	for _, failure := range worker.targetFailures {
+		if failure.degraded {
+			worker.status.State = "degraded"
+			break
+		}
+	}
 	worker.status.NextCheckAt = nil
 	worker.status.LastCheck = last
 	worker.mu.Unlock()
@@ -431,7 +456,7 @@ func validErrorCode(value string) bool {
 }
 
 func formatTime(value time.Time) string {
-	return value.UTC().Format(time.RFC3339Nano)
+	return value.UTC().Format("2006-01-02T15:04:05.000Z")
 }
 
 func cloneString(value *string) *string {

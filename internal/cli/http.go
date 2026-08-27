@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"mime"
 	"net/http"
 	"net/url"
 	"strings"
@@ -31,10 +30,10 @@ func requestBackupCommand(environment commandEnvironment) *cobra.Command {
 				Accepted      bool `json:"accepted"`
 			}
 			if err := callWorker(cmd.Context(), environment, http.MethodPost, worker.CheckPath, http.StatusAccepted, &result); err != nil {
-				return err
+				return commandFailure(codeInternal, "The backup request could not be delivered", err)
 			}
 			if result.SchemaVersion != worker.SchemaVersion || !result.Accepted {
-				return fmt.Errorf("worker returned an invalid acceptance response")
+				return commandFailure(codeInternal, "The worker returned an invalid response", nil)
 			}
 			return writeJSON(cmd.OutOrStdout(), result)
 		},
@@ -49,10 +48,10 @@ func statusCommand(environment commandEnvironment) *cobra.Command {
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			var status worker.Status
 			if err := callWorker(cmd.Context(), environment, http.MethodGet, worker.StatusPath, http.StatusOK, &status); err != nil {
-				return err
+				return commandFailure(codeInternal, "Worker status is unavailable", err)
 			}
 			if err := validateWorkerStatus(status); err != nil {
-				return err
+				return commandFailure(codeInternal, "The worker returned an invalid status", err)
 			}
 			return writeJSON(cmd.OutOrStdout(), status)
 		},
@@ -65,7 +64,13 @@ func healthcheckCommand(environment commandEnvironment) *cobra.Command {
 		Short: "Check whether the internal worker HTTP process is alive",
 		Args:  noArguments,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return callWorker(cmd.Context(), environment, http.MethodGet, worker.HealthPath, http.StatusNoContent, nil)
+			if err := callWorker(cmd.Context(), environment, http.MethodGet, worker.HealthPath, http.StatusNoContent, nil); err != nil {
+				return commandFailure(codeNotReady, "The backup worker is not healthy", err)
+			}
+			return writeJSON(cmd.OutOrStdout(), struct {
+				SchemaVersion int  `json:"schema_version"`
+				Healthy       bool `json:"healthy"`
+			}{ResultSchemaVersion, true})
 		},
 	}
 }
@@ -108,8 +113,7 @@ func callWorker(ctx context.Context, environment commandEnvironment, method, pat
 		}
 		return nil
 	}
-	mediaType, parameters, err := mime.ParseMediaType(response.Header.Get("Content-Type"))
-	if err != nil || mediaType != "application/json" || len(parameters) != 0 {
+	if response.Header.Get("Content-Type") != "application/json" {
 		return fmt.Errorf("worker returned an invalid content type")
 	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
@@ -134,7 +138,7 @@ func workerEndpoint(base, path string) (string, error) {
 }
 
 func validateWorkerStatus(status worker.Status) error {
-	if status.SchemaVersion != worker.SchemaVersion || !oneOf(status.State, "idle", "debouncing", "checking") || status.Targets == nil {
+	if status.SchemaVersion != worker.SchemaVersion || !oneOf(status.State, "idle", "debouncing", "checking", "partial", "degraded") || status.Targets == nil {
 		return fmt.Errorf("worker returned an invalid status document")
 	}
 	if !validUTCTime(status.StartedAt) || status.NextCheckAt != nil && !validUTCTime(*status.NextCheckAt) {
@@ -145,7 +149,8 @@ func validateWorkerStatus(status worker.Status) error {
 		if !validUTCTime(last.StartedAt) || !validUTCTime(last.FinishedAt) || !oneOf(last.Result, "unchanged", "created", "partial", "failed") {
 			return fmt.Errorf("worker returned an invalid last check")
 		}
-		if last.ContentID != nil && !snapshot.IsContentID(*last.ContentID) || last.ErrorCode != nil && !validErrorCode(*last.ErrorCode) {
+		if last.ContentID != nil && !snapshot.IsContentID(*last.ContentID) || last.ArchiveID != nil && !snapshot.IsContentID(*last.ArchiveID) ||
+			last.ErrorCode != nil && !validErrorCode(*last.ErrorCode) {
 			return fmt.Errorf("worker returned an invalid last check identifier")
 		}
 	}
@@ -163,7 +168,8 @@ func validateWorkerStatus(status worker.Status) error {
 				return fmt.Errorf("worker returned an invalid target timestamp")
 			}
 		}
-		if target.SnapshotID != nil && !validSnapshotID(*target.SnapshotID) || target.ContentID != nil && !snapshot.IsContentID(*target.ContentID) || target.ErrorCode != nil && !validErrorCode(*target.ErrorCode) {
+		if target.SnapshotID != nil && !validSnapshotID(*target.SnapshotID) || target.ContentID != nil && !snapshot.IsContentID(*target.ContentID) ||
+			target.ArchiveID != nil && !snapshot.IsContentID(*target.ArchiveID) || target.ErrorCode != nil && !validErrorCode(*target.ErrorCode) {
 			return fmt.Errorf("worker returned an invalid target identifier")
 		}
 	}
@@ -171,8 +177,8 @@ func validateWorkerStatus(status worker.Status) error {
 }
 
 func validUTCTime(value string) bool {
-	parsed, err := time.Parse(time.RFC3339Nano, value)
-	return err == nil && !parsed.IsZero() && strings.HasSuffix(value, "Z")
+	parsed, err := time.Parse("2006-01-02T15:04:05.000Z", value)
+	return err == nil && !parsed.IsZero() && parsed.UTC().Format("2006-01-02T15:04:05.000Z") == value
 }
 
 func validErrorCode(value string) bool {

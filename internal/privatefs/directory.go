@@ -14,14 +14,18 @@ func ValidatePrivateDirectory(path string) error {
 	if path == "" || path == string(filepath.Separator) || !filepath.IsAbs(path) || filepath.Clean(path) != path {
 		return fmt.Errorf("private directory path must be clean, absolute, and non-root")
 	}
+	if err := validateDirectoryChain(path, false); err != nil {
+		return err
+	}
 	info, err := os.Lstat(path)
 	if err != nil {
 		return err
 	}
 	permissions := info.Mode().Perm()
 	stat, ownerKnown := info.Sys().(*syscall.Stat_t)
-	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || !ownerKnown || stat.Uid != uint32(os.Geteuid()) || permissions != 0o700 {
-		return fmt.Errorf("path must be a real 0700 directory owned by effective UID %d", os.Geteuid())
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || !ownerKnown || stat.Uid != uint32(os.Geteuid()) ||
+		stat.Gid != uint32(os.Getegid()) || permissions != 0o700 {
+		return fmt.Errorf("path must be a real 0700 directory owned by effective identity %d:%d", os.Geteuid(), os.Getegid())
 	}
 	return nil
 }
@@ -41,7 +45,10 @@ func EnsurePrivateDirectory(path string) error {
 	if err := validateDirectoryChain(path, false); err != nil {
 		return err
 	}
-	return os.Chmod(path, 0o700)
+	if err := os.Chmod(path, 0o700); err != nil {
+		return err
+	}
+	return ValidatePrivateDirectory(path)
 }
 
 func validateDirectoryChain(path string, allowMissing bool) error {

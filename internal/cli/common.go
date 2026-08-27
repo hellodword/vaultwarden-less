@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/hellodword/vaultwarden-less/internal/buildinfo"
 	"github.com/hellodword/vaultwarden-less/internal/config"
 	"github.com/hellodword/vaultwarden-less/internal/privatefs"
 	"github.com/hellodword/vaultwarden-less/internal/restic"
@@ -18,7 +19,7 @@ import (
 	"github.com/hellodword/vaultwarden-less/internal/snapshot"
 )
 
-const ResultSchemaVersion = 2
+const ResultSchemaVersion = 1
 
 type repository interface {
 	VerifyVersion(context.Context) error
@@ -35,33 +36,40 @@ type repository interface {
 type restoreFunc func(context.Context, restoretool.Repository, restoretool.Request) (restoretool.Result, error)
 
 type commandEnvironment struct {
-	loadBackup      func(string) (*config.Backup, error)
-	loadCredentials func(string, *config.Backup) (*config.RoleCredentials, error)
-	loadNotifiers   func(string, *config.Backup) ([]config.Notifier, error)
-	readSecret      func(string) (string, error)
-	repository      func(*config.Backup) (repository, error)
-	restore         restoreFunc
-	httpClient      *http.Client
-	workerURL       string
-	credentialsPath string
-	notifierPath    string
-	passwordRoot    string
-	resticBinary    string
-	dataDir         string
-	stagingDir      string
-	cacheDir        string
-	restoreRoot     string
-	logger          *slog.Logger
+	loadBackup        func(string) (*config.Backup, error)
+	loadDeployment    func(string) (config.Deployment, error)
+	loadCredentials   func(string, *config.Backup) (*config.RoleCredentials, error)
+	loadNotifiers     func(string, *config.Backup) ([]config.Notifier, error)
+	validatePasswords func(string, *config.Backup) error
+	validateDirectory func(string) error
+	repository        func(*config.Backup) (repository, error)
+	restore           restoreFunc
+	httpClient        *http.Client
+	workerURL         string
+	deploymentPath    string
+	credentialsPath   string
+	notifierPath      string
+	passwordRoot      string
+	resticBinary      string
+	dataDir           string
+	stagingDir        string
+	cacheDir          string
+	restoreRoot       string
+	stateDir          string
+	ready             func() bool
+	logger            *slog.Logger
 }
 
 func defaultEnvironment(stderr io.Writer) commandEnvironment {
 	logger := slog.New(slog.NewJSONHandler(stderr, nil))
 	environment := commandEnvironment{
-		loadBackup:      config.LoadBackup,
-		loadCredentials: config.LoadRoleCredentials,
-		loadNotifiers:   config.LoadNotifierCredentials,
-		readSecret:      privatefs.Read,
-		restore:         restoretool.Run,
+		loadBackup:        config.LoadBackup,
+		loadDeployment:    config.LoadDeployment,
+		loadCredentials:   config.LoadRoleCredentials,
+		loadNotifiers:     config.LoadNotifierCredentials,
+		validatePasswords: config.ValidatePasswordDirectory,
+		validateDirectory: privatefs.ValidatePrivateDirectory,
+		restore:           restoretool.Run,
 		httpClient: &http.Client{
 			Timeout: 5 * time.Second,
 			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
@@ -69,6 +77,7 @@ func defaultEnvironment(stderr io.Writer) commandEnvironment {
 			},
 		},
 		workerURL:       config.WorkerURL,
+		deploymentPath:  config.DeploymentEnvPath,
 		credentialsPath: config.RoleCredentialsPath,
 		notifierPath:    config.NotifierCredentialsPath,
 		passwordRoot:    config.ResticPasswordRoot,
@@ -77,6 +86,8 @@ func defaultEnvironment(stderr io.Writer) commandEnvironment {
 		stagingDir:      config.StagingDir,
 		cacheDir:        config.CacheDir,
 		restoreRoot:     config.RestoreRoot,
+		stateDir:        config.StateDir,
+		ready:           buildinfo.Ready,
 		logger:          logger,
 	}
 	environment.repository = func(cfg *config.Backup) (repository, error) {
@@ -94,6 +105,10 @@ func defaultEnvironment(stderr io.Writer) commandEnvironment {
 		), nil
 	}
 	return environment
+}
+
+func (environment commandEnvironment) isReady() bool {
+	return environment.ready != nil && environment.ready()
 }
 
 func (environment commandEnvironment) backup(path string) (*config.Backup, error) {

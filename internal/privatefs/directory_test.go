@@ -64,6 +64,25 @@ func TestValidatePrivateDirectoryDoesNotMutateMountRoot(t *testing.T) {
 	}
 }
 
+func TestValidatePrivateDirectoryRejectsSymlinkAncestor(t *testing.T) {
+	t.Parallel()
+	realRoot := filepath.Join(t.TempDir(), "real")
+	if err := os.Mkdir(realRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	leaf := filepath.Join(realRoot, "leaf")
+	if err := os.Mkdir(leaf, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink(realRoot, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidatePrivateDirectory(filepath.Join(link, "leaf")); err == nil {
+		t.Fatal("symlink ancestor was accepted")
+	}
+}
+
 func TestAtomicRenamePrimitivesNeverOverwriteByAccident(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()

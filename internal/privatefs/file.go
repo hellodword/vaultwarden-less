@@ -17,6 +17,9 @@ func ReadBytes(path string, limit int64) ([]byte, error) {
 	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
 		return nil, fmt.Errorf("private file path must be clean and absolute")
 	}
+	if err := validateDirectoryChain(filepath.Dir(path), false); err != nil {
+		return nil, fmt.Errorf("inspect private file ancestors: %w", err)
+	}
 	info, err := os.Lstat(path)
 	if err != nil {
 		return nil, fmt.Errorf("inspect private file: %w", err)
@@ -25,7 +28,7 @@ func ReadBytes(path string, limit int64) ([]byte, error) {
 		return nil, fmt.Errorf("private path is not a regular file")
 	}
 	if !privateReadableMode(info) {
-		return nil, fmt.Errorf("private file must be owned by effective UID %d with mode 0600", os.Geteuid())
+		return nil, fmt.Errorf("private file must be owned by effective identity %d:%d with mode 0600", os.Geteuid(), os.Getegid())
 	}
 	if limit < 1 || info.Size() > limit {
 		return nil, fmt.Errorf("private file exceeds %d bytes", limit)
@@ -83,5 +86,5 @@ func Read(path string) (string, error) {
 func privateReadableMode(info os.FileInfo) bool {
 	permissions := info.Mode().Perm()
 	stat, ok := info.Sys().(*syscall.Stat_t)
-	return ok && stat.Uid == uint32(os.Geteuid()) && permissions == 0o600
+	return ok && stat.Uid == uint32(os.Geteuid()) && stat.Gid == uint32(os.Getegid()) && permissions == 0o600
 }

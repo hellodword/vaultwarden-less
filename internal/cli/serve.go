@@ -23,11 +23,11 @@ func serveCommand(configPath *string, environment commandEnvironment) *cobra.Com
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			cfg, err := environment.backup(*configPath)
 			if err != nil {
-				return err
+				return commandFailure(codeInvalidConfig, "The backup configuration is invalid", err)
 			}
 			notifiers, err := environment.notifiersFor(cfg)
 			if err != nil {
-				return err
+				return commandFailure(codeInvalidCredentials, "Notifier credentials are invalid", err)
 			}
 			logger := environment.logger
 			if logger == nil {
@@ -35,14 +35,14 @@ func serveCommand(configPath *string, environment commandEnvironment) *cobra.Com
 			}
 			notifications, err := notify.NewManager(notifiers, logger)
 			if err != nil {
-				return err
+				return commandFailure(codeInvalidCredentials, "Notifier credentials are invalid", err)
 			}
 			repository, err := environment.repositoryFor(cfg)
 			if err != nil {
-				return err
+				return commandFailure(codeInvalidCredentials, "Backup role credentials are invalid", err)
 			}
 			if err := repository.VerifyVersion(cmd.Context()); err != nil {
-				return err
+				return commandFailure(codeRepositoryFailure, "Restic version verification failed", err)
 			}
 
 			for _, target := range cfg.Targets {
@@ -94,7 +94,10 @@ func serveCommand(configPath *string, environment commandEnvironment) *cobra.Com
 			}
 			background.Wait()
 			logger.Info("backup worker stopped")
-			return result
+			if result != nil {
+				return commandFailure(codeInternal, "The backup worker stopped unexpectedly", result)
+			}
+			return nil
 		},
 	}
 }

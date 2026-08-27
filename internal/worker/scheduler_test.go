@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
@@ -352,13 +353,16 @@ func TestWorkerHTTPContract(t *testing.T) {
 	handler := Handler(worker)
 
 	assertHTTP(t, handler, http.MethodGet, HealthPath, "", "", http.StatusNoContent, "")
-	assertHTTP(t, handler, http.MethodPost, EventsPath, "application/json", `{"schema_version":2}`, http.StatusNoContent, "")
-	assertHTTP(t, handler, http.MethodPost, CheckPath, "application/json", `{"schema_version":2}`, http.StatusAccepted, "{\"schema_version\":2,\"accepted\":true}\n")
-	assertHTTP(t, handler, http.MethodPost, EventsPath, "application/json", `{"schema_version":2,"extra":true}`, http.StatusBadRequest, "")
-	assertHTTP(t, handler, http.MethodPost, EventsPath, "", `{"schema_version":2}`, http.StatusUnsupportedMediaType, "")
-	assertHTTP(t, handler, http.MethodPost, EventsPath, "application/json; charset=utf-8", `{"schema_version":2}`, http.StatusUnsupportedMediaType, "")
-	assertHTTP(t, handler, http.MethodPost, EventsPath, "application/json", strings.Repeat(" ", config.EventMaxBytes+1), http.StatusRequestEntityTooLarge, "")
-	assertHTTP(t, handler, http.MethodPost, EventsPath, "application/json", `{"schema_version":2}`+strings.Repeat(" ", config.EventMaxBytes), http.StatusRequestEntityTooLarge, "")
+	assertHTTP(t, handler, http.MethodPost, EventsPath, "application/json", `{"schema_version":1}`, http.StatusNoContent, "")
+	assertHTTP(t, handler, http.MethodPost, CheckPath, "application/json", `{"schema_version":1}`, http.StatusAccepted, "{\"schema_version\":1,\"accepted\":true}\n")
+	assertHTTP(t, handler, http.MethodPost, EventsPath, "application/json", `{"schema_version":1,"extra":true}`, http.StatusBadRequest, "")
+	assertHTTP(t, handler, http.MethodPost, EventsPath, "application/json", `{"schema_version":1,"schema_version":1}`, http.StatusBadRequest, "")
+	assertHTTP(t, handler, http.MethodPost, EventsPath, "application/json", `{"schema_version":"1"}`, http.StatusBadRequest, "")
+	assertHTTP(t, handler, http.MethodPost, EventsPath, "application/json", `{"schema_version":2}`, http.StatusBadRequest, "")
+	assertHTTP(t, handler, http.MethodPost, EventsPath, "", `{"schema_version":1}`, http.StatusBadRequest, "")
+	assertHTTP(t, handler, http.MethodPost, EventsPath, "application/json; charset=utf-8", `{"schema_version":1}`, http.StatusBadRequest, "")
+	assertHTTP(t, handler, http.MethodPost, EventsPath, "application/json", strings.Repeat(" ", config.EventMaxBytes+1), http.StatusBadRequest, "")
+	assertHTTP(t, handler, http.MethodPost, EventsPath, "application/json", `{"schema_version":1}`+strings.Repeat(" ", config.EventMaxBytes), http.StatusBadRequest, "")
 	assertHTTP(t, handler, http.MethodGet, HealthPath, "", "unexpected", http.StatusBadRequest, "")
 	assertHTTP(t, handler, http.MethodGet, StatusPath, "", "unexpected", http.StatusBadRequest, "")
 	assertHTTP(t, handler, http.MethodGet, EventsPath, "", "", http.StatusMethodNotAllowed, "")
@@ -379,6 +383,18 @@ func assertHTTP(t *testing.T, handler http.Handler, method, path, contentType, b
 	}
 	if wantBody != "" && response.Body.String() != wantBody {
 		t.Fatalf("%s %s body = %q, want %q", method, path, response.Body.String(), wantBody)
+	}
+	if wantStatus >= 400 {
+		var document struct {
+			SchemaVersion int `json:"schema_version"`
+			Error         struct {
+				Code    string `json:"code"`
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		if err := json.Unmarshal(response.Body.Bytes(), &document); err != nil || document.SchemaVersion != 1 || document.Error.Code == "" || document.Error.Message == "" {
+			t.Fatalf("%s %s error envelope = %#v/%v", method, path, document, err)
+		}
 	}
 }
 

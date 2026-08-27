@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -76,7 +77,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == HealthPath {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			w.Header().Set("Allow", "GET, HEAD")
-			writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "Method not allowed")
+			writeError(w, http.StatusMethodNotAllowed, "usage_error", "Method not allowed")
 			return
 		}
 		w.Header().Set("Cache-Control", "no-store")
@@ -84,7 +85,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.ContentLength > MaxRequestBytes {
-		writeError(w, http.StatusRequestEntityTooLarge, "request_too_large", "Request body exceeds 600 MiB")
+		writeError(w, http.StatusRequestEntityTooLarge, "usage_error", "Request body exceeds the configured limit")
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, MaxRequestBytes)
@@ -111,19 +112,43 @@ func (s *Server) rewrite(pr *httputil.ProxyRequest) {
 
 func (s *Server) modifyResponse(resp *http.Response) error {
 	if s.markDirty != nil && shouldRequestBackup(resp.Request.Method, resp.Request.URL.Path, resp.StatusCode) {
-		s.markDirty()
+		resp.Body = &completeResponseBody{ReadCloser: resp.Body, complete: s.markDirty}
 	}
 	return nil
+}
+
+type completeResponseBody struct {
+	io.ReadCloser
+	complete   func()
+	reachedEOF bool
+	closed     bool
+}
+
+func (body *completeResponseBody) Read(buffer []byte) (int, error) {
+	count, err := body.ReadCloser.Read(buffer)
+	if errors.Is(err, io.EOF) {
+		body.reachedEOF = true
+	}
+	return count, err
+}
+
+func (body *completeResponseBody) Close() error {
+	err := body.ReadCloser.Close()
+	if !body.closed && body.reachedEOF && err == nil {
+		body.closed = true
+		body.complete()
+	}
+	return err
 }
 
 func (s *Server) proxyError(w http.ResponseWriter, _ *http.Request, err error) {
 	var tooLarge *http.MaxBytesError
 	if errors.As(err, &tooLarge) {
-		writeError(w, http.StatusRequestEntityTooLarge, "request_too_large", "Request body exceeds 600 MiB")
+		writeError(w, http.StatusRequestEntityTooLarge, "usage_error", "Request body exceeds the configured limit")
 		return
 	}
 	s.log.Error("upstream request failed", "error_code", "upstream_unavailable")
-	writeError(w, http.StatusBadGateway, "upstream_unavailable", "Upstream unavailable")
+	writeError(w, http.StatusBadGateway, "internal_error", "Upstream unavailable")
 }
 
 func mustURL(raw string) *url.URL {
@@ -160,5 +185,5 @@ func writeError(w http.ResponseWriter, status int, code, message string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
-	_, _ = fmt.Fprintf(w, "{\"error\":{\"code\":%s,\"message\":%s}}\n", strconv.Quote(code), strconv.Quote(message))
+	_, _ = fmt.Fprintf(w, "{\"schema_version\":1,\"error\":{\"code\":%s,\"message\":%s}}\n", strconv.Quote(code), strconv.Quote(message))
 }
