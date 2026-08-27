@@ -136,6 +136,9 @@ let
         "ROCKET_ADDRESS=0.0.0.0"
         "ROCKET_PORT=80"
       ];
+      ExposedPorts = {
+        "80/tcp" = { };
+      };
       Labels = labels "vaultwarden-less Vaultwarden";
     };
   };
