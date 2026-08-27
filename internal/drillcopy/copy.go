@@ -7,8 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -21,22 +23,55 @@ const (
 	DestinationRoot = "/drill-data"
 )
 
+// ParseRuntimeIdentity parses the canonical non-root identity that will own the
+// disposable Vaultwarden data directory.
+func ParseRuntimeIdentity(rawUID, rawGID string) (uint32, uint32, error) {
+	uid, err := parseRuntimeID(rawUID)
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid drill runtime UID")
+	}
+	gid, err := parseRuntimeID(rawGID)
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid drill runtime GID")
+	}
+	return uid, gid, nil
+}
+
+func parseRuntimeID(raw string) (uint32, error) {
+	value, err := strconv.ParseUint(raw, 10, 32)
+	if err != nil || value == 0 || value == math.MaxUint32 || strconv.FormatUint(value, 10) != raw {
+		return 0, fmt.Errorf("runtime ID must be canonical non-root uint32")
+	}
+	return uint32(value), nil
+}
+
 // Run verifies one complete recovery point and copies only its manifest files
-// into an initially empty disposable Vaultwarden data directory.
-func Run(ctx context.Context, sourceRoot, destinationRoot string) error {
-	manifest, err := snapshot.Verify(ctx, sourceRoot)
+// into an initially empty disposable Vaultwarden data directory owned by the
+// explicitly configured runtime identity.
+func Run(ctx context.Context, sourceRoot, destinationRoot string, uid, gid uint32) error {
+	if os.Geteuid() != 0 || os.Getegid() != 0 {
+		return fmt.Errorf("drill copy helper must run as root")
+	}
+	if uid == 0 || gid == 0 || uid == math.MaxUint32 || gid == math.MaxUint32 {
+		return fmt.Errorf("drill runtime identity is invalid")
+	}
+	manifest, err := snapshot.VerifyOwned(ctx, sourceRoot, uid, gid)
 	if err != nil {
 		return fmt.Errorf("verify drill source: %w", err)
 	}
-	return copyManifestFiles(ctx, sourceRoot, destinationRoot, manifest.Files)
+	return copyManifestFiles(ctx, sourceRoot, destinationRoot, manifest.Files, uid, gid)
 }
 
-func copyManifestFiles(ctx context.Context, sourceRoot, destinationRoot string, files []snapshot.File) error {
+func copyManifestFiles(
+	ctx context.Context,
+	sourceRoot, destinationRoot string,
+	files []snapshot.File,
+	uid, gid uint32,
+) error {
 	if err := validateEmptyDestination(destinationRoot); err != nil {
 		return err
 	}
-	uid, gid := os.Geteuid(), os.Getegid()
-	if err := os.Chown(destinationRoot, uid, gid); err != nil {
+	if err := os.Chown(destinationRoot, int(uid), int(gid)); err != nil {
 		return fmt.Errorf("own drill destination: %w", err)
 	}
 	if err := os.Chmod(destinationRoot, 0o700); err != nil {
@@ -54,7 +89,7 @@ func copyManifestFiles(ctx context.Context, sourceRoot, destinationRoot string, 
 		if err := makeOwnedParents(destinationRoot, filepath.Dir(destination), uid, gid); err != nil {
 			return err
 		}
-		if err := copyListedFile(ctx, source, destination, listed); err != nil {
+		if err := copyListedFile(ctx, source, destination, listed, uid, gid); err != nil {
 			return fmt.Errorf("copy %s: %w", listed.Path, err)
 		}
 	}
@@ -103,7 +138,7 @@ func containedPath(root, relative string) (string, error) {
 	return joined, nil
 }
 
-func makeOwnedParents(root, parent string, uid, gid int) error {
+func makeOwnedParents(root, parent string, uid, gid uint32) error {
 	relative, err := filepath.Rel(root, parent)
 	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
 		return fmt.Errorf("drill destination parent escapes root")
@@ -121,7 +156,7 @@ func makeOwnedParents(root, parent string, uid, gid int) error {
 		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 			return fmt.Errorf("drill destination contains an unsafe directory")
 		}
-		if err := os.Chown(current, uid, gid); err != nil {
+		if err := os.Chown(current, int(uid), int(gid)); err != nil {
 			return fmt.Errorf("own drill directory: %w", err)
 		}
 		if err := os.Chmod(current, 0o700); err != nil {
@@ -131,7 +166,12 @@ func makeOwnedParents(root, parent string, uid, gid int) error {
 	return nil
 }
 
-func copyListedFile(ctx context.Context, sourcePath, destinationPath string, listed snapshot.File) error {
+func copyListedFile(
+	ctx context.Context,
+	sourcePath, destinationPath string,
+	listed snapshot.File,
+	uid, gid uint32,
+) error {
 	info, err := os.Lstat(sourcePath)
 	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 || info.Size() != listed.Size {
 		return fmt.Errorf("source is not the listed 0600 regular file")
@@ -170,6 +210,12 @@ func copyListedFile(ctx context.Context, sourcePath, destinationPath string, lis
 	if statErr != nil || !privatefs.SameFileVersion(opened, after) || written != listed.Size ||
 		"sha256:"+hex.EncodeToString(digest.Sum(nil)) != listed.SHA256 {
 		return fmt.Errorf("source changed or did not match the manifest")
+	}
+	if err := destination.Chown(int(uid), int(gid)); err != nil {
+		return fmt.Errorf("own drill destination file: %w", err)
+	}
+	if err := destination.Chmod(0o600); err != nil {
+		return fmt.Errorf("secure drill destination file: %w", err)
 	}
 	if err := destination.Sync(); err != nil {
 		return fmt.Errorf("sync drill destination file: %w", err)

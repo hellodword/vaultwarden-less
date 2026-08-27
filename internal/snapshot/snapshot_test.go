@@ -258,6 +258,29 @@ func TestBuilderCreatesAndVerifiesExactRecoverySet(t *testing.T) {
 	}
 }
 
+func TestVerifyOwnedBindsTheCompleteTreeToTheExpectedIdentity(t *testing.T) {
+	data := syntheticData(t, true)
+	_, point := buildFixture(t, data.dataDir)
+	uid, gid := uint32(os.Geteuid()), uint32(os.Getegid())
+	if _, err := VerifyOwned(context.Background(), point, uid, gid); err != nil {
+		t.Fatalf("verify explicit owner: %v", err)
+	}
+	wrongUID := uid + 1
+	if wrongUID == 0 {
+		wrongUID = uid - 1
+	}
+	if _, err := VerifyOwned(context.Background(), point, wrongUID, gid); err == nil {
+		t.Fatal("recovery point owned by a different UID was accepted")
+	}
+	wrongGID := gid + 1
+	if wrongGID == 0 {
+		wrongGID = gid - 1
+	}
+	if _, err := VerifyOwned(context.Background(), point, uid, wrongGID); err == nil {
+		t.Fatal("recovery point owned by a different GID was accepted")
+	}
+}
+
 func TestBuilderAcceptsEmptyCurrentSchema(t *testing.T) {
 	manifest, point := buildFixture(t, emptyCurrentData(t))
 	if len(manifest.Files) != 1 || manifest.Files[0].Path != "db.sqlite3" {

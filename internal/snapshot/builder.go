@@ -236,6 +236,10 @@ func cleanupTransientBuilds(stagingDir string) error {
 }
 
 func validateOwnedDirectory(path string) error {
+	return validateDirectoryOwnership(path, uint32(os.Geteuid()), uint32(os.Getegid()))
+}
+
+func validateDirectoryOwnership(path string, uid, gid uint32) error {
 	if path == "" || path == string(filepath.Separator) || !filepath.IsAbs(path) || filepath.Clean(path) != path {
 		return fmt.Errorf("path must be clean, absolute, and non-root")
 	}
@@ -244,8 +248,8 @@ func validateOwnedDirectory(path string) error {
 		return err
 	}
 	stat, ownerKnown := info.Sys().(*syscall.Stat_t)
-	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || !ownerKnown || stat.Uid != uint32(os.Geteuid()) || stat.Gid != uint32(os.Getegid()) || info.Mode().Perm() != 0o700 {
-		return fmt.Errorf("path must be a real 0700 directory owned by effective UID/GID")
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || !ownerKnown || stat.Uid != uid || stat.Gid != gid || info.Mode().Perm() != 0o700 {
+		return fmt.Errorf("path must be a real 0700 directory owned by expected UID/GID")
 	}
 	return nil
 }

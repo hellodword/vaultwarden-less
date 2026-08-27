@@ -20,9 +20,14 @@ func main() {
 		_, _ = fmt.Fprintln(os.Stderr, "vaultwarden-less-drill-copy requires a clean release image")
 		os.Exit(1)
 	}
+	uid, gid, err := drillcopy.ParseRuntimeIdentity(os.Getenv("RUNTIME_UID"), os.Getenv("RUNTIME_GID"))
+	if err != nil {
+		_, _ = fmt.Fprintln(os.Stderr, "vaultwarden-less-drill-copy failed")
+		os.Exit(1)
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	if err := drillcopy.Run(ctx, drillcopy.SourceRoot, drillcopy.DestinationRoot); err != nil {
+	if err := drillcopy.Run(ctx, drillcopy.SourceRoot, drillcopy.DestinationRoot, uid, gid); err != nil {
 		_, _ = fmt.Fprintln(os.Stderr, "vaultwarden-less-drill-copy failed")
 		os.Exit(1)
 	}

@@ -348,7 +348,11 @@ services:
     pull_policy: never
     profiles: [drill]
     restart: "no"
+    user: "0:0"
     network_mode: none
+    environment:
+      RUNTIME_UID: "${RUNTIME_UID:?RUNTIME_UID is required}"
+      RUNTIME_GID: "${RUNTIME_GID:?RUNTIME_GID is required}"
     cap_add: [CHOWN, DAC_OVERRIDE, FOWNER]
     entrypoint: [/bin/vaultwarden-less-drill-copy]
     volumes:

@@ -103,7 +103,15 @@ func walkJSONValue(decoder *json.Decoder) error {
 }
 
 func Verify(ctx context.Context, root string) (Manifest, error) {
-	if err := validateOwnedDirectory(root); err != nil {
+	return VerifyOwned(ctx, root, uint32(os.Geteuid()), uint32(os.Getegid()))
+}
+
+// VerifyOwned verifies a recovery point whose complete tree is owned by the
+// explicitly supplied identity. It is used by the bounded root-only drill copy
+// helper; normal callers should use Verify to bind ownership to their effective
+// identity.
+func VerifyOwned(ctx context.Context, root string, uid, gid uint32) (Manifest, error) {
+	if err := validateDirectoryOwnership(root, uid, gid); err != nil {
 		return Manifest{}, fmt.Errorf("recovery root is invalid: %w", err)
 	}
 	manifestData, err := readBoundedRegular(filepath.Join(root, "manifest.json"), maxManifestBytes)
@@ -134,7 +142,7 @@ func Verify(ctx context.Context, root string) (Manifest, error) {
 			allowedDirectories[directory] = struct{}{}
 		}
 	}
-	if err := walkRecoveryTree(root, expectedFiles, allowedDirectories); err != nil {
+	if err := walkRecoveryTree(root, expectedFiles, allowedDirectories, uid, gid); err != nil {
 		return Manifest{}, err
 	}
 
@@ -185,7 +193,12 @@ func validateManifestReferences(manifest Manifest, refs []referencedFile) error 
 	return nil
 }
 
-func walkRecoveryTree(root string, expectedFiles map[string]File, allowedDirectories map[string]struct{}) error {
+func walkRecoveryTree(
+	root string,
+	expectedFiles map[string]File,
+	allowedDirectories map[string]struct{},
+	uid, gid uint32,
+) error {
 	seen := make(map[string]struct{}, len(expectedFiles))
 	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
@@ -196,7 +209,7 @@ func walkRecoveryTree(root string, expectedFiles map[string]File, allowedDirecto
 			return err
 		}
 		stat, ownerKnown := info.Sys().(*syscall.Stat_t)
-		if info.Mode()&os.ModeSymlink != 0 || !ownerKnown || stat.Uid != uint32(os.Geteuid()) || stat.Gid != uint32(os.Getegid()) {
+		if info.Mode()&os.ModeSymlink != 0 || !ownerKnown || stat.Uid != uid || stat.Gid != gid {
 			return fmt.Errorf("recovery tree contains an unsafe entry")
 		}
 		if info.IsDir() {
