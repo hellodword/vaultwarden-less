@@ -20,8 +20,9 @@ by this repository. `audit_paths` names the upstream surfaces that matter most
 here. `VERSION` is deliberately separate because it versions this product,
 not an upstream.
 
-`scripts/generate_upstreams.py` validates the inventory and complete schema
-contract, then emits `internal/upstream/generated.go`. Run:
+`scripts/generate_upstreams.py` validates the complete inventory and schema
+contract, then emits the constants consumed by Go to
+`internal/upstream/generated.go`. Run:
 
 ```sh
 nix run .#just -- generate
@@ -187,8 +188,7 @@ nix run .#just -- bundle
 Also perform a manual restore and drill when Vaultwarden, Restic, Go, schema,
 filesystem publication, or Compose behavior changed.
 
-Before accepting the change, search for the old version, tag, digest, migration,
-package name, and removed routes across the entire tracked tree. Any remaining
-match must be generated evidence, a deliberate test for rejection, or an
-explained historical reference. There is no compatibility layer to preserve
-merely because an earlier release once used it.
+Before accepting the change, search the entire tracked tree for every replaced
+version, tag, digest, migration, package name, and route. Any remaining match
+must be generated evidence, a deliberate rejection test, or required audit
+context; do not retain a runtime compatibility path without a current contract.

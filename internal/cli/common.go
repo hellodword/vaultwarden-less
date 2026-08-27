@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/hellodword/vaultwarden-less/internal/config"
-	"github.com/hellodword/vaultwarden-less/internal/notify"
 	"github.com/hellodword/vaultwarden-less/internal/privatefs"
 	"github.com/hellodword/vaultwarden-less/internal/restic"
 	restoretool "github.com/hellodword/vaultwarden-less/internal/restore"
@@ -40,7 +39,6 @@ type commandEnvironment struct {
 	loadCredentials func(string, *config.Backup) (*config.RoleCredentials, error)
 	loadNotifiers   func(string, *config.Backup) ([]config.Notifier, error)
 	readSecret      func(string) (string, error)
-	validateNotify  func([]config.Notifier) error
 	repository      func(*config.Backup) (repository, error)
 	restore         restoreFunc
 	httpClient      *http.Client
@@ -63,7 +61,6 @@ func defaultEnvironment(stderr io.Writer) commandEnvironment {
 		loadCredentials: config.LoadRoleCredentials,
 		loadNotifiers:   config.LoadNotifierCredentials,
 		readSecret:      privatefs.Read,
-		validateNotify:  notify.ValidateConfigs,
 		restore:         restoretool.Run,
 		httpClient: &http.Client{
 			Timeout: 5 * time.Second,
@@ -91,7 +88,7 @@ func defaultEnvironment(stderr io.Writer) commandEnvironment {
 			environment.resticBinary,
 			environment.cacheDir,
 			environment.passwordRoot,
-			"",
+			config.RecoveryPointPath,
 			credentials,
 			environment.logger,
 		), nil

@@ -37,13 +37,11 @@ type errorResponse struct {
 	} `json:"error"`
 }
 
-type requestError struct {
+type requestFailure struct {
 	status  int
 	code    string
 	message string
 }
-
-func (err *requestError) Error() string { return err.code }
 
 func Handler(worker *Worker) http.Handler {
 	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
@@ -52,7 +50,7 @@ func Handler(worker *Worker) http.Handler {
 			return
 		}
 		switch request.URL.Path {
-		case HealthPath:
+		case HealthPath, StatusPath:
 			if request.Method != http.MethodGet {
 				methodNotAllowed(writer, http.MethodGet)
 				return
@@ -61,14 +59,8 @@ func Handler(worker *Worker) http.Handler {
 				writeError(writer, http.StatusBadRequest, "invalid_request", "GET requests must have an empty body.")
 				return
 			}
-			writer.WriteHeader(http.StatusNoContent)
-		case StatusPath:
-			if request.Method != http.MethodGet {
-				methodNotAllowed(writer, http.MethodGet)
-				return
-			}
-			if !emptyRequestBody(request) {
-				writeError(writer, http.StatusBadRequest, "invalid_request", "GET requests must have an empty body.")
+			if request.URL.Path == HealthPath {
+				writer.WriteHeader(http.StatusNoContent)
 				return
 			}
 			writeJSON(writer, http.StatusOK, worker.Status())
@@ -77,13 +69,8 @@ func Handler(worker *Worker) http.Handler {
 				methodNotAllowed(writer, http.MethodPost)
 				return
 			}
-			if err := decodeEventRequest(writer, request); err != nil {
-				var invalid *requestError
-				if errors.As(err, &invalid) {
-					writeError(writer, invalid.status, invalid.code, invalid.message)
-					return
-				}
-				writeError(writer, http.StatusBadRequest, "invalid_request", "Request must be strict schema v2 JSON.")
+			if failure := decodeEventRequest(writer, request); failure != nil {
+				writeError(writer, failure.status, failure.code, failure.message)
 				return
 			}
 			worker.Request()
@@ -110,16 +97,16 @@ func NewHTTPServer(worker *Worker) *http.Server {
 	}
 }
 
-func decodeEventRequest(writer http.ResponseWriter, request *http.Request) error {
+func decodeEventRequest(writer http.ResponseWriter, request *http.Request) *requestFailure {
 	mediaType, parameters, err := mime.ParseMediaType(request.Header.Get("Content-Type"))
 	if err != nil || mediaType != "application/json" || len(parameters) != 0 {
-		return &requestError{
+		return &requestFailure{
 			status: http.StatusUnsupportedMediaType, code: "unsupported_media_type",
 			message: "Content-Type must be exactly application/json.",
 		}
 	}
 	if request.ContentLength > config.EventMaxBytes {
-		return &requestError{status: http.StatusRequestEntityTooLarge, code: "request_too_large", message: "Request body is too large."}
+		return &requestFailure{status: http.StatusRequestEntityTooLarge, code: "request_too_large", message: "Request body is too large."}
 	}
 	request.Body = http.MaxBytesReader(writer, request.Body, config.EventMaxBytes)
 	decoder := json.NewDecoder(request.Body)
@@ -128,20 +115,20 @@ func decodeEventRequest(writer http.ResponseWriter, request *http.Request) error
 	if err := decoder.Decode(&body); err != nil {
 		var tooLarge *http.MaxBytesError
 		if errors.As(err, &tooLarge) {
-			return &requestError{status: http.StatusRequestEntityTooLarge, code: "request_too_large", message: "Request body is too large."}
+			return &requestFailure{status: http.StatusRequestEntityTooLarge, code: "request_too_large", message: "Request body is too large."}
 		}
-		return errors.New("invalid request body")
+		return &requestFailure{status: http.StatusBadRequest, code: "invalid_request", message: "Request must be strict schema v2 JSON."}
 	}
 	if body.SchemaVersion != SchemaVersion {
-		return errors.New("invalid request body")
+		return &requestFailure{status: http.StatusBadRequest, code: "invalid_request", message: "Request must be strict schema v2 JSON."}
 	}
 	var extra any
 	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
 		var tooLarge *http.MaxBytesError
 		if errors.As(err, &tooLarge) {
-			return &requestError{status: http.StatusRequestEntityTooLarge, code: "request_too_large", message: "Request body is too large."}
+			return &requestFailure{status: http.StatusRequestEntityTooLarge, code: "request_too_large", message: "Request body is too large."}
 		}
-		return errors.New("request contains trailing JSON")
+		return &requestFailure{status: http.StatusBadRequest, code: "invalid_request", message: "Request must be strict schema v2 JSON."}
 	}
 	return nil
 }

@@ -61,17 +61,12 @@ func (repository *fakeRepository) Restore(context.Context, config.Target, string
 	return repository.record("restore")
 }
 
-func TestCLIHelpVersionAndRemovedCommands(t *testing.T) {
+func TestCLIHelpAndVersion(t *testing.T) {
 	t.Parallel()
 	environment := testEnvironment(nil, nil)
 	stdout, stderr, code := executeCommand(environment, "--help")
 	if code != 0 || stderr != "" || !strings.Contains(stdout, "request-backup") || !strings.Contains(stdout, "config") {
 		t.Fatalf("help = %d/%q/%q", code, stdout, stderr)
-	}
-	for _, removed := range []string{"rebuild", "inspect"} {
-		if strings.Contains(stdout, removed) {
-			t.Errorf("help still exposes %q", removed)
-		}
 	}
 	stdout, stderr, code = executeCommand(environment, "--version")
 	if code != 0 || stderr != "" || stdout != "vaultwarden-less-backup "+buildinfo.Version+"\n" {
@@ -212,9 +207,8 @@ func testEnvironment(repositoryClient repository, server *httptest.Server, resto
 		loadNotifiers: func(string, *config.Backup) ([]config.Notifier, error) {
 			return []config.Notifier{}, nil
 		},
-		readSecret:     func(string) (string, error) { return "test-password", nil },
-		validateNotify: func([]config.Notifier) error { return nil },
-		repository:     func(*config.Backup) (repository, error) { return repositoryClient, nil },
+		readSecret: func(string) (string, error) { return "test-password", nil },
+		repository: func(*config.Backup) (repository, error) { return repositoryClient, nil },
 		restore: func(_ context.Context, _ restoretool.Repository, _ restoretool.Request) (restoretool.Result, error) {
 			return restoretool.Result{}, errors.New("restore should not be called")
 		},

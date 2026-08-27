@@ -40,10 +40,10 @@ patched Restic executable and locally built pinned Moto image:
    init;
 2. real backup, content-ID deduplication, a changed second snapshot, bounded
    listing, repository check, and unlock;
-3. latest and explicit-old restore plus full recovery-tree verification;
+3. latest and explicit earlier restore plus full recovery-tree verification;
 4. refusal to overwrite an output;
 5. failure on a deliberately invalid latest snapshot without fallback, while
-   explicit old selection still works;
+   explicit earlier selection still works;
 6. four controlled historical in-scope snapshots and one differently hosted
    out-of-scope snapshot;
 7. a nonempty exact dry-run removal set consisting only of controlled in-scope
@@ -87,12 +87,12 @@ Acceptance is exactly two recovery snapshots:
    exact two IDs and select none for removal. Restart the worker and require an
    unchanged check with the count still two.
 5. Restore latest, stop production, and start a drill from the disposable copy.
-   The old authenticated CLI session must fail. Fresh real-CLI sessions verify
-   organization, both collections, organization item, folder, updated item,
-   attachment bytes, ordinary Send bytes, exhausted access-limited Send, and
-   the second user's item.
-6. Restore snapshot 1 by its full ID, start a second drill, and verify the old
-   item password through a fresh real CLI.
+   The pre-restore authenticated CLI session must fail. Fresh real-CLI sessions
+   verify organization, both collections, organization item, folder, updated
+   item, attachment bytes, ordinary Send bytes, exhausted access-limited Send,
+   and the second user's item.
+6. Restore snapshot 1 by its full ID, start a second drill, and verify the
+   earlier item password through a fresh real CLI.
 
 The CLI subprocess environment is exactly isolated `HOME`, `TMPDIR`,
 `BITWARDENCLI_APPDATA_DIR`, `NODE_EXTRA_CA_CERTS`, and optional `BW_SESSION`.
@@ -141,5 +141,5 @@ nix run .#just -- bundle-verify dist/vaultwarden-less-<version>-linux-amd64
 all loaded IDs. This proves transfer, not credentials or storage. Before
 accepting a deployment or relevant upstream upgrade, also initialize a fresh
 deployment, validate its configuration, run a real backup, repository check,
-latest restore, explicit older restore, and a manual drill on the actual target
+latest restore, explicit earlier restore, and a manual drill on the actual target
 and actual S3-compatible service.

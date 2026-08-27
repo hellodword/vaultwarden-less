@@ -89,6 +89,7 @@ func TestMotoResticIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	recoveryPath := filepath.Join(stagingDir, "point")
 	credentialsDir := privateDirectory(t, root, "credentials")
 	passwordFile := writeSecret(t, credentialsDir, "moto", "moto-restic-password")
 	target := config.Target{
@@ -99,7 +100,7 @@ func TestMotoResticIntegration(t *testing.T) {
 	credentials := &config.RoleCredentials{SchemaVersion: config.SchemaVersion, Targets: map[string]config.S3Credentials{
 		"moto": {AccessKeyID: "test", SecretAccessKey: "test"},
 	}}
-	runner := restic.NewRunner(resticBinary, cacheDir, credentialsDir, first.Path, credentials, nil)
+	runner := restic.NewRunner(resticBinary, cacheDir, credentialsDir, recoveryPath, credentials, nil)
 	if err := runner.VerifyVersion(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -108,11 +109,11 @@ func TestMotoResticIntegration(t *testing.T) {
 	}
 
 	if !t.Run("backup_deduplicate_check_unlock_and_restore", func(t *testing.T) {
-		firstSync, err := runner.Ensure(ctx, target, first.Manifest)
+		firstSync, err := runner.Ensure(ctx, target, first)
 		if err != nil || !firstSync.Created {
 			t.Fatalf("first sync = %#v/%v", firstSync, err)
 		}
-		unchanged, err := runner.Ensure(ctx, target, first.Manifest)
+		unchanged, err := runner.Ensure(ctx, target, first)
 		if err != nil || unchanged.Created || unchanged.SnapshotID != firstSync.SnapshotID {
 			t.Fatalf("unchanged sync = %#v/%v", unchanged, err)
 		}
@@ -122,10 +123,10 @@ func TestMotoResticIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if second.Manifest.ContentID == first.Manifest.ContentID {
+		if second.ContentID == first.ContentID {
 			t.Fatal("source mutation did not change content ID")
 		}
-		secondSync, err := runner.Ensure(ctx, target, second.Manifest)
+		secondSync, err := runner.Ensure(ctx, target, second)
 		if err != nil || !secondSync.Created || secondSync.SnapshotID == firstSync.SnapshotID {
 			t.Fatalf("second sync = %#v/%v", secondSync, err)
 		}
@@ -142,32 +143,32 @@ func TestMotoResticIntegration(t *testing.T) {
 
 		latestOutput := filepath.Join(restoreRoot, "latest")
 		latest, err := restoretool.Run(ctx, runner, restoretool.Request{Target: target, Output: latestOutput, RestoreRoot: restoreRoot})
-		if err != nil || latest.SnapshotID != secondSync.SnapshotID || latest.ContentID != second.Manifest.ContentID {
+		if err != nil || latest.SnapshotID != secondSync.SnapshotID || latest.ContentID != second.ContentID {
 			t.Fatalf("latest restore = %#v/%v", latest, err)
 		}
 		if _, err := snapshot.Verify(ctx, latestOutput); err != nil {
 			t.Fatal(err)
 		}
-		explicitOutput := filepath.Join(restoreRoot, "explicit-old")
+		explicitOutput := filepath.Join(restoreRoot, "explicit-earlier")
 		explicit, err := restoretool.Run(ctx, runner, restoretool.Request{Target: target, SnapshotID: firstSync.SnapshotID, Output: explicitOutput, RestoreRoot: restoreRoot})
-		if err != nil || explicit.ContentID != first.Manifest.ContentID {
+		if err != nil || explicit.ContentID != first.ContentID {
 			t.Fatalf("explicit restore = %#v/%v", explicit, err)
 		}
 		if _, err := restoretool.Run(ctx, runner, restoretool.Request{Target: target, SnapshotID: firstSync.SnapshotID, Output: explicitOutput, RestoreRoot: restoreRoot}); err == nil {
 			t.Fatal("restore unexpectedly overwrote an existing output")
 		}
 
-		if err := os.RemoveAll(second.Path); err != nil {
+		if err := os.RemoveAll(recoveryPath); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.Mkdir(second.Path, 0o700); err != nil {
+		if err := os.Mkdir(recoveryPath, 0o700); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(filepath.Join(second.Path, "manifest.json"), []byte("{\"schema_version\":1}\n"), 0o600); err != nil {
+		if err := os.WriteFile(filepath.Join(recoveryPath, "manifest.json"), []byte("{\"schema_version\":1}\n"), 0o600); err != nil {
 			t.Fatal(err)
 		}
 		invalidContent := strings.Repeat("c", 64)
-		invalidID, err := rawResticBackup(ctx, resticBinary, cacheDir, passwordFile, second.Path, target, invalidContent)
+		invalidID, err := rawResticBackup(ctx, resticBinary, cacheDir, passwordFile, recoveryPath, target, invalidContent)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -178,9 +179,9 @@ func TestMotoResticIntegration(t *testing.T) {
 		if _, err := os.Lstat(invalidOutput); !os.IsNotExist(err) {
 			t.Fatalf("failed restore published output: %v", err)
 		}
-		oldAgain := filepath.Join(restoreRoot, "explicit-after-invalid")
-		if restored, err := restoretool.Run(ctx, runner, restoretool.Request{Target: target, SnapshotID: firstSync.SnapshotID, Output: oldAgain, RestoreRoot: restoreRoot}); err != nil || restored.SnapshotID == invalidID {
-			t.Fatalf("explicit old restore after invalid latest = %#v/%v", restored, err)
+		earlierAgain := filepath.Join(restoreRoot, "explicit-after-invalid")
+		if restored, err := restoretool.Run(ctx, runner, restoretool.Request{Target: target, SnapshotID: firstSync.SnapshotID, Output: earlierAgain, RestoreRoot: restoreRoot}); err != nil || restored.SnapshotID == invalidID {
+			t.Fatalf("explicit earlier restore after invalid latest = %#v/%v", restored, err)
 		}
 	}) {
 		return
@@ -191,7 +192,7 @@ func TestMotoResticIntegration(t *testing.T) {
 		historical := make([]string, 0, 4)
 		for index := 0; index < 4; index++ {
 			id, err := rawResticBackupAt(
-				ctx, resticBinary, cacheDir, passwordFile, first.Path, target,
+				ctx, resticBinary, cacheDir, passwordFile, recoveryPath, target,
 				fmt.Sprintf("%064x", index+1), restic.SnapshotHost,
 				baseTime.Add(time.Duration(index)*time.Second),
 			)
@@ -201,7 +202,7 @@ func TestMotoResticIntegration(t *testing.T) {
 			historical = append(historical, id)
 		}
 		outOfScopeID, err := rawResticBackupAt(
-			ctx, resticBinary, cacheDir, passwordFile, first.Path, target,
+			ctx, resticBinary, cacheDir, passwordFile, recoveryPath, target,
 			strings.Repeat("e", 64), "outside-vaultwarden-less",
 			baseTime.Add(10*time.Second),
 		)

@@ -1,18 +1,17 @@
 package proxy
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
-	"sync"
+	"strings"
 	"time"
 )
 
-var eventBody = []byte("{\"schema_version\":2}\n")
+const eventBody = "{\"schema_version\":2}\n"
 
 // EventSender coalesces any number of dirty marks into a single bounded signal.
 // Delivery never runs in a request goroutine and never delays the proxy response.
@@ -55,43 +54,39 @@ func (s *EventSender) MarkDirty() {
 	}
 }
 
-func (s *EventSender) Run(ctx context.Context, wg *sync.WaitGroup) {
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		pending := true // Startup always requests one worker check.
-		for {
-			if !pending {
-				select {
-				case <-ctx.Done():
-					return
-				case <-s.signal:
-					pending = true
-				}
-			}
-			if err := s.send(ctx); err != nil {
-				if ctx.Err() != nil {
-					return
-				}
-				s.recordFailure()
-				timer := time.NewTimer(s.retry)
-				select {
-				case <-ctx.Done():
-					timer.Stop()
-					return
-				case <-timer.C:
-				}
-				continue
-			}
-			s.recordRecovery()
+func (s *EventSender) Run(ctx context.Context) {
+	pending := true // Startup always requests one worker check.
+	for {
+		if !pending {
 			select {
+			case <-ctx.Done():
+				return
 			case <-s.signal:
 				pending = true
-			default:
-				pending = false
 			}
 		}
-	}()
+		if err := s.send(ctx); err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			s.recordFailure()
+			timer := time.NewTimer(s.retry)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+			continue
+		}
+		s.recordRecovery()
+		select {
+		case <-s.signal:
+			pending = true
+		default:
+			pending = false
+		}
+	}
 }
 
 func (s *EventSender) recordFailure() {
@@ -112,7 +107,7 @@ func (s *EventSender) recordRecovery() {
 }
 
 func (s *EventSender) send(ctx context.Context) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.url.String(), bytes.NewReader(eventBody))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.url.String(), strings.NewReader(eventBody))
 	if err != nil {
 		return fmt.Errorf("create event request: %w", err)
 	}

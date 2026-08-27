@@ -24,30 +24,25 @@ type Builder struct {
 	afterCopy  func(string)
 }
 
-type Result struct {
-	Path     string
-	Manifest Manifest
-}
-
 // Build constructs and verifies a complete recovery point, then publishes it
 // as StagingDir/point. A failed build leaves any prior point untouched.
-func (b Builder) Build(ctx context.Context) (_ Result, err error) {
+func (b Builder) Build(ctx context.Context) (_ Manifest, err error) {
 	if err := validateOwnedDirectory(b.DataDir); err != nil {
-		return Result{}, fmt.Errorf("validate data directory: %w", err)
+		return Manifest{}, fmt.Errorf("validate data directory: %w", err)
 	}
 	if err := validateOwnedDirectory(b.StagingDir); err != nil {
-		return Result{}, fmt.Errorf("validate staging directory: %w", err)
+		return Manifest{}, fmt.Errorf("validate staging directory: %w", err)
 	}
 	if err := cleanupTransientBuilds(b.StagingDir); err != nil {
-		return Result{}, fmt.Errorf("clean transient recovery builds: %w", err)
+		return Manifest{}, fmt.Errorf("clean transient recovery builds: %w", err)
 	}
 	buildDir, err := os.MkdirTemp(b.StagingDir, ".build-")
 	if err != nil {
-		return Result{}, fmt.Errorf("create recovery build directory: %w", err)
+		return Manifest{}, fmt.Errorf("create recovery build directory: %w", err)
 	}
 	if err := os.Chmod(buildDir, 0o700); err != nil {
 		_ = os.RemoveAll(buildDir)
-		return Result{}, fmt.Errorf("secure recovery build directory: %w", err)
+		return Manifest{}, fmt.Errorf("secure recovery build directory: %w", err)
 	}
 	published := false
 	defer func() {
@@ -59,41 +54,41 @@ func (b Builder) Build(ctx context.Context) (_ Result, err error) {
 	databasePath := filepath.Join(buildDir, "data", "db.sqlite3")
 	databaseRequired, err := checkedSizeSum(estimatedDatabaseBytes(b.DataDir), spaceReserve)
 	if err != nil {
-		return Result{}, err
+		return Manifest{}, err
 	}
 	if err := preflightSpace(b.StagingDir, databaseRequired); err != nil {
-		return Result{}, err
+		return Manifest{}, err
 	}
 	if err := onlineBackup(ctx, filepath.Join(b.DataDir, "db.sqlite3"), databasePath); err != nil {
-		return Result{}, err
+		return Manifest{}, err
 	}
 	if _, err := validateDatabase(ctx, databasePath); err != nil {
-		return Result{}, fmt.Errorf("validate recovery database: %w", err)
+		return Manifest{}, fmt.Errorf("validate recovery database: %w", err)
 	}
 	refs, err := referencedFiles(ctx, databasePath)
 	if err != nil {
-		return Result{}, err
+		return Manifest{}, err
 	}
 	var referencedBytes int64
 	for _, ref := range refs {
 		referencedBytes, err = checkedSizeSum(referencedBytes, ref.ExpectedSize)
 		if err != nil {
-			return Result{}, fmt.Errorf("referenced file size overflow")
+			return Manifest{}, fmt.Errorf("referenced file size overflow")
 		}
 	}
 	// The online backup is already present on the staging filesystem, so the
 	// second free-space reading must account only for files still to be copied.
-	recoveryRequired, err := remainingCopySpace(referencedBytes)
+	recoveryRequired, err := checkedSizeSum(referencedBytes, spaceReserve)
 	if err != nil {
-		return Result{}, err
+		return Manifest{}, err
 	}
 	if err := preflightSpace(b.StagingDir, recoveryRequired); err != nil {
-		return Result{}, err
+		return Manifest{}, err
 	}
 
 	databaseFile, err := hashRegularFile(ctx, databasePath)
 	if err != nil {
-		return Result{}, fmt.Errorf("hash recovery database: %w", err)
+		return Manifest{}, fmt.Errorf("hash recovery database: %w", err)
 	}
 	databaseFile.Path = "data/db.sqlite3"
 	files := []File{databaseFile}
@@ -107,20 +102,20 @@ func (b Builder) Build(ctx context.Context) (_ Result, err error) {
 		}
 		file, err := copyStableFile(ctx, b.DataDir, buildDir, ref, afterRead)
 		if err != nil {
-			return Result{}, fmt.Errorf("copy %s: %w", ref.Path, err)
+			return Manifest{}, fmt.Errorf("copy %s: %w", ref.Path, err)
 		}
 		files = append(files, file)
 	}
 
 	manifest, err := NewManifest(files)
 	if err != nil {
-		return Result{}, err
+		return Manifest{}, err
 	}
 	if err := writeManifest(filepath.Join(buildDir, "manifest.json"), manifest); err != nil {
-		return Result{}, err
+		return Manifest{}, err
 	}
 	if _, err := Verify(ctx, buildDir); err != nil {
-		return Result{}, fmt.Errorf("verify recovery build: %w", err)
+		return Manifest{}, fmt.Errorf("verify recovery build: %w", err)
 	}
 
 	point := filepath.Join(b.StagingDir, "point")
@@ -129,13 +124,9 @@ func (b Builder) Build(ctx context.Context) (_ Result, err error) {
 		published = true
 	}
 	if err != nil {
-		return Result{}, err
+		return Manifest{}, err
 	}
-	return Result{Path: point, Manifest: manifest}, nil
-}
-
-func remainingCopySpace(referencedBytes int64) (int64, error) {
-	return checkedSizeSum(referencedBytes, spaceReserve)
+	return manifest, nil
 }
 
 func publishRecoveryPoint(buildDir, point string) (bool, error) {

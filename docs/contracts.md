@@ -1,9 +1,7 @@
 # Contracts
 
-This release intentionally defines new product-v2 contracts. Configuration
-schema 1, manifest schema 1, worker HTTP schema 1, notification schema 1, and
-the old Restic product tag are not read, migrated, or deleted. The project has
-no historical deployment or database migration layer.
+This release uses product-v2 configuration, manifest, worker HTTP, and Restic
+contracts. Each durable format is versioned independently.
 
 A future breaking change must increment the specific contract it changes. Do
 not reuse one global version constant for unrelated formats.
@@ -171,9 +169,8 @@ tag: vaultwarden-less-recovery-v2
 identity tag: content-id=<64-lowercase-hex>
 ```
 
-Selection and retention always include the fixed host, path, and product tag.
-The old tag is outside this product's read and deletion scope. Explicit
-snapshot selection requires the full 64-character ID.
+Selection, retention, and deletion always require the fixed host, path, and
+product tag. Explicit snapshot selection requires the full 64-character ID.
 
 Retention is one `forget --prune`, grouped by `host,paths`, with:
 
@@ -188,24 +185,22 @@ keep-yearly 3
 
 ## Notifications
 
-Notification events use schema 2. Types are
-`recovery_point_created`, `source_degraded`, `source_recovered`,
-`target_degraded`, and `target_recovered`. Every payload has a non-null
-`targets` array.
+Enterprise WeChat and Bark notifications are rendered directly from in-memory
+backup outcomes; there is no notification JSON or persisted event format. A
+recovery message is sent after any check in which at least one target creates a
+snapshot and lists every configured target as `created`, `synced`, or `failed`.
+A later target catch-up can therefore produce another message for an existing
+content ID. Source and target degraded/recovered messages are emitted once per
+continuous in-process degraded interval and once on recovery.
 
-A recovery event is emitted after any check in which at least one target
-creates a snapshot. It lists every configured target as `created`, `synced`,
-or `failed`. Thus a later target catch-up can emit another event for an
-already-known content ID. Transition events are emitted once per continuous
-in-process degraded interval and once on recovery.
-
-Payloads contain no repository locator, repository credential, Restic password,
+Messages contain only safe target names, error codes, and shortened content
+identifiers. They contain no repository locator or credential, Restic password,
 notifier endpoint/key, stderr, or Vaultwarden record data.
 
 ## Offline bundle
 
-The deployment bundle has its own `bundle_schema_version: 1`; this is not a
-product-v1 runtime contract. A bundle directory contains:
+The deployment bundle uses its independent `bundle_schema_version: 1`. A bundle
+directory contains:
 
 ```text
 bundle.json

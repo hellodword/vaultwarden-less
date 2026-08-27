@@ -230,7 +230,6 @@ func TestEveryFailureLeavesFinalPathAbsent(t *testing.T) {
 			repository.selected.ContentID = "sha256:" + strings.Repeat("f", 64)
 		},
 	} {
-		configure := configure
 		t.Run(name, func(t *testing.T) {
 			restoreRoot := privateRestoreRoot(t)
 			output := filepath.Join(restoreRoot, "prepared")

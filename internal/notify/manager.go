@@ -12,7 +12,7 @@ import (
 
 const notifierQueueCapacity = 16
 
-var defaultRetryOffsets = []time.Duration{0, time.Minute, 5 * time.Minute}
+var defaultRetryDelays = []time.Duration{0, time.Minute, 4 * time.Minute}
 
 type senderWorker struct {
 	sender Sender
@@ -20,75 +20,47 @@ type senderWorker struct {
 }
 
 type Manager struct {
-	workers      []senderWorker
-	log          *slog.Logger
-	retryOffsets []time.Duration
-	wg           sync.WaitGroup
-	startOnce    sync.Once
+	workers     []senderWorker
+	log         *slog.Logger
+	retryDelays []time.Duration
 }
 
-type lazySender struct {
-	config config.Notifier
-	mu     sync.Mutex
-	sender Sender
-}
-
-func NewManager(configs []config.Notifier, logger *slog.Logger) *Manager {
+func NewManager(configs []config.Notifier, logger *slog.Logger) (*Manager, error) {
 	senders := make([]Sender, 0, len(configs))
 	for _, notifier := range configs {
-		senders = append(senders, &lazySender{config: notifier})
+		sender, err := senderForConfig(notifier)
+		if err != nil {
+			return nil, fmt.Errorf("initialize notifier %s: %w", notifier.Name, err)
+		}
+		senders = append(senders, sender)
 	}
-	return newManagerWithSenders(senders, logger, defaultRetryOffsets)
+	return newManagerWithSenders(senders, logger, defaultRetryDelays), nil
 }
 
-func newManagerWithSenders(senders []Sender, logger *slog.Logger, retryOffsets []time.Duration) *Manager {
+func newManagerWithSenders(senders []Sender, logger *slog.Logger, retryDelays []time.Duration) *Manager {
 	workers := make([]senderWorker, 0, len(senders))
 	for _, sender := range senders {
 		workers = append(workers, senderWorker{sender: sender, queue: make(chan Event, notifierQueueCapacity)})
 	}
-	return &Manager{workers: workers, log: logger, retryOffsets: append([]time.Duration(nil), retryOffsets...)}
+	return &Manager{workers: workers, log: logger, retryDelays: append([]time.Duration(nil), retryDelays...)}
 }
 
-func ValidateConfigs(configs []config.Notifier) error {
-	for _, notifier := range configs {
-		if _, err := senderForConfig(notifier); err != nil {
-			return fmt.Errorf("initialize notifier %s: %w", notifier.Name, err)
-		}
+func (manager *Manager) Run(ctx context.Context) {
+	var wait sync.WaitGroup
+	for index := range manager.workers {
+		worker := &manager.workers[index]
+		wait.Go(func() { manager.runWorker(ctx, worker) })
 	}
-	return nil
+	wait.Wait()
 }
-
-func (manager *Manager) Start(ctx context.Context) {
-	manager.startOnce.Do(func() {
-		for index := range manager.workers {
-			worker := &manager.workers[index]
-			manager.wg.Add(1)
-			go func() {
-				defer manager.wg.Done()
-				manager.runWorker(ctx, worker)
-			}()
-		}
-	})
-}
-
-func (manager *Manager) Wait() { manager.wg.Wait() }
 
 // Enqueue never blocks backup work. A full notifier queue drops this event and
 // records only a safe structured error.
 func (manager *Manager) Enqueue(event Event) {
-	if manager == nil {
-		return
-	}
-	if err := event.Validate(); err != nil {
-		manager.logError("notification_invalid", "")
-		return
-	}
 	for index := range manager.workers {
 		worker := &manager.workers[index]
-		copy := event
-		copy.Targets = append([]TargetStatus{}, event.Targets...)
 		select {
-		case worker.queue <- copy:
+		case worker.queue <- event:
 		default:
 			manager.logError("notification_queue_full", worker.sender.Name())
 		}
@@ -107,17 +79,7 @@ func (manager *Manager) runWorker(ctx context.Context, worker *senderWorker) {
 }
 
 func (manager *Manager) deliver(ctx context.Context, sender Sender, event Event) {
-	offsets := manager.retryOffsets
-	if len(offsets) == 0 {
-		offsets = defaultRetryOffsets
-	}
-	var previousOffset time.Duration
-	for attempt, offset := range offsets {
-		delay := offset - previousOffset
-		if delay < 0 {
-			delay = 0
-		}
-		previousOffset = offset
+	for _, delay := range manager.retryDelays {
 		if delay != 0 {
 			timer := time.NewTimer(delay)
 			select {
@@ -134,9 +96,6 @@ func (manager *Manager) deliver(ctx context.Context, sender Sender, event Event)
 			return
 		}
 		manager.logError("notification_delivery_failed", sender.Name())
-		if attempt == len(offsets)-1 {
-			return
-		}
 	}
 }
 
@@ -149,21 +108,6 @@ func (manager *Manager) logError(code, notifier string) {
 		return
 	}
 	manager.log.Error("notification operation failed", "notifier", notifier, "error_code", code)
-}
-
-func (sender *lazySender) Name() string { return sender.config.Name }
-
-func (sender *lazySender) Send(ctx context.Context, event Event) error {
-	sender.mu.Lock()
-	defer sender.mu.Unlock()
-	if sender.sender == nil {
-		initialized, err := senderForConfig(sender.config)
-		if err != nil {
-			return err
-		}
-		sender.sender = initialized
-	}
-	return sender.sender.Send(ctx, event)
 }
 
 func senderForConfig(notifier config.Notifier) (Sender, error) {

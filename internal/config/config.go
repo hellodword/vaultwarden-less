@@ -260,13 +260,6 @@ func (c Backup) Target(name string) (Target, bool) {
 	return Target{}, false
 }
 
-func (t Target) Backend() string {
-	if strings.HasPrefix(t.Repository, "s3:") {
-		return "s3"
-	}
-	return ""
-}
-
 func (t Target) Warnings() []string {
 	if strings.HasPrefix(t.Repository, "s3:http://") {
 		return []string{"plaintext_s3_endpoint"}

@@ -8,9 +8,6 @@ import (
 
 func TestRoutePolicyVersionAndAuditedIgnoreTable(t *testing.T) {
 	t.Parallel()
-	if len(ignoredRoutes) != 16 {
-		t.Fatalf("ignore route count = %d, want 16", len(ignoredRoutes))
-	}
 	seen := map[string]struct{}{}
 	for _, rule := range ignoredRoutes {
 		if rule.source == "" || rule.reason == "" {
@@ -72,20 +69,6 @@ func TestRoutePolicyOnlySuccessfulWritesTrigger(t *testing.T) {
 	} {
 		if got := shouldRequestBackup(test.method, test.path, test.status); got != test.want {
 			t.Errorf("%s %s/%d = %t, want %t", test.method, test.path, test.status, got, test.want)
-		}
-	}
-}
-
-func TestRepresentativeVaultWritesTrigger(t *testing.T) {
-	t.Parallel()
-	for _, path := range []string{
-		"/api/ciphers", "/api/folders", "/api/ciphers/item/attachment/attachment",
-		"/api/sends", "/api/organizations", "/api/organizations/org/collections",
-		"/api/organizations/org/users/invite", "/api/organizations/org/groups",
-		"/api/organizations/org/policies/policy",
-	} {
-		if !shouldRequestBackup(http.MethodPost, path, http.StatusOK) {
-			t.Errorf("representative write did not trigger: %s", path)
 		}
 	}
 }

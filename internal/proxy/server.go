@@ -31,23 +31,19 @@ const (
 	ShutdownTimeout               = 2 * time.Minute
 )
 
-type DirtyMarker interface {
-	MarkDirty()
-}
-
 type Server struct {
-	upstream *url.URL
-	marker   DirtyMarker
-	log      *slog.Logger
-	proxy    *httputil.ReverseProxy
-	http     *http.Server
+	upstream  *url.URL
+	markDirty func()
+	log       *slog.Logger
+	proxy     *httputil.ReverseProxy
+	http      *http.Server
 }
 
-func NewServer(marker DirtyMarker, log *slog.Logger) *Server {
-	return newServer(mustURL(UpstreamURL), marker, log)
+func NewServer(markDirty func(), log *slog.Logger) *Server {
+	return newServer(mustURL(UpstreamURL), markDirty, log)
 }
 
-func newServer(upstream *url.URL, marker DirtyMarker, log *slog.Logger) *Server {
+func newServer(upstream *url.URL, markDirty func(), log *slog.Logger) *Server {
 	transport := &http.Transport{
 		Proxy:                 nil,
 		DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
@@ -60,7 +56,7 @@ func newServer(upstream *url.URL, marker DirtyMarker, log *slog.Logger) *Server 
 		ResponseHeaderTimeout: UpstreamResponseHeaderTimeout,
 	}
 	rp := &httputil.ReverseProxy{Transport: transport}
-	s := &Server{upstream: upstream, marker: marker, log: log, proxy: rp}
+	s := &Server{upstream: upstream, markDirty: markDirty, log: log, proxy: rp}
 	rp.Rewrite = s.rewrite
 	rp.ModifyResponse = s.modifyResponse
 	rp.ErrorHandler = s.proxyError
@@ -114,8 +110,8 @@ func (s *Server) rewrite(pr *httputil.ProxyRequest) {
 }
 
 func (s *Server) modifyResponse(resp *http.Response) error {
-	if s.marker != nil && shouldRequestBackup(resp.Request.Method, resp.Request.URL.Path, resp.StatusCode) {
-		s.marker.MarkDirty()
+	if s.markDirty != nil && shouldRequestBackup(resp.Request.Method, resp.Request.URL.Path, resp.StatusCode) {
+		s.markDirty()
 	}
 	return nil
 }

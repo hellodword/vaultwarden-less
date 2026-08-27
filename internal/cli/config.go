@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/hellodword/vaultwarden-less/internal/notify"
 	"github.com/spf13/cobra"
 )
 
@@ -60,7 +61,7 @@ func configCommand(configPath *string, environment commandEnvironment) *cobra.Co
 			if err != nil {
 				return err
 			}
-			if err := environment.validateNotify(notifiers); err != nil {
+			if _, err := notify.NewManager(notifiers, nil); err != nil {
 				return err
 			}
 			result := configValidationResult{
@@ -71,7 +72,7 @@ func configCommand(configPath *string, environment commandEnvironment) *cobra.Co
 				Notifiers:     make([]configNotifier, 0, len(notifiers)),
 			}
 			for _, target := range cfg.Targets {
-				result.Targets = append(result.Targets, configTarget{Name: target.Name, Backend: target.Backend()})
+				result.Targets = append(result.Targets, configTarget{Name: target.Name, Backend: "s3"})
 				for _, warning := range target.Warnings() {
 					result.Warnings = append(result.Warnings, target.Name+":"+warning)
 				}

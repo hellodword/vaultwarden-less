@@ -30,7 +30,6 @@ const (
 	maxStderrOutput  = 1 << 20
 
 	SnapshotHost          = "vaultwarden-less"
-	SnapshotPath          = "/staging/point"
 	SnapshotTag           = "vaultwarden-less-recovery-v2"
 	DefaultSnapshotsLimit = 100
 	MaxSnapshotsLimit     = 1000
@@ -81,11 +80,7 @@ type Runner struct {
 }
 
 func (r Runner) VerifyVersion(ctx context.Context) error {
-	binary := r.Binary
-	if binary == "" {
-		binary = config.ResticBinary
-	}
-	output, err := r.runLogged(ctx, "version", "", binary, []string{"version"}, sanitizedEnvironment(nil), "")
+	output, err := r.runLogged(ctx, "version", "", r.Binary, []string{"version"}, sanitizedEnvironment(nil), "")
 	if err != nil {
 		return err
 	}
@@ -120,7 +115,7 @@ func (r Runner) Ensure(ctx context.Context, target config.Target, manifest snaps
 		"--host", SnapshotHost,
 		"--tag", SnapshotTag,
 		"--tag", "content-id="+contentHex,
-		"--", r.path(),
+		"--", r.recoveryPath,
 	)
 	output, err := r.runTargetCommand(ctx, target, "backup", arguments, environment, "")
 	if err != nil {
@@ -131,7 +126,15 @@ func (r Runner) Ensure(ctx context.Context, target config.Target, manifest snaps
 		return SyncResult{}, &OperationError{Code: "backup_result_invalid", ExitCode: -1}
 	}
 	result := SyncResult{SnapshotID: snapshotID, ContentID: manifest.ContentID, Created: true}
-	r.logResult("restic recovery snapshot synchronized", target.Name, result)
+	if r.Logger != nil {
+		r.Logger.Info(
+			"restic recovery snapshot synchronized",
+			"target", target.Name,
+			"snapshot_id", result.SnapshotID,
+			"content_id", result.ContentID,
+			"created", result.Created,
+		)
+	}
 	return result, nil
 }
 
@@ -204,7 +207,7 @@ func (r Runner) snapshotQuery(ctx context.Context, target config.Target, additio
 	arguments := append(base,
 		"snapshots", "--json",
 		"--host", SnapshotHost,
-		"--path", r.path(),
+		"--path", r.recoveryPath,
 		"--tag", SnapshotTag,
 	)
 	arguments = append(arguments, additional...)
@@ -212,7 +215,7 @@ func (r Runner) snapshotQuery(ctx context.Context, target config.Target, additio
 	if err != nil {
 		return nil, err
 	}
-	return parseSnapshots(output, r.path())
+	return parseSnapshots(output, r.recoveryPath)
 }
 
 func (r Runner) Init(ctx context.Context, target config.Target) error {
@@ -246,7 +249,7 @@ func (r Runner) Prune(ctx context.Context, target config.Target, apply bool) (Pr
 	arguments := []string{
 		"forget", "--json", "--prune",
 		"--host", SnapshotHost,
-		"--path", r.path(),
+		"--path", r.recoveryPath,
 		"--tag", SnapshotTag,
 		"--group-by", "host,paths",
 		"--keep-within", "24h",
@@ -263,7 +266,7 @@ func (r Runner) Prune(ctx context.Context, target config.Target, apply bool) (Pr
 	if err != nil {
 		return PruneResult{}, err
 	}
-	groups, err := parseForgetGroups(output, r.path())
+	groups, err := parseForgetGroups(output, r.recoveryPath)
 	if err != nil {
 		return PruneResult{}, &OperationError{Code: "prune_result_invalid", ExitCode: -1}
 	}
@@ -279,16 +282,9 @@ func (r Runner) Restore(ctx context.Context, target config.Target, snapshotID, d
 	}
 	_, err := r.maintenance(ctx, target, []string{
 		"restore", "--verify", "--target", destination,
-		snapshotID + ":" + r.path(),
+		snapshotID + ":" + r.recoveryPath,
 	})
 	return err
-}
-
-func (r Runner) path() string {
-	if r.recoveryPath != "" {
-		return r.recoveryPath
-	}
-	return SnapshotPath
 }
 
 func validateRestoreDestination(path string) error {
@@ -370,11 +366,7 @@ func sanitizedEnvironment(credentials map[string]string) []string {
 }
 
 func (r Runner) runTargetCommand(ctx context.Context, target config.Target, operation string, arguments, environment []string, directory string) ([]byte, error) {
-	binary := r.Binary
-	if binary == "" {
-		binary = config.ResticBinary
-	}
-	return r.runLogged(ctx, operation, target.Name, binary, arguments, environment, directory)
+	return r.runLogged(ctx, operation, target.Name, r.Binary, arguments, environment, directory)
 }
 
 func (r Runner) runLogged(ctx context.Context, operation, target, binary string, arguments, environment []string, directory string) ([]byte, error) {
@@ -412,19 +404,6 @@ func operationExitCode(err error) int {
 		return operationError.ExitCode
 	}
 	return -1
-}
-
-func (r Runner) logResult(message, target string, result SyncResult) {
-	if r.Logger == nil {
-		return
-	}
-	r.Logger.Info(
-		message,
-		"target", target,
-		"snapshot_id", result.SnapshotID,
-		"content_id", result.ContentID,
-		"created", result.Created,
-	)
 }
 
 func (r Runner) run(ctx context.Context, binary string, arguments, environment []string, directory string) ([]byte, error) {

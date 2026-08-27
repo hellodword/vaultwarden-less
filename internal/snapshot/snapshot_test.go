@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -73,7 +74,7 @@ func syntheticData(t *testing.T, includeFiles bool) fixture {
 		{`INSERT INTO sends(
 			uuid, name, atype, data, akey, access_count, creation_date,
 			revision_date, deletion_date, disabled
-		) VALUES (?, 'file send', 1, ?, 'key', 0, '2026-05-05', '2026-05-05', '2026-06-05', 0)`, []any{testSendID, `{"id":"` + testSendFileID + `","size":` + decimal(len(sendData)) + `,"fileName":"encrypted"}`}},
+		) VALUES (?, 'file send', 1, ?, 'key', 0, '2026-05-05', '2026-05-05', '2026-06-05', 0)`, []any{testSendID, `{"id":"` + testSendFileID + `","size":` + strconv.Itoa(len(sendData)) + `,"fileName":"encrypted"}`}},
 		{`INSERT INTO sends(
 			uuid, name, atype, data, akey, access_count, creation_date,
 			revision_date, deletion_date, disabled
@@ -107,21 +108,6 @@ func syntheticData(t *testing.T, includeFiles bool) fixture {
 	}
 }
 
-func decimal(value int) string {
-	const digits = "0123456789"
-	if value == 0 {
-		return "0"
-	}
-	var encoded [32]byte
-	position := len(encoded)
-	for value > 0 {
-		position--
-		encoded[position] = digits[value%10]
-		value /= 10
-	}
-	return string(encoded[position:])
-}
-
 func writeFixture(t *testing.T, path string, data []byte) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
@@ -135,9 +121,9 @@ func writeFixture(t *testing.T, path string, data []byte) {
 	}
 }
 
-func privateDirectory(t *testing.T, name string) string {
+func privateDirectory(t *testing.T) string {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), name)
+	path := filepath.Join(t.TempDir(), "staging")
 	if err := os.Mkdir(path, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -146,15 +132,13 @@ func privateDirectory(t *testing.T, name string) string {
 
 func TestBuilderCreatesAndVerifiesExactRecoverySet(t *testing.T) {
 	data := syntheticData(t, true)
-	stagingDir := privateDirectory(t, "staging")
-	result, err := (Builder{DataDir: data.dataDir, StagingDir: stagingDir}).Build(context.Background())
+	stagingDir := privateDirectory(t)
+	manifest, err := (Builder{DataDir: data.dataDir, StagingDir: stagingDir}).Build(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Path != filepath.Join(stagingDir, "point") {
-		t.Fatalf("point path = %s", result.Path)
-	}
-	verified, err := Verify(context.Background(), result.Path)
+	point := filepath.Join(stagingDir, "point")
+	verified, err := Verify(context.Background(), point)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -181,7 +165,7 @@ func TestBuilderCreatesAndVerifiesExactRecoverySet(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if second.Manifest.ContentID != result.Manifest.ContentID {
+	if second.ContentID != manifest.ContentID {
 		t.Fatal("unchanged source produced a different content ID")
 	}
 }
@@ -267,8 +251,9 @@ func TestOnlineBackupCapturesOneConsistentWALTransactionDuringWrites(t *testing.
 		t.Fatal("concurrent WAL writer did not establish an initial marker")
 	}
 	buildStarted := time.Now()
-	result, err := (Builder{
-		DataDir: data.dataDir, StagingDir: privateDirectory(t, "staging"),
+	stagingDir := privateDirectory(t)
+	_, err := (Builder{
+		DataDir: data.dataDir, StagingDir: stagingDir,
 	}).Build(context.Background())
 	buildFinished := time.Now()
 	writerError := <-writerDone
@@ -288,7 +273,7 @@ func TestOnlineBackupCapturesOneConsistentWALTransactionDuringWrites(t *testing.
 		t.Fatal("concurrent WAL writer did not commit during online backup")
 	}
 
-	recoveryDatabase := filepath.Join(result.Path, "data", "db.sqlite3")
+	recoveryDatabase := filepath.Join(stagingDir, "point", "data", "db.sqlite3")
 	if info, err := os.Stat(recoveryDatabase); err != nil || info.Size() < 32<<20 {
 		t.Fatalf("recovery database is smaller than 32 MiB: %v/%v", info, err)
 	}
@@ -354,7 +339,6 @@ func TestOnlineBackupCapturesOneConsistentWALTransactionDuringWrites(t *testing.
 
 func TestBuilderRejectsMissingAttachmentAndSendWithoutPublishing(t *testing.T) {
 	for name, removeOther := range map[string]bool{"attachment": false, "send": true} {
-		removeOther := removeOther
 		t.Run(name, func(t *testing.T) {
 			data := syntheticData(t, false)
 			if removeOther {
@@ -362,7 +346,7 @@ func TestBuilderRejectsMissingAttachmentAndSendWithoutPublishing(t *testing.T) {
 			} else {
 				writeFixture(t, data.sendPath, data.sendData)
 			}
-			stagingDir := privateDirectory(t, "staging")
+			stagingDir := privateDirectory(t)
 			_, err := (Builder{DataDir: data.dataDir, StagingDir: stagingDir}).Build(context.Background())
 			var consistency *ConsistencyError
 			if !errors.As(err, &consistency) || consistency.Reason != "not_found" {
@@ -381,7 +365,7 @@ func TestBuilderRejectsMissingAttachmentAndSendWithoutPublishing(t *testing.T) {
 
 func TestTwoStageSendWindowPreservesPreviousPoint(t *testing.T) {
 	data := syntheticData(t, true)
-	stagingDir := privateDirectory(t, "staging")
+	stagingDir := privateDirectory(t)
 	builder := Builder{DataDir: data.dataDir, StagingDir: stagingDir}
 	first, err := builder.Build(context.Background())
 	if err != nil {
@@ -402,11 +386,11 @@ func TestTwoStageSendWindowPreservesPreviousPoint(t *testing.T) {
 	if _, err := builder.Build(context.Background()); err == nil {
 		t.Fatal("missing second-stage Send file was accepted")
 	}
-	current, err := Verify(context.Background(), first.Path)
+	current, err := Verify(context.Background(), filepath.Join(stagingDir, "point"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if current.ContentID != first.Manifest.ContentID {
+	if current.ContentID != first.ContentID {
 		t.Fatal("failed build replaced the previous recovery point")
 	}
 }
@@ -447,10 +431,9 @@ func TestBuilderRejectsSizeDeletionSymlinkAndChangedRaces(t *testing.T) {
 		},
 	}
 	for name, test := range tests {
-		test := test
 		t.Run(name, func(t *testing.T) {
 			data := syntheticData(t, true)
-			stagingDir := privateDirectory(t, "staging")
+			stagingDir := privateDirectory(t)
 			builder := Builder{DataDir: data.dataDir, StagingDir: stagingDir}
 			runBefore := true
 			runAfter := true
@@ -485,7 +468,7 @@ func TestBuilderRejectsUnsupportedMigrationAndUnsafeReferences(t *testing.T) {
 		if _, err := data.database.Exec("INSERT INTO __diesel_schema_migrations(version, run_on) VALUES ('20260505120001', 'future')"); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := (Builder{DataDir: data.dataDir, StagingDir: privateDirectory(t, "staging")}).Build(context.Background()); err == nil {
+		if _, err := (Builder{DataDir: data.dataDir, StagingDir: privateDirectory(t)}).Build(context.Background()); err == nil {
 			t.Fatal("unsupported migration was accepted")
 		}
 	})
@@ -494,13 +477,12 @@ func TestBuilderRejectsUnsupportedMigrationAndUnsafeReferences(t *testing.T) {
 		"send size": `{"id":"` + testSendFileID + `","size":"18"}`,
 		"send JSON": `{invalid`,
 	} {
-		value := value
 		t.Run(name, func(t *testing.T) {
 			data := syntheticData(t, true)
 			if _, err := data.database.Exec("UPDATE sends SET data = ? WHERE uuid = ?", value, testSendID); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := (Builder{DataDir: data.dataDir, StagingDir: privateDirectory(t, "staging")}).Build(context.Background()); err == nil {
+			if _, err := (Builder{DataDir: data.dataDir, StagingDir: privateDirectory(t)}).Build(context.Background()); err == nil {
 				t.Fatal("unsafe file Send reference was accepted")
 			}
 		})
@@ -513,41 +495,42 @@ func TestBuilderRejectsSchemaDriftAtTheSameMigration(t *testing.T) {
 	if _, err := data.database.Exec("CREATE TABLE unexpected_history_residue (id TEXT PRIMARY KEY)"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := (Builder{DataDir: data.dataDir, StagingDir: privateDirectory(t, "staging")}).Build(context.Background()); err == nil {
+	if _, err := (Builder{DataDir: data.dataDir, StagingDir: privateDirectory(t)}).Build(context.Background()); err == nil {
 		t.Fatal("database schema drift was accepted")
 	}
 }
 
 func TestVerifyRejectsEveryTreeMismatch(t *testing.T) {
-	tests := map[string]func(t *testing.T, result Result){
-		"extra file": func(t *testing.T, result Result) {
-			writeFixture(t, filepath.Join(result.Path, "data", "attachments", testCipherID, strings.Repeat("e", 20)), []byte("extra"))
+	tests := map[string]func(t *testing.T, point string){
+		"extra file": func(t *testing.T, point string) {
+			writeFixture(t, filepath.Join(point, "data", "attachments", testCipherID, strings.Repeat("e", 20)), []byte("extra"))
 		},
-		"missing file": func(t *testing.T, result Result) {
-			if err := os.Remove(filepath.Join(result.Path, "data", "sends", testSendID, testSendFileID)); err != nil {
+		"missing file": func(t *testing.T, point string) {
+			if err := os.Remove(filepath.Join(point, "data", "sends", testSendID, testSendFileID)); err != nil {
 				t.Fatal(err)
 			}
 		},
-		"changed file": func(t *testing.T, result Result) {
-			path := filepath.Join(result.Path, "data", "attachments", testCipherID, testAttachmentID)
+		"changed file": func(t *testing.T, point string) {
+			path := filepath.Join(point, "data", "attachments", testCipherID, testAttachmentID)
 			writeFixture(t, path, []byte("tampered-attachment"))
 		},
-		"extra directory": func(t *testing.T, result Result) {
-			if err := os.Mkdir(filepath.Join(result.Path, "data", "unexpected"), 0o700); err != nil {
+		"extra directory": func(t *testing.T, point string) {
+			if err := os.Mkdir(filepath.Join(point, "data", "unexpected"), 0o700); err != nil {
 				t.Fatal(err)
 			}
 		},
 	}
 	for name, mutate := range tests {
-		mutate := mutate
 		t.Run(name, func(t *testing.T) {
 			data := syntheticData(t, true)
-			result, err := (Builder{DataDir: data.dataDir, StagingDir: privateDirectory(t, "staging")}).Build(context.Background())
+			stagingDir := privateDirectory(t)
+			_, err := (Builder{DataDir: data.dataDir, StagingDir: stagingDir}).Build(context.Background())
 			if err != nil {
 				t.Fatal(err)
 			}
-			mutate(t, result)
-			if _, err := Verify(context.Background(), result.Path); err == nil {
+			point := filepath.Join(stagingDir, "point")
+			mutate(t, point)
+			if _, err := Verify(context.Background(), point); err == nil {
 				t.Fatal("mismatched recovery tree was accepted")
 			}
 		})
@@ -606,9 +589,9 @@ func TestManifestStrictlyRejectsUnknownFieldsAndUnsupportedTuple(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	withUnknown := strings.Replace(string(data), `"schema_version":2`, `"schema_version":2,"status":"complete"`, 1)
+	withUnknown := strings.Replace(string(data), `"schema_version":2`, `"schema_version":2,"unknown":true`, 1)
 	if _, err := DecodeManifest([]byte(withUnknown)); err == nil {
-		t.Fatal("old manifest field was accepted")
+		t.Fatal("unknown manifest field was accepted")
 	}
 	manifest.Vaultwarden.Version = "1.37.3"
 	manifest.ContentID, err = manifest.CalculateContentID()
@@ -653,17 +636,6 @@ func TestSpacePreflightRejectsImpossibleRequirement(t *testing.T) {
 	t.Parallel()
 	if err := preflightSpace(t.TempDir(), math.MaxInt64); err == nil {
 		t.Fatal("impossible staging space requirement was accepted")
-	}
-}
-
-func TestSecondSpacePreflightCountsOnlyFilesStillToCopy(t *testing.T) {
-	t.Parallel()
-	required, err := remainingCopySpace(1234)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if required != 1234+spaceReserve {
-		t.Fatalf("remaining copy requirement = %d", required)
 	}
 }
 

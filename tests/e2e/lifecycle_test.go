@@ -30,7 +30,7 @@ import (
 
 const (
 	testPassword             = "Correct Horse Battery Staple 2026!"
-	oldItemPassword          = "old-e2e-item-password"
+	initialItemPassword      = "initial-e2e-item-password"
 	newItemPassword          = "new-e2e-item-password"
 	secondPassword           = "second-user-password"
 	organizationItemPassword = "organization-item-password"
@@ -118,7 +118,7 @@ func newE2EHarness(t *testing.T, ctx context.Context) *e2eHarness {
 	harness.productionCompose = filepath.Join(localRoot, "compose.yml")
 	harness.testCompose = filepath.Join(localRoot, "compose.e2e.yml")
 	t.Cleanup(harness.cleanup)
-	if output, err := harness.docker(nil, "info"); err != nil {
+	if output, err := harness.docker("info"); err != nil {
 		t.Fatalf("Docker daemon is required: %v: %s", err, truncateDiagnostic(output, 2000))
 	}
 
@@ -168,15 +168,15 @@ func (h *e2eHarness) prepareImages() {
 		if len(paths) != 1 {
 			h.t.Fatalf("Nix returned invalid output for %s: %q", attribute, output)
 		}
-		if loaded, err := h.docker(nil, "load", "--input", paths[0]); err != nil {
+		if loaded, err := h.docker("load", "--input", paths[0]); err != nil {
 			h.t.Fatalf("load Nix image %s: %v: %s", attribute, err, harnessDiagnostics(loaded))
 		}
 	}
 	official := upstream.VaultwardenImageRepository + ":" + upstream.VaultwardenVersion + "@" + upstream.VaultwardenImageDigest
-	if output, err := h.docker(nil, "pull", official); err != nil {
+	if output, err := h.docker("pull", official); err != nil {
 		h.t.Fatalf("pull pinned Vaultwarden image: %v: %s", err, harnessDiagnostics(output))
 	}
-	if output, err := h.docker(nil, "tag", official, upstream.VaultwardenLocalImage); err != nil {
+	if output, err := h.docker("tag", official, upstream.VaultwardenLocalImage); err != nil {
 		h.t.Fatalf("tag pinned Vaultwarden image: %v: %s", err, harnessDiagnostics(output))
 	}
 }
@@ -321,7 +321,7 @@ func (h *e2eHarness) tryCompose(ctx context.Context, arguments ...string) (strin
 		h.testCompose,
 	}
 	base = append(base, arguments...)
-	return h.dockerContext(ctx, nil, base...)
+	return h.dockerContext(ctx, base...)
 }
 
 func (h *e2eHarness) startMotoAndRepository() {
@@ -404,7 +404,6 @@ func (h *e2eHarness) waitHealthy(service string, timeout time.Duration) {
 		container, err := h.tryCompose(h.ctx, "ps", "--quiet", service)
 		if err == nil && strings.TrimSpace(container) != "" {
 			output, inspectError := h.docker(
-				nil,
 				"inspect",
 				"--format",
 				"{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}",
@@ -643,7 +642,6 @@ func (h *e2eHarness) singleFileIn(relativeDirectory string) string {
 	h.t.Helper()
 	relativeDirectory = cleanTestRelative(h.t, relativeDirectory)
 	output, err := h.docker(
-		nil,
 		"exec",
 		h.vaultwardenContainer(),
 		"find",
@@ -691,7 +689,6 @@ func (h *e2eHarness) holdDataFile(relative string) func() {
 func (h *e2eHarness) renameContainerFile(from, to string) {
 	h.t.Helper()
 	output, err := h.docker(
-		nil,
 		"exec",
 		h.vaultwardenContainer(),
 		"mv",
@@ -843,7 +840,7 @@ func (h *e2eHarness) startDrill(recoveryName string) {
 		"drill-copy",
 	)
 	volume := h.project + "_e2e-drill-data"
-	_, _ = h.docker(nil, "volume", "rm", volume)
+	_, _ = h.docker("volume", "rm", volume)
 	h.writeComposeFiles(recoveryName)
 	h.compose("--profile", "drill", "up", "--detach", "drill-vaultwarden")
 	h.waitHealthy("drill-vaultwarden", 3*time.Minute)
@@ -888,7 +885,7 @@ func (h *e2eHarness) cleanup() {
 	}
 	if h.project != "" {
 		containers, _ := h.dockerContext(
-			cleanupContext, nil,
+			cleanupContext,
 			"ps",
 			"--all",
 			"--quiet",
@@ -896,7 +893,7 @@ func (h *e2eHarness) cleanup() {
 			"label=com.docker.compose.project="+h.project,
 		)
 		networks, _ := h.dockerContext(
-			cleanupContext, nil,
+			cleanupContext,
 			"network",
 			"ls",
 			"--quiet",
@@ -904,7 +901,7 @@ func (h *e2eHarness) cleanup() {
 			"label=com.docker.compose.project="+h.project,
 		)
 		volumes, _ := h.dockerContext(
-			cleanupContext, nil,
+			cleanupContext,
 			"volume",
 			"ls",
 			"--quiet",
@@ -917,16 +914,16 @@ func (h *e2eHarness) cleanup() {
 	}
 }
 
-func (h *e2eHarness) docker(input []byte, arguments ...string) (string, error) {
-	return h.dockerContext(h.ctx, input, arguments...)
+func (h *e2eHarness) docker(arguments ...string) (string, error) {
+	return h.dockerContext(h.ctx, arguments...)
 }
 
-func (h *e2eHarness) dockerContext(ctx context.Context, input []byte, arguments ...string) (string, error) {
+func (h *e2eHarness) dockerContext(ctx context.Context, arguments ...string) (string, error) {
 	arguments = append([]string{"--config", h.dockerConfig}, arguments...)
 	return runCommandWithEnvironment(
 		ctx,
 		h.repository,
-		input,
+		nil,
 		h.dockerEnv,
 		h.dockerPath,
 		arguments...,
@@ -985,7 +982,7 @@ func environmentOrDefault(name, fallback string) string {
 func harnessDiagnostics(value string) string {
 	return redactDiagnostics(value,
 		testPassword,
-		oldItemPassword,
+		initialItemPassword,
 		newItemPassword,
 		secondPassword,
 		organizationItemPassword,

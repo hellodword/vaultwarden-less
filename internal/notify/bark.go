@@ -3,7 +3,6 @@ package notify
 import (
 	"bytes"
 	"context"
-	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -155,5 +154,3 @@ func padInteger(value *big.Int, size int) []byte {
 	copy(result[size-len(raw):], raw)
 	return result
 }
-
-var _ crypto.Signer = (*ecdsa.PrivateKey)(nil)

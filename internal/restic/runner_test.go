@@ -64,6 +64,7 @@ func testRunner(t *testing.T, execute executeFunc) (Runner, config.Target, *[]re
 		CacheDir:     cache,
 		PasswordRoot: credentialsDir,
 		Credentials:  credentials,
+		recoveryPath: config.RecoveryPointPath,
 	}
 	runner.execute = func(ctx context.Context, binary string, arguments, environment []string, directory string) ([]byte, error) {
 		if binary != runner.Binary {
@@ -99,7 +100,7 @@ func rawRecoverySnapshot(id, content, when string) rawSnapshot {
 		Time:     when,
 		Hostname: SnapshotHost,
 		Tags:     []string{SnapshotTag, "content-id=" + strings.TrimPrefix(content, "sha256:")},
-		Paths:    []string{SnapshotPath},
+		Paths:    []string{config.RecoveryPointPath},
 	}
 }
 
@@ -139,16 +140,6 @@ func TestEnsureBacksUpDifferentContentOnceWithFixedIdentity(t *testing.T) {
 		case "snapshots":
 			return encodedSnapshots(t, rawRecoverySnapshot(firstSnapshotID, firstContentID, "2026-08-25T12:00:00Z")), nil
 		case "backup":
-			for _, forbidden := range []string{"--skip-if-unchanged", "complete", "incomplete"} {
-				if slices.Contains(arguments, forbidden) {
-					t.Fatalf("forbidden backup argument: %s", forbidden)
-				}
-			}
-			for _, required := range []string{"--host", SnapshotHost, "--tag", SnapshotTag, "content-id=" + strings.TrimPrefix(manifest.ContentID, "sha256:"), "--", SnapshotPath} {
-				if !slices.Contains(arguments, required) {
-					t.Fatalf("missing backup argument %q in %#v", required, arguments)
-				}
-			}
 			assertExactCredentialEnvironment(t, environment)
 			return []byte(`{"message_type":"status"}` + "\n" + `{"message_type":"summary","snapshot_id":"` + secondSnapshotID + `"}` + "\n"), nil
 		default:
@@ -167,6 +158,21 @@ func TestEnsureBacksUpDifferentContentOnceWithFixedIdentity(t *testing.T) {
 	}
 	if len(*calls) != 2 {
 		t.Fatalf("calls = %d", len(*calls))
+	}
+	wantArguments := []string{
+		"--repo", target.Repository,
+		"--password-file", filepath.Join(runner.PasswordRoot, target.Name),
+		"--cache-dir", filepath.Join(runner.CacheDir, target.Name),
+		"--option", "s3.bucket-lookup=path",
+		"--option", "s3.region=ap-singapore",
+		"backup", "--json",
+		"--host", SnapshotHost,
+		"--tag", SnapshotTag,
+		"--tag", "content-id=" + strings.TrimPrefix(manifest.ContentID, "sha256:"),
+		"--", config.RecoveryPointPath,
+	}
+	if arguments := (*calls)[1].arguments; !slices.Equal(arguments, wantArguments) {
+		t.Fatalf("backup arguments = %#v, want %#v", arguments, wantArguments)
 	}
 }
 
@@ -248,7 +254,6 @@ func TestSnapshotsBoundNormalizesTimesAndReportsTruncation(t *testing.T) {
 
 func TestResolveSnapshotUsesLatestOrOneExactFullID(t *testing.T) {
 	for name, requested := range map[string]string{"latest": "", "explicit": secondSnapshotID} {
-		requested := requested
 		t.Run(name, func(t *testing.T) {
 			runner, target, calls := testRunner(t, func(_ context.Context, _ string, arguments, _ []string, _ string) ([]byte, error) {
 				if operation(arguments) != "snapshots" {
@@ -278,13 +283,12 @@ func TestResolveSnapshotUsesLatestOrOneExactFullID(t *testing.T) {
 
 func TestPruneIsOneForgetCallWithFixedRetention(t *testing.T) {
 	for _, apply := range []bool{false, true} {
-		apply := apply
 		t.Run(map[bool]string{false: "dry-run", true: "apply"}[apply], func(t *testing.T) {
 			runner, target, calls := testRunner(t, func(_ context.Context, _ string, arguments, _ []string, _ string) ([]byte, error) {
 				if operation(arguments) != "forget" {
 					t.Fatalf("unexpected operation: %#v", arguments)
 				}
-				return []byte(`[{"host":"` + SnapshotHost + `","paths":["` + SnapshotPath + `"],"keep":[{"id":"` + firstSnapshotID + `"}],"remove":[{"id":"` + secondSnapshotID + `"}]}]`), nil
+				return []byte(`[{"host":"` + SnapshotHost + `","paths":["` + config.RecoveryPointPath + `"],"keep":[{"id":"` + firstSnapshotID + `"}],"remove":[{"id":"` + secondSnapshotID + `"}]}]`), nil
 			})
 			result, err := runner.Prune(context.Background(), target, apply)
 			if err != nil {
@@ -323,7 +327,7 @@ func TestRestoreUsesExactSnapshotSubfolderAndCallerContext(t *testing.T) {
 	if err := runner.Restore(ctx, target, firstSnapshotID, destination); err != nil {
 		t.Fatal(err)
 	}
-	if len(*calls) != 1 || !slices.Contains((*calls)[0].arguments, firstSnapshotID+":"+SnapshotPath) {
+	if len(*calls) != 1 || !slices.Contains((*calls)[0].arguments, firstSnapshotID+":"+config.RecoveryPointPath) {
 		t.Fatalf("restore arguments = %#v", (*calls)[0].arguments)
 	}
 }

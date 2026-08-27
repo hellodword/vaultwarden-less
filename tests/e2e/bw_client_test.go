@@ -38,8 +38,9 @@ type bitwardenSendReceiver struct {
 	caFile  string
 }
 
-func newBitwardenCLI(t *testing.T, appdata, server, caFile, email, password string) *bitwardenCLI {
+func newBitwardenCLI(t *testing.T, appdata, server, caFile, email string) *bitwardenCLI {
 	t.Helper()
+	password := testPassword
 	path, err := exec.LookPath("bw")
 	if err != nil {
 		t.Fatal(err)
@@ -117,7 +118,7 @@ func (client *bitwardenCLI) tryRun(ctx context.Context, input []byte, arguments 
 func (client *bitwardenCLI) expectSyncFailure(ctx context.Context) {
 	client.t.Helper()
 	if _, diagnostics, err := client.tryRun(ctx, nil, "sync", "--force"); err == nil {
-		client.t.Fatal("old authenticated CLI session remained valid after RSA regeneration")
+		client.t.Fatal("pre-restore authenticated CLI session remained valid after RSA regeneration")
 	} else if containsSecret(diagnostics, client.password, client.session) {
 		client.t.Fatal("CLI diagnostics exposed a password")
 	}

@@ -145,8 +145,9 @@ nix run .#just -- logs
 `init` is safe to repeat with the same explicit identity but intentionally
 refuses wrong ownership, modes, symlinks, existing non-private files, and a
 different UID/GID. UID/GID 0 is supported only when explicitly chosen. It does
-not update an old layout. Run the recipe from an account that can `chown` the
-new layout when the selected identity differs from the invoking account.
+not alter paths outside the current declared layout. Run the recipe from an
+account that can `chown` that layout when the selected identity differs from
+the invoking account.
 
 Compose bind paths are relative to the explicit deployment project directory
 and resolve to absolute paths for the Docker daemon. If a client uses
@@ -175,7 +176,7 @@ serving. They do not test SQLite, S3, Restic, or notifiers.
 The scheduler can delay a request for quieting and the minimum check-start
 interval. Process-local status disappears on restart. `repo-snapshots` is the
 durable repository view and is intentionally bounded; raise the limit up to
-1000 when auditing older history.
+1000 when auditing deeper history.
 
 Structured logs are safe metadata, not a data backup. Restic logs exclude
 arguments, stderr, locators, and secrets.
@@ -191,10 +192,9 @@ nix run .#just -- repo-prune primary
 nix run .#just -- repo-prune-apply primary
 ```
 
-The first prune is a dry run. Only `repo-prune-apply` deletes matching
-product-v2 snapshots according to fixed retention. It cannot select an older
-product tag. Deleting any out-of-scope history is a separate, explicit
-operator operation.
+The first prune is a dry run. Only `repo-prune-apply` deletes snapshots matching
+the fixed product-v2 identity and retention policy. Deleting any out-of-scope
+history is a separate, explicit operator operation.
 
 Repository targets run serially. A slow first target delays later targets.
 After an outage, a target receives the newest point rather than every
@@ -206,12 +206,12 @@ Restore publishes only a verified absent output:
 
 ```sh
 nix run .#just -- restore primary prepared
-nix run .#just -- restore-snapshot <full-64-hex-id> primary older
+nix run .#just -- restore-snapshot <full-64-hex-id> primary earlier
 ```
 
 The default resolves the latest product-v2 snapshot. If that snapshot is
 corrupt or incompatible, restore fails; it never silently falls back. Select an
-older full ID explicitly.
+earlier full ID explicitly.
 
 The output and every parent must satisfy the private-directory contract. Restic
 writes a temporary sibling, complete verification runs, and an atomic
@@ -246,8 +246,8 @@ the supported API/CLI paths, but an operator drill is still required after
 initial deployment, every Vaultwarden upgrade, storage changes, and at a
 locally chosen periodic interval.
 
-Because RSA state is excluded, expect old access, refresh, invite, attachment,
-and download tokens to fail after recovery.
+Because RSA state is excluded, expect pre-recovery access, refresh, invite,
+attachment, and download tokens to fail after recovery.
 
 ## Failure boundaries
 

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sync"
 
 	"github.com/hellodword/vaultwarden-less/internal/config"
 	"github.com/hellodword/vaultwarden-less/internal/notify"
@@ -28,7 +29,12 @@ func serveCommand(configPath *string, environment commandEnvironment) *cobra.Com
 			if err != nil {
 				return err
 			}
-			if err := environment.validateNotify(notifiers); err != nil {
+			logger := environment.logger
+			if logger == nil {
+				logger = slog.New(slog.NewJSONHandler(cmd.ErrOrStderr(), nil))
+			}
+			notifications, err := notify.NewManager(notifiers, logger)
+			if err != nil {
 				return err
 			}
 			repository, err := environment.repositoryFor(cfg)
@@ -39,10 +45,6 @@ func serveCommand(configPath *string, environment commandEnvironment) *cobra.Com
 				return err
 			}
 
-			logger := environment.logger
-			if logger == nil {
-				logger = slog.New(slog.NewJSONHandler(cmd.ErrOrStderr(), nil))
-			}
 			for _, target := range cfg.Targets {
 				for _, warning := range target.Warnings() {
 					logger.Warn("configuration warning", "target", target.Name, "warning", warning)
@@ -50,16 +52,17 @@ func serveCommand(configPath *string, environment commandEnvironment) *cobra.Com
 			}
 			ctx, cancel := context.WithCancel(cmd.Context())
 			defer cancel()
-			notifications := notify.NewManager(notifiers, logger)
-			notifications.Start(ctx)
-			backupWorker := worker.New(cfg, snapshot.Builder{DataDir: environment.dataDir, StagingDir: environment.stagingDir}, repository, notifications, logger)
+			builder := snapshot.Builder{DataDir: environment.dataDir, StagingDir: environment.stagingDir}
+			backupWorker := worker.New(cfg, builder.Build, repository.Ensure, notifications.Enqueue, logger)
 			server := worker.NewHTTPServer(backupWorker)
 			serverError := make(chan error, 1)
 			workerDone := make(chan struct{})
-			go func() {
+			var background sync.WaitGroup
+			background.Go(func() { notifications.Run(ctx) })
+			background.Go(func() {
 				defer close(workerDone)
 				backupWorker.Run(ctx)
-			}()
+			})
 			go func() { serverError <- server.ListenAndServe() }()
 			logger.Info("backup worker started", "listen_address", server.Addr)
 
@@ -89,7 +92,7 @@ func serveCommand(configPath *string, environment commandEnvironment) *cobra.Com
 					result = fmt.Errorf("backup scheduler shutdown timed out")
 				}
 			}
-			notifications.Wait()
+			background.Wait()
 			logger.Info("backup worker stopped")
 			return result
 		},

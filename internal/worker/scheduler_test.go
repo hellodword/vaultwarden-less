@@ -131,7 +131,7 @@ type fixedSource struct {
 	called   chan struct{}
 }
 
-func (source *fixedSource) Build(context.Context) (snapshot.Result, error) {
+func (source *fixedSource) Build(context.Context) (snapshot.Manifest, error) {
 	source.calls++
 	if source.called != nil {
 		select {
@@ -140,9 +140,9 @@ func (source *fixedSource) Build(context.Context) (snapshot.Result, error) {
 		}
 	}
 	if source.err != nil {
-		return snapshot.Result{}, source.err
+		return snapshot.Manifest{}, source.err
 	}
-	return snapshot.Result{Path: config.RecoveryPointPath, Manifest: source.manifest}, nil
+	return source.manifest, nil
 }
 
 type orderedRepository struct {
@@ -207,7 +207,7 @@ func TestSchedulerRunRetainsDemandArrivingDuringCheck(t *testing.T) {
 		results: map[string]restic.SyncResult{"primary": syncResult('a', manifest.ContentID, true)},
 		errors:  map[string]error{}, started: make(chan struct{}, 1), release: make(chan struct{}),
 	}
-	worker := newWithClock(workerConfig("primary"), source, repository, nil, discardLogger(), clock)
+	worker := newWithClock(workerConfig("primary"), source.Build, repository.Ensure, nil, discardLogger(), clock)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { defer close(done); worker.Run(ctx) }()
@@ -237,11 +237,11 @@ func TestWorkerConsistencyFailureRetriesEveryThirtySeconds(t *testing.T) {
 	manifest := workerManifest(t)
 	source := &fixedSource{manifest: manifest, err: &snapshot.ConsistencyError{Path: "data/attachments/x/y", Reason: "not_found"}}
 	repository := &orderedRepository{results: map[string]restic.SyncResult{"primary": syncResult('a', manifest.ContentID, false)}, errors: map[string]error{}}
-	worker := newWithClock(workerConfig("primary"), source, repository, nil, discardLogger(), clock)
+	worker := newWithClock(workerConfig("primary"), source.Build, repository.Ensure, nil, discardLogger(), clock)
 	done := make(chan checkOutcome, 1)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go func() { done <- worker.check(ctx, base) }()
+	go func() { done <- worker.check(ctx) }()
 	if got := <-clock.created; got != config.ConsistencyRetry {
 		t.Fatalf("consistency retry = %s", got)
 	}
@@ -261,8 +261,9 @@ func TestWorkerTargetsAreSerialAndPartialResultRetries(t *testing.T) {
 		errors:  map[string]error{"secondary": &restic.OperationError{Code: "backup_failed"}},
 	}
 	collector := &eventCollector{}
-	worker := New(workerConfig("primary", "secondary"), &fixedSource{manifest: manifest}, repository, collector, discardLogger())
-	outcome := worker.check(context.Background(), time.Now().UTC())
+	source := &fixedSource{manifest: manifest}
+	worker := New(workerConfig("primary", "secondary"), source.Build, repository.Ensure, collector.Enqueue, discardLogger())
+	outcome := worker.check(context.Background())
 	if outcome.result != "partial" || !outcome.retry || outcome.errorCode != "target_failed" {
 		t.Fatalf("partial outcome = %#v", outcome)
 	}
@@ -288,15 +289,16 @@ func TestWorkerNotifiesWhenASecondTargetCatchesUpToKnownContent(t *testing.T) {
 		},
 	}
 	collector := &eventCollector{}
-	worker := New(workerConfig("primary", "secondary"), &fixedSource{manifest: manifest}, repository, collector, discardLogger())
-	first := worker.check(context.Background(), time.Now().UTC())
+	source := &fixedSource{manifest: manifest}
+	worker := New(workerConfig("primary", "secondary"), source.Build, repository.Ensure, collector.Enqueue, discardLogger())
+	first := worker.check(context.Background())
 	if first.result != "partial" {
 		t.Fatalf("first outcome = %#v", first)
 	}
 	repository.results["primary"] = syncResult('a', manifest.ContentID, false)
 	repository.results["secondary"] = syncResult('b', manifest.ContentID, true)
 	delete(repository.errors, "secondary")
-	second := worker.check(context.Background(), time.Now().UTC())
+	second := worker.check(context.Background())
 	if second.result != "created" {
 		t.Fatalf("catch-up outcome = %#v", second)
 	}
@@ -313,7 +315,8 @@ func TestWorkerDegradedTransitionsOccurOnceAndRecoverOnce(t *testing.T) {
 	t.Parallel()
 	base := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
 	collector := &eventCollector{}
-	worker := New(workerConfig("primary"), &fixedSource{}, &orderedRepository{}, collector, discardLogger())
+	source, repository := &fixedSource{}, &orderedRepository{}
+	worker := New(workerConfig("primary"), source.Build, repository.Ensure, collector.Enqueue, discardLogger())
 	worker.targetFailed(0, base, "backup_failed")
 	worker.targetFailed(0, base.Add(config.DegradedAfter-time.Second), "backup_failed")
 	if got := len(collector.snapshot()); got != 0 {
@@ -331,7 +334,8 @@ func TestWorkerDegradedTransitionsOccurOnceAndRecoverOnce(t *testing.T) {
 
 func TestWorkerInitialStatusHasNullHistoryAndArrayTargets(t *testing.T) {
 	t.Parallel()
-	worker := New(workerConfig("primary"), &fixedSource{}, &orderedRepository{}, nil, discardLogger())
+	source, repository := &fixedSource{}, &orderedRepository{}
+	worker := New(workerConfig("primary"), source.Build, repository.Ensure, nil, discardLogger())
 	status := worker.Status()
 	if status.State != "idle" || status.NextCheckAt != nil || status.LastCheck != nil || status.Targets == nil || len(status.Targets) != 1 {
 		t.Fatalf("initial status = %#v", status)
@@ -343,7 +347,8 @@ func TestWorkerInitialStatusHasNullHistoryAndArrayTargets(t *testing.T) {
 
 func TestWorkerHTTPContract(t *testing.T) {
 	t.Parallel()
-	worker := New(workerConfig("primary"), &fixedSource{}, &orderedRepository{}, nil, discardLogger())
+	source, repository := &fixedSource{}, &orderedRepository{}
+	worker := New(workerConfig("primary"), source.Build, repository.Ensure, nil, discardLogger())
 	handler := Handler(worker)
 
 	assertHTTP(t, handler, http.MethodGet, HealthPath, "", "", http.StatusNoContent, "")

@@ -6,12 +6,12 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/x509"
-	"encoding/json"
 	"encoding/pem"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -19,56 +19,28 @@ import (
 	"github.com/hellodword/vaultwarden-less/internal/config"
 )
 
-func recoveryEvent(id string) Event {
-	return NewRecoveryEvent(
-		id,
-		"2026-08-23T12:00:00Z",
-		"sha256:"+strings.Repeat("a", 64),
-		[]TargetStatus{
+func recoveryEvent() Event {
+	return Event{
+		Type:      "recovery_point_created",
+		ContentID: "sha256:" + strings.Repeat("a", 64),
+		Targets: []TargetStatus{
 			{Name: "primary", State: "created"},
 			{Name: "cold", State: "failed", ErrorCode: "command_failed"},
 		},
-	)
-}
-
-func TestEventContractAlwaysUsesTargetArraysAndContainsNoSecrets(t *testing.T) {
-	t.Parallel()
-	events := []Event{
-		recoveryEvent("recovery"),
-		NewSourceEvent("source", "source_degraded", "2026-08-23T12:00:00Z", "source_check_failed"),
-		NewTargetEvent("target", "target_recovered", "2026-08-23T12:00:00Z", TargetStatus{Name: "primary", State: "healthy"}),
-	}
-	for _, event := range events {
-		if err := event.Validate(); err != nil {
-			t.Fatal(err)
-		}
-		data, err := json.Marshal(event)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if strings.Contains(string(data), `"targets":null`) {
-			t.Fatalf("null targets in %s", data)
-		}
-		for _, forbidden := range []string{"repository", "password", "webhook", "private_key", "AWS_SECRET"} {
-			if strings.Contains(string(data), forbidden) {
-				t.Fatalf("notification contains forbidden field %q: %s", forbidden, data)
-			}
-		}
 	}
 }
 
 func TestRecoveryMessageListsEveryTargetOutcome(t *testing.T) {
 	t.Parallel()
-	event := NewRecoveryEvent(
-		"recovery",
-		"2026-08-23T12:00:00Z",
-		"sha256:"+strings.Repeat("a", 64),
-		[]TargetStatus{
+	event := Event{
+		Type:      "recovery_point_created",
+		ContentID: "sha256:" + strings.Repeat("a", 64),
+		Targets: []TargetStatus{
 			{Name: "primary", State: "created"},
 			{Name: "archive", State: "synced"},
 			{Name: "cold", State: "failed", ErrorCode: "command_failed"},
 		},
-	)
+	}
 	message := event.Message()
 	for _, expected := range []string{"created=[primary]", "synced=[archive]", "failed=[cold]"} {
 		if !strings.Contains(message, expected) {
@@ -100,53 +72,40 @@ func (sender *countingSender) Send(context.Context, Event) error {
 	return nil
 }
 
-func TestManagerAttemptsEachNotificationAtMostThreeTimes(t *testing.T) {
-	sender := &countingSender{name: "operations", failUntil: 99, reached: make(chan int64, 3)}
-	manager := newManagerWithSenders([]Sender{sender}, nil, []time.Duration{0, 0, 0})
-	ctx, cancel := context.WithCancel(context.Background())
-	manager.Start(ctx)
-	manager.Enqueue(recoveryEvent("three-attempts"))
-	for {
-		select {
-		case calls := <-sender.reached:
-			if calls == 3 {
-				cancel()
-				manager.Wait()
-				if sender.calls.Load() != 3 {
-					t.Fatalf("calls = %d", sender.calls.Load())
+func TestManagerRetryLimitAndSuccessStop(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		failUntil int64
+		wantCalls int64
+	}{
+		{name: "three-attempt limit", failUntil: 99, wantCalls: 3},
+		{name: "stop after success", failUntil: 1, wantCalls: 2},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			sender := &countingSender{name: "operations", failUntil: test.failUntil, reached: make(chan int64, 3)}
+			manager := newManagerWithSenders([]Sender{sender}, nil, []time.Duration{0, 0, 0})
+			ctx, cancel := context.WithCancel(context.Background())
+			var wait sync.WaitGroup
+			wait.Go(func() { manager.Run(ctx) })
+			manager.Enqueue(recoveryEvent())
+			for {
+				select {
+				case calls := <-sender.reached:
+					if calls == test.wantCalls {
+						cancel()
+						wait.Wait()
+						if sender.calls.Load() != test.wantCalls {
+							t.Fatalf("calls = %d, want %d", sender.calls.Load(), test.wantCalls)
+						}
+						return
+					}
+				case <-time.After(time.Second):
+					cancel()
+					wait.Wait()
+					t.Fatal("notification attempts did not finish")
 				}
-				return
 			}
-		case <-time.After(time.Second):
-			cancel()
-			manager.Wait()
-			t.Fatal("notification attempts did not finish")
-		}
-	}
-}
-
-func TestManagerStopsRetryingAfterSuccess(t *testing.T) {
-	sender := &countingSender{name: "operations", failUntil: 1, reached: make(chan int64, 3)}
-	manager := newManagerWithSenders([]Sender{sender}, nil, []time.Duration{0, 0, 0})
-	ctx, cancel := context.WithCancel(context.Background())
-	manager.Start(ctx)
-	manager.Enqueue(recoveryEvent("eventual-success"))
-	for {
-		select {
-		case calls := <-sender.reached:
-			if calls == 2 {
-				cancel()
-				manager.Wait()
-				if sender.calls.Load() != 2 {
-					t.Fatalf("calls = %d", sender.calls.Load())
-				}
-				return
-			}
-		case <-time.After(time.Second):
-			cancel()
-			manager.Wait()
-			t.Fatal("notification success did not finish")
-		}
+		})
 	}
 }
 
@@ -154,22 +113,11 @@ func TestManagerQueueIsBoundedAndNonblocking(t *testing.T) {
 	t.Parallel()
 	sender := &countingSender{name: "operations"}
 	manager := newManagerWithSenders([]Sender{sender}, nil, []time.Duration{0})
-	for index := 0; index < notifierQueueCapacity+20; index++ {
-		manager.Enqueue(recoveryEvent("bounded-" + string(rune('a'+index%26))))
+	for range notifierQueueCapacity + 20 {
+		manager.Enqueue(recoveryEvent())
 	}
 	if queued := len(manager.workers[0].queue); queued != notifierQueueCapacity {
 		t.Fatalf("queued = %d", queued)
-	}
-}
-
-func TestManagerPreservesEmptyTargetArray(t *testing.T) {
-	t.Parallel()
-	sender := &countingSender{name: "operations"}
-	manager := newManagerWithSenders([]Sender{sender}, nil, []time.Duration{0})
-	manager.Enqueue(NewSourceEvent("source", "source_degraded", "2026-08-23T12:00:00Z", "source_check_failed"))
-	queued := <-manager.workers[0].queue
-	if queued.Targets == nil || len(queued.Targets) != 0 {
-		t.Fatalf("queued targets = %#v, want a non-nil empty array", queued.Targets)
 	}
 }
 
@@ -177,15 +125,16 @@ func TestCancellationDropsPendingRetries(t *testing.T) {
 	sender := &countingSender{name: "operations", failUntil: 99, reached: make(chan int64, 1)}
 	manager := newManagerWithSenders([]Sender{sender}, nil, []time.Duration{0, time.Hour, time.Hour})
 	ctx, cancel := context.WithCancel(context.Background())
-	manager.Start(ctx)
-	manager.Enqueue(recoveryEvent("cancel"))
+	var wait sync.WaitGroup
+	wait.Go(func() { manager.Run(ctx) })
+	manager.Enqueue(recoveryEvent())
 	select {
 	case <-sender.reached:
 		cancel()
-		manager.Wait()
+		wait.Wait()
 	case <-time.After(time.Second):
 		cancel()
-		manager.Wait()
+		wait.Wait()
 		t.Fatal("first attempt did not start")
 	}
 	if sender.calls.Load() != 1 {
@@ -199,6 +148,9 @@ func TestWechatChecksHTTPAndErrcode(t *testing.T) {
 		if !strings.Contains(string(body), `"msgtype":"text"`) {
 			t.Errorf("unexpected WeChat payload: %s", body)
 		}
+		if strings.Contains(string(body), "synthetic-webhook-secret") {
+			t.Errorf("WeChat payload exposed webhook material: %s", body)
+		}
 		writer.Header().Set("Content-Type", "application/json")
 		switch request.URL.Path {
 		case "/http-error":
@@ -211,13 +163,13 @@ func TestWechatChecksHTTPAndErrcode(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	sender := &wechatSender{name: "wechat", url: server.URL, client: server.Client()}
-	if err := sender.Send(context.Background(), recoveryEvent("wechat")); err != nil {
+	sender := &wechatSender{name: "wechat", url: server.URL + "?key=synthetic-webhook-secret", client: server.Client()}
+	if err := sender.Send(context.Background(), recoveryEvent()); err != nil {
 		t.Fatal(err)
 	}
 	for _, path := range []string{"/http-error", "/api-error"} {
 		sender.url = server.URL + path
-		if err := sender.Send(context.Background(), recoveryEvent("wechat-error")); err == nil {
+		if err := sender.Send(context.Background(), recoveryEvent()); err == nil {
 			t.Fatalf("WeChat failure at %s was accepted", path)
 		}
 	}
@@ -254,6 +206,12 @@ func TestBarkUsesHTTP2JWTAndChecksAPNsReason(t *testing.T) {
 		if !strings.HasPrefix(request.Header.Get("authorization"), "bearer ") || request.Header.Get("apns-topic") != "me.fin.bark" {
 			t.Errorf("missing APNs headers: %#v", request.Header)
 		}
+		body, _ := io.ReadAll(request.Body)
+		for _, forbidden := range []string{strings.Repeat("a", 64), "KEY123", "TEAM123", "PRIVATE KEY"} {
+			if strings.Contains(string(body), forbidden) {
+				t.Errorf("APNs payload exposed notifier material %q", forbidden)
+			}
+		}
 		if fail.Load() {
 			writer.WriteHeader(http.StatusGone)
 			_, _ = io.WriteString(writer, `{"reason":"Unregistered"}`)
@@ -284,13 +242,13 @@ func TestBarkUsesHTTP2JWTAndChecksAPNsReason(t *testing.T) {
 	sender.endpoint = server.URL
 	sender.client = server.Client()
 	sender.client.CheckRedirect = func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }
-	if err := sender.Send(context.Background(), recoveryEvent("bark-ok")); err != nil {
+	if err := sender.Send(context.Background(), recoveryEvent()); err != nil {
 		t.Fatal(err)
 	}
 	http1 := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) { writer.WriteHeader(http.StatusOK) }))
 	sender.endpoint = http1.URL
 	sender.client = http1.Client()
-	if err := sender.Send(context.Background(), recoveryEvent("bark-http1")); err == nil || !strings.Contains(err.Error(), "HTTP/2") {
+	if err := sender.Send(context.Background(), recoveryEvent()); err == nil || !strings.Contains(err.Error(), "HTTP/2") {
 		t.Fatalf("APNs HTTP/1 response was accepted: %v", err)
 	}
 	http1.Close()
@@ -298,7 +256,7 @@ func TestBarkUsesHTTP2JWTAndChecksAPNsReason(t *testing.T) {
 	sender.client = server.Client()
 	sender.client.CheckRedirect = func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }
 	fail.Store(true)
-	if err := sender.Send(context.Background(), recoveryEvent("bark-fail")); err == nil || !strings.Contains(err.Error(), "Unregistered") {
+	if err := sender.Send(context.Background(), recoveryEvent()); err == nil || !strings.Contains(err.Error(), "Unregistered") {
 		t.Fatalf("APNs failure was not checked: %v", err)
 	}
 }

@@ -166,7 +166,7 @@ role. Notifier credentials are mounted only into the resident worker.
 | `internal/restic` | Restic process boundary and parsers |
 | `internal/restore` | Exact snapshot selection and atomic restore publication |
 | `internal/worker` | In-memory scheduling, status, and private HTTP API |
-| `internal/notify` | Event contract and bounded delivery workers |
+| `internal/notify` | Safe message rendering and bounded delivery workers |
 | `internal/privatefs` | Private-file checks and Linux atomic rename primitives |
 | `internal/upstream` | Generated pins and embedded Vaultwarden schema |
 | `nix/` | Toolchain, products, local images, checks, and the Restic patch |

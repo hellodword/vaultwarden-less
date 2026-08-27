@@ -57,7 +57,6 @@ func TestBackupRejectsUnknownFieldsDurationsAndUnsafeRepositories(t *testing.T) 
 		"S3 no bucket":       "schema_version: 2\ntargets:\n  - name: s3\n    repository: s3:https://example.test\n",
 		"S3 fragment":        "schema_version: 2\ntargets:\n  - name: s3\n    repository: s3:https://example.test/bucket/repo#fragment\n",
 	} {
-		document := document
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			if _, err := DecodeBackup([]byte(document)); err == nil {

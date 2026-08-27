@@ -17,17 +17,13 @@ import (
 	"time"
 )
 
-type marker struct{ count atomic.Int64 }
-
-func (marker *marker) MarkDirty() { marker.count.Add(1) }
-
-func proxyServer(t *testing.T, upstream string, dirty DirtyMarker) *Server {
+func proxyServer(t *testing.T, upstream string, markDirty func()) *Server {
 	t.Helper()
 	parsed, err := url.Parse(upstream)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return newServer(parsed, dirty, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	return newServer(parsed, markDirty, slog.New(slog.NewJSONHandler(io.Discard, nil)))
 }
 
 func TestTransparentProxyPreservesResponseAndForwardingHeaders(t *testing.T) {
@@ -42,8 +38,8 @@ func TestTransparentProxyPreservesResponseAndForwardingHeaders(t *testing.T) {
 		_, _ = writer.Write([]byte("exact upstream body"))
 	}))
 	defer upstream.Close()
-	marked := &marker{}
-	server := proxyServer(t, upstream.URL, marked)
+	var marked atomic.Int64
+	server := proxyServer(t, upstream.URL, func() { marked.Add(1) })
 	request := httptest.NewRequest(http.MethodPatch, "http://vault.example/api/ciphers/item?revision=7", strings.NewReader("request body"))
 	request.Host = "vault.example"
 	request.Header.Set("Forwarded", `for="203.0.113.7";proto=https;host="vault.example"`)
@@ -70,8 +66,8 @@ func TestTransparentProxyPreservesResponseAndForwardingHeaders(t *testing.T) {
 	if got := strings.Join(forwarded.Header.Values("X-Forwarded-For"), "|"); got != "203.0.113.7|198.51.100.9" {
 		t.Fatalf("X-Forwarded-For = %q", got)
 	}
-	if marked.count.Load() != 1 {
-		t.Fatalf("backup marks = %d", marked.count.Load())
+	if marked.Load() != 1 {
+		t.Fatalf("backup marks = %d", marked.Load())
 	}
 }
 
@@ -83,8 +79,8 @@ func TestProxyTriggerUsesPathNotQueryAndOnlyTwoXX(t *testing.T) {
 		writer.WriteHeader(int(status.Load()))
 	}))
 	defer upstream.Close()
-	marked := &marker{}
-	server := proxyServer(t, upstream.URL, marked)
+	var marked atomic.Int64
+	server := proxyServer(t, upstream.URL, func() { marked.Add(1) })
 	for _, test := range []struct {
 		method string
 		path   string
@@ -101,8 +97,8 @@ func TestProxyTriggerUsesPathNotQueryAndOnlyTwoXX(t *testing.T) {
 		status.Store(int64(test.code))
 		response := httptest.NewRecorder()
 		server.ServeHTTP(response, httptest.NewRequest(test.method, "http://vault.example"+test.path, nil))
-		if marked.count.Load() != test.want {
-			t.Fatalf("%s %s/%d marks = %d, want %d", test.method, test.path, test.code, marked.count.Load(), test.want)
+		if marked.Load() != test.want {
+			t.Fatalf("%s %s/%d marks = %d, want %d", test.method, test.path, test.code, marked.Load(), test.want)
 		}
 	}
 }
@@ -115,7 +111,7 @@ func TestProxyBodyLimitAndHealthAreLocal(t *testing.T) {
 		writer.WriteHeader(http.StatusOK)
 	}))
 	defer upstream.Close()
-	server := proxyServer(t, upstream.URL, &marker{})
+	server := proxyServer(t, upstream.URL, nil)
 
 	request := httptest.NewRequest(http.MethodPost, "http://vault.example/api/ciphers", nil)
 	request.ContentLength = MaxRequestBytes + 1
@@ -149,7 +145,7 @@ func TestTransparentStreamingResponse(t *testing.T) {
 		_, _ = writer.Write([]byte("second"))
 	}))
 	defer upstream.Close()
-	proxyHTTP := httptest.NewServer(proxyServer(t, upstream.URL, &marker{}))
+	proxyHTTP := httptest.NewServer(proxyServer(t, upstream.URL, nil))
 	defer proxyHTTP.Close()
 
 	response, err := proxyHTTP.Client().Get(proxyHTTP.URL + "/api/stream")
@@ -183,7 +179,7 @@ func TestTransparentWebSocketUpgrade(t *testing.T) {
 		_ = buffer.Flush()
 	}))
 	defer upstream.Close()
-	proxyHTTP := httptest.NewServer(proxyServer(t, upstream.URL, &marker{}))
+	proxyHTTP := httptest.NewServer(proxyServer(t, upstream.URL, nil))
 	defer proxyHTTP.Close()
 	parsed, _ := url.Parse(proxyHTTP.URL)
 	connection, err := net.DialTimeout("tcp", parsed.Host, time.Second)
@@ -217,7 +213,7 @@ func TestEventSenderRetriesStartupPendingUntilSuccess(t *testing.T) {
 	endpoint := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		attempt := count.Add(1)
 		body, _ := io.ReadAll(request.Body)
-		if request.Method != http.MethodPost || request.Header.Get("Content-Type") != "application/json" || string(body) != string(eventBody) {
+		if request.Method != http.MethodPost || request.Header.Get("Content-Type") != "application/json" || string(body) != eventBody {
 			writer.WriteHeader(http.StatusBadRequest)
 			return
 		}
@@ -234,7 +230,7 @@ func TestEventSenderRetriesStartupPendingUntilSuccess(t *testing.T) {
 	sender.retry = time.Millisecond
 	ctx, cancel := context.WithCancel(context.Background())
 	var wait sync.WaitGroup
-	sender.Run(ctx, &wait)
+	wait.Go(func() { sender.Run(ctx) })
 	select {
 	case <-succeeded:
 	case <-time.After(2 * time.Second):
@@ -269,7 +265,7 @@ func TestEventSenderRetainsSignalArrivingDuringSend(t *testing.T) {
 	sender := newEventSender(parsed, time.Second, slog.New(slog.NewJSONHandler(io.Discard, nil)))
 	ctx, cancel := context.WithCancel(context.Background())
 	var wait sync.WaitGroup
-	sender.Run(ctx, &wait)
+	wait.Go(func() { sender.Run(ctx) })
 	<-started
 	for range 1000 {
 		sender.MarkDirty()
@@ -298,7 +294,7 @@ func TestEventFailureCannotChangeUpstreamResponse(t *testing.T) {
 	sender.retry = 10 * time.Millisecond
 	ctx, cancel := context.WithCancel(context.Background())
 	var wait sync.WaitGroup
-	sender.Run(ctx, &wait)
+	wait.Go(func() { sender.Run(ctx) })
 
 	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 		writer.Header().Set("X-Exact", "yes")
@@ -307,7 +303,7 @@ func TestEventFailureCannotChangeUpstreamResponse(t *testing.T) {
 	}))
 	defer upstream.Close()
 	response := httptest.NewRecorder()
-	proxyServer(t, upstream.URL, sender).ServeHTTP(response, httptest.NewRequest(http.MethodPatch, "http://vault.example/api/ciphers/item", nil))
+	proxyServer(t, upstream.URL, sender.MarkDirty).ServeHTTP(response, httptest.NewRequest(http.MethodPatch, "http://vault.example/api/ciphers/item", nil))
 	cancel()
 	wait.Wait()
 	if response.Code != http.StatusAlreadyReported || response.Header().Get("X-Exact") != "yes" || response.Body.String() != "unchanged" {

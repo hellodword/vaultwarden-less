@@ -20,8 +20,9 @@ import (
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	os.Exit(execute(ctx, os.Args[1:], os.Stdout, os.Stderr))
+	code := execute(ctx, os.Args[1:], os.Stdout, os.Stderr)
+	stop()
+	os.Exit(code)
 }
 
 func execute(ctx context.Context, arguments []string, stdout, stderr io.Writer) int {
@@ -71,8 +72,8 @@ func serve(ctx context.Context, stderr io.Writer) int {
 	defer stop()
 	events := proxyserver.NewEventSender(logger)
 	var eventWait sync.WaitGroup
-	events.Run(serveContext, &eventWait)
-	server := proxyserver.NewServer(events, logger)
+	eventWait.Go(func() { events.Run(serveContext) })
+	server := proxyserver.NewServer(events.MarkDirty, logger)
 	serveError := make(chan error, 1)
 	go func() { serveError <- server.ListenAndServe() }()
 	logger.Info("proxy started", "listen_address", proxyserver.ListenAddress)

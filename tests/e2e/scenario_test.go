@@ -26,8 +26,8 @@ func TestVaultwardenBackupRestoreE2E(t *testing.T) {
 	secondEmail := fmt.Sprintf("vaultwarden-less-e2e-two-%d@example.com", unique)
 	firstRegistration := registerAccount(ctx, t, harness.publicHTTP, firstEmail, testPassword)
 	_ = registerAccount(ctx, t, harness.publicHTTP, secondEmail, testPassword)
-	firstClient := newBitwardenCLI(t, filepath.Join(harness.localRoot, "bw-first"), harness.publicTLS, harness.tlsCAFile, firstEmail, testPassword)
-	secondClient := newBitwardenCLI(t, filepath.Join(harness.localRoot, "bw-second"), harness.publicTLS, harness.tlsCAFile, secondEmail, testPassword)
+	firstClient := newBitwardenCLI(t, filepath.Join(harness.localRoot, "bw-first"), harness.publicTLS, harness.tlsCAFile, firstEmail)
+	secondClient := newBitwardenCLI(t, filepath.Join(harness.localRoot, "bw-second"), harness.publicTLS, harness.tlsCAFile, secondEmail)
 	firstClient.login(ctx)
 	secondClient.login(ctx)
 	organizationName := "Vaultwarden-less Recovery Organization"
@@ -70,7 +70,7 @@ func TestVaultwardenBackupRestoreE2E(t *testing.T) {
 	folderName := "Vaultwarden-less Recovery Folder"
 	folderID := firstClient.createFolder(ctx, folderName)
 	itemName := "Vaultwarden-less E2E Login"
-	itemID := firstClient.createItem(ctx, itemName, oldItemPassword, folderID)
+	itemID := firstClient.createItem(ctx, itemName, initialItemPassword, folderID)
 	secondItemID := secondClient.createItem(ctx, "Second User Recovery Item", secondPassword, "")
 	attachmentData := []byte("vaultwarden-less attachment\nwith a stable payload\n")
 	attachmentPath := privateTestPath(t, harness.localRoot, "attachment.txt", attachmentData)
@@ -161,7 +161,7 @@ func TestVaultwardenBackupRestoreE2E(t *testing.T) {
 	harness.startDrill("drill")
 	firstClient.expectSyncFailure(ctx)
 
-	restoredFirst := newBitwardenCLI(t, filepath.Join(harness.localRoot, "bw-restored-first"), harness.publicTLS, harness.tlsCAFile, firstEmail, testPassword)
+	restoredFirst := newBitwardenCLI(t, filepath.Join(harness.localRoot, "bw-restored-first"), harness.publicTLS, harness.tlsCAFile, firstEmail)
 	restoredFirst.login(ctx)
 	if stringValue(restoredFirst.getOrganization(ctx, organizationID)["name"]) != organizationName {
 		t.Fatal("organization did not survive restore")
@@ -195,22 +195,22 @@ func TestVaultwardenBackupRestoreE2E(t *testing.T) {
 	restoredFirst.getFileSend(ctx, sendID, restoredSend)
 	assertFileContent(t, restoredSend, sendData)
 	restoredFirst.expectFileSendAccessFailure(ctx, limitedSendID)
-	restoredSecond := newBitwardenCLI(t, filepath.Join(harness.localRoot, "bw-restored-second"), harness.publicTLS, harness.tlsCAFile, secondEmail, testPassword)
+	restoredSecond := newBitwardenCLI(t, filepath.Join(harness.localRoot, "bw-restored-second"), harness.publicTLS, harness.tlsCAFile, secondEmail)
 	restoredSecond.login(ctx)
 	if itemPassword(t, restoredSecond.getItem(ctx, secondItemID)) != secondPassword {
 		t.Fatal("second user's item did not survive restore")
 	}
 
 	harness.stopDrill()
-	old := harness.restore(firstSnapshot.ID, "old")
-	if old.SnapshotID != firstSnapshot.ID || old.ContentID != firstSnapshot.ContentID {
-		t.Fatalf("explicit old restore = %#v", old)
+	earlier := harness.restore(firstSnapshot.ID, "earlier")
+	if earlier.SnapshotID != firstSnapshot.ID || earlier.ContentID != firstSnapshot.ContentID {
+		t.Fatalf("explicit earlier restore = %#v", earlier)
 	}
-	harness.startDrill("old")
-	oldClient := newBitwardenCLI(t, filepath.Join(harness.localRoot, "bw-restored-old"), harness.publicTLS, harness.tlsCAFile, firstEmail, testPassword)
-	oldClient.login(ctx)
-	if itemPassword(t, oldClient.getItem(ctx, itemID)) != oldItemPassword {
-		t.Fatal("explicit old snapshot did not restore the old item content")
+	harness.startDrill("earlier")
+	earlierClient := newBitwardenCLI(t, filepath.Join(harness.localRoot, "bw-restored-earlier"), harness.publicTLS, harness.tlsCAFile, firstEmail)
+	earlierClient.login(ctx)
+	if itemPassword(t, earlierClient.getItem(ctx, itemID)) != initialItemPassword {
+		t.Fatal("explicit earlier snapshot did not restore the earlier item content")
 	}
 	harness.stopDrill()
 }

@@ -6,10 +6,8 @@ in front of Vaultwarden, creates a verified recovery point from SQLite plus the
 attachment and file-Send payloads referenced by that database, and stores that
 point in one or more S3-backed Restic repositories.
 
-The project is intentionally early. It does not carry compatibility code for
-older configuration, manifests, databases, tags, or deployment layouts. A
-change to a durable contract must be made explicit, versioned, tested, and
-documented.
+The repository contains one complete current contract set. A change to a
+durable contract must be explicit, versioned, tested, and documented.
 
 ## Sources of truth
 
@@ -27,10 +25,9 @@ The repository is designed to be understandable before it is upgradeable:
 - [`docs/upstream-maintenance.md`](docs/upstream-maintenance.md) is the
   one-upstream-at-a-time review procedure.
 
-Hosted workflows, registry publication, and container build recipes outside
-Nix are not part of the project. Nix builds the product binaries, patched
-Restic, and all project-owned images locally. The official Vaultwarden image is
-pulled only by its audited digest and retagged with a local-only name.
+Nix builds the product binaries, patched Restic, and all project-owned images
+locally. The official Vaultwarden image is pulled only by its audited digest
+and retagged with a local-only name.
 
 ## Recovery boundary
 
