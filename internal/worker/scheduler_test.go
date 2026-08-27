@@ -54,6 +54,25 @@ func TestSchedulerDemandDuringCheckIsRetained(t *testing.T) {
 	assertSchedule(t, &state, base.Add(config.QuietWindow+config.MinimumCheckInterval), triggerDemand)
 }
 
+func TestWaitingPreservesPartialAndDegradedStatus(t *testing.T) {
+	t.Parallel()
+	next := time.Date(2026, 8, 27, 12, 5, 0, 0, time.UTC)
+	worker := New(workerConfig("primary"), nil, nil, nil, discardLogger())
+	for _, state := range []string{"partial", "degraded"} {
+		worker.status.State = state
+		worker.setWaiting("idle", &next)
+		status := worker.Status()
+		if status.State != state || status.NextCheckAt == nil || *status.NextCheckAt != formatTime(next) {
+			t.Fatalf("waiting %s status = %#v", state, status)
+		}
+	}
+	worker.status.State = "idle"
+	worker.setWaiting("debouncing", &next)
+	if status := worker.Status(); status.State != "debouncing" {
+		t.Fatalf("ordinary waiting status = %#v", status)
+	}
+}
+
 func assertSchedule(t *testing.T, state *schedule, want time.Time, wantKind triggerKind) {
 	t.Helper()
 	got, kind, ok := state.next()

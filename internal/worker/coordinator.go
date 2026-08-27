@@ -361,6 +361,9 @@ func (worker *Worker) recordTargetAttempt(index int, now time.Time) {
 
 func (worker *Worker) setWaiting(state string, next *time.Time) {
 	worker.mu.Lock()
+	if worker.status.State == "partial" || worker.status.State == "degraded" {
+		state = worker.status.State
+	}
 	worker.status.State = state
 	if next == nil {
 		worker.status.NextCheckAt = nil
