@@ -499,6 +499,12 @@ func TestSubprocessBoundsStderrTimeoutCancellationAndRedaction(t *testing.T) {
 	runHelper := func(ctx context.Context, mode string) ([]byte, error) {
 		return runner.run(ctx, os.Args[0], []string{"-test.run=TestResticHelperProcess", "--", mode}, []string{"GO_WANT_RESTIC_HELPER=1"}, "")
 	}
+	for range 100 {
+		output, err := runHelper(context.Background(), "small-output")
+		if err != nil || string(output) != "small deterministic output\nPASS\n" {
+			t.Fatalf("small subprocess output = %q/%v", output, err)
+		}
+	}
 
 	_, err := runHelper(context.Background(), "stderr-secret")
 	var operationError *OperationError
@@ -536,6 +542,8 @@ func TestResticHelperProcess(t *testing.T) {
 	}
 	mode := os.Args[len(os.Args)-1]
 	switch mode {
+	case "small-output":
+		_, _ = fmt.Fprintln(os.Stdout, "small deterministic output")
 	case "stderr-secret":
 		_, _ = fmt.Fprint(os.Stderr, "sensitive-diagnostic")
 		os.Exit(7)

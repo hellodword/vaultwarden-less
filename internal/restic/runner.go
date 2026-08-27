@@ -17,7 +17,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 	"unicode/utf8"
@@ -472,29 +471,14 @@ func (r Runner) run(ctx context.Context, binary string, arguments, environment [
 	command.Dir = directory
 	command.Env = slices.Clone(environment)
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	stdoutPipe, err := command.StdoutPipe()
-	if err != nil {
-		return nil, &OperationError{Code: "command_failed", ExitCode: -1}
-	}
-	stderrPipe, err := command.StderrPipe()
-	if err != nil {
-		return nil, &OperationError{Code: "command_failed", ExitCode: -1}
-	}
+	stdout := newBoundedWriter(maxCommandOutput)
+	stderr := newBoundedWriter(maxStderrOutput)
+	command.Stdout = &stdout
+	command.Stderr = &stderr
 	if err := command.Start(); err != nil {
 		return nil, &OperationError{Code: "command_failed", ExitCode: -1}
 	}
 
-	var stdout, stderr boundedRead
-	var readers sync.WaitGroup
-	readers.Add(2)
-	go func() {
-		defer readers.Done()
-		stdout = drainBounded(stdoutPipe, maxCommandOutput)
-	}()
-	go func() {
-		defer readers.Done()
-		stderr = drainBounded(stderrPipe, maxStderrOutput)
-	}()
 	waited := make(chan error, 1)
 	go func() { waited <- command.Wait() }()
 
@@ -516,7 +500,6 @@ func (r Runner) run(ctx context.Context, binary string, arguments, environment [
 			waitError = <-waited
 		}
 	}
-	readers.Wait()
 	if cancelled {
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			return nil, &OperationError{Code: "timeout", ExitCode: -1}
@@ -528,7 +511,7 @@ func (r Runner) run(ctx context.Context, binary string, arguments, environment [
 	if errors.As(waitError, &exitError) {
 		exitCode = exitError.ExitCode()
 	}
-	if stdout.err != nil || stderr.err != nil || stdout.exceeded || stderr.exceeded {
+	if stdout.exceeded || stderr.exceeded {
 		return nil, &OperationError{Code: "output_limit", ExitCode: exitCode}
 	}
 	if waitError != nil {
@@ -546,35 +529,25 @@ func terminateProcessGroup(process *os.Process, signal syscall.Signal) {
 	}
 }
 
-type boundedRead struct {
+type boundedWriter struct {
 	data     []byte
+	limit    int
 	exceeded bool
-	err      error
 }
 
-func drainBounded(reader io.Reader, limit int) boundedRead {
-	result := boundedRead{data: make([]byte, 0, min(limit, 64<<10))}
-	buffer := make([]byte, 32<<10)
-	for {
-		count, err := reader.Read(buffer)
-		if count > 0 {
-			remaining := limit - len(result.data)
-			if remaining > 0 {
-				keep := min(remaining, count)
-				result.data = append(result.data, buffer[:keep]...)
-			}
-			if count > remaining {
-				result.exceeded = true
-			}
-		}
-		if errors.Is(err, io.EOF) {
-			return result
-		}
-		if err != nil {
-			result.err = err
-			return result
-		}
+func newBoundedWriter(limit int) boundedWriter {
+	return boundedWriter{data: make([]byte, 0, min(limit, 64<<10)), limit: limit}
+}
+
+func (writer *boundedWriter) Write(data []byte) (int, error) {
+	remaining := writer.limit - len(writer.data)
+	if remaining > 0 {
+		writer.data = append(writer.data, data[:min(remaining, len(data))]...)
 	}
+	if len(data) > remaining {
+		writer.exceeded = true
+	}
+	return len(data), nil
 }
 
 type rawSnapshot struct {
