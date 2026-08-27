@@ -64,15 +64,9 @@ not from this file. It accepts only the declared `@@...@@` template tokens and
 rejects unresolved tokens or Compose `${...}` interpolation. Compose is always
 called with `/dev/null` as its environment file, an explicit project name,
 the deployment root as project directory, and rendered YAML on stdin.
-The production and drill project names are fixed, so one Docker daemon supports
-one vaultwarden-less deployment; use a separate daemon or VM for another
-instance.
-
-Docker subprocesses receive only `PATH`, `TMPDIR`, an isolated credential-free
-Docker config, and these optional standard client inputs when the caller
-supplied them: `DOCKER_HOST`, `DOCKER_TLS_VERIFY`, `DOCKER_CERT_PATH`, and
-`DOCKER_API_VERSION`. SSH is used for ordinary port forwarding, not as a hidden
-Docker transport contract.
+The production and drill project names are fixed. Docker subprocesses inherit
+the caller's ordinary process environment and use an isolated credential-free
+client configuration.
 
 ## Backup configuration
 
@@ -137,7 +131,7 @@ Notifier credentials are mounted only into the resident worker.
 template disables signup, invitation, admin, web-vault, push, icon download,
 and outbound features. It and regenerated RSA state are outside recovery.
 
-## Validation and remote daemons
+## Validation
 
 ```sh
 nix run .#just -- config-validate
@@ -148,8 +142,3 @@ notifier fields without contacting repositories. Maintenance commands validate
 the maintenance role again before invoking Restic.
 
 Relative Compose binds are intentionally rooted at the source/deployment tree.
-With a remote Docker daemon, that exact absolute tree and ownership must exist
-on the Docker host. For real deployment, run Just through SSH on that host.
-Using `DOCKER_HOST` from a different machine is appropriate for image loading
-and isolated verification when ports are forwarded, but it does not copy or
-initialize the host filesystem.

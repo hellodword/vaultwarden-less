@@ -1,0 +1,12 @@
+schema_version: 1
+upgrade_verification_targets:
+  - primary
+targets:
+  - name: primary
+    repository: s3:https://objects.example.test/bucket/vaultwarden
+    options:
+      - name: s3.bucket-lookup
+        value: path
+notifiers:
+  - name: operations
+    type: wechat

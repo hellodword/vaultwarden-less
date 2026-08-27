@@ -224,16 +224,11 @@ class DeploymentScriptTest(unittest.TestCase):
             ):
                 deploy.require_deployment_name(invalid, "name")
 
-    def test_docker_environment_is_an_allowlist(self) -> None:
+    def test_docker_environment_inherits_the_caller(self) -> None:
         supplied = {
             "PATH": "/nix/tools",
             "TMPDIR": "/safe-tmp",
-            "DOCKER_HOST": "tcp://127.0.0.1:2375",
-            "DOCKER_TLS_VERIFY": "1",
-            "DOCKER_CERT_PATH": "/certificates",
-            "DOCKER_API_VERSION": "1.47",
-            "HOME": "/must-not-leak",
-            "AWS_SECRET_ACCESS_KEY": "must-not-leak",
+            "CALLER_SETTING": "preserved",
         }
         with mock.patch.dict(os.environ, supplied, clear=True):
             environment = deploy.docker_environment(Path("/isolated-docker-config"))
@@ -243,10 +238,7 @@ class DeploymentScriptTest(unittest.TestCase):
                 "PATH": "/nix/tools",
                 "TMPDIR": "/safe-tmp",
                 "DOCKER_CONFIG": "/isolated-docker-config",
-                "DOCKER_HOST": "tcp://127.0.0.1:2375",
-                "DOCKER_TLS_VERIFY": "1",
-                "DOCKER_CERT_PATH": "/certificates",
-                "DOCKER_API_VERSION": "1.47",
+                "CALLER_SETTING": "preserved",
             },
         )
 
@@ -270,7 +262,8 @@ class DeploymentScriptTest(unittest.TestCase):
                 deploy.PRODUCTION_PROJECT,
             )
             self.assertEqual(arguments[arguments.index("--file") + 1], "-")
-            self.assertNotIn("HOME", keywords["env"])
+            self.assertEqual(keywords["env"]["HOME"], os.environ["HOME"])
+            self.assertIn("DOCKER_CONFIG", keywords["env"])
             self.assertNotIn("${", keywords["input"])
             self.assertTrue(keywords["check"])
             self.assertTrue(keywords["text"])

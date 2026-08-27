@@ -101,20 +101,10 @@ diagnostics redact passwords and sessions. Every isolated recipient also runs
 `bw config server` explicitly because the Send URL does not configure the CLI
 SDK endpoint used to request its access token.
 
-## Remote Docker through SSH forwarding
+## Explicit test ports
 
-When the daemon is remote, bind fixed ports on its loopback and forward the
-same local ports in a separate SSH session:
-
-```sh
-ssh -N \
-  -L 45201:127.0.0.1:45201 \
-  -L 45202:127.0.0.1:45202 \
-  -L 45203:127.0.0.1:45203 user@docker-host
-
-DOCKER_HOST=tcp://docker-host:2375 nix run .#just -- integration 45201
-DOCKER_HOST=tcp://docker-host:2375 nix run .#just -- e2e 45202 45203
-```
+The real test commands accept optional fixed loopback ports. Nonzero values
+must be distinct and within `1024..65535`; omit them for ephemeral ports.
 
 Expected final evidence includes:
 
@@ -123,8 +113,7 @@ go test verification passed: TestMotoResticIntegration
 go test verification passed: TestVaultwardenBackupRestoreE2E
 ```
 
-With a local daemon, omit port arguments and Docker chooses ephemeral loopback
-ports. Do not expose these verification ports publicly.
+Do not expose verification ports publicly.
 
 ## Offline bundle and real-device acceptance
 

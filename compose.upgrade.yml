@@ -1,0 +1,214 @@
+x-upgrade-service-defaults: &upgrade-service-defaults
+  platform: linux/amd64
+  user: "${RUNTIME_UID:?RUNTIME_UID is required}:${RUNTIME_GID:?RUNTIME_GID is required}"
+  read_only: true
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  stop_grace_period: 2m
+  logging:
+    driver: local
+    options:
+      max-size: 20m
+      max-file: "3"
+
+x-upgrade-maintenance-volumes: &upgrade-maintenance-volumes
+  - type: bind
+    source: .
+    target: /deployment
+    bind:
+      create_host_path: false
+  - type: bind
+    source: ./config/backup.yaml
+    target: /config/backup.yaml
+    read_only: true
+    bind:
+      create_host_path: false
+  - type: bind
+    source: ./credentials/maintenance.yaml
+    target: /run/credentials/role.yaml
+    read_only: true
+    bind:
+      create_host_path: false
+  - type: bind
+    source: ./credentials/restic
+    target: /run/credentials/restic
+    read_only: true
+    bind:
+      create_host_path: false
+  - type: bind
+    source: ./cache
+    target: /cache
+    bind:
+      create_host_path: false
+
+services:
+  vaultwarden:
+    image: "vaultwarden-less-vaultwarden:${B_RELEASE:?B_RELEASE is required}"
+
+  backup:
+    image: "vaultwarden-less-backup:${B_RELEASE:?B_RELEASE is required}"
+
+  proxy:
+    image: "vaultwarden-less-proxy:${B_RELEASE:?B_RELEASE is required}"
+
+  config-check-backup:
+    image: "vaultwarden-less-backup:${B_RELEASE:?B_RELEASE is required}"
+
+  config-check-maintenance:
+    image: "vaultwarden-less-backup:${B_RELEASE:?B_RELEASE is required}"
+
+  maintenance:
+    image: "vaultwarden-less-backup:${B_RELEASE:?B_RELEASE is required}"
+
+  restore:
+    image: "vaultwarden-less-backup:${B_RELEASE:?B_RELEASE is required}"
+
+  drill-copy:
+    image: "vaultwarden-less-vaultwarden:${B_RELEASE:?B_RELEASE is required}"
+
+  drill-vaultwarden:
+    image: "vaultwarden-less-vaultwarden:${B_RELEASE:?B_RELEASE is required}"
+
+  upgrade-a:
+    <<: *upgrade-service-defaults
+    image: "vaultwarden-less-backup:${A_RELEASE:?A_RELEASE is required}"
+    pull_policy: never
+    profiles: [upgrade]
+    restart: "no"
+    entrypoint: [/bin/vaultwarden-less-backup]
+    command: [--help]
+    volumes: *upgrade-maintenance-volumes
+    networks:
+      - maintenance-outbound
+
+  upgrade-b:
+    <<: *upgrade-service-defaults
+    image: "vaultwarden-less-backup:${B_RELEASE:?B_RELEASE is required}"
+    pull_policy: never
+    profiles: [upgrade]
+    restart: "no"
+    entrypoint: [/bin/vaultwarden-less-backup]
+    command: [--help]
+    volumes: *upgrade-maintenance-volumes
+    networks:
+      - maintenance-outbound
+
+  rollback-vaultwarden-a:
+    <<: *upgrade-service-defaults
+    image: "vaultwarden-less-vaultwarden:${A_RELEASE:?A_RELEASE is required}"
+    pull_policy: never
+    profiles: [rollback]
+    restart: unless-stopped
+    hostname: vaultwarden
+    env_file:
+      - ./config/vaultwarden.env
+    volumes:
+      - type: bind
+        source: ./data
+        target: /data
+        bind:
+          create_host_path: false
+    networks:
+      app:
+        aliases: [vaultwarden]
+    healthcheck:
+      test: [CMD, /healthcheck.sh]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  rollback-backup-a:
+    <<: *upgrade-service-defaults
+    image: "vaultwarden-less-backup:${A_RELEASE:?A_RELEASE is required}"
+    pull_policy: never
+    profiles: [rollback]
+    restart: unless-stopped
+    hostname: backup
+    entrypoint: [/bin/vaultwarden-less-backup]
+    command: [serve]
+    volumes:
+      - type: bind
+        source: ./config/backup.yaml
+        target: /config/backup.yaml
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./credentials/restic
+        target: /run/credentials/restic
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./cache
+        target: /cache
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./data
+        target: /data
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./staging
+        target: /staging
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./state
+        target: /state
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./credentials/backup.yaml
+        target: /run/credentials/role.yaml
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./credentials/notifiers.yaml
+        target: /run/credentials/notifiers.yaml
+        read_only: true
+        bind:
+          create_host_path: false
+    networks:
+      events:
+        aliases: [backup]
+      backup-outbound: {}
+    healthcheck:
+      test: [CMD, /bin/vaultwarden-less-backup, healthcheck]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+
+  rollback-proxy-a:
+    <<: *upgrade-service-defaults
+    image: "vaultwarden-less-proxy:${A_RELEASE:?A_RELEASE is required}"
+    pull_policy: never
+    profiles: [rollback]
+    restart: unless-stopped
+    hostname: proxy
+    entrypoint: [/bin/vaultwarden-less-proxy]
+    command: [serve]
+    depends_on:
+      rollback-vaultwarden-a:
+        condition: service_healthy
+      rollback-backup-a:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${LISTEN_PORT:?LISTEN_PORT is required}:8080"
+    networks:
+      - app
+      - events
+      - proxy-ingress
+    healthcheck:
+      test: [CMD, /bin/vaultwarden-less-proxy, healthcheck]
+      interval: 10s
+      timeout: 3s
+      retries: 6

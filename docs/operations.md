@@ -26,28 +26,9 @@ check-full         every gate above
 There is no hosted CI or registry release path. A maintainer runs these gates
 locally and keeps the resulting evidence with the review.
 
-When the Docker API is remote but its published ports are not directly
-reachable, reserve three unused ports on both machines and forward them in a
-separate terminal:
-
-```sh
-ssh -N \
-  -L 45201:127.0.0.1:45201 \
-  -L 45202:127.0.0.1:45202 \
-  -L 45203:127.0.0.1:45203 user@docker-host
-```
-
-Then keep the Docker API remote while the tests reach the forwarded ports via
-local loopback:
-
-```sh
-DOCKER_HOST=tcp://docker-host:2375 nix run .#just -- integration 45201
-DOCKER_HOST=tcp://docker-host:2375 nix run .#just -- e2e 45202 45203
-```
-
-With a local Docker daemon, omit the port arguments; Docker chooses ephemeral
-loopback ports. The fixed ports are a test transport detail, never production
-service exposure.
+Real test recipes accept optional fixed loopback ports. Omit the arguments to
+let Docker choose ephemeral ports. Nonzero values must be distinct and in the
+documented unprivileged range.
 
 The E2E deliberately uses the production 30-second quiet window and five-minute
 minimum check-start interval. It must publish exactly two recovery points and
@@ -72,12 +53,8 @@ digest, applies only a local tag, and runs `docker save` for all three images.
 It also records image IDs, checksums, source, license material, and CycloneDX
 SBOMs. Nothing is pushed.
 
-Copy the entire resulting directory using removable media or a transport such
-as:
-
-```sh
-scp -r dist/vaultwarden-less-<version>-linux-amd64 deploy-host:/srv/
-```
+Move the resulting directory to the deployment device using an
+operator-selected mechanism outside this project contract.
 
 On the deployment device:
 
@@ -149,12 +126,7 @@ not alter paths outside the current declared layout. Run the recipe from an
 account that can `chown` that layout when the selected identity differs from
 the invoking account.
 
-Compose bind paths are relative to the explicit deployment project directory
-and resolve to absolute paths for the Docker daemon. If a client uses
-`DOCKER_HOST` to reach another machine, image loading can be remote, but `init`
-still changes the local filesystem. For a real bind-mounted deployment, run
-initialization and operations on the deployment host through SSH, or provision
-the exact same absolute paths and ownership there.
+Compose bind paths are relative to the explicit deployment project directory.
 
 Only the proxy is published, at `127.0.0.1:8080` by default. Terminate TLS at a
 trusted edge, remove any external path prefix, discard untrusted forwarding

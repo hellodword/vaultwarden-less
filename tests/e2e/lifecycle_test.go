@@ -959,24 +959,7 @@ func runCommandWithEnvironment(
 }
 
 func isolatedDockerEnvironment(configDirectory string) []string {
-	environment := []string{
-		"PATH=" + os.Getenv("PATH"),
-		"TMPDIR=" + environmentOrDefault("TMPDIR", "/tmp"),
-		"DOCKER_CONFIG=" + configDirectory,
-	}
-	for _, name := range []string{"DOCKER_HOST", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH", "DOCKER_API_VERSION"} {
-		if value, ok := os.LookupEnv(name); ok {
-			environment = append(environment, name+"="+value)
-		}
-	}
-	return environment
-}
-
-func environmentOrDefault(name, fallback string) string {
-	if value := os.Getenv(name); value != "" {
-		return value
-	}
-	return fallback
+	return append(os.Environ(), "DOCKER_CONFIG="+configDirectory)
 }
 
 func harnessDiagnostics(value string) string {

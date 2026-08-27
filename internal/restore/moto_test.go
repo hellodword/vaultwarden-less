@@ -503,16 +503,7 @@ func newDockerClient(t *testing.T) *dockerClient {
 	); err != nil {
 		t.Fatal(err)
 	}
-	environment := []string{
-		"PATH=" + os.Getenv("PATH"),
-		"TMPDIR=/tmp",
-		"DOCKER_CONFIG=" + config,
-	}
-	for _, name := range []string{"DOCKER_HOST", "DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH", "DOCKER_API_VERSION"} {
-		if value, ok := os.LookupEnv(name); ok {
-			environment = append(environment, name+"="+value)
-		}
-	}
+	environment := append(os.Environ(), "DOCKER_CONFIG="+config)
 	return &dockerClient{binary: binary, config: config, environment: environment}
 }
 

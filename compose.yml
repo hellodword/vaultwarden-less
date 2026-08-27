@@ -1,0 +1,404 @@
+name: vaultwarden-less
+
+x-service-defaults: &service-defaults
+  platform: linux/amd64
+  restart: unless-stopped
+  user: "${RUNTIME_UID:?RUNTIME_UID is required}:${RUNTIME_GID:?RUNTIME_GID is required}"
+  read_only: true
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  stop_grace_period: 2m
+  logging:
+    driver: local
+    options:
+      max-size: 20m
+      max-file: "3"
+
+x-backup-config-mount: &backup-config-mount
+  type: bind
+  source: ./config/backup.yaml
+  target: /config/backup.yaml
+  read_only: true
+  bind:
+    create_host_path: false
+
+x-restic-credentials-mount: &restic-credentials-mount
+  type: bind
+  source: ./credentials/restic
+  target: /run/credentials/restic
+  read_only: true
+  bind:
+    create_host_path: false
+
+x-cache-mount: &cache-mount
+  type: bind
+  source: ./cache
+  target: /cache
+  bind:
+    create_host_path: false
+
+services:
+  vaultwarden:
+    <<: *service-defaults
+    image: vaultwarden-less-vaultwarden:local
+    pull_policy: never
+    hostname: vaultwarden
+    env_file:
+      - ./config/vaultwarden.env
+    volumes:
+      - type: bind
+        source: ./data
+        target: /data
+        bind:
+          create_host_path: false
+    networks:
+      app:
+        aliases: [vaultwarden]
+    healthcheck:
+      test: [CMD, /healthcheck.sh]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  backup:
+    <<: *service-defaults
+    image: vaultwarden-less-backup:local
+    pull_policy: never
+    hostname: backup
+    entrypoint: [/bin/vaultwarden-less-backup]
+    command: [serve]
+    volumes:
+      - *backup-config-mount
+      - *restic-credentials-mount
+      - *cache-mount
+      - type: bind
+        source: ./data
+        target: /data
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./staging
+        target: /staging
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./state
+        target: /state
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./credentials/backup.yaml
+        target: /run/credentials/role.yaml
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./credentials/notifiers.yaml
+        target: /run/credentials/notifiers.yaml
+        read_only: true
+        bind:
+          create_host_path: false
+    networks:
+      events:
+        aliases: [backup]
+      backup-outbound: {}
+    healthcheck:
+      test: [CMD, /bin/vaultwarden-less-backup, healthcheck]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+
+  proxy:
+    <<: *service-defaults
+    image: vaultwarden-less-proxy:local
+    pull_policy: never
+    hostname: proxy
+    entrypoint: [/bin/vaultwarden-less-proxy]
+    command: [serve]
+    depends_on:
+      vaultwarden:
+        condition: service_healthy
+      backup:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${LISTEN_PORT:?LISTEN_PORT is required}:8080"
+    networks:
+      - app
+      - events
+      - proxy-ingress
+    healthcheck:
+      test: [CMD, /bin/vaultwarden-less-proxy, healthcheck]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+
+  config-check-backup:
+    <<: *service-defaults
+    image: vaultwarden-less-backup:local
+    pull_policy: never
+    profiles: [maintenance]
+    restart: "no"
+    network_mode: none
+    entrypoint: [/bin/vaultwarden-less-backup]
+    command: [config, validate, --role, backup]
+    volumes:
+      - *backup-config-mount
+      - *restic-credentials-mount
+      - *cache-mount
+      - type: bind
+        source: ./.env
+        target: /deployment/.env
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./data
+        target: /data
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./staging
+        target: /staging
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./restore
+        target: /restore
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./state
+        target: /state
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./credentials/backup.yaml
+        target: /run/credentials/role.yaml
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./credentials/notifiers.yaml
+        target: /run/credentials/notifiers.yaml
+        read_only: true
+        bind:
+          create_host_path: false
+
+  config-check-maintenance:
+    <<: *service-defaults
+    image: vaultwarden-less-backup:local
+    pull_policy: never
+    profiles: [maintenance]
+    restart: "no"
+    network_mode: none
+    entrypoint: [/bin/vaultwarden-less-backup]
+    command: [config, validate, --role, maintenance]
+    volumes:
+      - *backup-config-mount
+      - *restic-credentials-mount
+      - *cache-mount
+      - type: bind
+        source: ./.env
+        target: /deployment/.env
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./data
+        target: /data
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./staging
+        target: /staging
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./restore
+        target: /restore
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./state
+        target: /state
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./credentials/maintenance.yaml
+        target: /run/credentials/role.yaml
+        read_only: true
+        bind:
+          create_host_path: false
+
+  maintenance:
+    <<: *service-defaults
+    image: vaultwarden-less-backup:local
+    pull_policy: never
+    profiles: [maintenance]
+    restart: "no"
+    entrypoint: [/bin/vaultwarden-less-backup]
+    command: [--help]
+    volumes:
+      - *backup-config-mount
+      - *restic-credentials-mount
+      - *cache-mount
+      - type: bind
+        source: ./data
+        target: /data
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./staging
+        target: /staging
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./restore
+        target: /restore
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./state
+        target: /state
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./credentials/maintenance.yaml
+        target: /run/credentials/role.yaml
+        read_only: true
+        bind:
+          create_host_path: false
+    networks:
+      - maintenance-outbound
+
+  restore:
+    <<: *service-defaults
+    image: vaultwarden-less-backup:local
+    pull_policy: never
+    profiles: [restore]
+    restart: "no"
+    entrypoint: [/bin/vaultwarden-less-backup]
+    command: [--help]
+    volumes:
+      - *backup-config-mount
+      - *restic-credentials-mount
+      - *cache-mount
+      - type: bind
+        source: ./restore
+        target: /restore
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./state
+        target: /state
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./credentials/maintenance.yaml
+        target: /run/credentials/role.yaml
+        read_only: true
+        bind:
+          create_host_path: false
+    networks:
+      - maintenance-outbound
+
+  drill-copy:
+    <<: *service-defaults
+    image: vaultwarden-less-vaultwarden:local
+    pull_policy: never
+    profiles: [drill]
+    restart: "no"
+    user: 0:0
+    network_mode: none
+    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER]
+    entrypoint: [/bin/sh, -eu, -c]
+    command:
+      - |
+        test -f /source/db.sqlite3
+        test -z "$$(ls -A /drill-data)"
+        cp /source/db.sqlite3 /drill-data/db.sqlite3
+        for directory in attachments sends; do
+          if test -d "/source/$$directory"; then
+            cp -a "/source/$$directory" "/drill-data/$$directory"
+          fi
+        done
+        chown -R "$$1:$$2" /drill-data
+      - drill-copy
+      - "${RUNTIME_UID:?RUNTIME_UID is required}"
+      - "${RUNTIME_GID:?RUNTIME_GID is required}"
+    volumes:
+      - type: bind
+        source: ./restore/drill
+        target: /source
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: volume
+        source: drill-data
+        target: /drill-data
+
+  drill-vaultwarden:
+    <<: *service-defaults
+    image: vaultwarden-less-vaultwarden:local
+    pull_policy: never
+    profiles: [drill]
+    restart: "no"
+    depends_on:
+      drill-copy:
+        condition: service_completed_successfully
+    environment:
+      DOMAIN: "http://127.0.0.1:${DRILL_PORT:?DRILL_PORT is required}"
+      DATA_FOLDER: /data
+      DATABASE_URL: sqlite:///data/db.sqlite3
+      RSA_KEY_FILENAME: /data/rsa_key
+      ATTACHMENTS_FOLDER: /data/attachments
+      SENDS_FOLDER: /data/sends
+      WEB_VAULT_ENABLED: "false"
+      ENABLE_WEBSOCKET: "false"
+      PUSH_ENABLED: "false"
+      SIGNUPS_ALLOWED: "false"
+      INVITATIONS_ALLOWED: "false"
+      DISABLE_ICON_DOWNLOAD: "true"
+    volumes:
+      - type: volume
+        source: drill-data
+        target: /data
+    ports:
+      - "127.0.0.1:${DRILL_PORT:?DRILL_PORT is required}:80"
+    networks:
+      - drill
+      - drill-ingress
+    healthcheck:
+      test: [CMD, /healthcheck.sh]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+networks:
+  app:
+    internal: true
+  events:
+    internal: true
+  proxy-ingress:
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: "false"
+  backup-outbound: {}
+  maintenance-outbound: {}
+  drill:
+    internal: true
+  drill-ingress:
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: "false"
+
+volumes:
+  drill-data: {}

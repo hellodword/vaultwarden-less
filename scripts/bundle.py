@@ -21,12 +21,6 @@ IMAGE_ID_PATTERN = re.compile(r"sha256:[0-9a-f]{64}")
 LOCAL_TAG_PATTERN = re.compile(
     r"vaultwarden-less-(backup|proxy|vaultwarden):[a-z0-9][a-z0-9._-]{0,127}"
 )
-DOCKER_INPUTS = (
-    "DOCKER_HOST",
-    "DOCKER_TLS_VERIFY",
-    "DOCKER_CERT_PATH",
-    "DOCKER_API_VERSION",
-)
 ANONYMOUS_DOCKER_CONFIG = '{"auths":{"https://index.docker.io/v1/":{}}}\n'
 
 
@@ -70,18 +64,10 @@ def sha256_file(path: Path) -> str:
 
 
 def docker_environment(config_directory: Path) -> dict[str, str]:
-    path = os.environ.get("PATH")
-    if not path:
+    environment = os.environ.copy()
+    if not environment.get("PATH"):
         raise ValueError("PATH is required to locate Nix-provided Docker tools")
-    environment = {
-        "PATH": path,
-        "TMPDIR": os.environ.get("TMPDIR", "/tmp"),
-        "DOCKER_CONFIG": os.fspath(config_directory),
-    }
-    for name in DOCKER_INPUTS:
-        value = os.environ.get(name)
-        if value is not None:
-            environment[name] = value
+    environment["DOCKER_CONFIG"] = os.fspath(config_directory)
     return environment
 
 
