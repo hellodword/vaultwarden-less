@@ -1,11 +1,14 @@
 package upstream
 
 import (
+	"bytes"
 	"crypto/sha256"
 	_ "embed"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"slices"
 	"strings"
 	"sync"
@@ -37,16 +40,14 @@ var (
 
 func VaultwardenSchemaContract() (SchemaContract, error) {
 	loadSchemaOnce.Do(func() {
-		decoder := json.NewDecoder(strings.NewReader(string(schemaContractJSON)))
-		decoder.DisallowUnknownFields()
-		if err := decoder.Decode(&loadedSchema); err != nil {
+		if err := decodeStrictJSON(schemaContractJSON, &loadedSchema); err != nil {
 			loadedSchemaErr = fmt.Errorf("decode embedded Vaultwarden schema contract: %w", err)
 			return
 		}
 		if loadedSchema.ContractVersion != 1 ||
-			loadedSchema.VaultwardenVersion != VaultwardenVersion ||
-			loadedSchema.DatabaseMigration != VaultwardenMigration ||
-			loadedSchema.Fingerprint != VaultwardenSchemaFingerprint ||
+			loadedSchema.VaultwardenVersion == "" ||
+			loadedSchema.DatabaseMigration == "" ||
+			!validDigest(loadedSchema.Fingerprint) ||
 			len(loadedSchema.Objects) == 0 ||
 			SchemaFingerprint(loadedSchema.Objects) != loadedSchema.Fingerprint {
 			loadedSchemaErr = fmt.Errorf("embedded Vaultwarden schema contract is inconsistent")
@@ -81,4 +82,29 @@ func SchemaFingerprint(objects []SchemaObject) string {
 		_, _ = digest.Write([]byte{'\n'})
 	}
 	return "sha256:" + hex.EncodeToString(digest.Sum(nil))
+}
+
+func decodeStrictJSON(data []byte, destination any) error {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(destination); err != nil {
+		return err
+	}
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		return fmt.Errorf("document contains trailing JSON")
+	}
+	return nil
+}
+
+func validDigest(value string) bool {
+	if len(value) != len("sha256:")+64 || !strings.HasPrefix(value, "sha256:") {
+		return false
+	}
+	raw := strings.TrimPrefix(value, "sha256:")
+	if strings.ToLower(raw) != raw {
+		return false
+	}
+	_, err := hex.DecodeString(raw)
+	return err == nil
 }

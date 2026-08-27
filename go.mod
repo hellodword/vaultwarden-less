@@ -2,7 +2,7 @@ module github.com/hellodword/vaultwarden-less
 
 go 1.26
 
-toolchain go1.26.7
+toolchain go1.26.5
 
 require (
 	github.com/goccy/go-yaml v1.19.2

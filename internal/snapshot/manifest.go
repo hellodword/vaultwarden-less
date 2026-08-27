@@ -42,13 +42,6 @@ type contentPayload struct {
 	Files         []File           `json:"files"`
 }
 
-var supportedVaultwardenTuples = []VaultwardenTuple{{
-	Version:                   upstream.VaultwardenVersion,
-	DatabaseMigration:         upstream.VaultwardenMigration,
-	DatabaseSchemaFingerprint: upstream.VaultwardenSchemaFingerprint,
-	Image:                     upstream.VaultwardenImageRepository + "@" + upstream.VaultwardenImageDigest,
-}}
-
 func NewManifest(files []File) (Manifest, error) {
 	files = slices.Clone(files)
 	if files == nil {
@@ -57,10 +50,14 @@ func NewManifest(files []File) (Manifest, error) {
 	slices.SortFunc(files, func(left, right File) int {
 		return strings.Compare(left.Path, right.Path)
 	})
+	vaultwarden, err := currentVaultwardenTuple()
+	if err != nil {
+		return Manifest{}, err
+	}
 	manifest := Manifest{
 		SchemaVersion:  ManifestVersion,
 		CreatorVersion: buildinfo.Version,
-		Vaultwarden:    supportedVaultwardenTuples[0],
+		Vaultwarden:    vaultwarden,
 		Files:          files,
 	}
 	contentID, err := manifest.CalculateContentID()
@@ -126,7 +123,21 @@ func (m Manifest) Validate() error {
 }
 
 func supportedVaultwardenTuple(tuple VaultwardenTuple) bool {
-	return slices.Contains(supportedVaultwardenTuples, tuple)
+	current, err := currentVaultwardenTuple()
+	return err == nil && tuple == current
+}
+
+func currentVaultwardenTuple() (VaultwardenTuple, error) {
+	contract, err := upstream.VaultwardenSchemaContract()
+	if err != nil {
+		return VaultwardenTuple{}, err
+	}
+	return VaultwardenTuple{
+		Version:                   contract.VaultwardenVersion,
+		DatabaseMigration:         contract.DatabaseMigration,
+		DatabaseSchemaFingerprint: contract.Fingerprint,
+		Image:                     "vaultwarden-less-vaultwarden:local",
+	}, nil
 }
 
 func validCreatorVersion(value string) bool {

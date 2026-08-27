@@ -269,7 +269,7 @@ func validateDatabase(ctx context.Context, path string) (databaseValidation, err
 	if err := database.QueryRowContext(ctx, "SELECT max(version) FROM __diesel_schema_migrations").Scan(&migration); err != nil {
 		return databaseValidation{}, fmt.Errorf("read database migration: %w", err)
 	}
-	if !migration.Valid || migration.String != upstream.VaultwardenMigration {
+	if !migration.Valid || migration.String != contract.DatabaseMigration {
 		return databaseValidation{}, fmt.Errorf("unsupported database migration")
 	}
 	return databaseValidation{Migration: migration.String, SchemaFingerprint: schemaFingerprint}, nil

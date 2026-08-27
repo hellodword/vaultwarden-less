@@ -78,7 +78,7 @@ func recoveryTemplate(t *testing.T) (string, snapshot.Manifest) {
 	for _, object := range contract.Objects {
 		statements = append(statements, object.SQL)
 	}
-	statements = append(statements, "INSERT INTO __diesel_schema_migrations(version) VALUES ('"+upstream.VaultwardenMigration+"')")
+	statements = append(statements, "INSERT INTO __diesel_schema_migrations(version) VALUES ('"+contract.DatabaseMigration+"')")
 	for _, statement := range statements {
 		if _, err := database.Exec(statement); err != nil {
 			_ = database.Close()

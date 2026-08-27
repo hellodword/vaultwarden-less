@@ -23,11 +23,10 @@ import (
 	"github.com/hellodword/vaultwarden-less/internal/restic"
 	restoretool "github.com/hellodword/vaultwarden-less/internal/restore"
 	"github.com/hellodword/vaultwarden-less/internal/snapshot"
-	"github.com/hellodword/vaultwarden-less/internal/upstream"
 	_ "github.com/mattn/go-sqlite3"
 )
 
-var motoServerImage = "vaultwarden-less-moto:" + upstream.MotoVersion
+const motoServerImage = "vaultwarden-less-moto:local"
 
 var (
 	runMotoIntegration = flag.Bool("run-moto-integration", false, "run the real Moto and Restic integration test")

@@ -25,7 +25,6 @@ import (
 	"time"
 
 	productcli "github.com/hellodword/vaultwarden-less/internal/cli"
-	"github.com/hellodword/vaultwarden-less/internal/upstream"
 )
 
 const (
@@ -47,7 +46,6 @@ type e2eHarness struct {
 	repository        string
 	localRoot         string
 	project           string
-	version           string
 	publishedHost     string
 	proxyHostPort     int
 	drillHostPort     int
@@ -84,14 +82,6 @@ func newE2EHarness(t *testing.T, ctx context.Context) *e2eHarness {
 		filepath.Join(dockerConfig, "config.json"),
 		"{\"auths\":{\"https://index.docker.io/v1/\":{}}}\n",
 	)
-	versionData, err := os.ReadFile(filepath.Join(repository, "VERSION"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	version := strings.TrimSpace(string(versionData))
-	if !regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+$`).MatchString(version) {
-		t.Fatalf("invalid VERSION %q", version)
-	}
 	if _, err := exec.LookPath("bw"); err != nil {
 		t.Fatalf("the Nix-provided official bw CLI is required: %v", err)
 	}
@@ -107,7 +97,6 @@ func newE2EHarness(t *testing.T, ctx context.Context) *e2eHarness {
 		repository:    repository,
 		localRoot:     localRoot,
 		project:       fmt.Sprintf("vwless-e2e-%d-%d", os.Getpid(), time.Now().UnixNano()),
-		version:       version,
 		publishedHost: "127.0.0.1",
 		proxyHostPort: *proxyPort,
 		drillHostPort: *drillPort,
@@ -137,7 +126,7 @@ func repositoryRoot(t *testing.T) string {
 	}
 	for {
 		if _, err := os.Stat(filepath.Join(current, "deploy", "compose.template.yml")); err == nil {
-			if _, err := os.Stat(filepath.Join(current, "VERSION")); err == nil {
+			if _, err := os.Stat(filepath.Join(current, "flake.nix")); err == nil {
 				return current
 			}
 		}
@@ -150,7 +139,7 @@ func repositoryRoot(t *testing.T) string {
 }
 
 func (h *e2eHarness) prepareImages() {
-	for _, attribute := range []string{"backup-image", "proxy-image", "moto-image"} {
+	for _, attribute := range []string{"backup-image", "proxy-image", "vaultwarden-image", "moto-image"} {
 		output, err := runCommand(
 			h.ctx,
 			h.repository,
@@ -171,13 +160,6 @@ func (h *e2eHarness) prepareImages() {
 		if loaded, err := h.docker("load", "--input", paths[0]); err != nil {
 			h.t.Fatalf("load Nix image %s: %v: %s", attribute, err, harnessDiagnostics(loaded))
 		}
-	}
-	official := upstream.VaultwardenImageRepository + ":" + upstream.VaultwardenVersion + "@" + upstream.VaultwardenImageDigest
-	if output, err := h.docker("pull", official); err != nil {
-		h.t.Fatalf("pull pinned Vaultwarden image: %v: %s", err, harnessDiagnostics(output))
-	}
-	if output, err := h.docker("tag", official, upstream.VaultwardenLocalImage); err != nil {
-		h.t.Fatalf("tag pinned Vaultwarden image: %v: %s", err, harnessDiagnostics(output))
 	}
 }
 
@@ -231,9 +213,9 @@ func (h *e2eHarness) writeComposeFiles(drillName string) {
 		map[string]string{
 			"@@USER_UID@@":           "10000",
 			"@@USER_GID@@":           "10000",
-			"@@IMAGE_BACKUP@@":       "vaultwarden-less-backup:" + h.version,
-			"@@IMAGE_PROXY@@":        "vaultwarden-less-proxy:" + h.version,
-			"@@IMAGE_VAULTWARDEN@@":  upstream.VaultwardenLocalImage,
+			"@@IMAGE_BACKUP@@":       "vaultwarden-less-backup:local",
+			"@@IMAGE_PROXY@@":        "vaultwarden-less-proxy:local",
+			"@@IMAGE_VAULTWARDEN@@":  "vaultwarden-less-vaultwarden:local",
 			"@@PORT_PROXY@@":         "0",
 			"@@PORT_DRILL@@":         "0",
 			"@@RESTORE_NAME_DRILL@@": drillName,
@@ -243,8 +225,8 @@ func (h *e2eHarness) writeComposeFiles(drillName string) {
 		h.t,
 		filepath.Join(h.repository, "tests", "e2e", "compose.template.yml"),
 		map[string]string{
-			"@@IMAGE_VAULTWARDEN@@": upstream.VaultwardenLocalImage,
-			"@@IMAGE_MOTO@@":        "vaultwarden-less-moto:" + upstream.MotoVersion,
+			"@@IMAGE_VAULTWARDEN@@": "vaultwarden-less-vaultwarden:local",
+			"@@IMAGE_MOTO@@":        "vaultwarden-less-moto:local",
 			"@@E2E_DOMAIN@@":        h.publicTLS,
 			"@@PORT_PROXY_E2E@@":    strconv.Itoa(h.proxyHostPort),
 			"@@PORT_DRILL_E2E@@":    strconv.Itoa(h.drillHostPort),

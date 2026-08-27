@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"sort"
 	"strconv"
@@ -22,7 +23,6 @@ import (
 	"github.com/hellodword/vaultwarden-less/internal/config"
 	"github.com/hellodword/vaultwarden-less/internal/privatefs"
 	"github.com/hellodword/vaultwarden-less/internal/snapshot"
-	"github.com/hellodword/vaultwarden-less/internal/upstream"
 )
 
 const (
@@ -34,6 +34,8 @@ const (
 	DefaultSnapshotsLimit = 100
 	MaxSnapshotsLimit     = 1000
 )
+
+var resticVersionPattern = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$`)
 
 type OperationError struct {
 	Code     string
@@ -85,7 +87,8 @@ func (r Runner) VerifyVersion(ctx context.Context) error {
 		return err
 	}
 	value := strings.TrimSpace(string(output))
-	if value != "restic "+upstream.ResticVersion && !strings.HasPrefix(value, "restic "+upstream.ResticVersion+" ") {
+	fields := strings.Fields(value)
+	if len(fields) < 2 || fields[0] != "restic" || !resticVersionPattern.MatchString(fields[1]) {
 		return &OperationError{Code: "version_mismatch", ExitCode: -1}
 	}
 	return nil

@@ -1,74 +1,157 @@
-"""Resolve one explicit upstream tag and write a read-only audit diff report."""
+"""Resolve one explicit upstream tag and write a binary-safe audit report."""
 
 from __future__ import annotations
 
 import argparse
 import fnmatch
+import json
+import os
 import re
 import subprocess
 import sys
+import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
 import tomllib
 
-UPSTREAMS = {
-    "vaultwarden": (
-        "vaultwarden",
-        "https://github.com/dani-garcia/vaultwarden.git",
-    ),
-    "bitwarden-cli": (
-        "bitwarden_cli",
-        "https://github.com/bitwarden/clients.git",
-    ),
-    "restic": ("restic", "https://github.com/restic/restic.git"),
-    "moto": ("moto", "https://github.com/getmoto/moto.git"),
-    "go": ("go", "https://go.googlesource.com/go"),
-}
+COMPONENTS = ("vaultwarden", "bitwarden-cli", "restic", "moto", "go")
+SECTION_NAMES = {"bitwarden-cli": "bitwarden_cli"}
 TAG_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/+\-]{0,127}")
 COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}")
+STATUS_PATTERN = re.compile(r"[ACDMRTUXB][0-9]{0,3}")
+MARKDOWN_CONTROLS = "`*_<>[]()#!|&"
+
+
+@dataclass(frozen=True)
+class Change:
+    status: str
+    paths: tuple[bytes, ...]
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("component", choices=sorted(UPSTREAMS))
+    parser.add_argument("component", choices=COMPONENTS)
     parser.add_argument("candidate_tag")
     parser.add_argument("--upstreams", type=Path, default=Path("UPSTREAMS.toml"))
     return parser.parse_args()
 
 
-def run(arguments: list[str], *, capture: bool = False) -> str:
-    completed = subprocess.run(
+def run(arguments: list[str], *, cwd: Path | None = None) -> bytes:
+    return subprocess.run(
         arguments,
+        cwd=cwd,
         check=True,
-        stdout=subprocess.PIPE if capture else None,
-        text=True,
-    )
-    return completed.stdout if capture else ""
+        capture_output=True,
+    ).stdout
 
 
-def git(repository: Path, arguments: list[str], *, capture: bool = False) -> str:
-    return run(["git", "-C", str(repository), *arguments], capture=capture)
+def git(repository: Path, arguments: list[str]) -> bytes:
+    return run(["git", "-C", os.fspath(repository), *arguments])
 
 
 def resolve_tag(repository: Path, tag: str, namespace: str) -> str:
     reference = f"refs/vaultwarden-less/{namespace}"
-    run(
+    git(
+        repository,
         [
-            "git",
-            "-C",
-            str(repository),
             "fetch",
             "--force",
             "--no-tags",
             "origin",
             f"refs/tags/{tag}:{reference}",
-        ]
+        ],
     )
-    commit = git(repository, ["rev-parse", f"{reference}^{{commit}}"], capture=True)
-    commit = commit.strip()
+    commit = (
+        git(repository, ["rev-parse", f"{reference}^{{commit}}"])
+        .decode("ascii")
+        .strip()
+    )
     if not COMMIT_PATTERN.fullmatch(commit):
         raise ValueError(f"upstream tag {tag!r} did not resolve to a commit")
     return commit
+
+
+def parse_changes(data: bytes) -> list[Change]:
+    fields = data.split(b"\0")
+    if fields and fields[-1] == b"":
+        fields.pop()
+    changes: list[Change] = []
+    index = 0
+    while index < len(fields):
+        try:
+            status = fields[index].decode("ascii")
+        except UnicodeDecodeError as error:
+            raise ValueError("diff contains a non-ASCII status") from error
+        index += 1
+        if not STATUS_PATTERN.fullmatch(status):
+            raise ValueError(f"diff contains invalid status {status!r}")
+        path_count = 2 if status.startswith(("R", "C")) else 1
+        if index + path_count > len(fields):
+            raise ValueError("diff name-status output is truncated")
+        paths = tuple(fields[index : index + path_count])
+        if any(not path for path in paths):
+            raise ValueError("diff contains an empty path")
+        changes.append(Change(status=status, paths=paths))
+        index += path_count
+    return changes
+
+
+def decode_path(value: bytes) -> str:
+    return value.decode("utf-8", "surrogateescape")
+
+
+def markdown_literal(value: str) -> str:
+    encoded = json.dumps(value, ensure_ascii=True)
+    for character in MARKDOWN_CONTROLS:
+        encoded = encoded.replace(character, f"\\u{ord(character):04x}")
+    return encoded
+
+
+def audited(change: Change, patterns: list[str]) -> bool:
+    return any(
+        fnmatch.fnmatchcase(decode_path(path), pattern)
+        for path in change.paths
+        for pattern in patterns
+    )
+
+
+def change_line(change: Change) -> str:
+    paths = " -> ".join(markdown_literal(decode_path(path)) for path in change.paths)
+    return f"- {markdown_literal(change.status)} {paths}"
+
+
+def parse_commits(data: bytes) -> list[tuple[str, str]]:
+    commits: list[tuple[str, str]] = []
+    for record in data.split(b"\0"):
+        if not record:
+            continue
+        commit, separator, subject = record.partition(b"\t")
+        if not separator:
+            raise ValueError("git log output is malformed")
+        commit_text = commit.decode("ascii")
+        if not COMMIT_PATTERN.fullmatch(commit_text):
+            raise ValueError("git log contains an invalid commit")
+        commits.append((commit_text, subject.decode("utf-8", "surrogateescape")))
+    return commits
+
+
+def atomic_write(path: Path, text: str) -> None:
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as output:
+            descriptor = -1
+            output.write(text)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        temporary.unlink(missing_ok=True)
 
 
 def main() -> int:
@@ -77,13 +160,15 @@ def main() -> int:
         if not TAG_PATTERN.fullmatch(args.candidate_tag):
             raise ValueError("candidate tag has an invalid form")
         metadata = tomllib.loads(args.upstreams.read_text(encoding="utf-8"))
-        section_name, remote = UPSTREAMS[args.component]
-        section = metadata[section_name]
+        section = metadata[SECTION_NAMES.get(args.component, args.component)]
+        repository_url = section["repository"]
         base_tag = section["source_tag"]
         base_commit = section["source_commit"]
         audit_paths = section["audit_paths"]
         if (
-            not isinstance(base_tag, str)
+            not isinstance(repository_url, str)
+            or not repository_url.startswith("https://")
+            or not isinstance(base_tag, str)
             or not COMMIT_PATTERN.fullmatch(base_commit)
             or not isinstance(audit_paths, list)
             or not all(isinstance(item, str) and item for item in audit_paths)
@@ -104,14 +189,14 @@ def main() -> int:
                     "clone",
                     "--filter=blob:none",
                     "--no-checkout",
-                    remote,
-                    str(repository),
+                    repository_url,
+                    os.fspath(repository),
                 ]
             )
-        actual_remote = git(
-            repository, ["remote", "get-url", "origin"], capture=True
-        ).strip()
-        if actual_remote != remote:
+        actual_remote = (
+            git(repository, ["remote", "get-url", "origin"]).decode("utf-8").strip()
+        )
+        if actual_remote != repository_url:
             raise ValueError("cached upstream repository has an unexpected origin")
 
         resolved_base = resolve_tag(repository, base_tag, "base")
@@ -120,68 +205,64 @@ def main() -> int:
         candidate_commit = resolve_tag(repository, args.candidate_tag, "candidate")
         git(repository, ["checkout", "--detach", "--force", candidate_commit])
 
-        changed_output = git(
-            repository,
-            ["diff", "--name-status", base_commit, candidate_commit],
-            capture=True,
+        changes = parse_changes(
+            git(
+                repository,
+                [
+                    "diff",
+                    "--name-status",
+                    "-z",
+                    "--find-renames",
+                    "--find-copies",
+                    base_commit,
+                    candidate_commit,
+                    "--",
+                ],
+            )
         )
-        changed_lines = [line for line in changed_output.splitlines() if line]
-        audit_lines = []
-        for line in changed_lines:
-            path = line.split("\t")[-1]
-            if any(fnmatch.fnmatchcase(path, pattern) for pattern in audit_paths):
-                audit_lines.append(line)
-        stat = git(
-            repository,
-            ["diff", "--stat", base_commit, candidate_commit],
-            capture=True,
-        ).rstrip()
-        commits = git(
-            repository,
-            [
-                "log",
-                "--format=%H %s",
-                "--no-merges",
-                f"{base_commit}..{candidate_commit}",
-            ],
-            capture=True,
-        ).rstrip()
+        commits = parse_commits(
+            git(
+                repository,
+                [
+                    "log",
+                    "-z",
+                    "--format=%H%x09%s",
+                    "--no-merges",
+                    f"{base_commit}..{candidate_commit}",
+                ],
+            )
+        )
+        audit_changes = [change for change in changes if audited(change, audit_paths)]
         report = [
             f"# {args.component} upstream audit",
             "",
-            f"- Current tag: `{base_tag}`",
-            f"- Current commit: `{base_commit}`",
-            f"- Candidate tag: `{args.candidate_tag}`",
-            f"- Candidate commit: `{candidate_commit}`",
+            f"- Current tag: {markdown_literal(base_tag)}",
+            f"- Current commit: {markdown_literal(base_commit)}",
+            f"- Candidate tag: {markdown_literal(args.candidate_tag)}",
+            f"- Candidate commit: {markdown_literal(candidate_commit)}",
             "",
             "## Audited-surface changes",
             "",
-            "```text",
-            *(audit_lines or ["(none)"]),
-            "```",
-            "",
-            "## Full diff stat",
-            "",
-            "```text",
-            stat or "(none)",
-            "```",
+            *(change_line(change) for change in audit_changes),
+            *(["- (none)"] if not audit_changes else []),
             "",
             "## Non-merge commits",
             "",
-            "```text",
-            commits or "(none)",
-            "```",
+            *(
+                f"- {markdown_literal(commit)} {markdown_literal(subject)}"
+                for commit, subject in commits
+            ),
+            *(["- (none)"] if not commits else []),
             "",
             "## All changed paths",
             "",
-            "```text",
-            *(changed_lines or ["(none)"]),
-            "```",
+            *(change_line(change) for change in changes),
+            *(["- (none)"] if not changes else []),
             "",
         ]
         safe_tag = re.sub(r"[^A-Za-z0-9._-]", "_", args.candidate_tag)
         destination = component_root / f"report-{safe_tag}.md"
-        destination.write_text("\n".join(report), encoding="utf-8", newline="\n")
+        atomic_write(destination, "\n".join(report))
         print(destination)
     except (
         KeyError,

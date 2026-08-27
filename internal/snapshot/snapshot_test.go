@@ -68,7 +68,7 @@ func syntheticData(t *testing.T, includeFiles bool) fixture {
 		query string
 		args  []any
 	}{
-		{"INSERT INTO __diesel_schema_migrations(version, run_on) VALUES (?, '2026-05-05')", []any{upstream.VaultwardenMigration}},
+		{"INSERT INTO __diesel_schema_migrations(version, run_on) VALUES (?, '2026-05-05')", []any{contract.DatabaseMigration}},
 		{"INSERT INTO ciphers(uuid, created_at, updated_at, atype, name, data) VALUES (?, '2026-05-05', '2026-05-05', 2, 'cipher', '{}')", []any{testCipherID}},
 		{"INSERT INTO attachments(id, cipher_uuid, file_name, file_size) VALUES (?, ?, 'encrypted', ?)", []any{testAttachmentID, testCipherID, len(attachmentData)}},
 		{`INSERT INTO sends(
@@ -281,8 +281,12 @@ func TestOnlineBackupCapturesOneConsistentWALTransactionDuringWrites(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if validation.Migration != upstream.VaultwardenMigration ||
-		validation.SchemaFingerprint != upstream.VaultwardenSchemaFingerprint {
+	contract, err := upstream.VaultwardenSchemaContract()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if validation.Migration != contract.DatabaseMigration ||
+		validation.SchemaFingerprint != contract.Fingerprint {
 		t.Fatalf("recovery database contract = %#v", validation)
 	}
 	recovered, err := sql.Open("sqlite3", sqliteURI(recoveryDatabase, "ro"))

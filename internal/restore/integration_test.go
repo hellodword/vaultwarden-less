@@ -33,7 +33,7 @@ func createSyntheticVaultwarden(t *testing.T, dataDir string) *sql.DB {
 			t.Fatal(err)
 		}
 	}
-	if _, err := database.Exec(`INSERT INTO __diesel_schema_migrations(version) VALUES (?)`, upstream.VaultwardenMigration); err != nil {
+	if _, err := database.Exec(`INSERT INTO __diesel_schema_migrations(version) VALUES (?)`, contract.DatabaseMigration); err != nil {
 		_ = database.Close()
 		t.Fatal(err)
 	}

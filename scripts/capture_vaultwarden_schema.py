@@ -5,8 +5,11 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import sqlite3
+import stat
 import sys
+import tempfile
 from pathlib import Path
 
 import tomllib
@@ -34,54 +37,100 @@ def schema_fingerprint(objects: list[dict[str, str]]) -> str:
     return "sha256:" + digest.hexdigest()
 
 
+def require_regular(path: Path, description: str) -> None:
+    information = path.lstat()
+    if stat.S_ISLNK(information.st_mode) or not stat.S_ISREG(information.st_mode):
+        raise ValueError(f"{description} must be a regular non-symlink file")
+
+
+def require_output_parent(path: Path) -> Path:
+    parent = path.parent if path.parent != Path("") else Path(".")
+    information = parent.lstat()
+    if stat.S_ISLNK(information.st_mode) or not stat.S_ISDIR(information.st_mode):
+        raise ValueError("output parent must be a real directory")
+    if path.exists() or path.is_symlink():
+        require_regular(path, "existing output")
+    return parent
+
+
+def capture(database_path: Path, upstreams_path: Path) -> bytes:
+    require_regular(database_path, "source database")
+    require_regular(upstreams_path, "upstream inventory")
+    upstreams = tomllib.loads(upstreams_path.read_text(encoding="utf-8"))
+    vaultwarden = upstreams["vaultwarden"]
+    expected_migration = vaultwarden["database_migration"]
+    source_tag = vaultwarden["source_tag"]
+    if not isinstance(expected_migration, str) or not isinstance(source_tag, str):
+        raise TypeError("Vaultwarden audit metadata is invalid")
+
+    uri = database_path.resolve(strict=True).as_uri() + "?mode=ro"
+    database = sqlite3.connect(uri, uri=True)
+    try:
+        database.execute("PRAGMA query_only = ON")
+        if database.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
+            raise ValueError("source database failed quick_check")
+        migration = database.execute(
+            "SELECT max(version) FROM __diesel_schema_migrations"
+        ).fetchone()[0]
+        if migration != expected_migration:
+            raise ValueError("source database migration does not match UPSTREAMS.toml")
+        rows = database.execute(
+            """
+            SELECT type, name, tbl_name, coalesce(sql, '')
+            FROM sqlite_schema
+            WHERE type IN ('index', 'table', 'trigger', 'view')
+              AND name NOT LIKE 'sqlite_%'
+            ORDER BY type, name
+            """
+        ).fetchall()
+    finally:
+        database.close()
+    objects = [
+        {"type": row[0], "name": row[1], "table": row[2], "sql": row[3].strip()}
+        for row in rows
+    ]
+    if not objects:
+        raise ValueError("source database has no application schema objects")
+    contract = {
+        "contract_version": 1,
+        "vaultwarden_version": source_tag,
+        "database_migration": expected_migration,
+        "fingerprint": schema_fingerprint(objects),
+        "objects": objects,
+    }
+    return (json.dumps(contract, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+
+
+def atomic_write(path: Path, data: bytes) -> None:
+    parent = require_output_parent(path)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        os.fchmod(descriptor, 0o644)
+        with os.fdopen(descriptor, "wb", closefd=True) as output:
+            descriptor = -1
+            output.write(data)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+        directory = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        temporary.unlink(missing_ok=True)
+
+
 def main() -> int:
     args = parse_args()
     try:
-        upstreams = tomllib.loads(args.upstreams.read_text(encoding="utf-8"))
-        expected_migration = upstreams["vaultwarden"]["database_migration"]
-        uri = f"file:{args.database.resolve()}?mode=ro"
-        database = sqlite3.connect(uri, uri=True)
-        try:
-            quick_check = database.execute("PRAGMA quick_check").fetchall()
-            if quick_check != [("ok",)]:
-                raise ValueError("source database failed quick_check")
-            migration = database.execute(
-                "SELECT max(version) FROM __diesel_schema_migrations"
-            ).fetchone()[0]
-            if migration != expected_migration:
-                raise ValueError(
-                    "source database migration does not match UPSTREAMS.toml"
-                )
-            rows = database.execute(
-                """
-                SELECT type, name, tbl_name, coalesce(sql, '')
-                FROM sqlite_schema
-                WHERE type IN ('index', 'table', 'trigger', 'view')
-                  AND name NOT LIKE 'sqlite_%'
-                ORDER BY type, name
-                """
-            ).fetchall()
-        finally:
-            database.close()
-        objects = [
-            {"type": row[0], "name": row[1], "table": row[2], "sql": row[3].strip()}
-            for row in rows
-        ]
-        if not objects:
-            raise ValueError("source database has no application schema objects")
-        contract = {
-            "contract_version": 1,
-            "vaultwarden_version": upstreams["vaultwarden"]["version"],
-            "database_migration": expected_migration,
-            "fingerprint": schema_fingerprint(objects),
-            "objects": objects,
-        }
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(
-            json.dumps(contract, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-            newline="\n",
-        )
+        atomic_write(args.output, capture(args.database, args.upstreams))
+        print(args.output)
     except (
         KeyError,
         OSError,
