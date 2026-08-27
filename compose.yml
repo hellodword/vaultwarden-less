@@ -158,6 +158,12 @@ services:
         bind:
           create_host_path: false
       - type: bind
+        source: ./config/vaultwarden.env
+        target: /deployment/vaultwarden.env
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
         source: ./data
         target: /data
         read_only: true
@@ -207,6 +213,12 @@ services:
       - type: bind
         source: ./.env
         target: /deployment/.env
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./config/vaultwarden.env
+        target: /deployment/vaultwarden.env
         read_only: true
         bind:
           create_host_path: false
@@ -317,24 +329,9 @@ services:
     pull_policy: never
     profiles: [drill]
     restart: "no"
-    user: 0:0
     network_mode: none
     cap_add: [CHOWN, DAC_OVERRIDE, FOWNER]
-    entrypoint: [/bin/sh, -eu, -c]
-    command:
-      - |
-        test -f /source/db.sqlite3
-        test -z "$$(ls -A /drill-data)"
-        cp /source/db.sqlite3 /drill-data/db.sqlite3
-        for directory in attachments sends; do
-          if test -d "/source/$$directory"; then
-            cp -a "/source/$$directory" "/drill-data/$$directory"
-          fi
-        done
-        chown -R "$$1:$$2" /drill-data
-      - drill-copy
-      - "${RUNTIME_UID:?RUNTIME_UID is required}"
-      - "${RUNTIME_GID:?RUNTIME_GID is required}"
+    entrypoint: [/bin/vaultwarden-less-drill-copy]
     volumes:
       - type: bind
         source: ./restore/drill

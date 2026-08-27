@@ -2,6 +2,8 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 set positional-arguments := true
 
 system := "x86_64-linux"
+compose := "docker compose --env-file .env --file compose.yml"
+drill_compose := "docker compose --project-name vaultwarden-less-drill --env-file .env --file compose.yml --profile drill"
 
 # Format repository-owned source files.
 fmt:
@@ -53,6 +55,79 @@ release output_root:
 # Verify and load one exact two-file image release.
 image-load release_directory:
     nix run .#image-load -- "$1"
+
+# Validate both isolated credential roles and every private deployment input.
+config-validate:
+    {{compose}} --profile maintenance run --rm --no-deps config-check-backup
+    {{compose}} --profile maintenance run --rm --no-deps config-check-maintenance
+
+# Start the production topology only after both configuration roles pass.
+up: config-validate
+    {{compose}} up --detach vaultwarden backup proxy
+
+# Stop and remove only the normal production Compose project.
+down:
+    {{compose}} down
+
+# Show the normal production service state.
+ps:
+    {{compose}} ps
+
+# Show bounded recent production logs.
+logs:
+    {{compose}} logs --tail 200 vaultwarden backup proxy
+
+# Ask the resident worker to run one debounced recovery check.
+request-backup:
+    {{compose}} exec --no-TTY backup /bin/vaultwarden-less-backup request-backup
+
+# Read the resident worker's strict JSON status.
+status:
+    {{compose}} exec --no-TTY backup /bin/vaultwarden-less-backup status
+
+# Initialize one configured repository using the isolated maintenance role.
+repo-init target: config-validate
+    {{compose}} --profile maintenance run --rm --no-deps maintenance repo init --target "$1"
+
+# List bounded recovery snapshots for one target.
+repo-snapshots target limit="100": config-validate
+    {{compose}} --profile maintenance run --rm --no-deps maintenance repo snapshots --target "$1" --limit "$2"
+
+# Check repository metadata without reading pack data.
+repo-check target: config-validate
+    {{compose}} --profile maintenance run --rm --no-deps maintenance repo check --target "$1"
+
+# Check repository metadata and one explicit monthly pack subset.
+repo-check-subset target subset: config-validate
+    {{compose}} --profile maintenance run --rm --no-deps maintenance repo check --target "$1" --read-data-subset "$2"
+
+# Remove a stale repository lock using the maintenance role.
+repo-unlock target: config-validate
+    {{compose}} --profile maintenance run --rm --no-deps maintenance repo unlock --target "$1"
+
+# Preview the fixed retention policy; this never mutates the repository.
+repo-prune target: config-validate
+    {{compose}} --profile maintenance run --rm --no-deps maintenance repo prune --target "$1"
+
+# Explicitly apply the fixed retention policy.
+repo-prune-apply target: config-validate
+    {{compose}} --profile maintenance run --rm --no-deps maintenance repo prune --target "$1" --apply
+
+# Restore latest or one full snapshot ID to a previously absent name.
+restore target output snapshot="latest": config-validate
+    {{compose}} --profile restore run --rm --no-deps restore restore --target "$1" --snapshot "$3" --output "$2"
+
+# Start an isolated drill from restore/drill in its own Compose project.
+drill-up: config-validate
+    {{drill_compose}} up --detach drill-vaultwarden
+
+# Show the isolated drill state.
+drill-status:
+    {{drill_compose}} ps
+
+# Remove only the isolated drill project and its disposable volume.
+drill-down:
+    {{drill_compose}} down --volumes
 
 # Deterministically capture an audited Vaultwarden SQLite schema candidate.
 schema-capture database output="internal/upstream/vaultwarden-schema.json":

@@ -42,11 +42,13 @@ type commandEnvironment struct {
 	loadNotifiers     func(string, *config.Backup) ([]config.Notifier, error)
 	validatePasswords func(string, *config.Backup) error
 	validateDirectory func(string) error
+	validateFile      func(string) error
 	repository        func(*config.Backup) (repository, error)
 	restore           restoreFunc
 	httpClient        *http.Client
 	workerURL         string
 	deploymentPath    string
+	vaultwardenPath   string
 	credentialsPath   string
 	notifierPath      string
 	passwordRoot      string
@@ -69,7 +71,17 @@ func defaultEnvironment(stderr io.Writer) commandEnvironment {
 		loadNotifiers:     config.LoadNotifierCredentials,
 		validatePasswords: config.ValidatePasswordDirectory,
 		validateDirectory: privatefs.ValidatePrivateDirectory,
-		restore:           restoretool.Run,
+		validateFile: func(path string) error {
+			data, err := privatefs.ReadBytes(path, config.MaxConfigBytes)
+			if err != nil {
+				return err
+			}
+			if len(data) == 0 {
+				return fmt.Errorf("private file is empty")
+			}
+			return nil
+		},
+		restore: restoretool.Run,
 		httpClient: &http.Client{
 			Timeout: 5 * time.Second,
 			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
@@ -78,6 +90,7 @@ func defaultEnvironment(stderr io.Writer) commandEnvironment {
 		},
 		workerURL:       config.WorkerURL,
 		deploymentPath:  config.DeploymentEnvPath,
+		vaultwardenPath: config.VaultwardenEnvPath,
 		credentialsPath: config.RoleCredentialsPath,
 		notifierPath:    config.NotifierCredentialsPath,
 		passwordRoot:    config.ResticPasswordRoot,

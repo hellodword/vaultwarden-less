@@ -58,6 +58,12 @@ func configCommand(configPath *string, environment commandEnvironment) *cobra.Co
 			if err := environment.validatePasswords(environment.passwordRoot, cfg); err != nil {
 				return commandFailure(codeInvalidCredentials, "The Restic password set is invalid", err)
 			}
+			if environment.validateFile == nil {
+				return commandFailure(codeInternal, "Private file validation is unavailable", nil)
+			}
+			if err := environment.validateFile(environment.vaultwardenPath); err != nil {
+				return commandFailure(codeUnsafePath, "The Vaultwarden environment file is unsafe", err)
+			}
 			if environment.validateDirectory == nil {
 				return commandFailure(codeInternal, "Private directory validation is unavailable", nil)
 			}

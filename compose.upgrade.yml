@@ -17,8 +17,15 @@ x-upgrade-service-defaults: &upgrade-service-defaults
 
 x-upgrade-maintenance-volumes: &upgrade-maintenance-volumes
   - type: bind
-    source: .
-    target: /deployment
+    source: ./.env
+    target: /deployment/.env
+    read_only: true
+    bind:
+      create_host_path: false
+  - type: bind
+    source: ./config/vaultwarden.env
+    target: /deployment/vaultwarden.env
+    read_only: true
     bind:
       create_host_path: false
   - type: bind
@@ -42,6 +49,26 @@ x-upgrade-maintenance-volumes: &upgrade-maintenance-volumes
   - type: bind
     source: ./cache
     target: /cache
+    bind:
+      create_host_path: false
+  - type: bind
+    source: ./data
+    target: /data
+    bind:
+      create_host_path: false
+  - type: bind
+    source: ./staging
+    target: /staging
+    bind:
+      create_host_path: false
+  - type: bind
+    source: ./restore
+    target: /restore
+    bind:
+      create_host_path: false
+  - type: bind
+    source: ./state
+    target: /state
     bind:
       create_host_path: false
 

@@ -33,6 +33,7 @@ const (
 
 	DefaultBackupConfigPath = "/config/backup.yaml"
 	DeploymentEnvPath       = "/deployment/.env"
+	VaultwardenEnvPath      = "/deployment/vaultwarden.env"
 	RoleCredentialsPath     = "/run/credentials/role.yaml"
 	ResticPasswordRoot      = "/run/credentials/restic"
 	NotifierCredentialsPath = "/run/credentials/notifiers.yaml"

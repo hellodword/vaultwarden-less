@@ -57,6 +57,12 @@ let
     cgoEnabled = false;
   };
 
+  drillCopy = productPackage {
+    name = "vaultwarden-less-drill-copy";
+    subPackage = "cmd/vaultwarden-less-drill-copy";
+    cgoEnabled = true;
+  };
+
   labels =
     title:
     {
@@ -119,6 +125,7 @@ let
     '';
     contents = [
       pkgs.vaultwarden
+      drillCopy
       vaultwardenHealthcheck
       pkgs.cacert
       pkgs.tzdata
