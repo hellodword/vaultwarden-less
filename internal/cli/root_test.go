@@ -5,9 +5,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -157,6 +160,74 @@ func TestConfigValidateRoleGoldenAndFailureClassification(t *testing.T) {
 	assertErrorJSON(t, stderr, codeUnsafePath)
 }
 
+func TestUpgradePrepareGoldenAndServingGateClassification(t *testing.T) {
+	setBuildIdentity(t, strings.Repeat("a", 40), "RELEASE.2026-08-27T12-00-00Z-gaaaaaaaaaaaa", "true")
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "state")
+	dataDir := filepath.Join(root, "data")
+	for _, directory := range []string{stateDir, dataDir} {
+		if err := os.Mkdir(directory, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	environment := testEnvironment(nil, nil)
+	environment.stateDir = stateDir
+	environment.dataDir = dataDir
+	toCommit := strings.Repeat("b", 40)
+	toRelease := "RELEASE.2026-08-27T13-00-00Z-gbbbbbbbbbbbb"
+	stdout, stderr, code := executeCommand(
+		environment,
+		"upgrade", "prepare", "--to-commit", toCommit, "--to-release", toRelease,
+	)
+	want := `{"schema_version":1,"upgrade_id":"` + strings.Repeat("a", 40) + `..` + toCommit +
+		`","phase":"prepared","from_commit":"` + strings.Repeat("a", 40) + `","to_commit":"` + toCommit + `","targets":[]}` + "\n"
+	if code != 0 || stderr != "" || stdout != want {
+		t.Fatalf("upgrade prepare = %d/%q/%q", code, stdout, stderr)
+	}
+	stdout, stderr, code = executeCommand(environment, "upgrade", "prepare", "--to-commit", "short", "--to-release", toRelease)
+	if code != 2 || stdout != "" {
+		t.Fatalf("invalid upgrade identity = %d/%q/%q", code, stdout, stderr)
+	}
+	assertErrorJSON(t, stderr, codeUsageError)
+
+	called := false
+	environment.allowServe = func(string, string, config.Deployment) error { return errors.New("frozen") }
+	environment.loadBackup = func(string) (*config.Backup, error) {
+		called = true
+		return nil, errors.New("must not load")
+	}
+	stdout, stderr, code = executeCommand(environment, "serve")
+	if code != 1 || stdout != "" || called {
+		t.Fatalf("frozen serve = %d/%q/%q/called=%t", code, stdout, stderr, called)
+	}
+	assertErrorJSON(t, stderr, codeNotReady)
+}
+
+func TestUpgradeDeadlineKeepsStableTimeoutClassification(t *testing.T) {
+	err := classifyUpgradeFailure(fmt.Errorf("upgrade: %w", context.DeadlineExceeded))
+	var commandError *CommandError
+	if !errors.As(err, &commandError) || commandError.Code != codeTimeout {
+		t.Fatalf("upgrade deadline classification = %#v", err)
+	}
+}
+
+func TestUpgradeSyncRequiresBothExactRecoveryIdentities(t *testing.T) {
+	manifest := snapshot.Manifest{
+		ContentID: "sha256:" + strings.Repeat("a", 64),
+		ArchiveID: "sha256:" + strings.Repeat("b", 64),
+	}
+	synchronized := restic.SyncResult{
+		SnapshotID: strings.Repeat("c", 64), ContentID: manifest.ContentID, ArchiveID: manifest.ArchiveID,
+	}
+	if !validUpgradeSync(manifest, synchronized) {
+		t.Fatal("exact upgrade evidence was rejected")
+	}
+	synchronized.ArchiveID = "sha256:" + strings.Repeat("d", 64)
+	if validUpgradeSync(manifest, synchronized) {
+		t.Fatal("mismatched archive identity was accepted")
+	}
+}
+
 func TestWorkerClientCommandsHaveExactJSON(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		switch request.URL.Path {
@@ -247,7 +318,12 @@ func testEnvironment(repositoryClient repository, server *httptest.Server, resto
 				Targets: []config.Target{{Name: "primary", Repository: "s3:https://objects.example.test/bucket", Options: []config.Option{}}}, Notifiers: []config.Notifier{},
 			}, nil
 		},
-		loadDeployment: func(string) (config.Deployment, error) { return config.Deployment{SchemaVersion: 1}, nil },
+		loadDeployment: func(string) (config.Deployment, error) {
+			return config.Deployment{
+				SchemaVersion: 1, RuntimeUID: uint32(os.Geteuid()), RuntimeGID: uint32(os.Getegid()),
+				ListenPort: 8080, DrillPort: 8081,
+			}, nil
+		},
 		loadCredentials: func(string, *config.Backup) (*config.RoleCredentials, error) {
 			return &config.RoleCredentials{SchemaVersion: config.SchemaVersion, Targets: map[string]config.RoleTarget{"primary": {Environment: map[string]string{"AWS_ACCESS_KEY_ID": "test"}}}}, nil
 		},
@@ -259,11 +335,14 @@ func testEnvironment(repositoryClient repository, server *httptest.Server, resto
 		restore: func(_ context.Context, _ restoretool.Repository, _ restoretool.Request) (restoretool.Result, error) {
 			return restoretool.Result{}, errors.New("restore should not be called")
 		},
+		allowServe: func(string, string, config.Deployment) error { return nil },
+		drillCheck: func(context.Context) error { return nil },
 		httpClient: &http.Client{Timeout: time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }},
 		workerURL:  "http://127.0.0.1:1", deploymentPath: "/deployment/.env", vaultwardenPath: "/deployment/vaultwarden.env",
 		credentialsPath: "/credentials/role.yaml",
 		notifierPath:    "/credentials/notifiers.yaml", passwordRoot: "/credentials/restic", resticBinary: "restic",
 		dataDir: "/data", stagingDir: "/staging", cacheDir: "/cache", restoreRoot: "/restore", stateDir: "/state",
+		now:   func() time.Time { return time.Date(2026, 8, 27, 12, 34, 56, 789_000_000, time.UTC) },
 		ready: func() bool { return true },
 	}
 	if server != nil {

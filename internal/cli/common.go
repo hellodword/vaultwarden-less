@@ -17,6 +17,7 @@ import (
 	"github.com/hellodword/vaultwarden-less/internal/restic"
 	restoretool "github.com/hellodword/vaultwarden-less/internal/restore"
 	"github.com/hellodword/vaultwarden-less/internal/snapshot"
+	"github.com/hellodword/vaultwarden-less/internal/upgrade"
 )
 
 const ResultSchemaVersion = 1
@@ -45,6 +46,8 @@ type commandEnvironment struct {
 	validateFile      func(string) error
 	repository        func(*config.Backup) (repository, error)
 	restore           restoreFunc
+	allowServe        func(string, string, config.Deployment) error
+	drillCheck        func(context.Context) error
 	httpClient        *http.Client
 	workerURL         string
 	deploymentPath    string
@@ -58,6 +61,7 @@ type commandEnvironment struct {
 	cacheDir          string
 	restoreRoot       string
 	stateDir          string
+	now               func() time.Time
 	ready             func() bool
 	logger            *slog.Logger
 }
@@ -81,7 +85,9 @@ func defaultEnvironment(stderr io.Writer) commandEnvironment {
 			}
 			return nil
 		},
-		restore: restoretool.Run,
+		restore:    restoretool.Run,
+		allowServe: upgrade.ServingAllowed,
+		drillCheck: checkUpgradeDrill,
 		httpClient: &http.Client{
 			Timeout: 5 * time.Second,
 			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
@@ -100,6 +106,7 @@ func defaultEnvironment(stderr io.Writer) commandEnvironment {
 		cacheDir:        config.CacheDir,
 		restoreRoot:     config.RestoreRoot,
 		stateDir:        config.StateDir,
+		now:             time.Now,
 		ready:           buildinfo.Ready,
 		logger:          logger,
 	}

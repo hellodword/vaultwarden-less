@@ -144,10 +144,10 @@ func newCommand(stdout, stderr io.Writer, environment commandEnvironment) *cobra
 		configCommand(&configPath, environment),
 		repoCommand(&configPath, environment),
 		restoreCommand(&configPath, environment),
+		upgradeCommand(&configPath, environment),
+		rollbackCommand(environment),
 		healthcheckCommand(environment),
 		versionCommand(),
-		upgradeCommand(),
-		rollbackCommand(),
 	)
 	return root
 }
@@ -179,37 +179,6 @@ func versionCommand() *cobra.Command {
 			return writeJSON(command.OutOrStdout(), result)
 		},
 	}
-}
-
-func upgradeCommand() *cobra.Command {
-	command := &cobra.Command{Use: "upgrade", Short: "Run the explicit A/B upgrade state machine", Args: noArguments,
-		RunE: func(_ *cobra.Command, _ []string) error { return usageError("An upgrade subcommand is required") }}
-	var toCommit, toRelease string
-	prepare := &cobra.Command{Use: "prepare", Args: noArguments, RunE: func(_ *cobra.Command, _ []string) error {
-		if toCommit == "" || toRelease == "" {
-			return usageError("--to-commit and --to-release are required")
-		}
-		return commandFailure(codeUpgradeState, "Upgrade state is not prepared", nil)
-	}}
-	prepare.Flags().StringVar(&toCommit, "to-commit", "", "candidate full commit")
-	prepare.Flags().StringVar(&toRelease, "to-release", "", "candidate immutable release")
-	command.AddCommand(prepare)
-	for _, name := range []string{"freeze", "migrate-check", "verify", "accept"} {
-		name := name
-		command.AddCommand(&cobra.Command{Use: name, Args: noArguments, RunE: func(_ *cobra.Command, _ []string) error {
-			return commandFailure(codeUpgradeState, fmt.Sprintf("Upgrade phase %s is not available", name), nil)
-		}})
-	}
-	return command
-}
-
-func rollbackCommand() *cobra.Command {
-	command := &cobra.Command{Use: "rollback", Short: "Apply an explicit pre-accept rollback", Args: noArguments,
-		RunE: func(_ *cobra.Command, _ []string) error { return usageError("A rollback subcommand is required") }}
-	command.AddCommand(&cobra.Command{Use: "apply", Args: noArguments, RunE: func(_ *cobra.Command, _ []string) error {
-		return commandFailure(codeUpgradeState, "Rollback state is not available", nil)
-	}})
-	return command
 }
 
 func noArguments(_ *cobra.Command, arguments []string) error {

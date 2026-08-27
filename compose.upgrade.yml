@@ -123,6 +123,7 @@ services:
     volumes: *upgrade-maintenance-volumes
     networks:
       - maintenance-outbound
+      - drill
 
   rollback-vaultwarden-a:
     <<: *upgrade-service-defaults
@@ -230,6 +231,19 @@ services:
         condition: service_healthy
     ports:
       - "127.0.0.1:${LISTEN_PORT:?LISTEN_PORT is required}:8080"
+    volumes:
+      - type: bind
+        source: ./.env
+        target: /deployment/.env
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./state
+        target: /state
+        read_only: true
+        bind:
+          create_host_path: false
     networks:
       - app
       - events

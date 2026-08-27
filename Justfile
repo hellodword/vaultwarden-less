@@ -4,6 +4,8 @@ set positional-arguments := true
 system := "x86_64-linux"
 compose := "docker compose --env-file .env --file compose.yml"
 drill_compose := "docker compose --project-name vaultwarden-less-drill --env-file .env --file compose.yml --profile drill"
+upgrade_compose := "docker compose --env-file state/upgrade/current/compose.env --file compose.yml --file compose.upgrade.yml"
+upgrade_overlay := "docker compose --env-file .env --file compose.yml --file compose.upgrade.yml"
 
 # Format repository-owned source files.
 fmt:
@@ -128,6 +130,54 @@ drill-status:
 # Remove only the isolated drill project and its disposable volume.
 drill-down:
     {{drill_compose}} down --volumes
+
+# Create immutable A-owned upgrade identity before loading B.
+upgrade-prepare to_commit to_release: config-validate
+    {{compose}} --profile maintenance run --rm --no-deps maintenance upgrade prepare --to-commit "$1" --to-release "$2"
+
+# Stop writes in the fixed order and let immutable A freeze repository and rollback evidence.
+upgrade-freeze: config-validate
+    {{compose}} stop proxy
+    {{compose}} stop backup vaultwarden
+    {{upgrade_compose}} --profile upgrade run --rm --no-deps upgrade-a upgrade freeze
+
+# Start only immutable B Vaultwarden so no proxy or resident backup can serve before acceptance.
+upgrade-start-b:
+    {{upgrade_compose}} --profile maintenance run --rm --no-deps config-check-backup
+    {{upgrade_compose}} --profile maintenance run --rm --no-deps config-check-maintenance
+    {{upgrade_compose}} up --detach --no-deps --wait --wait-timeout 180 vaultwarden
+
+# Record B's exact audited migration and schema after Vaultwarden migration.
+upgrade-migrate-check:
+    {{upgrade_compose}} --profile upgrade run --rm --no-deps upgrade-b upgrade migrate-check
+
+# Stop active B, create and really restore B evidence, then start the isolated B drill.
+upgrade-verify:
+    {{upgrade_compose}} stop proxy backup vaultwarden
+    {{upgrade_compose}} --profile upgrade run --rm --no-deps upgrade-b upgrade verify
+    {{upgrade_compose}} --profile drill up --detach --wait --wait-timeout 180 drill-vaultwarden
+
+# Accept only while upgrade-b can reach the healthy drill, then expose B and remove disposable drill runtime state.
+upgrade-accept:
+    A_RELEASE="$(sed -n 's/^A_RELEASE=//p' state/upgrade/current/compose.env)"; \
+      B_RELEASE="$(sed -n 's/^B_RELEASE=//p' state/upgrade/current/compose.env)"; \
+      test -n "$A_RELEASE"; test -n "$B_RELEASE"; export A_RELEASE B_RELEASE; \
+      {{upgrade_compose}} --profile upgrade --profile drill run --rm --no-deps upgrade-b upgrade accept; \
+      {{upgrade_overlay}} up --detach vaultwarden backup proxy; \
+      {{upgrade_overlay}} --profile drill stop drill-vaultwarden; \
+      {{upgrade_overlay}} --profile drill rm --force drill-vaultwarden drill-copy; \
+      docker volume rm vaultwarden-less_drill-data
+
+# Stop every B service, explicitly exchange A data, and start only immutable A rollback services.
+upgrade-rollback:
+    A_RELEASE="$(sed -n 's/^A_RELEASE=//p' state/upgrade/current/compose.env)"; \
+      B_RELEASE="$(sed -n 's/^B_RELEASE=//p' state/upgrade/current/compose.env)"; \
+      test -n "$A_RELEASE"; test -n "$B_RELEASE"; export A_RELEASE B_RELEASE; \
+      {{upgrade_compose}} --profile drill stop proxy backup vaultwarden drill-vaultwarden; \
+      {{upgrade_compose}} --profile drill rm --force proxy backup vaultwarden drill-vaultwarden drill-copy; \
+      if docker volume inspect vaultwarden-less_drill-data >/dev/null 2>&1; then docker volume rm vaultwarden-less_drill-data; fi; \
+      {{upgrade_compose}} --profile upgrade run --rm --no-deps upgrade-a rollback apply; \
+      {{upgrade_overlay}} --profile rollback up --detach rollback-vaultwarden-a rollback-backup-a rollback-proxy-a
 
 # Deterministically capture an audited Vaultwarden SQLite schema candidate.
 schema-capture database output="internal/upstream/vaultwarden-schema.json":

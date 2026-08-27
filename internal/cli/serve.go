@@ -22,6 +22,19 @@ func serveCommand(configPath *string, environment commandEnvironment) *cobra.Com
 		Short: "Run the in-memory scheduler, backup worker, and internal HTTP API",
 		Args:  noArguments,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if environment.allowServe == nil {
+				return commandFailure(codeInternal, "Upgrade serving gate is unavailable", nil)
+			}
+			if environment.loadDeployment == nil {
+				return commandFailure(codeInternal, "Deployment validation is unavailable", nil)
+			}
+			deployment, err := environment.loadDeployment(environment.deploymentPath)
+			if err != nil {
+				return commandFailure(codeInvalidConfig, "The deployment environment is invalid", err)
+			}
+			if err := environment.allowServe(environment.stateDir, buildinfo.ProjectCommit, deployment); err != nil {
+				return commandFailure(codeNotReady, "Backup serving is frozen pending upgrade completion", err)
+			}
 			cfg, err := environment.backup(*configPath)
 			if err != nil {
 				return commandFailure(codeInvalidConfig, "The backup configuration is invalid", err)

@@ -31,6 +31,23 @@ type databaseValidation struct {
 	SchemaFingerprint string
 }
 
+// DatabaseContract is the audited migration and schema identity of one fully
+// validated Vaultwarden database.
+type DatabaseContract struct {
+	Migration         string
+	SchemaFingerprint string
+}
+
+// ValidateDatabaseContract runs the same integrity, foreign-key, schema,
+// projection, and migration checks used for published recovery points.
+func ValidateDatabaseContract(ctx context.Context, path string) (DatabaseContract, error) {
+	validated, err := validateDatabase(ctx, path)
+	if err != nil {
+		return DatabaseContract{}, err
+	}
+	return DatabaseContract(validated), nil
+}
+
 var unsignedIntegerPattern = regexp.MustCompile(`^(0|[1-9][0-9]*)$`)
 
 func onlineBackup(ctx context.Context, sourcePath, destinationPath string) error {

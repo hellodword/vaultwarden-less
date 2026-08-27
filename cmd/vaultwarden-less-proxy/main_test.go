@@ -96,6 +96,21 @@ func TestProxyDirtyServeRefusesBeforeSideEffects(t *testing.T) {
 	assertProxyError(t, stderr.String(), "not_ready")
 }
 
+func TestProxyUpgradeGateRefusesBeforeServing(t *testing.T) {
+	called := false
+	environment := proxyEnvironment{
+		ready:      func() bool { return true },
+		allowServe: func() error { return errors.New("pending acceptance") },
+		serve:      func(context.Context, io.Writer) error { called = true; return nil },
+	}
+	var stdout, stderr bytes.Buffer
+	code := executeWithEnvironment(context.Background(), []string{"serve"}, &stdout, &stderr, environment)
+	if code != 1 || stdout.Len() != 0 || called {
+		t.Fatalf("upgrade-gated serve = %d/%q/%q/called=%t", code, stdout.String(), stderr.String(), called)
+	}
+	assertProxyError(t, stderr.String(), "not_ready")
+}
+
 func assertProxyError(t *testing.T, output, code string) {
 	t.Helper()
 	decoder := json.NewDecoder(strings.NewReader(output))
