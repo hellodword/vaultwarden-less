@@ -63,6 +63,7 @@ type e2eHarness struct {
 	dockerPath        string
 	dockerEnv         []string
 	productionCompose string
+	upgradeCompose    string
 	testCompose       string
 	targets           []string
 	publicHTTP        string
@@ -83,12 +84,19 @@ type e2eHarness struct {
 var (
 	runBackupE2E      = flag.Bool("run-backup-e2e", false, "run the real Vaultwarden backup/restore lifecycle")
 	runMultiTargetE2E = flag.Bool("run-multitarget-e2e", false, "run the real multi-target degradation lifecycle")
+	runUpgradeE2E     = flag.Bool("run-upgrade-e2e", false, "run the real A/B upgrade and rollback lifecycle")
+	upgradeFromCommit = flag.String("upgrade-from-commit", "", "full clean A commit for the upgrade lifecycle")
+	upgradeToCommit   = flag.String("upgrade-to-commit", "", "full clean B commit for the upgrade lifecycle")
 	proxyPort         = flag.Int("proxy-host-port", 0, "fixed proxy host port; zero asks Docker for an ephemeral port")
 	drillPort         = flag.Int("drill-host-port", 0, "fixed drill host port; zero asks Docker for an ephemeral port")
 	preloadedImages   = flag.Bool("preloaded-images", false, "use already loaded local test images")
 )
 
 func newE2EHarness(t *testing.T, ctx context.Context, targets ...string) *e2eHarness {
+	return newE2EHarnessWithImages(t, ctx, !*preloadedImages, targets...)
+}
+
+func newE2EHarnessWithImages(t *testing.T, ctx context.Context, prepareImages bool, targets ...string) *e2eHarness {
 	t.Helper()
 	if len(targets) == 0 {
 		targets = []string{"primary"}
@@ -131,6 +139,7 @@ func newE2EHarness(t *testing.T, ctx context.Context, targets ...string) *e2eHar
 		targets:       slices.Clone(targets),
 	}
 	harness.productionCompose = filepath.Join(repository, "compose.yml")
+	harness.upgradeCompose = filepath.Join(repository, "compose.upgrade.yml")
 	harness.testCompose = filepath.Join(repository, "tests", "e2e", "compose.override.yml")
 	t.Cleanup(harness.cleanup)
 	if output, err := harness.docker("info"); err != nil {
@@ -141,7 +150,7 @@ func newE2EHarness(t *testing.T, ctx context.Context, targets ...string) *e2eHar
 	harness.startNotifierReceiver()
 	harness.prepareDeployment()
 	harness.validateComposeModel()
-	if !*preloadedImages {
+	if prepareImages {
 		harness.prepareImages()
 	}
 	return harness
@@ -333,10 +342,15 @@ func (h *e2eHarness) prepareDeployment() {
 	}
 
 	deployment := readTrackedExample(h.t, filepath.Join(h.repository, ".env.example"))
+	listenPort := unusedLoopbackPort(h.t)
+	drillDeploymentPort := unusedLoopbackPort(h.t)
+	for drillDeploymentPort == listenPort {
+		drillDeploymentPort = unusedLoopbackPort(h.t)
+	}
 	deployment = strings.Replace(deployment, "RUNTIME_UID=1000", "RUNTIME_UID="+strconv.Itoa(os.Geteuid()), 1)
 	deployment = strings.Replace(deployment, "RUNTIME_GID=1000", "RUNTIME_GID="+strconv.Itoa(os.Getegid()), 1)
-	deployment = strings.Replace(deployment, "LISTEN_PORT=8080", "LISTEN_PORT=18080", 1)
-	deployment = strings.Replace(deployment, "DRILL_PORT=8081", "DRILL_PORT=18081", 1)
+	deployment = strings.Replace(deployment, "LISTEN_PORT=8080", "LISTEN_PORT="+strconv.Itoa(listenPort), 1)
+	deployment = strings.Replace(deployment, "DRILL_PORT=8081", "DRILL_PORT="+strconv.Itoa(drillDeploymentPort), 1)
 	writePrivateFile(h.t, filepath.Join(h.localRoot, ".env"), deployment)
 
 	vaultwarden := readTrackedExample(h.t, filepath.Join(h.repository, "config", "vaultwarden.example.env"))
@@ -495,6 +509,22 @@ func composePublishedPort(port int) string {
 		return ""
 	}
 	return strconv.Itoa(port)
+}
+
+func unusedLoopbackPort(t *testing.T) int {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if port < 1024 || port > 65535 {
+		t.Fatalf("kernel selected an invalid unprivileged port %d", port)
+	}
+	return port
 }
 
 func writePrivateFile(t *testing.T, filename, content string) {

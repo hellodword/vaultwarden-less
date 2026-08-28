@@ -58,6 +58,10 @@ e2e-backup proxy_host_port="0" drill_host_port="0" preloaded_images="false":
 e2e-multitarget proxy_host_port="0" drill_host_port="0" preloaded_images="false":
     extra=(); if [[ "$3" == "true" ]]; then extra=(-preloaded-images); elif [[ "$3" != "false" ]]; then echo "preloaded_images must be true or false" >&2; exit 2; fi; nix develop --command python3 scripts/verify_go_test.py --require github.com/hellodword/vaultwarden-less/tests/e2e:TestMultiTargetDegradationAndCatchUp -- go test -json ./tests/e2e -run '^TestMultiTargetDegradationAndCatchUp$' -count=1 -timeout=75m -args -run-multitarget-e2e -proxy-host-port "$1" -drill-host-port "$2" "${extra[@]}"
 
+# Run the isolated A/B framework, forced failures, explicit rollback, and acceptance lifecycle.
+e2e-upgrade from_commit to_commit proxy_host_port="0" drill_host_port="0" preloaded_images="false":
+    extra=(); if [[ "$5" == "true" ]]; then extra=(-preloaded-images); elif [[ "$5" != "false" ]]; then echo "preloaded_images must be true or false" >&2; exit 2; fi; nix develop --command python3 scripts/verify_go_test.py --require github.com/hellodword/vaultwarden-less/tests/e2e:TestUpgradeRollbackLifecycle -- go test -json ./tests/e2e -run '^TestUpgradeRollbackLifecycle$' -count=1 -timeout=110m -args -run-upgrade-e2e -upgrade-from-commit "$1" -upgrade-to-commit "$2" -proxy-host-port "$3" -drill-host-port "$4" "${extra[@]}"
+
 # Run every fast, security, image, integration, and non-upgrade real gate.
 check-full: check security build integration e2e-backup e2e-multitarget
 
