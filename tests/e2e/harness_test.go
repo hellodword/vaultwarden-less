@@ -22,7 +22,6 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
-	"path"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -31,9 +30,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-
-	productcli "github.com/hellodword/vaultwarden-less/internal/cli"
-	productworker "github.com/hellodword/vaultwarden-less/internal/worker"
 )
 
 const (
@@ -115,10 +111,8 @@ func newE2EHarnessWithImages(t *testing.T, ctx context.Context, prepareImages bo
 	if _, err := exec.LookPath("bw"); err != nil {
 		t.Fatalf("the Nix-provided official bw CLI is required: %v", err)
 	}
-	validateOptionalPort(t, "-proxy-host-port", *proxyPort)
-	validateOptionalPort(t, "-drill-host-port", *drillPort)
-	if *proxyPort != 0 && *proxyPort == *drillPort {
-		t.Fatal("explicit proxy and drill ports must differ")
+	if err := validateScenarioPorts(*proxyPort, *drillPort); err != nil {
+		t.Fatal(err)
 	}
 	dockerPath, err := exec.LookPath("docker")
 	if err != nil {
@@ -497,10 +491,42 @@ func renderRoleExample(t *testing.T, example string, targets []string) string {
 	return result
 }
 
-func validateOptionalPort(t *testing.T, name string, port int) {
-	t.Helper()
-	if port != 0 && (port < 1024 || port > 65535) {
-		t.Fatalf("%s must be zero or an unprivileged TCP port", name)
+func validateScenarioPorts(proxy, drill int) error {
+	for name, port := range map[string]int{
+		"proxy": proxy,
+		"drill": drill,
+	} {
+		if port != 0 && (port < 1024 || port > 65535) {
+			return fmt.Errorf("%s port must be zero or an unprivileged TCP port", name)
+		}
+	}
+	if proxy != 0 && proxy == drill {
+		return fmt.Errorf("explicit proxy and drill ports must differ")
+	}
+	return nil
+}
+
+func TestValidateScenarioPorts(t *testing.T) {
+	t.Parallel()
+	for name, test := range map[string]struct {
+		proxy int
+		drill int
+		valid bool
+	}{
+		"ephemeral":        {proxy: 0, drill: 0, valid: true},
+		"unprivileged":     {proxy: 1024, drill: 65535, valid: true},
+		"proxy privileged": {proxy: 1023, drill: 0},
+		"drill privileged": {proxy: 0, drill: 1023},
+		"proxy overflow":   {proxy: 65536, drill: 0},
+		"drill overflow":   {proxy: 0, drill: 65536},
+		"same explicit":    {proxy: 2048, drill: 2048},
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := validateScenarioPorts(test.proxy, test.drill)
+			if (err == nil) != test.valid {
+				t.Fatalf("validateScenarioPorts(%d, %d) error = %v", test.proxy, test.drill, err)
+			}
+		})
 	}
 }
 
@@ -562,51 +588,6 @@ func (h *e2eHarness) tryCompose(ctx context.Context, arguments ...string) (strin
 	}
 	base = append(base, arguments...)
 	return h.dockerContext(ctx, base...)
-}
-
-func (h *e2eHarness) startMotoAndRepository() {
-	services := make([]string, 0, len(h.targets)+2)
-	services = append(services, "up", "--detach")
-	for _, target := range h.targets {
-		services = append(services, "moto-"+target)
-	}
-	h.compose(services...)
-	for _, target := range h.targets {
-		h.createMotoBucket(target)
-		h.initRepository(target)
-	}
-}
-
-func (h *e2eHarness) initRepository(target string) {
-	h.t.Helper()
-	h.compose(
-		"--profile", "maintenance", "run", "--rm", "--no-deps", "maintenance",
-		"repo", "init", "--target", target, "--config", "/config/backup.yaml",
-	)
-}
-
-func (h *e2eHarness) createMotoBucket(target string) {
-	h.t.Helper()
-	service := "moto-" + target
-	bucket := "vaultwarden-less-e2e-" + target
-	deadline := time.Now().Add(90 * time.Second)
-	for time.Now().Before(deadline) {
-		_, err := h.tryCompose(
-			h.ctx,
-			"exec", "--no-TTY", service, "python", "-c",
-			"import boto3,sys; boto3.client('s3', endpoint_url='http://127.0.0.1:5000', aws_access_key_id='test', aws_secret_access_key='test', region_name='us-east-1').create_bucket(Bucket=sys.argv[1])",
-			bucket,
-		)
-		if err == nil {
-			return
-		}
-		select {
-		case <-h.ctx.Done():
-			h.t.Fatal(h.ctx.Err())
-		case <-time.After(500 * time.Millisecond):
-		}
-	}
-	h.t.Fatalf("Moto target %s did not accept bucket creation", target)
 }
 
 func (h *e2eHarness) startVaultwarden() {
@@ -723,412 +704,6 @@ func (h *e2eHarness) waitHTTP(endpoint string, status int, timeout time.Duration
 		}
 	}
 	h.t.Fatalf("endpoint %s did not return %d", endpoint, status)
-}
-
-type snapshotList struct {
-	SchemaVersion int    `json:"schema_version"`
-	Target        string `json:"target"`
-	Limit         int    `json:"limit"`
-	Truncated     bool   `json:"truncated"`
-	Snapshots     []struct {
-		ID            string `json:"id"`
-		Time          string `json:"time"`
-		ProjectCommit string `json:"project_commit"`
-		ContentID     string `json:"content_id"`
-		ArchiveID     string `json:"archive_id"`
-	} `json:"snapshots"`
-}
-
-type pruneOutput struct {
-	SchemaVersion int    `json:"schema_version"`
-	Operation     string `json:"operation"`
-	Target        string `json:"target"`
-	Applied       bool   `json:"applied"`
-	Groups        []struct {
-		Host              string   `json:"host"`
-		Paths             []string `json:"paths"`
-		KeepSnapshotIDs   []string `json:"keep_snapshot_ids"`
-		RemoveSnapshotIDs []string `json:"remove_snapshot_ids"`
-	} `json:"groups"`
-}
-
-func (h *e2eHarness) repositoryCheck() {
-	h.repositoryCheckTarget("primary")
-}
-
-func (h *e2eHarness) repositoryCheckTarget(target string) {
-	output := h.compose(
-		"--profile", "maintenance", "run", "--rm", "--no-deps", "maintenance",
-		"repo", "check", "--target", target,
-		"--config", "/config/backup.yaml",
-	)
-	var result struct {
-		SchemaVersion int    `json:"schema_version"`
-		Operation     string `json:"operation"`
-		Target        string `json:"target"`
-		Success       bool   `json:"success"`
-	}
-	if decodeExactJSON(output, &result) != nil ||
-		result.SchemaVersion != productcli.ResultSchemaVersion || result.Operation != "check" ||
-		result.Target != target || !result.Success {
-		h.t.Fatalf("invalid repository check result: %s", harnessDiagnostics(output))
-	}
-}
-
-func (h *e2eHarness) prune(apply bool) pruneOutput {
-	arguments := []string{
-		"--profile", "maintenance", "run", "--rm", "--no-deps", "maintenance",
-		"repo", "prune", "--target", "primary", "--config", "/config/backup.yaml",
-	}
-	if apply {
-		arguments = append(arguments, "--apply")
-	}
-	output := h.compose(arguments...)
-	var result pruneOutput
-	if decodeExactJSON(output, &result) != nil ||
-		result.SchemaVersion != productcli.ResultSchemaVersion || result.Operation != "prune" ||
-		result.Target != "primary" || result.Applied != apply || result.Groups == nil {
-		h.t.Fatalf("invalid repository prune result: %s", harnessDiagnostics(output))
-	}
-	return result
-}
-
-func (h *e2eHarness) snapshots() (snapshotList, error) {
-	return h.targetSnapshots("primary")
-}
-
-func (h *e2eHarness) targetSnapshots(target string) (snapshotList, error) {
-	output, err := h.tryCompose(
-		h.ctx,
-		"exec",
-		"--no-TTY",
-		"backup",
-		"/bin/vaultwarden-less-backup",
-		"repo",
-		"snapshots",
-		"--target",
-		target,
-		"--limit",
-		"100",
-		"--config",
-		"/config/backup.yaml",
-	)
-	if err != nil {
-		return snapshotList{}, err
-	}
-	var result snapshotList
-	if err := decodeExactJSON(output, &result); err != nil ||
-		result.SchemaVersion != productcli.ResultSchemaVersion ||
-		result.Target != target || result.Limit != 100 ||
-		result.Snapshots == nil || result.Truncated {
-		return snapshotList{}, fmt.Errorf("invalid snapshots response")
-	}
-	seen := make(map[string]bool, len(result.Snapshots))
-	var previous time.Time
-	for index, item := range result.Snapshots {
-		parsed, err := time.Parse(time.RFC3339, item.Time)
-		if err != nil || !lowerHex64Pattern.MatchString(item.ID) ||
-			!lowerHex40Pattern.MatchString(item.ProjectCommit) ||
-			!contentIDPattern.MatchString(item.ContentID) ||
-			!contentIDPattern.MatchString(item.ArchiveID) || seen[item.ID] ||
-			(index > 0 && parsed.After(previous)) {
-			return snapshotList{}, fmt.Errorf("invalid snapshot identity or ordering")
-		}
-		seen[item.ID] = true
-		previous = parsed
-	}
-	return result, nil
-}
-
-func (h *e2eHarness) status() productworker.Status {
-	h.t.Helper()
-	output := h.compose("exec", "--no-TTY", "backup", "/bin/vaultwarden-less-backup", "status")
-	var status productworker.Status
-	if err := decodeExactJSON(output, &status); err != nil ||
-		status.SchemaVersion != productworker.SchemaVersion || status.Targets == nil {
-		h.t.Fatalf("invalid worker status: %v: %s", err, harnessDiagnostics(output))
-	}
-	return status
-}
-
-func (h *e2eHarness) requestBackup() {
-	h.t.Helper()
-	output := h.compose("exec", "--no-TTY", "backup", "/bin/vaultwarden-less-backup", "request-backup")
-	var result struct {
-		SchemaVersion int  `json:"schema_version"`
-		Accepted      bool `json:"accepted"`
-	}
-	if err := decodeExactJSON(output, &result); err != nil ||
-		result.SchemaVersion != productworker.SchemaVersion || !result.Accepted {
-		h.t.Fatalf("invalid backup request result: %v: %s", err, harnessDiagnostics(output))
-	}
-}
-
-func (h *e2eHarness) waitCheckAfter(previousFinished, result string, timeout time.Duration) productworker.Status {
-	h.t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		status := h.status()
-		if status.LastCheck != nil && status.LastCheck.FinishedAt != previousFinished && status.LastCheck.Result == result {
-			return status
-		}
-		select {
-		case <-h.ctx.Done():
-			h.t.Fatal(h.ctx.Err())
-		case <-time.After(2 * time.Second):
-		}
-	}
-	h.t.Fatalf("worker did not complete a new %s check", result)
-	return productworker.Status{}
-}
-
-func (h *e2eHarness) waitSnapshotCount(count int, timeout time.Duration) snapshotList {
-	h.t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		result, err := h.snapshots()
-		if err == nil && len(result.Snapshots) == count {
-			return result
-		}
-		if err == nil && len(result.Snapshots) > count {
-			h.t.Fatalf("snapshot count jumped to %d, want %d", len(result.Snapshots), count)
-		}
-		select {
-		case <-h.ctx.Done():
-			h.t.Fatal(h.ctx.Err())
-		case <-time.After(3 * time.Second):
-		}
-	}
-	h.t.Fatalf("snapshot count did not become %d", count)
-	return snapshotList{}
-}
-
-func (h *e2eHarness) assertSnapshotCountFor(count int, duration time.Duration) {
-	h.t.Helper()
-	deadline := time.Now().Add(duration)
-	observed := false
-	for time.Now().Before(deadline) {
-		result, err := h.snapshots()
-		if err == nil {
-			observed = true
-			if len(result.Snapshots) != count {
-				h.t.Fatalf("snapshot count became %d during an inconsistent source window, want %d", len(result.Snapshots), count)
-			}
-		}
-		select {
-		case <-h.ctx.Done():
-			h.t.Fatal(h.ctx.Err())
-		case <-time.After(2 * time.Second):
-		}
-	}
-	if !observed {
-		h.t.Fatal("could not observe repository snapshots during inconsistent source window")
-	}
-}
-
-func (h *e2eHarness) waitWorkerState(want string, timeout time.Duration) {
-	h.t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		output, err := h.tryCompose(
-			h.ctx,
-			"exec",
-			"--no-TTY",
-			"backup",
-			"/bin/vaultwarden-less-backup",
-			"status",
-		)
-		if err == nil {
-			var status struct {
-				State string `json:"state"`
-			}
-			if json.Unmarshal([]byte(output), &status) == nil && status.State == want {
-				return
-			}
-		}
-		select {
-		case <-h.ctx.Done():
-			h.t.Fatal(h.ctx.Err())
-		case <-time.After(time.Second):
-		}
-	}
-	h.t.Fatalf("worker state did not become %s", want)
-}
-
-func (h *e2eHarness) singleFileIn(relativeDirectory string) string {
-	h.t.Helper()
-	relativeDirectory = cleanTestRelative(h.t, relativeDirectory)
-	directory := filepath.Join(h.localRoot, filepath.FromSlash(relativeDirectory))
-	entries, err := os.ReadDir(directory)
-	if err != nil {
-		h.t.Fatalf("list file Send data: %v", err)
-	}
-	if len(entries) != 1 || !lowerHex64Pattern.MatchString(entries[0].Name()) {
-		h.t.Fatalf("file Send directory contains unexpected entries: %#v", entries)
-	}
-	info, err := entries[0].Info()
-	if err != nil || !info.Mode().IsRegular() {
-		h.t.Fatalf("file Send entry is not a regular file: %v", err)
-	}
-	return relativeDirectory + "/" + entries[0].Name()
-}
-
-func (h *e2eHarness) holdDataFile(relative string) func() {
-	h.t.Helper()
-	relative = cleanTestRelative(h.t, relative)
-	if !strings.HasPrefix(relative, "data/") {
-		h.t.Fatalf("refusing to hold a non-data test path %q", relative)
-	}
-	source := filepath.Join(h.localRoot, filepath.FromSlash(relative))
-	held := filepath.Join(h.localRoot, "data", ".e2e-held-"+strings.ReplaceAll(strings.TrimPrefix(relative, "data/"), "/", "-"))
-	restored := false
-	h.renameDataFile(source, held)
-	restore := func() {
-		if restored {
-			return
-		}
-		h.renameDataFile(held, source)
-		restored = true
-	}
-	h.t.Cleanup(restore)
-	return restore
-}
-
-func (h *e2eHarness) renameDataFile(from, to string) {
-	h.t.Helper()
-	if err := os.Rename(from, to); err != nil {
-		h.t.Fatalf("rename E2E data file: %v", err)
-	}
-}
-
-func cleanTestRelative(t *testing.T, value string) string {
-	t.Helper()
-	clean := path.Clean(value)
-	if value == "" || strings.HasPrefix(value, "/") || clean == "." || clean == ".." || strings.HasPrefix(clean, "../") || clean != value {
-		t.Fatalf("unsafe E2E relative path %q", value)
-	}
-	return value
-}
-
-func (h *e2eHarness) waitUnchangedCheck(previousFinished string, timeout time.Duration) {
-	h.t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		output, err := h.tryCompose(
-			h.ctx,
-			"exec",
-			"--no-TTY",
-			"backup",
-			"/bin/vaultwarden-less-backup",
-			"status",
-		)
-		if err == nil {
-			var status struct {
-				LastCheck *struct {
-					FinishedAt string `json:"finished_at"`
-					Result     string `json:"result"`
-				} `json:"last_check"`
-			}
-			if json.Unmarshal([]byte(output), &status) == nil &&
-				status.LastCheck != nil &&
-				status.LastCheck.FinishedAt != previousFinished &&
-				status.LastCheck.Result == "unchanged" {
-				return
-			}
-		}
-		select {
-		case <-h.ctx.Done():
-			h.t.Fatal(h.ctx.Err())
-		case <-time.After(2 * time.Second):
-		}
-	}
-	h.t.Fatal("worker did not complete an unchanged startup check")
-}
-
-type restoreOutput struct {
-	SchemaVersion int    `json:"schema_version"`
-	Target        string `json:"target"`
-	SnapshotID    string `json:"snapshot_id"`
-	ProjectCommit string `json:"project_commit"`
-	ContentID     string `json:"content_id"`
-	ArchiveID     string `json:"archive_id"`
-	Output        string `json:"output"`
-}
-
-func (h *e2eHarness) restore(snapshotID, outputName string) restoreOutput {
-	return h.restoreTarget("primary", snapshotID, outputName)
-}
-
-func (h *e2eHarness) restoreTarget(target, snapshotID, outputName string) restoreOutput {
-	if !regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`).MatchString(outputName) {
-		h.t.Fatalf("unsafe restore output name %q", outputName)
-	}
-	arguments := []string{
-		"--profile",
-		"restore",
-		"run",
-		"--rm",
-		"--no-deps",
-		"restore",
-		"restore",
-		"--target",
-		target,
-		"--output",
-		outputName,
-		"--config",
-		"/config/backup.yaml",
-	}
-	if snapshotID != "" {
-		arguments = append(arguments, "--snapshot", snapshotID)
-	}
-	output := h.compose(arguments...)
-	var result restoreOutput
-	if err := decodeExactJSON(output, &result); err != nil ||
-		result.SchemaVersion != productcli.ResultSchemaVersion ||
-		result.Target != target || result.Output != "/restore/"+outputName ||
-		!lowerHex64Pattern.MatchString(result.SnapshotID) ||
-		!lowerHex40Pattern.MatchString(result.ProjectCommit) ||
-		!contentIDPattern.MatchString(result.ContentID) ||
-		!contentIDPattern.MatchString(result.ArchiveID) {
-		h.t.Fatalf("invalid restore output: %v: %s", err, harnessDiagnostics(output))
-	}
-	return result
-}
-
-func decodeExactJSON(value string, destination any) error {
-	decoder := json.NewDecoder(strings.NewReader(value))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(destination); err != nil {
-		return err
-	}
-	var extra any
-	if err := decoder.Decode(&extra); err != io.EOF {
-		if err == nil {
-			return fmt.Errorf("multiple JSON documents")
-		}
-		return err
-	}
-	return nil
-}
-
-func TestDecodeExactJSONRejectsUnknownAndAdditionalDocuments(t *testing.T) {
-	t.Parallel()
-	type result struct {
-		SchemaVersion int `json:"schema_version"`
-	}
-	var decoded result
-	if err := decodeExactJSON(`{"schema_version":2}`, &decoded); err != nil || decoded.SchemaVersion != 2 {
-		t.Fatalf("valid result = %#v/%v", decoded, err)
-	}
-	for name, value := range map[string]string{
-		"unknown":    `{"schema_version":2,"extra":true}`,
-		"additional": `{"schema_version":2} {"schema_version":2}`,
-	} {
-		withResult := result{}
-		if err := decodeExactJSON(value, &withResult); err == nil {
-			t.Fatalf("%s JSON was accepted", name)
-		}
-	}
 }
 
 func (h *e2eHarness) stopProduction() {
