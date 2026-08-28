@@ -1,190 +1,191 @@
 # Architecture
 
-## Design rules
+This document explains the implemented system shape. Exact fields, limits,
+paths, JSON, and failure codes are normative only in
+[the schema 1 contracts](contracts.md).
 
-The repository optimizes for a future maintainer who must first understand the
-current audited boundary and only then change it:
-
-1. One file owns each pin or contract.
-2. Generated Go constants are derived from reviewed metadata, never edited.
-3. Upstream source trees are not vendored.
-4. Runtime decisions do not parse localized command stderr.
-5. Source data is mounted read-only to backup code.
-6. Publication is atomic and never overwrites an unknown destination.
-7. Process-local state is explicitly disposable; Restic is the durable record.
-
-The supported product and upstream revisions are defined by
-[`VERSION`](../VERSION) and [`UPSTREAMS.toml`](../UPSTREAMS.toml).
-
-## Runtime flow
+## Dataflow
 
 ```text
-trusted TLS/header-cleaning edge
-             │ root-path HTTP/WebSocket
-             ▼
-       transparent proxy ── one-bit event demand ──► backup worker
-             │                                      │
-             ▼                                      │ SQLite online backup
-        Vaultwarden                                 ▼
-                                             /staging/point
-                                                   │ serial Restic backup
-                                                   ▼
-                                              ordered S3 targets
+trusted TLS and header-cleaning edge
+                  |
+                  | loopback-published HTTP/WebSocket
+                  v
+              proxy :8080 ----------------------+
+                  |                              |
+                  | unchanged upstream request  | authenticated write/login event
+                  v                              v
+             Vaultwarden                     backup worker
+                  |                              |
+                  | live /data                   | SQLite online backup
+                  |                              | referenced-file stable copies
+                  |                              v
+                  +------------------------> /staging/point
+                                                 |
+                                                 | verified manifest + identities
+                                                 v
+                                      Restic target 1, then target 2, ...
 ```
 
-The proxy preserves upstream status, headers, streaming, bodies, and WebSocket
-behavior. A successful non-read method requests a backup check unless its exact
-route is in the audited read-like table in
-[`internal/proxy/policy.go`](../internal/proxy/policy.go). Each exception
-contains its upstream source location and reason. File-Send access endpoints
-are deliberately treated as writes because access limits mutate durable state.
-An unrecognized read-like POST causes an extra check; content identity prevents
-an unnecessary snapshot.
+The proxy is transparent: it forwards root-path traffic and emits one bounded
+event only after a qualifying upstream response is completely received and is
+successful. The event is demand, not proof that a recovery snapshot exists.
+The worker also performs startup, periodic, and fallback checks, so losing its
+in-memory event queue does not lose the durable state of the repositories.
 
-The proxy forwards `Forwarded`, `X-Real-IP`, and `X-Forwarded-*` exactly as
-received. The preceding edge is therefore the trust boundary: it must discard
-untrusted copies and set authoritative values. Only root-path deployment is
-supported.
+The worker mounts live Vaultwarden data read-only. It uses SQLite's online
+backup interface, validates the complete audited schema and migration, closes
+the reference set from the copied database, and stable-copies only referenced
+attachments and file-Send payloads. A changing, missing, unsafe, or unexpected
+file prevents publication. Staging is disposable; Restic snapshots are the
+durable recovery record.
 
-## Scheduler and failure state
+Targets execute serially in configuration order. A target can be degraded
+while another succeeds. When a failed target returns, it catches up to the
+newest verified recovery point; the product does not invent intermediate
+points that were never stored there.
 
-The worker has one serial scheduling loop and no scheduler database:
+## Network boundaries
 
-- startup, proxy events, and `request-backup` set the same coalescing demand;
-- demand is quieted for 30 seconds, capped at two minutes from the first event;
-- check starts are at least five minutes apart;
-- demand arriving during a check remains pending;
-- a successful check schedules a no-demand check 12 hours later;
-- a changing or temporarily missing referenced file retries after 30 seconds;
-- other source and target failures retry after five minutes; and
-- a continuous failure becomes degraded after 30 minutes, with one degraded
-  and one recovery transition event.
+| Network | Members | Property |
+| --- | --- | --- |
+| `app` | proxy, Vaultwarden | Internal; carries only proxied application traffic. |
+| `events` | proxy, backup | Internal; carries only the worker event/status API. |
+| `proxy-ingress` | proxy | Non-internal bridge used solely for the loopback publication. |
+| `backup-outbound` | backup | Repository and notifier egress for the resident worker. |
+| `maintenance-outbound` | one-shot maintenance/restore/upgrade services | Repository egress without joining application networks. |
+| `drill` | drill Vaultwarden and upgrade verifier | Internal recovery-drill traffic. |
+| `drill-ingress` | drill Vaultwarden | Separate loopback publication for a disposable drill. |
 
-Targets execute in configuration order. A failed target later catches up to the
-newest recovery point; intermediate points are not replayed. Whenever at least
-one target creates a snapshot, the check emits a recovery event, including when
-a previously failed target catches up to content already held by another
-target. Restart intentionally loses status, retry timers, transition state, and
-queued notifications.
+No production container receives the container-engine socket. Normal Compose
+uses only local image aliases and `pull_policy: never`; it cannot build or pull
+an image. Only the proxy and drill endpoints are published, both on loopback.
 
-## Recovery-point transaction
+## Filesystem and identity boundaries
 
-Both `/data` and `/staging` must be real, non-symlink, exact-mode 0700
-directories owned by the effective service UID. A build occurs under a
-recognized `/staging/.build-*` name:
+The deployment directory is both the ordinary Git clone and the root of
+ignored private/runtime state:
 
-1. A free-space check accounts for the live database, WAL estimate, and reserve.
-2. SQLite's online backup API copies the database and normalizes the copy to
-   DELETE journal mode.
-3. `integrity_check`, `foreign_key_check`, the exact complete SQLite schema,
-   its fingerprint, and the pinned latest migration are verified.
-4. Attachment and file-Send references are derived from the copied database.
-   UUIDs, IDs, sizes, JSON shapes, and relative paths are strictly validated.
-5. A second free-space check counts only referenced files still to be copied;
-   the already-created database is not counted twice.
-6. Each source payload must remain the same non-symlink regular file across
-   inspection, open, copy, and final inspection.
-7. The strict manifest is written, synced, and used to re-derive and verify the
-   complete tree. Missing, changed, or extra files and directories fail.
-8. First publication uses Linux `renameat2(RENAME_NOREPLACE)`. Replacement
-   uses `RENAME_EXCHANGE`; there is no check-then-rename fallback. Parent
-   directory entries are synced.
+```text
+.env                         exact deployment identity and ports
+config/                      private product and Vaultwarden configuration
+credentials/                 isolated backup/maintenance/notifier/password inputs
+data/                        live Vaultwarden data
+staging/                     disposable recovery-point construction
+cache/                       disposable Restic cache
+restore/                     verified, operator-named restore outputs
+state/                       worker and upgrade evidence
+dist/                        ignored release output
+tmp/                         ignored task output
+```
 
-A failed build never replaces the previous point. An unsupported kernel or
-filesystem fails safe instead of weakening atomicity. Staging is reproducible
-scratch state: only recognized `.build-*` entries are cleaned automatically.
+Private directories are mode `0700`; private files are mode `0600`; both are
+owned by the exact runtime UID/GID in `.env`. Every ancestor is checked without
+following symlinks. Resident services use that non-root identity, a read-only
+root filesystem, `no-new-privileges`, and no Linux capabilities.
 
-The schema contract is a tracked generated artifact. It is captured from a
-fresh database created by the exact audited Vaultwarden image, then reviewed
-and regenerated with `scripts/capture_vaultwarden_schema.py`. Product code
-embeds the complete object list rather than accepting a migration number alone.
+The sole root container is the bounded, networkless drill-copy helper. It gets
+only `CHOWN`, `DAC_OVERRIDE`, and `FOWNER`, copies a previously verified restore
+into a new disposable volume, and assigns that volume to the configured runtime
+identity. It does not alter the restore source or production data.
 
-## Restic boundary
+Role credentials are intentionally duplicated and checked independently:
 
-[`internal/restic`](../internal/restic) is a thin, typed adapter around the
-locally built patched Restic executable:
+- `credentials/backup.yaml` is available only to the resident worker.
+- `credentials/maintenance.yaml` is available only to one-shot repository,
+  restore, and upgrade commands.
+- each target has one separate Restic password file;
+- notifier secrets are available only to the resident worker.
 
-- every target has a distinct password file and credential entry;
-- Restic receives exactly `TMPDIR=/tmp` and the selected target's two AWS
-  credential variables; no ambient process environment is inherited;
-- repository, password, and cache values are structured process arguments;
-- snapshots are restricted by fixed host, path, and product-v2 tag;
-- a content-ID tag is the equality boundary;
-- full 64-character snapshot IDs are required for selection;
-- listing is bounded and reports truncation; and
-- command output is size-limited and parsed as strict JSON.
+Restic receives a fixed executable, temp directory, password file, repository
+argument, declared target environment, and controlled options. It does not
+inherit ambient host credentials, `HOME`, `PATH`, proxy variables, or debug
+settings.
 
-Structured Restic logs contain only operation, target, duration, exit code, and
-safe snapshot/content identifiers. Arguments, repository locators, stderr, and
-credentials are never logged.
+## Recovery identity
 
-Notifications are best effort. Each configured notifier has a bounded
-process-local queue and attempts delivery immediately, after one minute, and
-after five minutes. Queue overflow and delivery failure cannot change backup
-success.
+Each point has two independent identities:
 
-## Restore and drill
+- `content_id` is a canonical logical encoding of the accepted SQLite schema
+  and rows plus the byte contents of referenced payloads. It is stable across
+  SQLite page layout, insertion order, `VACUUM`, and archive metadata changes.
+- `archive_id` covers the exact recovery-tree entries and bytes that Restic
+  stores.
 
-Restore resolves exactly one snapshot, restores into a private temporary
-sibling, verifies the manifest, complete schema, complete tree, and content tag,
-then publishes with `RENAME_NOREPLACE` and syncs the parent. It never falls
-back from an invalid latest snapshot and never reuses or overwrites an output.
+The manifest records both IDs, the full clean product commit, and the creation
+instant. Restic snapshots repeat schema, project, content, and archive identity
+as tags. Backup can reuse an existing snapshot only after all of those facts
+agree; restore recomputes and checks them all. This separates semantic equality
+from exact archive equality and prevents a tag alone from authorizing recovery.
 
-The drill reads a verified restore read-only, copies its `data` directory into
-a newly reset disposable named volume, and starts Vaultwarden on isolated
-networks. The verified restore itself remains unchanged. Drill teardown deletes
-only the disposable copy volume.
+The recovery closure contains the copied database and only the attachment and
+file-Send payloads referenced by it. It excludes RSA keys, SQLite sidecars,
+configuration, caches, templates, old Vaultwarden backups, and orphaned files.
+Restored Vaultwarden therefore creates a new RSA identity. Existing access,
+refresh, invite, attachment, and download tokens are expected to become
+invalid; users establish fresh sessions after recovery.
 
-## Compose isolation
+## Restore and drill boundary
 
-`scripts/deploy.py` validates `config/deployment.yaml`, derives local image
-tags from the same metadata used by bundle/generation tools, and renders the
-single production template. The rendered document is not persisted. There is
-no `.env` merge or private environment-variable vocabulary to remember.
+A restore selects `latest` or one full snapshot ID from one named target,
+downloads into a task-owned temporary sibling, and performs complete schema,
+manifest, tag, identity, path, and file verification. Publication is an atomic
+no-replace rename to a previously absent `/restore/<name>`. No command chooses
+an earlier snapshot after a failed latest restore, overwrites an output, or
+deletes production data.
 
-- `app`: private proxy-to-Vaultwarden data plane.
-- `events`: private proxy-to-worker control plane.
-- `proxy-ingress`: loopback-only production publication.
-- `backup-outbound`: resident repository and notifier egress.
-- `maintenance-outbound`: one-shot maintenance and restore egress.
-- `drill` and `drill-ingress`: isolated copied data and loopback drill
-  publication.
+A drill is a separate Compose project and volume. It copies one operator-chosen
+`restore/drill` tree, starts the same immutable Vaultwarden image without the
+production proxy or worker, and publishes a different loopback port. Removing
+the drill project and volume cannot remove the verified restore.
 
-Maintenance and restore do not join `events`. The worker receives only its
-backup-role credentials; maintenance and restore receive only the maintenance
-role. Notifier credentials are mounted only into the resident worker.
+## Release and deployment split
 
-## Repository map
+Nix owns builds, tests, and release creation. A clean commit produces three
+images, each tagged with both `local` and one deterministic immutable release
+name. OCI revision, version, and creation labels derive from that commit.
 
-| Path | Responsibility |
-| --- | --- |
-| `cmd/` | Two small process entry points |
-| `internal/cli` | Typed CLI/JSON contract and dependency wiring |
-| `internal/config` | Strict schema-v2 configuration and credentials |
-| `internal/proxy` | Transparent forwarding and audited event policy |
-| `internal/snapshot` | SQLite copy, referenced-file capture, manifest, verification |
-| `internal/restic` | Restic process boundary and parsers |
-| `internal/restore` | Exact snapshot selection and atomic restore publication |
-| `internal/worker` | In-memory scheduling, status, and private HTTP API |
-| `internal/notify` | Safe message rendering and bounded delivery workers |
-| `internal/privatefs` | Private-file checks and Linux atomic rename primitives |
-| `internal/upstream` | Generated pins and embedded Vaultwarden schema |
-| `nix/` | Toolchain, products, local images, checks, and the Restic patch |
-| `deploy/` | Production Compose and Vaultwarden public templates |
-| `tests/e2e/` | Real Vaultwarden/Bitwarden/Restic/Moto lifecycle |
-| `scripts/` | Deployment, verification, generation, bundle, and audit tools |
+The release directory contains only:
 
-There are no checked-out upstream trees, release scripts, hosted CI workflows,
-or registry-specific files.
+```text
+images.tar.gz
+SHA256SUMS
+```
 
-## Build and artifact ownership
+The archive loads directly through standard `docker image load`, contains six
+references for three image IDs, and excludes the test-only Moto image. The
+ordinary deployment host verifies and loads these bytes; it does not compile,
+contact a registry, or need Nix.
 
-Nix builds the product binaries and images, patched Restic, and the test-only
-Moto image. The official Vaultwarden image is accepted only at the digest in
-`UPSTREAMS.toml` and receives a local tag containing its digest prefix.
-Nothing is pushed.
+## Upgrade ownership
 
-`internal/upstream/generated.go` and the Vaultwarden schema JSON are tracked
-because they are small review artifacts consumed at compile time. They have
-deterministic generators and checks. Build outputs, upstream checkouts, audit
-reports, bundles, databases, screenshots, and runtime state are ignored.
+An upgrade is an explicit A/B state machine, not `docker compose pull`:
+
+- immutable A owns prepare, freeze, rollback evidence, and rollback apply;
+- immutable B owns migration checking, repository verification, drill
+  verification, and accept;
+- B cannot expose its proxy or start its resident worker before accept;
+- A never interprets B candidate evidence when rolling back;
+- accept and rollback are mutually exclusive terminal states.
+
+Freeze stops writes, records same-filesystem rollback data owned by A, and
+binds it to immutable release identities. B must migrate, create and restore
+evidence, verify configured repositories, and pass an isolated drill before an
+operator can accept. On any pre-accept failure the operator invokes explicit A
+rollback; there is no automatic data exchange. See [Upgrades](upgrades.md).
+
+## Failure semantics
+
+- Health proves only that a process can answer its local health check.
+- Worker status is bounded process state; repository snapshots are durable
+  evidence.
+- A missing or changing referenced payload fails closed and preserves the last
+  good point.
+- A target failure does not convert partial success into complete success.
+- Notification queues are bounded, best effort, and non-durable.
+- Restore, drill, upgrade, and rollback validate exact owners before side
+  effects and never infer permission to overwrite a real destination.
+- Moto acceptance validates the Restic/S3 protocol boundary, not a cloud
+  provider's production behavior.
+- Framework A/B acceptance with two commits is not real cross-version evidence
+  unless the actual Vaultwarden versions differ.

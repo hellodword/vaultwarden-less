@@ -1,98 +1,128 @@
 # vaultwarden-less
 
-`vaultwarden-less` is an opinionated Linux/amd64 backup and restore system for
-one explicitly audited Vaultwarden release. It places a transparent event proxy
-in front of Vaultwarden, creates a verified recovery point from SQLite plus the
-attachment and file-Send payloads referenced by that database, and stores that
-point in one or more S3-backed Restic repositories.
+`vaultwarden-less` is a Linux/amd64 backup, restore, drill, and explicit-upgrade
+system for one audited Vaultwarden release. A transparent loopback proxy turns
+successful writes and logins into backup demand. The worker creates a verified
+SQLite recovery point, includes only database-referenced attachments and file
+Sends, and writes it to one or more Restic repositories.
 
-The repository contains one complete current contract set. A change to a
-durable contract must be explicit, versioned, tested, and documented.
+The deployment host needs only Git, Docker Engine, the Docker Compose plugin,
+and a release directory containing `images.tar.gz` and `SHA256SUMS`. It does
+not need Nix, Go, Python, Restic, or a registry.
 
-## Sources of truth
+## Ten-minute local start
 
-The repository is designed to be understandable before it is upgradeable:
-
-- [`VERSION`](VERSION) is the product version.
-- [`UPSTREAMS.toml`](UPSTREAMS.toml) records every audited upstream tag,
-  commit, digest, source hash, and audit surface.
-- [`internal/upstream/vaultwarden-schema.json`](internal/upstream/vaultwarden-schema.json)
-  is the complete accepted SQLite schema.
-- [`Justfile`](Justfile) is the operator and developer command index.
-- [`deploy/compose.template.yml`](deploy/compose.template.yml) is the only
-  shipped deployment topology; `scripts/deploy.py` renders its small declared
-  token set from strict deployment YAML and audited metadata.
-- [`docs/upstream-maintenance.md`](docs/upstream-maintenance.md) is the
-  one-upstream-at-a-time review procedure.
-
-Nix builds the product binaries, patched Restic, and all project-owned images
-locally. The official Vaultwarden image is pulled only by its audited digest
-and retagged with a local-only name.
-
-## Recovery boundary
-
-A recovery point contains exactly:
-
-- an SQLite online-backup copy at `data/db.sqlite3`;
-- attachment files referenced by that copy; and
-- file-Send payloads referenced by that copy.
-
-It excludes RSA keys, `config.json`, caches, templates, temporary files,
-SQLite sidecars, Vaultwarden-created backups, and orphaned payloads. After a
-restore, Vaultwarden creates a new RSA key, so existing access, refresh, invite,
-attachment, and download tokens may stop working. Users should establish fresh
-sessions.
-
-The scheduler and notifier queues are in memory. Restic snapshots are the
-durable fact. Startup and periodic checks recover from lost process-local
-signals; they do not reconstruct notification history.
-
-## Commands
-
-Use the pinned Just app as the only outer interface:
+Start from the exact clean Git commit named by the release producer. Do not
+mix a release archive with another commit, and never run `git clean -x` or
+`git clean -X` in a deployment clone: ignored credentials and Vaultwarden data
+are deliberately stored there.
 
 ```sh
-nix run .#just -- --list
-nix run .#just -- check
-nix run .#just -- check-full
+git clone <repository-url> vaultwarden-less
+cd vaultwarden-less
+git checkout --detach <full-clean-commit>
+test -z "$(git status --porcelain=v1 --untracked-files=all)"
 ```
 
-Recipes enter either the full development shell or the lightweight deployment
-shell themselves. Do not install project tools globally.
-
-For deployment, build the complete image bundle on a fast Linux/amd64 machine,
-copy it to the target, and load it there:
+Create private deployment inputs. Run these commands as the account whose UID
+and GID will run the containers, or change ownership to that identity before
+validation.
 
 ```sh
-nix run .#just -- bundle
-nix run .#just -- bundle-load dist/vaultwarden-less-<version>-linux-amd64
-nix run .#just -- init <runtime-uid> <runtime-gid>
+install -d -m 0700 config credentials credentials/restic
+install -d -m 0700 data staging cache restore state dist tmp
+install -m 0600 .env.example .env
+install -m 0600 config/backup.example.yaml config/backup.yaml
+install -m 0600 config/vaultwarden.example.env config/vaultwarden.env
+install -m 0600 credentials/backup.example.yaml credentials/backup.yaml
+install -m 0600 credentials/maintenance.example.yaml credentials/maintenance.yaml
+install -m 0600 credentials/notifiers.example.yaml credentials/notifiers.yaml
+install -m 0600 credentials/restic/primary.example credentials/restic/primary
 ```
 
-The bundle is a checked `docker save` archive. The deployment device performs
-`docker load`; it does not compile Vaultwarden-less or Restic. See
-[Operations](docs/operations.md#offline-image-transfer) before initial
-deployment.
+Edit the private copies. In particular:
 
-After editing the generated private configuration:
+- `.env` must contain exactly the five documented assignments. Set
+  `RUNTIME_UID` and `RUNTIME_GID` to the owner of every private path, choose two
+  different unprivileged loopback ports, and keep `DEPLOYMENT_SCHEMA_VERSION=1`.
+- Set `DOMAIN` in `config/vaultwarden.env` to the public HTTPS origin. Review
+  every security-sensitive Vaultwarden setting rather than enabling examples
+  blindly.
+- Set the repository and provider options in `config/backup.yaml`, put the same
+  target keys in both role credential files, and replace each Restic password.
+- Configure the notifier credentials, or set `notifiers: []` in
+  `config/backup.yaml` and use `notifiers: {}` in
+  `credentials/notifiers.yaml`.
+
+See [Configuration](docs/configuration.md) and [provider recipes](docs/providers.md)
+before inserting cloud credentials.
+
+Verify and load the exact two-file release with ordinary host tools:
 
 ```sh
-nix run .#just -- config-validate
-nix run .#just -- repo-init primary
-nix run .#just -- up
-nix run .#just -- status
+(cd <release-directory> && sha256sum --check SHA256SUMS)
+gzip --decompress --stdout <release-directory>/images.tar.gz | docker image load
 ```
 
-Only the proxy is published, on loopback by default. A trusted TLS edge must
-remove untrusted forwarding headers and send root-path HTTP/WebSocket traffic
-to that proxy. The worker API remains on a private Compose network.
+Validate both isolated credential roles before any repository or application
+operation:
 
-## Documentation
+```sh
+docker compose --env-file .env --file compose.yml --profile maintenance run --rm --no-deps config-check-backup
+docker compose --env-file .env --file compose.yml --profile maintenance run --rm --no-deps config-check-maintenance
+```
 
-- [Architecture](docs/architecture.md)
-- [Configuration](docs/configuration.md)
-- [Contracts](docs/contracts.md)
-- [Operations and recovery](docs/operations.md)
-- [Verification evidence and acceptance](docs/verification.md)
-- [Upstream review and upgrade strategy](docs/upstream-maintenance.md)
-- [Licensing and provenance](NOTICE.md)
+Initialize each new repository once, then start the three production services:
+
+```sh
+docker compose --env-file .env --file compose.yml --profile maintenance run --rm --no-deps maintenance repo init --target primary
+docker compose --env-file .env --file compose.yml up --detach vaultwarden backup proxy
+docker compose --env-file .env --file compose.yml ps
+docker compose --env-file .env --file compose.yml exec --no-TTY backup /bin/vaultwarden-less-backup status
+```
+
+Only the proxy is published, and only on loopback. Put a trusted TLS edge in
+front of it, remove untrusted forwarding headers there, and forward root-path
+HTTP and WebSocket traffic. A healthy process is not proof of a completed
+backup; confirm durable snapshots and complete a restore drill before relying
+on the deployment. The exact procedure is in [Operations](docs/operations.md).
+
+## Build and verification host
+
+Development, release creation, and automated acceptance use the pinned Nix
+environment. Do not install project tools globally.
+
+```sh
+nix develop --command just --list
+nix develop --command just check
+nix develop --command just check-full
+nix develop --command just release <ignored-output-root>
+```
+
+`check-full` includes the fast gate, vulnerability scan, all products, real
+Moto/Restic integration, the ordinary Vaultwarden backup/restore/drill
+lifecycle, and the real two-repository degradation/catch-up lifecycle. Upgrade
+acceptance is a separate command because it needs two explicit clean commits.
+
+## Documentation map
+
+- [Architecture](docs/architecture.md): dataflow, networks, recovery identity,
+  and ownership boundaries.
+- [Schema 1 contracts](docs/contracts.md): normative machine behavior.
+- [Configuration](docs/configuration.md): private files, modes, identities, and
+  examples.
+- [Storage providers](docs/providers.md): six S3-compatible provider recipes.
+- [Operations](docs/operations.md): backup, status, maintenance, restore, and
+  drills.
+- [Upgrades and rollback](docs/upgrades.md): prepare, freeze, verify, accept,
+  and explicit rollback.
+- [Verification](docs/verification.md): what each gate proves and does not
+  prove.
+- [Upstream maintenance](docs/upstream-maintenance.md): one-component review
+  checklists.
+- [Licensing and provenance](NOTICE.md): project and Vaultwarden obligations.
+
+The authoritative pins are [`UPSTREAMS.toml`](UPSTREAMS.toml), the complete
+accepted SQLite schema is
+[`internal/upstream/vaultwarden-schema.json`](internal/upstream/vaultwarden-schema.json),
+and [`Justfile`](Justfile) is the exact command index.

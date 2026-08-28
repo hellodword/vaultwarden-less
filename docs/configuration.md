@@ -1,144 +1,232 @@
 # Configuration
 
-Deployment configuration uses strict schema 1. Product and credential
-documents use strict schema 2. Unknown fields, duplicate keys, additional YAML
-documents, and implicit credential fallback are rejected. Every private file
-must be a non-symlink regular file with mode 0600 under real mode-0700
-directories owned by the configured runtime identity.
+This document shows how to create deployment inputs. Exact validators and
+limits are normative in [the schema 1 contracts](contracts.md). Storage-specific
+endpoints and permissions are in [Storage providers](providers.md).
 
-Create the layout with explicit numeric ownership:
+## Private layout and ownership
+
+The ordinary Git clone is the deployment directory. Tracked `*.example*` files
+are public templates; their private counterparts and all runtime directories
+are ignored. Never put real credentials in an example and never run
+`git clean -x` or `git clean -X` in this clone.
+
+Create the layout as the account whose identity will run the containers:
 
 ```sh
-nix run .#just -- init <runtime-uid> <runtime-gid>
+install -d -m 0700 config credentials credentials/restic
+install -d -m 0700 data staging cache restore state dist tmp
+install -m 0600 .env.example .env
+install -m 0600 config/backup.example.yaml config/backup.yaml
+install -m 0600 config/vaultwarden.example.env config/vaultwarden.env
+install -m 0600 credentials/backup.example.yaml credentials/backup.yaml
+install -m 0600 credentials/maintenance.example.yaml credentials/maintenance.yaml
+install -m 0600 credentials/notifiers.example.yaml credentials/notifiers.yaml
+install -m 0600 credentials/restic/primary.example credentials/restic/primary
 ```
 
-The command exclusively creates missing content, validates anything already
-present, and never replaces a secret or changes an established identity. It is
-safe to repeat with the same UID/GID. UID or GID 0 is supported only when an
-operator deliberately chooses root; there is no hidden default identity. The
-invoking account must be allowed to `chown` new files when the selected numeric
-identity differs from its own.
+Every private directory must be a real, non-symlink directory with mode
+`0700`. Every private file must be a real, non-symlink regular file with mode
+`0600`. They and their required subdirectories must be owned by the exact
+runtime UID/GID. Validation walks ancestors without following symlinks and
+rejects group/world permissions rather than silently repairing them.
 
-## Deployment layout
+If the runtime identity differs from the invoking account, create or chown only
+the explicit deployment paths with an administrative account. Do not apply a
+recursive ownership change to a parent directory or an existing machine-wide
+path.
 
-```text
-config/
-  deployment.yaml
-  backup/backup.yaml
-  vaultwarden/vaultwarden.env
-credentials/
-  backup/credentials.yaml
-  maintenance/credentials.yaml
-  restic/<target-name>
-  notifiers/credentials.yaml
-data/
-staging/
-cache/
-restore/
+## Deployment environment
+
+`.env` contains exactly five unquoted assignments and no comments or blank
+lines:
+
+```dotenv
+DEPLOYMENT_SCHEMA_VERSION=1
+RUNTIME_UID=1000
+RUNTIME_GID=1000
+LISTEN_PORT=8080
+DRILL_PORT=8081
 ```
 
-Runtime directories are ignored by Git. `deploy/` contains only public
-templates. There is no root `.env`, image registry setting, or project-private
-environment-variable protocol.
+- IDs are canonical decimal `1..4294967294` and must match private-path
+  ownership.
+- ports are canonical decimal `1024..65535`, must differ, and are published
+  only on loopback by tracked Compose.
+- leading zeros, signs, whitespace, quotes, interpolation, extra variables,
+  and symlinks are rejected.
 
-## Deployment configuration
-
-`config/deployment.yaml` has exactly these fields:
-
-```yaml
-schema_version: 1
-runtime_uid: 1000
-runtime_gid: 1000
-listen_port: 8080
-drill_port: 8081
-```
-
-- `schema_version` is the integer 1, not a quoted value or boolean.
-- UID/GID are integers from 0 through 4294967294.
-- ports are integers from 0 through 65535; 0 asks Docker for an ephemeral
-  loopback port.
-- equal nonzero production and drill ports are rejected.
-
-The renderer reads product/image identity from `VERSION` and `UPSTREAMS.toml`,
-not from this file. It accepts only the declared `@@...@@` template tokens and
-rejects unresolved tokens or Compose `${...}` interpolation. Compose is always
-called with `/dev/null` as its environment file, an explicit project name,
-the deployment root as project directory, and rendered YAML on stdin.
-The production and drill project names are fixed. Docker subprocesses inherit
-the caller's ordinary process environment and use an isolated credential-free
-client configuration.
+The normal and drill ports may be chosen freely inside those bounds. Do not
+publish either port directly on an untrusted interface.
 
 ## Backup configuration
 
-`config/backup/backup.yaml` declares targets in serial execution order and
-contains notifier references, never secrets:
+`config/backup.yaml` defines ordered targets, the subset required during an
+upgrade, and optional notifiers:
 
 ```yaml
-schema_version: 2
-
+schema_version: 1
+upgrade_verification_targets:
+  - primary
 targets:
   - name: primary
-    repository: s3:https://objects.example.test/bucket/vaultwarden
-    restic_options:
-      s3.bucket-lookup: path
-      s3.region: ap-singapore
-
+    repository: s3:https://objects.example.invalid/vaultwarden-primary
+    options:
+      - name: s3.bucket-lookup
+        value: path
 notifiers:
   - name: operations
     type: wechat
 ```
 
-At least one target is required. Names are unique lowercase identifiers. A
-repository is a credential-free `s3:http[s]://host/bucket/path` locator.
-User information, query strings, fragments, empty/traversal components, and
-unknown Restic options are rejected. Plain HTTP is test-only and warns.
+Target names use lowercase letters, digits, and hyphens and begin with a
+letter. Target order is semantic: backup and maintenance run serially in that
+order. Each option is a separate name/value pair so arguments are passed to
+Restic without shell interpretation. Repository and option values are never
+logged.
 
-Only `s3.bucket-lookup` (`auto`, `dns`, or `path`) and a constrained
-`s3.region` are configurable. Scheduling, retries, retention, paths, Restic
-identity, and supported upstream tuples remain product constants.
-
-## Role credentials and Restic passwords
-
-The worker reads `credentials/backup/credentials.yaml`; one-shot maintenance
-and restore read `credentials/maintenance/credentials.yaml`:
+For two repositories, add the second target and its independent password and
+role credentials:
 
 ```yaml
-schema_version: 2
+schema_version: 1
+upgrade_verification_targets:
+  - primary
+  - secondary
 targets:
-  primary:
-    AWS_ACCESS_KEY_ID: replace-me
-    AWS_SECRET_ACCESS_KEY: replace-me
+  - name: primary
+    repository: s3:https://objects-a.example.invalid/vaultwarden
+    options:
+      - name: s3.bucket-lookup
+        value: path
+  - name: secondary
+    repository: s3:https://objects-b.example.invalid/vaultwarden
+    options:
+      - name: s3.bucket-lookup
+        value: path
+notifiers: []
 ```
 
-The target key set must exactly match `backup.yaml`. Each entry accepts exactly
-the two shown keys. Restic receives exactly those two variables plus
-`TMPDIR=/tmp`; ambient AWS, Restic, HOME, PATH, and session variables are not
-forwarded.
+`upgrade_verification_targets` must contain configured target names and should
+include every repository that must be proven before accepting B. Normal backup
+still attempts every configured target regardless of this subset.
 
-Each target also has a distinct 0600 password file, for example
-`credentials/restic/primary`. There is no shared-password or environment
-fallback. Back up credential and password files separately from repositories.
+## Isolated role credentials
 
-## Notifiers and Vaultwarden
+`credentials/backup.yaml` and `credentials/maintenance.yaml` have the same
+schema and must contain exactly the configured target keys:
 
-`credentials/notifiers/credentials.yaml` has exactly one entry per notifier
-reference and no extras. WeChat accepts one HTTPS `webhook_url`. Bark requires
-its device token, PKCS#8 P-256 key, key/team IDs, topic, and optional sound.
-Notifier credentials are mounted only into the resident worker.
+```yaml
+schema_version: 1
+targets:
+  primary:
+    environment:
+      AWS_ACCESS_KEY_ID: replace-me
+      AWS_SECRET_ACCESS_KEY: replace-me
+```
 
-`config/vaultwarden/vaultwarden.env` starts from
-`deploy/vaultwarden.env.template` and is passed only to Vaultwarden. The
-template disables signup, invitation, admin, web-vault, push, icon download,
-and outbound features. It and regenerated RSA state are outside recovery.
+Create separate provider keys for the two files. The backup key belongs only
+to the resident worker. The maintenance key belongs only to one-shot init,
+check, prune, restore, and upgrade commands. This separation limits a resident
+service compromise and permits independent rotation.
+
+Environment names match `[A-Z_][A-Z0-9_]{0,127}`. Empty values, NUL, and
+oversized values are rejected. `RESTIC_*`, `PATH`, `HOME`, temp-directory
+variables, loader variables, and debug/runtime injection variables are
+reserved. Ambient host environment is not inherited.
+
+Each target also has a separate password file at
+`credentials/restic/<target>`:
+
+```text
+replace-with-a-long-random-restic-password
+```
+
+The password file is raw text with one optional final LF. Do not reuse a cloud
+secret, Vaultwarden password, or another target's Restic password. Losing this
+password makes the encrypted repository unrecoverable; store a protected copy
+outside the deployment and test it through a restore.
+
+The key sets in backup credentials, maintenance credentials, target passwords,
+and `config/backup.yaml` must agree exactly. Adding or removing a target is one
+coordinated configuration change.
+
+## Notifiers
+
+The only supported notifier type is WeCom/WeChat Work. For a configured
+notifier, `credentials/notifiers.yaml` contains the matching key exactly:
+
+```yaml
+schema_version: 1
+notifiers:
+  operations:
+    webhook_url: https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=replace-me
+```
+
+To disable notifications, use both:
+
+```yaml
+# config/backup.yaml
+notifiers: []
+```
+
+```yaml
+# credentials/notifiers.yaml
+schema_version: 1
+notifiers: {}
+```
+
+Notifier delivery is bounded and best effort. It reports safe target names,
+stable codes, and shortened digests; it is not durable backup evidence. Protect
+the webhook as a secret and rotate it through the provider if disclosed.
+
+## Vaultwarden environment
+
+Start from `config/vaultwarden.example.env` and review every value. Required
+storage paths are fixed to the mounted recovery boundary:
+
+```dotenv
+DATA_FOLDER=/data
+DATABASE_URL=sqlite:///data/db.sqlite3
+RSA_KEY_FILENAME=/data/rsa_key
+ATTACHMENTS_FOLDER=/data/attachments
+SENDS_FOLDER=/data/sends
+```
+
+Set `DOMAIN` to the exact public HTTPS origin presented by the trusted edge.
+The tracked example disables signups, invitations, the web vault, outbound
+icon download, push, SMTP-like features, and non-global HTTP requests. These
+are security defaults, not a claim that every deployment should have identical
+business policy. Changes must be deliberate and reviewed against the pinned
+Vaultwarden release.
+
+The RSA key is deliberately excluded from recovery. A restored or drilled
+instance creates a new key and invalidates old token-bearing sessions. This is
+a recovery property, not a configuration defect.
 
 ## Validation
 
+Load the exact release images before validation. Then run both role checks:
+
 ```sh
-nix run .#just -- config-validate
+docker compose --env-file .env --file compose.yml --profile maintenance run --rm --no-deps config-check-backup
+docker compose --env-file .env --file compose.yml --profile maintenance run --rm --no-deps config-check-maintenance
 ```
 
-This validates product configuration, target passwords, role key sets, and
-notifier fields without contacting repositories. Maintenance commands validate
-the maintenance role again before invoking Restic.
+Each command must print one schema-1 JSON success document and exit zero.
+Together they check the five-field environment, exact YAML, ownership, modes,
+symlink containment, target/password key sets, both role files, notifier
+credentials, and required runtime directories. They intentionally do not
+contact a repository.
 
-Relative Compose binds are intentionally rooted at the source/deployment tree.
+After validation, initialize every newly created repository with the
+maintenance role:
+
+```sh
+docker compose --env-file .env --file compose.yml --profile maintenance run --rm --no-deps maintenance repo init --target primary
+```
+
+Do not run `repo init` on an unknown nonempty location. Confirm the bucket,
+prefix, account, region, role, and independent Restic password first. A real
+`repo check`, backup, restore, and drill are still required before accepting
+the deployment.

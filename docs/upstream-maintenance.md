@@ -1,194 +1,249 @@
 # Upstream maintenance
 
-This project does not automate upstream upgrades. The goal is a repeatable
-manual review: at any later date, a maintainer should be able to identify what
-is pinned, inspect one candidate, understand every affected boundary, and
-produce a small reviewable change.
+Upstream changes are deliberate, one-component reviews. The goal is not to
+follow the newest tag; it is to preserve the implemented schema-1 behavior with
+auditable evidence, exact inputs, a small diff, and a complete rollback path.
 
-## Inventory model
+[`UPSTREAMS.toml`](../UPSTREAMS.toml) is the human-reviewed inventory for
+Vaultwarden, Bitwarden CLI, Restic, Moto, and Go. It records source repository,
+tag, commit, and relevant audit paths; Vaultwarden also records the accepted
+migration, complete schema, and recovery projection. Nix package sources,
+hashes, and dependency graph are owned by `flake.nix` and the tool-generated
+`flake.lock`, not duplicated in prose.
 
-[`UPSTREAMS.toml`](../UPSTREAMS.toml) is the human-reviewed inventory for:
+Never edit a dependency lockfile by hand. Change an authoritative input, then
+use its declared dependency tool. Do not combine an upstream update with
+unrelated cleanup, formatting churn, provider changes, or contract redesign.
 
-- Vaultwarden;
-- the official Bitwarden CLI used by E2E;
-- Restic;
-- Moto; and
-- Go.
+## Baseline and candidate report
 
-Each section records an exact tag and commit plus the build digest/hash needed
-by this repository. `audit_paths` names the upstream surfaces that matter most
-here. `VERSION` is deliberately separate because it versions this product,
-not an upstream.
-
-`scripts/generate_upstreams.py` validates the complete inventory and schema
-contract, then emits the constants consumed by Go to
-`internal/upstream/generated.go`. Run:
+Start from a clean branch at a passing commit:
 
 ```sh
-nix run .#just -- generate
-nix run .#just -- generate-check
+git status --short --branch
+nix develop --command just check
+nix develop --command just security
+nix develop --command just build
 ```
 
-Never edit the generated Go file. Never put the same upstream pin into Compose,
-a release script, or prose as another authority.
-
-The Nix flake lock owns the exact nixpkgs and treefmt inputs. Update it only
-through Nix commands, never with a text editor. Go module sums and any upstream
-module sums represented in the Restic patch are likewise produced by Go
-tooling.
-
-## Review one component at a time
-
-Start from a clean branch and a passing baseline. Pick one explicit candidate
-tag:
+Create one ignored candidate report:
 
 ```sh
-nix run .#just -- upstream-diff vaultwarden <candidate-tag>
+nix develop --command just upstream-diff <component> <candidate-tag>
 ```
 
-Supported component names are `vaultwarden`, `bitwarden-cli`, `restic`,
-`moto`, and `go`. The command:
+Components are `vaultwarden`, `bitwarden-cli`, `restic`, `moto`, and `go`.
+The standard-library script resolves current and candidate tags to commits from
+the expected origin, emits the full name-status diff and audited-path subset,
+and safely quotes hostile path or subject bytes. The report is an index, not an
+approval. Read official release notes, security notices, provenance, license
+changes, migrations, and the actual source diff.
 
-1. clones or reuses an ignored checkout under `tmp/upstream-audit`;
-2. resolves the currently recorded tag and verifies that it still reaches the
-   recorded commit;
-3. resolves the candidate tag without moving any project pin;
-4. writes an ignored report containing audited-surface changes, full diff stat,
-   commits, and all changed paths.
-
-The report is a starting index, not approval. Read release notes, security
-notices, migrations, and the actual source diff. Verify tag signatures or
-release attestations when that upstream provides them. Record conclusions in
-the project review or commit message, not in a permanent pile of generated
-reports.
-
-Do not combine unrelated upstream upgrades. If a shared nixpkgs update changes
-multiple tools, identify every changed package and either review them together
-as an explicit toolchain change or keep the prior flake input.
+Resolve all changing external facts from official upstream sources and current
+local package output. Do not rely on remembered versions, image digests, CLI
+flags, advisories, or maintenance status.
 
 ## Vaultwarden checklist
 
-Vaultwarden is the primary compatibility boundary. Review at least:
+Vaultwarden is the primary durable compatibility boundary. Review at least:
 
-- all SQLite migrations since the current commit;
-- database models and every attachment/file-Send reference shape;
-- routes that mutate ciphers, folders, Sends, organizations, collections,
-  membership, groups, policies, and access counters;
-- every ignored proxy route and its source-line evidence;
-- environment variables, default behavior, healthcheck, UID and filesystem
-  assumptions in the official image;
-- registration, authentication, token, and API changes exercised by E2E; and
-- license/provenance changes in the distributed image.
+- every SQLite migration since the accepted commit and its forward behavior;
+- all database tables, columns, indexes, triggers, and migration records;
+- models and paths for attachments and file-Send metadata, including unsafe or
+  missing-path behavior;
+- API routes that mutate ciphers, folders, Sends, organizations, collections,
+  membership, groups, policies, access counts, login, and token state;
+- every proxy event and ignored-route decision against source-line evidence;
+- registration, authentication, KDF, organization bootstrap, token, and JSON
+  behavior exercised by the narrow fixtures and official Bitwarden CLI;
+- environment variables, defaults, healthcheck, non-root UID/GID, filesystem,
+  SQLite, and signal behavior of the Nix package;
+- web-vault and AGPL/provenance implications of the distributed image.
 
-Obtain the official image by the candidate digest, not a floating tag. Start it
-against a new empty directory and let it create a fresh database. Confirm its
-latest migration and capture the complete schema:
+Build or obtain the candidate only through the declared Nix input. Start it
+against a new ignored private directory and let it create a fresh SQLite
+database. Capture the complete schema with the project script:
 
 ```sh
-nix develop --command python3 scripts/capture_vaultwarden_schema.py \
-  --database /absolute/path/to/fresh/db.sqlite3 \
-  --output internal/upstream/vaultwarden-schema.json
+nix develop --command just schema-capture /absolute/path/to/fresh/db.sqlite3 internal/upstream/vaultwarden-schema.json
 ```
 
-The capture rejects a database whose latest migration differs from the
-inventory. Review the JSON diff object by object. A migration number alone is
-not sufficient evidence because an image can drift at the same migration.
+The capture opens SQLite read-only with WAL awareness, checks integrity and the
+exact recorded migration, and writes deterministic schema JSON. Review the
+entire diff. A migration number alone is not compatibility evidence.
 
-Then update the Vaultwarden inventory fields, regenerate constants, review the
-proxy policy, and run unit, integration, E2E, restore, and drill checks. The
-official image digest, source tag/commit, migration, full schema fingerprint,
-manifest tuple, local tag, and E2E expectation must move as one change.
+Update the Vaultwarden tag, commit, migration, schema, and recovery projection
+as one reviewed unit. Then update every exact test expectation and image input
+that is genuinely owned by that change. Do not add a legacy schema or fallback
+unless a separately authorized durable contract requires it.
 
-Two small crypto/protocol fixtures exist because the official CLI exposes
-neither account registration nor initial organization creation. Their shapes
-are reviewed against the recorded Bitwarden client revision and Vaultwarden
-endpoints; all subsequent vault and organization operations use the official
-CLI. The fixtures are not a general client implementation.
+Acceptance requires the complete local gate, release reproducibility, real
+backup/restore/drill lifecycle, two-target degradation/catch-up, and the A/B
+upgrade suite with the prior actual Vaultwarden version as A and the candidate
+actual version as B. If those versions do not differ, the result is only
+framework evidence.
 
 ## Bitwarden CLI checklist
 
-The official CLI is a test oracle, not a runtime dependency. Review:
+The official Bitwarden CLI is an E2E oracle, not a production dependency.
+Review:
 
-- CLI release notes and authentication/session changes;
-- anonymous Send access-token issuance, persistence, expiry, and reuse (the
-  current CLI caches a recipient token, so access-count assertions must use a
-  fresh appdata directory for each recipient and explicitly configure its
-  server before token issuance);
-- create/edit/read behavior used by `tests/e2e`;
-- item, folder, attachment, Send, organization, and collection JSON shapes;
-- KDF, registration, user/org key generation, EncString, RSA encapsulation,
-  and Node crypto changes relevant to the narrow fixture; and
-- the nixpkgs package version actually selected by the flake.
+- release notes, authentication, server configuration, session, and password
+  file behavior;
+- JSON shapes and commands used for login, sync, item/folder, attachment,
+  organization, collection, and Send operations;
+- anonymous Send access-token issuance, expiry, caching, access limits, and
+  isolated recipient application data;
+- KDF, registration, user/organization key generation, EncString, AES-CBC-HMAC,
+  RSA-OAEP, and Node crypto behavior used by the two narrow fixtures;
+- the exact `bw --version` selected by the locked Nix package set.
 
-If nixpkgs does not provide the exact audited CLI version, do not merely retag
-the inventory. Either advance the flake input after reviewing its other package
-changes or keep the existing CLI. The Nix toolchain check compares
-`bw --version` with the inventory.
+If the current Nix input cannot provide the reviewed candidate, do not merely
+change `UPSTREAMS.toml`. Either keep the current CLI or update the Nix input and
+audit every package that moves with it. Registration and initial organization
+creation remain bounded fixtures only because the CLI lacks those operations;
+all later behavior must continue through the real CLI.
+
+Run deterministic crypto vectors repeatedly, all fast/race checks, ordinary
+and two-target E2E, and upgrade E2E. A green CLI version command does not prove
+protocol compatibility.
 
 ## Restic checklist
 
-Restic is built from the exact source commit in the inventory. Review:
+Restic is the unmodified package from the one locked Nix package set. Review:
 
-- snapshot, backup, restore, forget/prune, check, init, and unlock CLI behavior;
-- JSON output schemas and exit-code semantics;
-- S3 backend and credential behavior;
-- host/path/tag filtering and full snapshot IDs;
-- restore subfolder behavior and verification;
-- cancellation, locking, cache, and output-size assumptions; and
-- licensing and security advisories.
+- official release/security notes and the exact source revision selected by
+  Nix;
+- `init`, `backup`, `snapshots`, `check`, `unlock`, `forget --prune`, and
+  `restore` flags, exit codes, and JSON schemas;
+- S3-compatible backend, credentials, region, bucket lookup, multipart,
+  locking, caching, and timeout behavior;
+- full snapshot IDs, host/path/tag filtering, subfolder restore, and object
+  deletion semantics;
+- process-group cancellation, pipe drain/wait, stderr limits/redaction, frame
+  limits, UTF-8, and unknown-field behavior;
+- license and transitive security changes relevant to distribution.
 
-`nix/patches/restic-go-1.26.patch` is an ordered, reproducible patch against
-the pinned unmodified tree. Recreate it in an ignored temporary checkout with
-the pinned Go toolchain and supported Go module commands. Do not hand-edit
-`go.sum` lines. Keep the patch limited to the toolchain and necessary
-dependency updates; when upstream incorporates them, shrink or remove it.
+Do not introduce a local Restic patch or custom derivation merely to force a
+version. Advance the Nix input only after reviewing other package movement, or
+retain the current package. The toolchain check must match the recorded Restic
+tag and readable source revision.
 
-Update `source_hash` with Nix fetch tooling and `vendor_hash` through
-`buildGoModule`'s normal mismatch/report cycle. Verify the upstream release
-archive SHA separately when the release publishes one. Then run the real
-Moto/Restic round trip, E2E, vulnerability checks, and a bundle build.
+Run unit and race tests for the Restic adapter, the real Moto/Restic integration
+including init/check/prune/restore failures, both real Vaultwarden lifecycles,
+upgrade E2E, vulnerability checks, and deterministic release creation. Moto is
+not a substitute for a real configured storage provider.
 
 ## Go checklist
 
-Go affects both product binaries and the patched Restic build. Review:
+Go affects product binaries, SQLite behavior, the race detector, and every Go
+test. Review:
 
-- release and security notes;
-- compiler/linker, runtime, crypto, net, os, database/sql, and syscall changes;
+- release and security notes, including fixed standard-library vulnerabilities;
+- compiler/linker, runtime, crypto, `net`, `os`, `database/sql`, and syscall
+  changes;
 - Linux/amd64 and CGO behavior for SQLite;
-- `renameat2`, process cancellation, and race-detector behavior; and
-- whether Restic now supports the candidate without a local patch.
+- `renameat2`, file identity, stable copy, process groups, cancellation, pipes,
+  and race-detector changes;
+- the Go requirement of every module and the exact `go version` from Nix;
+- whether the same Nix update also changes Vaultwarden, Restic, Bitwarden CLI,
+  Moto, SQLite, or analysis tools.
 
-Update the inventory URL/hash, the product `go` and `toolchain` directives
-using `go mod edit`, and regenerate the Restic patch with Go tooling. The Nix
-toolchain check must report the exact inventory version and
-`GOTOOLCHAIN=local`.
+Use `go mod edit` inside the pinned development environment for `go` or
+`toolchain` directives. Update `flake.lock` only through Nix's supported lock
+command after choosing and auditing the exact Nix input revision. Update
+`UPSTREAMS.toml` to the official Go tag and commit only after current official
+source evidence is established. `GOTOOLCHAIN=local` and the actual toolchain
+version must match the inventory.
+
+Run `govulncheck ./...` before and after the change, all fast and race checks,
+all products, real integration/lifecycles, upgrade E2E, and two clean release
+builds. A toolchain bump is incomplete while any reachable known vulnerability
+remains or any frozen upstream version moved without review.
 
 ## Moto checklist
 
-Moto is test-only and locally packaged by Nix. Review S3 endpoint, bucket,
-listing, object, multipart, and authentication behavior used by integration and
-E2E. Confirm the nixpkgs Moto package version equals the inventory before
-changing the local image tag. A green mocked test does not replace review of
-real S3-compatible storage behavior.
+Moto is test-only and never enters the production release archive. Review its
+S3 server behavior used here: endpoint startup, authentication, bucket
+creation, list/read/write/delete, multipart, object metadata, failures, and
+cleanup. Confirm the actual Nix package version and readable source revision
+against `UPSTREAMS.toml`.
 
-## Required convergence checks
+Run the real integration test and both Vaultwarden lifecycle suites. Inspect
+that each required Go test genuinely ran and passed and that all task-owned
+containers, networks, and volumes are gone. A Moto update does not authorize a
+production provider claim.
 
-After changing one upstream:
+## Shared Nix-input changes
+
+All five audited components currently come from one locked Nix package set,
+directly or as build/test tooling. A single Nix input change can therefore move
+several components. Before applying it:
+
+1. evaluate the candidate package versions and readable source revisions in an
+   isolated clean copy;
+2. compare every audited component, not only the one that motivated the update;
+3. choose a revision that minimizes unrelated movement without missing a
+   required security fix;
+4. generate the lock update with Nix and inspect its complete diff;
+5. update every moved inventory entry or reject the candidate;
+6. validate in the isolated copy before applying the same declared commands to
+   the main worktree.
+
+Lockfile churn, download volume, or a successful evaluation is not proof that
+the selected product set is unchanged.
+
+## Required acceptance
+
+Run focused tests first, then the complete gates:
 
 ```sh
-nix run .#just -- generate-check
-nix run .#just -- check
-nix run .#just -- security
-nix run .#just -- build
-nix run .#just -- integration
-nix run .#just -- e2e
-nix run .#just -- bundle
+nix develop --command just check
+nix develop --command just security
+nix develop --command just build
+nix develop --command just integration
+nix develop --command just e2e-backup
+nix develop --command just e2e-multitarget
+nix develop --command just e2e-upgrade <A-full-commit> <B-full-commit>
 ```
 
-Also perform a manual restore and drill when Vaultwarden, Restic, Go, schema,
-filesystem publication, or Compose behavior changed.
+Generate the release twice from the same exact clean commit into two previously
+absent ignored roots:
 
-Before accepting the change, search the entire tracked tree for every replaced
-version, tag, digest, migration, package name, and route. Any remaining match
-must be generated evidence, a deliberate rejection test, or required audit
-context; do not retain a runtime compatibility path without a current contract.
+```sh
+nix develop --command just release <first-ignored-output-root>
+nix develop --command just release <second-ignored-output-root>
+```
+
+Require byte-identical `images.tar.gz` and `SHA256SUMS`, successful checksum and
+standard `docker image load`, exactly six references for three image IDs,
+matching OCI labels, no Moto image, and the actual expected upstream versions.
+Then repeat the archive-only cold deployment acceptance in
+[Operations](operations.md) on an ordinary isolated Linux/amd64 host.
+
+For an actual Vaultwarden change, the upgrade suite must cover migration
+permission failure, invalid verification target, corrupt drill, isolated
+evidence/accept, explicit rollback for each pre-accept failure, and success with
+two genuinely different Vaultwarden versions.
+
+## Final review
+
+Before committing the upstream unit:
+
+- review `git status`, unstaged/staged diffs, generated-file ownership, and the
+  exact lock diff;
+- search tracked files for replaced tags, commits, migrations, package
+  versions, API routes, image assumptions, and obsolete compatibility paths;
+- confirm examples, contracts, architecture, operations, verification, and
+  provider prose still agree;
+- classify every failure as introduced, pre-existing, or environment-caused
+  and rerun the narrowest failing command;
+- remove ignored source checkouts, reports, releases, logs, databases, and
+  runtime resources created by the review;
+- stage only explicit task paths and keep unrelated user work untouched.
+
+Record what changed, official evidence consulted, actual versions, commands and
+results, reproducibility facts, real scenario coverage, known unverified
+boundaries, cleanup, and the exact commit. Do not claim completion from a
+version-string update or a test framework that did not execute its required
+scenario.

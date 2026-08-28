@@ -1,18 +1,14 @@
 # Schema 1 contracts
 
-This document is the normative machine contract for the schema 1 redesign. The
-contracts are frozen; the runtime remains pending until the implementation and
-acceptance gates in the implementation plan pass. A tracked example or Compose
-file is part of this contract and must not be treated as proof that the current
-binary already implements it.
+This document is the normative machine contract for the implemented schema 1
+product. Tracked examples, Compose files, binaries, tests, and operator prose
+must agree with it; none can silently redefine it.
 
-The user authorized replacement of product schema 2, the bundle, CLI,
-configuration, recovery format, and upgrade behavior. There is no migration
-from schema 2 or from the current 0.2.0 data. To read old configuration,
-snapshots, or runtime data, check out the exact clean commit that created it and
-use that commit's complete toolchain. This authorization does not authorize
-destroying real data, publishing, deploying production, or changing an
-unlisted durable contract.
+Schema 1 deliberately has no migration from older product schemas or runtime
+data. To read old configuration, snapshots, or state, check out the exact clean
+commit that created it and use that commit's complete toolchain. No product
+command authorizes destroying or overwriting real data, publishing, deploying,
+or changing another durable contract.
 
 All `schema_version` values in this document are the JSON or YAML integer `1`,
 never a string or boolean. All instants are UTC RFC 3339 with exactly three

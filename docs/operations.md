@@ -1,239 +1,266 @@
-# Operations
+# Operations and recovery
 
-All supported project actions start with `nix run .#just --`. The Just recipe
-selects either the full pinned development environment or the lightweight
-deployment environment. Do not globally install project toolchains or maintain
-a second set of release commands.
+These procedures run on an ordinary Linux/amd64 deployment host with Git,
+Docker Engine, and the Docker Compose plugin. Nix is needed only to build or
+verify source and create releases. Run commands from the exact deployment
+clone; Compose bind paths are relative to it.
 
-## Quality gates
+Never run `git clean -x` or `git clean -X` in a deployment clone. Do not delete
+or overwrite `data`, `restore`, `state`, credentials, or a repository merely to
+make a command pass.
 
-```text
-generate-check   verify generated upstream constants
-fmt / fmt-check  format or check Go, Nix, and Python
-test             run Go and deployment-script tests
-race             run Go tests with the race detector
-vet               run go vet
-lint              run golangci-lint and Ruff
-compose-check     render every production Compose profile
-check             normal local gate plus nix flake check
-security          run govulncheck
-build             build binaries, patched Restic, and all local images
-integration       real patched-Restic/Moto round trip
-e2e               real Vaultwarden/Bitwarden backup and restore lifecycle
-check-full         every gate above
-```
+## Release transfer and startup
 
-There is no hosted CI or registry release path. A maintainer runs these gates
-locally and keeps the resulting evidence with the review.
-
-Real test recipes accept optional fixed loopback ports. Omit the arguments to
-let Docker choose ephemeral ports. Nonzero values must be distinct and in the
-documented unprivileged range.
-
-The E2E deliberately uses the production 30-second quiet window and five-minute
-minimum check-start interval. It must publish exactly two recovery points and
-therefore takes several minutes even with cached images. The complete assertion
-matrix and no-skip proof are in [Verification](verification.md).
-
-## Offline image transfer
-
-Build images on a capable Linux/amd64 machine. Do not compile the product or
-Restic on a slow deployment device.
-
-On the build machine, from a clean committed worktree:
+A release directory must contain exactly `images.tar.gz` and `SHA256SUMS` from
+one clean commit. Verify and load it before changing the running stack:
 
 ```sh
-nix run .#just -- check-full
-nix run .#just -- bundle
+(cd <release-directory> && sha256sum --check SHA256SUMS)
+gzip --decompress --stdout <release-directory>/images.tar.gz | docker image load
 ```
 
-`bundle` builds the backup and proxy images with Nix, builds the patched
-Restic executable into the backup image, pulls Vaultwarden by its exact audited
-digest, applies only a local tag, and runs `docker save` for all three images.
-It also records image IDs, checksums, source, license material, and CycloneDX
-SBOMs. Nothing is pushed.
+The archive contains local and immutable references for the three production
+images and no test image. A successful load proves transferred image bytes and
+labels, not configuration or repository access.
 
-Move the resulting directory to the deployment device using an
-operator-selected mechanism outside this project contract.
-
-On the deployment device:
+Validate both isolated roles:
 
 ```sh
-nix run .#just -- bundle-load /srv/vaultwarden-less-<version>-linux-amd64
+docker compose --env-file .env --file compose.yml --profile maintenance run --rm --no-deps config-check-backup
+docker compose --env-file .env --file compose.yml --profile maintenance run --rm --no-deps config-check-maintenance
 ```
 
-That command checks `images.tar.sha256`, runs `docker load`, and verifies
-every loaded image ID. It enters only `devShells.deploy`, which contains
-Docker, Compose, and Python; it does not depend on the locally built product or
-Restic derivations.
-
-The portable mechanism underneath the recipe is deliberately ordinary Docker:
+Initialize only a known-empty, dedicated repository target, once:
 
 ```sh
-# Performed by bundle creation on the build machine:
-docker save --output images.tar vaultwarden-less-backup:<version> \
-  vaultwarden-less-proxy:<version> vaultwarden-less-vaultwarden:<audited-local-tag>
-
-# Performed after checksum verification on the deployment device:
-docker load --input images.tar
+docker compose --env-file .env --file compose.yml --profile maintenance run --rm --no-deps maintenance repo init --target primary
 ```
 
-For an air-gapped target, make the lightweight Nix deployment-shell closure
-available in advance. The same load boundary can be inspected directly with
-`nix develop .#deploy --command docker load --input images.tar`, followed by
-`bundle-verify`. The image archive avoids all product compilation; it does not
-include Nix inputs or a Docker daemon.
-
-A bundle never contains deployment configuration, application settings,
-credentials, passwords, volumes, databases, staging, or restored data.
-Transfer and back up those separately.
-
-## Initial deployment
-
-Use the source tree from the same commit recorded in `bundle.json` (the bundle
-also contains `source.tar`). On the deployment host filesystem:
+Start the exact production services after both checks succeed:
 
 ```sh
-nix run .#just -- init <runtime-uid> <runtime-gid>
+docker compose --env-file .env --file compose.yml up --detach vaultwarden backup proxy
+docker compose --env-file .env --file compose.yml ps
+docker compose --env-file .env --file compose.yml logs --tail 200 vaultwarden backup proxy
 ```
 
-Edit:
+Only the proxy is bound to loopback. A trusted TLS edge must present the
+configured public `DOMAIN`, remove untrusted forwarding headers, and send
+root-path HTTP and WebSocket traffic to the proxy. The worker API and direct
+Vaultwarden endpoint remain on internal networks.
 
-```text
-config/deployment.yaml
-config/vaultwarden/vaultwarden.env
-config/backup/backup.yaml
-credentials/backup/credentials.yaml
-credentials/maintenance/credentials.yaml
-credentials/restic/<target>
-credentials/notifiers/credentials.yaml
-```
-
-Then validate and start:
+`down` stops and removes only the normal Compose project; bind-mounted data and
+private inputs remain:
 
 ```sh
-nix run .#just -- config-validate
-nix run .#just -- repo-init primary
-nix run .#just -- up
-nix run .#just -- ps
-nix run .#just -- logs
+docker compose --env-file .env --file compose.yml down
 ```
 
-`init` is safe to repeat with the same explicit identity but intentionally
-refuses wrong ownership, modes, symlinks, existing non-private files, and a
-different UID/GID. UID/GID 0 is supported only when explicitly chosen. It does
-not alter paths outside the current declared layout. Run the recipe from an
-account that can `chown` that layout when the selected identity differs from
-the invoking account.
+## Status and backup demand
 
-Compose bind paths are relative to the explicit deployment project directory.
-
-Only the proxy is published, at `127.0.0.1:8080` by default. Terminate TLS at a
-trusted edge, remove any external path prefix, discard untrusted forwarding
-headers, and forward root-path HTTP and WebSocket traffic. `down` stops the
-stack without deleting source, staging, restore, or repository data.
-
-## Backup health
+Read resident process status:
 
 ```sh
-nix run .#just -- request-backup
-nix run .#just -- status
-nix run .#just -- repo-snapshots primary 100
+docker compose --env-file .env --file compose.yml exec --no-TTY backup /bin/vaultwarden-less-backup status
 ```
 
-`request-backup` acknowledges an in-memory demand; it does not claim that a
-snapshot exists. Health endpoints prove only that the relevant HTTP process is
-serving. They do not test SQLite, S3, Restic, or notifiers.
+Request one debounced check:
 
-The scheduler can delay a request for quieting and the minimum check-start
-interval. Process-local status disappears on restart. `repo-snapshots` is the
-durable repository view and is intentionally bounded; raise the limit up to
-1000 when auditing deeper history.
+```sh
+docker compose --env-file .env --file compose.yml exec --no-TTY backup /bin/vaultwarden-less-backup request-backup
+```
 
-Structured logs are safe metadata, not a data backup. Restic logs exclude
-arguments, stderr, locators, and secrets.
+The acknowledgement means only that demand was accepted. A check can wait for
+the 30-second quiet period, extend quieting to two minutes, and wait for the
+five-minute minimum check-start interval. A source inconsistency retries after
+30 seconds; ordinary target failure retries after five minutes; 30 minutes of
+continuous target failure becomes degraded. A 12-hour fallback check protects
+against lost process-local events.
+
+Worker state is `idle`, `debouncing`, `checking`, `partial`, or `degraded`.
+Target state is `unknown`, `healthy`, `retrying`, or `degraded`. `partial`
+means at least one configured repository has the point and another does not;
+it must not be reported as complete success.
+
+Status and notification queues reset on worker restart. Repository snapshots
+are the durable fact. Confirm them independently:
+
+```sh
+docker compose --env-file .env --file compose.yml --profile maintenance run --rm --no-deps maintenance repo snapshots --target primary --limit 100
+```
+
+Use the full 64-character snapshot ID returned here for an explicit earlier
+restore. Do not parse log messages as a snapshot contract.
 
 ## Repository maintenance
 
-```sh
-nix run .#just -- repo-snapshots primary 100
-nix run .#just -- repo-check primary
-nix run .#just -- repo-check primary 1/12
-nix run .#just -- repo-unlock primary
-nix run .#just -- repo-prune primary
-nix run .#just -- repo-prune-apply primary
-```
+Run maintenance only after both role validation commands pass. The one-shot
+maintenance container has repository egress but does not join application
+networks.
 
-The first prune is a dry run. Only `repo-prune-apply` deletes snapshots matching
-the fixed product-v2 identity and retention policy. Deleting any out-of-scope
-history is a separate, explicit operator operation.
-
-Repository targets run serially. A slow first target delays later targets.
-After an outage, a target receives the newest point rather than every
-intermediate point.
-
-## Restore
-
-Restore publishes only a verified absent output:
+List snapshots and check repository metadata:
 
 ```sh
-nix run .#just -- restore primary prepared
-nix run .#just -- restore-snapshot <full-64-hex-id> primary earlier
+docker compose --env-file .env --file compose.yml --profile maintenance run --rm --no-deps maintenance repo snapshots --target primary --limit 100
+docker compose --env-file .env --file compose.yml --profile maintenance run --rm --no-deps maintenance repo check --target primary
 ```
 
-The default resolves the latest product-v2 snapshot. If that snapshot is
-corrupt or incompatible, restore fails; it never silently falls back. Select an
-earlier full ID explicitly.
-
-The output and every parent must satisfy the private-directory contract. Restic
-writes a temporary sibling, complete verification runs, and an atomic
-no-replace rename publishes it. A failure removes the temporary sibling and
-leaves the requested output absent. The tool never overwrites or resets real
-restore data.
-
-## Recovery drill
-
-Pass the validated restore output name created beneath `restore/`:
+Unlock is for a confirmed stale Restic lock after proving no backup, restore,
+prune, or other client is active:
 
 ```sh
-nix run .#just -- drill-up prepared
-nix run .#just -- drill-status
-nix run .#just -- drill-down
+docker compose --env-file .env --file compose.yml --profile maintenance run --rm --no-deps maintenance repo unlock --target primary
 ```
 
-Each `drill-up` resets only the separate drill Compose project's disposable
-copy volume, uses a root-only one-shot copy service to populate and chown that
-volume to the explicitly configured runtime identity, and starts the same
-pinned Vaultwarden image as that identity on isolated networks and a loopback
-port. The copy service has no network and receives only the `CHOWN`,
-`DAC_OVERRIDE`, and `FOWNER` capabilities needed to read the private restore
-and prepare the disposable volume. No long-running product image has a hidden
-default user.
-`drill-down` deletes only that disposable volume. It does not change or delete
-the verified restore.
+Prune always begins with a preview:
 
-Use fresh sessions to verify login, items, folders, attachments, file Sends and
-their access limits, organizations, and collections. The automated E2E covers
-the supported API/CLI paths, but an operator drill is still required after
-initial deployment, every Vaultwarden upgrade, storage changes, and at a
-locally chosen periodic interval.
+```sh
+docker compose --env-file .env --file compose.yml --profile maintenance run --rm --no-deps maintenance repo prune --target primary
+```
 
-Because RSA state is excluded, expect pre-recovery access, refresh, invite,
-attachment, and download tokens to fail after recovery.
+Review every retained and removed full snapshot ID. Only then apply the exact
+fixed policy:
 
-## Failure boundaries
+```sh
+docker compose --env-file .env --file compose.yml --profile maintenance run --rm --no-deps maintenance repo prune --target primary --apply
+docker compose --env-file .env --file compose.yml --profile maintenance run --rm --no-deps maintenance repo check --target primary
+```
 
-- The worker sees live `/data` read-only and never pauses or deletes production
-  Vaultwarden data.
-- A changing referenced payload prevents publication and preserves the previous
-  recovery point.
-- Staging can be rebuilt and is not scheduler state.
-- Target histories can differ after outages.
-- Notification queues are best effort and disappear at shutdown.
-- Restore and drill never authorize deletion of a real destination.
-- Image bundles prove transferred image bytes and IDs, not the correctness of
-  deployment secrets or external S3 behavior.
+The fixed retention is within 24 hours, 48 hourly, 14 daily, 8 weekly, 12
+monthly, and 3 yearly snapshots. Selection is limited to this product's exact
+host, path, schema, project, content, and archive identity. Provider lifecycle
+rules must not independently expire active Restic objects. Object lock may make
+unlock or prune fail; see [Storage providers](providers.md).
 
-For upstream changes, follow
-[the one-component review procedure](upstream-maintenance.md) rather than
-editing pins opportunistically.
+## Verified restore
+
+Restore latest to one previously absent output name:
+
+```sh
+docker compose --env-file .env --file compose.yml --profile restore run --rm --no-deps restore restore --target primary --snapshot latest --output drill
+```
+
+Restore an explicit earlier full snapshot ID to a different absent name:
+
+```sh
+docker compose --env-file .env --file compose.yml --profile restore run --rm --no-deps restore restore --target primary --snapshot <full-64-character-id> --output earlier
+```
+
+The output name resolves beneath `restore/`. Restore downloads into a private
+temporary sibling, verifies exact tags, manifest, file set, sizes, hashes,
+SQLite integrity and foreign keys, complete audited schema, database
+references, canonical content identity, and archive identity, then atomically
+publishes the output without replacement. It never falls back from a corrupt
+latest point to an earlier point and never overwrites an existing output.
+
+On failure, preserve the error JSON, run `repo check`, and select a known full
+earlier ID explicitly if incident policy authorizes it. Use a new output name;
+do not delete a verified restore merely to reuse its name.
+
+## Isolated recovery drill
+
+The drill profile consumes exactly `restore/drill`, so create that verified
+output first. Start the separate project and wait for health:
+
+```sh
+docker compose --project-name vaultwarden-less-drill --env-file .env --file compose.yml --profile drill up --detach --wait --wait-timeout 180 drill-vaultwarden
+docker compose --project-name vaultwarden-less-drill --env-file .env --file compose.yml --profile drill ps
+```
+
+Configure a normal Bitwarden client for the drill's loopback origin. Use fresh
+sessions and verify, at minimum:
+
+- both a personal and an organization item, including a value changed after an
+  earlier recovery point;
+- folders, organizations, collections, and membership;
+- attachment bytes and ordinary file-Send bytes;
+- the exhausted behavior of an access-limited Send when present;
+- a second user and data owned by that user.
+
+An authenticated session captured before recovery should fail against the
+drill. Login again and establish fresh sessions. RSA state is intentionally
+excluded, so prior access, refresh, invitation, attachment, and download tokens
+are expected to be invalid.
+
+Remove only the disposable drill project and volume:
+
+```sh
+docker compose --project-name vaultwarden-less-drill --env-file .env --file compose.yml --profile drill down --volumes
+```
+
+The verified `restore/drill` tree remains. The production stack is a different
+Compose project and is not changed by drill cleanup.
+
+## Restart durability check
+
+After the first successful point and after material deployment changes, prove
+that durable repository state survives a complete service restart:
+
+```sh
+docker compose --env-file .env --file compose.yml stop proxy backup vaultwarden
+docker compose --env-file .env --file compose.yml up --detach vaultwarden backup proxy
+docker compose --env-file .env --file compose.yml exec --no-TTY backup /bin/vaultwarden-less-backup request-backup
+docker compose --env-file .env --file compose.yml --profile maintenance run --rm --no-deps maintenance repo snapshots --target primary --limit 100
+docker compose --env-file .env --file compose.yml --profile maintenance run --rm --no-deps maintenance repo check --target primary
+```
+
+Wait for a completed worker check before interpreting the snapshot list.
+Unchanged logical content may reuse the existing point even if the fresh
+SQLite archive bytes differ. That is expected content-ID deduplication, not a
+missed backup.
+
+## Two-target degradation and catch-up
+
+Test this only with controlled acceptance targets. Do not create a provider
+outage or revoke production credentials without exact authorization.
+
+1. Configure two independent repositories, passwords, and role keys; validate
+   both roles and initialize both targets.
+2. Create changed Vaultwarden data and wait until both targets report the same
+   `content_id` with their own verified snapshots.
+3. Make only the secondary target unavailable through the controlled test
+   mechanism, create another change, and request a backup.
+4. Prove the primary succeeds, the secondary retries, and after 30 minutes the
+   worker reports partial/degraded rather than complete success.
+5. Restore secondary access without changing source data. The worker must
+   catch that target up to the same latest `content_id`.
+6. Run `repo check`, latest restore, and drill from each target. Do not accept
+   equality based only on snapshot count or timestamp.
+
+Targets execute serially, so a slow first target delays later targets. Catch-up
+stores the newest verified point; it does not synthesize every missed
+intermediate state.
+
+## Cold deployment acceptance
+
+Before relying on a new deployment, use an ordinary isolated Linux/amd64 host
+with only Git, Docker Engine, and Compose for deployment operations:
+
+1. clone the exact clean commit and verify the working tree;
+2. create private copies and modes exactly as in the README;
+3. checksum and standard-load the two-file archive;
+4. run both configuration checks and initialize two real repositories;
+5. start production, create real Vaultwarden data through a normal client, and
+   obtain verified points on both targets;
+6. stop and restart all three services and prove repository continuity;
+7. restore latest and an earlier full ID, run a drill, verify data, and prove
+   old-session invalidation plus fresh login;
+8. run the controlled two-target degradation/catch-up sequence;
+9. remove only acceptance-created containers, networks, volumes, and temporary
+   directories, then prove no such resource remains.
+
+The operator should not need to read Go/Nix source or install project tools to
+perform those steps. A real provider must still be tested separately from the
+Moto-based automated boundary.
+
+## Incident boundary
+
+The product creates verified restore trees and disposable drills; it does not
+replace live `data`. Promotion of a restore into production is a destructive
+real-data decision and requires exact authorization plus a verified recovery
+copy of the current tree. Keep the failed source intact, record the selected
+snapshot and identities, complete the drill, plan rollback, and only then use
+a separately reviewed incident procedure.
+
+For an audited A/B product change, do not improvise image replacement or data
+promotion. Follow [Upgrades and explicit rollback](upgrades.md).
