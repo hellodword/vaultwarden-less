@@ -15,7 +15,7 @@ labels, or `compose.env` by hand.
 Before `prepare`:
 
 - A is an exact clean schema-1 release and its three production services are
-  healthy.
+  healthy; `state/deployment/active.json` exactly names A.
 - A has recent verified snapshots on every configured upgrade-verification
   target, and a latest restore plus drill has passed.
 - B is an exact clean schema-1 commit with a separately generated and checked
@@ -29,6 +29,11 @@ Before `prepare`:
 - the operator has recorded the full A/B commits, immutable release names,
   repository evidence, expected Vaultwarden versions, maintenance window, and
   the decision owner for accept versus rollback.
+
+The B Vaultwarden entry runs only in `upgrade-candidate` mode. Before it opens
+the active database, the gate proves that the image is the B named by current
+state, active identity still names A, and frozen rollback evidence exists.
+Ordinary `normal` mode cannot be substituted for this transition.
 
 Framework acceptance needs different clean product commits and immutable tags.
 It is complete orchestration evidence for that exact managed release pair even

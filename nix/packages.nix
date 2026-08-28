@@ -63,6 +63,12 @@ let
     cgoEnabled = true;
   };
 
+  vaultwardenGate = productPackage {
+    name = "vaultwarden-less-vaultwarden";
+    subPackage = "cmd/vaultwarden-less-vaultwarden";
+    cgoEnabled = false;
+  };
+
   labels =
     title:
     {
@@ -116,14 +122,6 @@ let
     '';
   };
 
-  vaultwardenEntrypoint = pkgs.writeShellApplication {
-    name = "vaultwarden-less-vaultwarden";
-    text = ''
-      umask 077
-      exec ${pkgs.vaultwarden}/bin/vaultwarden "$@"
-    '';
-  };
-
   vaultwardenImage = pkgs.dockerTools.buildLayeredImage {
     name = "vaultwarden-less-vaultwarden";
     tag = "local";
@@ -135,12 +133,13 @@ let
       pkgs.vaultwarden
       drillCopy
       vaultwardenHealthcheck
-      vaultwardenEntrypoint
+      vaultwardenGate
       pkgs.cacert
       pkgs.tzdata
     ];
     config = commonImageConfig // {
       Entrypoint = [ "/bin/vaultwarden-less-vaultwarden" ];
+      Cmd = [ "normal" ];
       Env = [
         "ROCKET_ADDRESS=0.0.0.0"
         "ROCKET_PORT=80"

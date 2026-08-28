@@ -47,12 +47,25 @@ services:
     image: vaultwarden-less-vaultwarden:local
     pull_policy: never
     hostname: vaultwarden
+    command: [normal]
     env_file:
       - ./config/vaultwarden.env
     volumes:
       - type: bind
+        source: ./.env
+        target: /deployment/.env
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
         source: ./data
         target: /data
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./state
+        target: /state
+        read_only: true
         bind:
           create_host_path: false
     networks:
@@ -317,6 +330,34 @@ services:
     networks:
       - maintenance-outbound
 
+  deployment-admin:
+    <<: *service-defaults
+    image: vaultwarden-less-backup:local
+    pull_policy: never
+    profiles: [deployment]
+    restart: "no"
+    network_mode: none
+    entrypoint: [/bin/vaultwarden-less-backup]
+    command: [--help]
+    volumes:
+      - type: bind
+        source: ./.env
+        target: /deployment/.env
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./data
+        target: /data
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./state
+        target: /state
+        bind:
+          create_host_path: false
+
   restore:
     <<: *service-defaults
     image: vaultwarden-less-backup:local
@@ -378,6 +419,7 @@ services:
     pull_policy: never
     profiles: [drill]
     restart: "no"
+    command: [drill]
     depends_on:
       drill-copy:
         condition: service_completed_successfully
@@ -398,6 +440,24 @@ services:
       - type: volume
         source: drill-data
         target: /data
+      - type: bind
+        source: ./.env
+        target: /deployment/.env
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./restore/drill
+        target: /recovery
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./state
+        target: /state
+        read_only: true
+        bind:
+          create_host_path: false
     ports:
       - "127.0.0.1:${DRILL_PORT:?DRILL_PORT is required}:80"
     networks:

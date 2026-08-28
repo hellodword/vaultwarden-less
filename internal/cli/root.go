@@ -26,13 +26,14 @@ const (
 	codeVerification       = "verification_failure"
 	codeTimeout            = "timeout"
 	codeUpgradeState       = "upgrade_state_invalid"
+	codeDeploymentState    = "deployment_state_invalid"
 	codeInternal           = "internal_error"
 )
 
 var stableErrorCodes = map[string]struct{}{
 	codeUsageError: {}, codeInvalidConfig: {}, codeInvalidCredentials: {}, codeUnsafePath: {}, codeNotReady: {},
 	codeConflict: {}, codeSourceInconsistent: {}, codeUnsupportedSchema: {}, codeRepositoryFailure: {},
-	codeVerification: {}, codeTimeout: {}, codeUpgradeState: {}, codeInternal: {},
+	codeVerification: {}, codeTimeout: {}, codeUpgradeState: {}, codeDeploymentState: {}, codeInternal: {},
 }
 
 type CommandError struct {
@@ -139,6 +140,7 @@ func newCommand(stdout, stderr io.Writer, environment commandEnvironment) *cobra
 	root.CompletionOptions.DisableDefaultCmd = true
 	root.AddCommand(
 		serveCommand(&configPath, environment),
+		deploymentCommand(environment),
 		requestBackupCommand(environment),
 		statusCommand(environment),
 		configCommand(&configPath, environment),

@@ -74,7 +74,7 @@ data/                        live Vaultwarden data
 staging/                     disposable recovery-point construction
 cache/                       disposable Restic cache
 restore/                     verified, operator-named restore outputs
-state/                       worker and upgrade evidence
+state/                       active deployment identity and workflow evidence
 dist/                        ignored release output
 tmp/                         ignored task output
 ```
@@ -88,6 +88,15 @@ The sole root container is the bounded, networkless drill-copy helper. It gets
 only `CHOWN`, `DAC_OVERRIDE`, and `FOWNER`, copies a previously verified restore
 into a new disposable volume, and assigns that volume to the configured runtime
 identity. It does not alter the restore source or production data.
+
+Every production image carries one immutable project commit and release. The
+private `state/deployment/active.json` is the only serving authority: normal
+Vaultwarden, backup, and proxy independently reject a missing, damaged, or
+mismatched identity. The Vaultwarden gate runs before `/bin/vaultwarden`, so a
+rejected image cannot open or migrate `/data/db.sqlite3` or create SQLite/WAL
+or RSA state. Upgrade, rollback, drill, and import use explicit Compose argv
+and their narrower durable workflow evidence; no mode is inferred from tags or
+the presence of a database.
 
 Role credentials are intentionally duplicated and checked independently:
 

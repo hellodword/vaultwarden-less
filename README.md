@@ -78,6 +78,7 @@ operation:
 ```sh
 docker compose --env-file .env --file compose.yml --profile maintenance run --rm --no-deps config-check-backup
 docker compose --env-file .env --file compose.yml --profile maintenance run --rm --no-deps config-check-maintenance
+docker compose --env-file .env --file compose.yml --profile deployment run --rm --no-deps deployment-admin deployment init
 ```
 
 Initialize each new repository once, then start the three production services:

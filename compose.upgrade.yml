@@ -75,6 +75,7 @@ x-upgrade-maintenance-volumes: &upgrade-maintenance-volumes
 services:
   vaultwarden:
     image: "vaultwarden-less-vaultwarden:${B_RELEASE:?B_RELEASE is required}"
+    command: [upgrade-candidate]
 
   backup:
     image: "vaultwarden-less-backup:${B_RELEASE:?B_RELEASE is required}"
@@ -148,12 +149,25 @@ services:
     profiles: [rollback]
     restart: unless-stopped
     hostname: vaultwarden
+    command: [rollback]
     env_file:
       - ./config/vaultwarden.env
     volumes:
       - type: bind
+        source: ./.env
+        target: /deployment/.env
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
         source: ./data
         target: /data
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./state
+        target: /state
+        read_only: true
         bind:
           create_host_path: false
     networks:

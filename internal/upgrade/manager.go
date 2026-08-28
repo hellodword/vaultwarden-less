@@ -582,6 +582,105 @@ func ServingAllowed(stateDir, projectCommit string, deployment config.Deployment
 	return stateError(ErrorInvalidState, fmt.Errorf("serving identity is unrelated to current upgrade"))
 }
 
+// CandidateServingAllowed permits only immutable B while active identity still
+// names A and the current upgrade has durable frozen rollback evidence. It is
+// intentionally narrower than the normal serving gate.
+func CandidateServingAllowed(
+	stateDir, projectCommit, release, activeProjectCommit, activeRelease string,
+	deployment config.Deployment,
+) error {
+	if !ValidCommit(projectCommit) || !ValidRelease(release, projectCommit) ||
+		!ValidCommit(activeProjectCommit) || !ValidRelease(activeRelease, activeProjectCommit) {
+		return stateError(ErrorInvalidState, fmt.Errorf("candidate serving identity is invalid"))
+	}
+	state, err := validateStateLayout(stateDir)
+	if err != nil {
+		return err
+	}
+	if err := validateCurrentEntries(state.current); err != nil {
+		return stateError(ErrorInvalidState, err)
+	}
+	prepare, err := readPrepare(state, deployment)
+	if err != nil {
+		return err
+	}
+	if projectCommit != prepare.ToCommit || release != prepare.ToRelease ||
+		activeProjectCommit != prepare.FromCommit || activeRelease != prepare.FromRelease {
+		return stateError(ErrorConflict, fmt.Errorf("candidate and active identities do not match current upgrade"))
+	}
+	if _, err := readTicket(state, prepare); err != nil {
+		return err
+	}
+	rollbackExists, err := pathExists(state.rollback)
+	if err != nil || !rollbackExists {
+		return stateError(ErrorInvalidState, fmt.Errorf("frozen rollback data is missing"))
+	}
+	candidateExists, err := pathExists(state.candidate)
+	if err != nil {
+		return stateError(ErrorInvalidState, err)
+	}
+	if candidateExists {
+		candidate, readErr := readCandidate(state, prepare)
+		if readErr != nil {
+			return readErr
+		}
+		if candidate.Phase != PhaseMigrated && candidate.Phase != PhaseVerified {
+			return stateError(ErrorConflict, fmt.Errorf("candidate phase is terminal"))
+		}
+	}
+	return nil
+}
+
+// DrillServingAllowed accepts an ordinary verified restore when no upgrade is
+// current. During an upgrade it additionally requires exact B verification
+// evidence for the restored content and archive identities.
+func DrillServingAllowed(
+	stateDir, projectCommit, release, contentID, archiveID string,
+	deployment config.Deployment,
+) error {
+	if !ValidCommit(projectCommit) || !ValidRelease(release, projectCommit) || !validDigest(contentID) || !validDigest(archiveID) {
+		return stateError(ErrorInvalidState, fmt.Errorf("drill identity is invalid"))
+	}
+	state := paths(stateDir)
+	currentExists, err := pathExists(state.current)
+	if err != nil {
+		return stateError(ErrorInvalidState, err)
+	}
+	if !currentExists {
+		return nil
+	}
+	state, err = validateStateLayout(stateDir)
+	if err != nil {
+		return err
+	}
+	if err := validateCurrentEntries(state.current); err != nil {
+		return stateError(ErrorInvalidState, err)
+	}
+	prepare, err := readPrepare(state, deployment)
+	if err != nil {
+		return err
+	}
+	if projectCommit != prepare.ToCommit || release != prepare.ToRelease {
+		return stateError(ErrorConflict, fmt.Errorf("upgrade drill is not owned by candidate B"))
+	}
+	if _, err := readTicket(state, prepare); err != nil {
+		return err
+	}
+	candidate, err := readCandidate(state, prepare)
+	if err != nil {
+		return err
+	}
+	if candidate.Phase != PhaseVerified {
+		return stateError(ErrorConflict, fmt.Errorf("upgrade drill lacks verified evidence"))
+	}
+	for _, evidence := range candidate.Targets {
+		if evidence.ContentID == contentID && evidence.ArchiveID == archiveID {
+			return nil
+		}
+	}
+	return stateError(ErrorVerification, fmt.Errorf("upgrade drill identity does not match verification evidence"))
+}
+
 func (manager Manager) validate() error {
 	if !ValidCommit(manager.ProjectCommit) || !ValidRelease(manager.Release, manager.ProjectCommit) {
 		return stateError(ErrorInvalidState, fmt.Errorf("manager release identity is invalid"))

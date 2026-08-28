@@ -30,6 +30,17 @@ docker compose --env-file .env --file compose.yml --profile maintenance run --rm
 docker compose --env-file .env --file compose.yml --profile maintenance run --rm --no-deps config-check-maintenance
 ```
 
+For one new deployment only, while `data` is completely empty and no import
+or upgrade is current, bind it to the exact loaded immutable release:
+
+```sh
+docker compose --env-file .env --file compose.yml --profile deployment run --rm --no-deps deployment-admin deployment init
+```
+
+The result is `initialized` or, for the exact same already-recorded identity,
+`already_initialized`. Any other existing, damaged, or mismatched active state
+is a hard stop; do not synthesize or edit `state/deployment/active.json`.
+
 Initialize only a known-empty, dedicated repository target, once:
 
 ```sh
@@ -239,7 +250,8 @@ with only Git, Docker Engine, and Compose for deployment operations:
 1. clone the exact clean commit and verify the working tree;
 2. create private copies and modes exactly as in the README;
 3. checksum and standard-load the two-file archive;
-4. run both configuration checks and initialize two real repositories;
+4. run both configuration checks, initialize the empty deployment identity,
+   and initialize two real repositories;
 5. start production, create real Vaultwarden data through a normal client, and
    obtain verified points on both targets;
 6. stop and restart all three services and prove repository continuity;

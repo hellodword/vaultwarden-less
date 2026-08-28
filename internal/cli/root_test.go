@@ -78,7 +78,7 @@ func TestCLIExactCommandSetHelpAndDevelopmentVersion(t *testing.T) {
 		}
 	}
 	slices.Sort(names)
-	if !slices.Equal(names, []string{"config", "healthcheck", "repo", "request-backup", "restore", "rollback", "serve", "status", "upgrade", "version"}) {
+	if !slices.Equal(names, []string{"config", "deployment", "healthcheck", "repo", "request-backup", "restore", "rollback", "serve", "status", "upgrade", "version"}) {
 		t.Fatalf("command set = %#v", names)
 	}
 	stdout, stderr, code := executeCommand(environment, "--help")
@@ -107,6 +107,8 @@ func TestCLIUsageRuntimeAndDirtyFailuresHaveOneErrorDocument(t *testing.T) {
 		{"unknown"},
 		{"serve", "extra"},
 		{"config"},
+		{"deployment"},
+		{"deployment", "init", "extra"},
 		{"config", "validate"},
 		{"repo"},
 		{"repo", "snapshots"},
@@ -134,6 +136,56 @@ func TestCLIUsageRuntimeAndDirtyFailuresHaveOneErrorDocument(t *testing.T) {
 	stdout, stderr, code = executeCommand(dirty, "repo", "init", "--target", "primary")
 	if code != 1 || stdout != "" || len(repository.calls) != 0 {
 		t.Fatalf("dirty command side effects = %d/%q/%q/%#v", code, stdout, stderr, repository.calls)
+	}
+	assertErrorJSON(t, stderr, codeNotReady)
+}
+
+func TestDeploymentInitGoldenAndActiveServeGate(t *testing.T) {
+	commit := strings.Repeat("a", 40)
+	release := "RELEASE.2026-08-27T12-34-56Z-gaaaaaaaaaaaa"
+	setBuildIdentity(t, commit, release, "true")
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "state")
+	dataDir := filepath.Join(root, "data")
+	for _, directory := range []string{stateDir, dataDir} {
+		if err := os.Mkdir(directory, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	environment := testEnvironment(nil, nil)
+	environment.stateDir = stateDir
+	environment.dataDir = dataDir
+
+	stdout, stderr, code := executeCommand(environment, "deployment", "init")
+	want := `{"schema_version":1,"status":"initialized","project_commit":"` + commit + `","release":"` + release + `"}` + "\n"
+	if code != 0 || stderr != "" || stdout != want {
+		t.Fatalf("deployment init = %d/%q/%q", code, stdout, stderr)
+	}
+	stdout, stderr, code = executeCommand(environment, "deployment", "init")
+	want = strings.Replace(want, `"status":"initialized"`, `"status":"already_initialized"`, 1)
+	if code != 0 || stderr != "" || stdout != want {
+		t.Fatalf("deployment init repeat = %d/%q/%q", code, stdout, stderr)
+	}
+
+	activeChecked, upgradeChecked, backupLoaded := false, false, false
+	environment.requireActive = func(_, projectCommit, activeRelease string) error {
+		activeChecked = true
+		if projectCommit != commit || activeRelease != release {
+			t.Fatalf("active identity = %q/%q", projectCommit, activeRelease)
+		}
+		return errors.New("mismatch")
+	}
+	environment.allowServe = func(string, string, config.Deployment) error {
+		upgradeChecked = true
+		return nil
+	}
+	environment.loadBackup = func(string) (*config.Backup, error) {
+		backupLoaded = true
+		return nil, errors.New("must not load")
+	}
+	stdout, stderr, code = executeCommand(environment, "serve")
+	if code != 1 || stdout != "" || !activeChecked || upgradeChecked || backupLoaded {
+		t.Fatalf("active-gated serve = %d/%q/%q/%t/%t/%t", code, stdout, stderr, activeChecked, upgradeChecked, backupLoaded)
 	}
 	assertErrorJSON(t, stderr, codeNotReady)
 }
@@ -360,10 +412,11 @@ func testEnvironment(repositoryClient repository, server *httptest.Server, resto
 		restore: func(_ context.Context, _ restoretool.Repository, _ restoretool.Request) (restoretool.Result, error) {
 			return restoretool.Result{}, errors.New("restore should not be called")
 		},
-		allowServe: func(string, string, config.Deployment) error { return nil },
-		drillCheck: func(context.Context) error { return nil },
-		httpClient: &http.Client{Timeout: time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }},
-		workerURL:  "http://127.0.0.1:1", deploymentPath: "/deployment/.env", vaultwardenPath: "/deployment/vaultwarden.env",
+		requireActive: func(string, string, string) error { return nil },
+		allowServe:    func(string, string, config.Deployment) error { return nil },
+		drillCheck:    func(context.Context) error { return nil },
+		httpClient:    &http.Client{Timeout: time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }},
+		workerURL:     "http://127.0.0.1:1", deploymentPath: "/deployment/.env", vaultwardenPath: "/deployment/vaultwarden.env",
 		credentialsPath: "/credentials/role.yaml",
 		notifierPath:    "/credentials/notifiers.yaml", passwordRoot: "/credentials/restic", resticBinary: "restic",
 		dataDir: "/data", stagingDir: "/staging", cacheDir: "/cache", restoreRoot: "/restore", stateDir: "/state",

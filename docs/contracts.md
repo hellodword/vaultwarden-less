@@ -112,8 +112,8 @@ Every ancestor is inspected without following a symlink. Examples are public
 templates and are not subject to private-file ownership checks until copied to
 their private names.
 
-`compose.yml` is the production topology and defines the `maintenance`,
-`restore`, and `drill` profiles. `compose.upgrade.yml` is used only as an
+`compose.yml` is the production topology and defines the `deployment`,
+`maintenance`, `restore`, and `drill` profiles. `compose.upgrade.yml` is used only as an
 overlay during an upgrade or rollback. Both files are normative. They use only
 the three `vaultwarden-less-*:local` production aliases in normal operation,
 contain no `build:` key, set `pull_policy: never`, publish only the proxy and
@@ -127,7 +127,54 @@ Before production `up`, both `config-check-backup` and
 `config-check-maintenance` must succeed. Together they validate `.env`, all
 private paths and modes, target/password key sets, role isolation, notifier
 credentials, and both role configurations without contacting a repository.
-An operator must not use `docker compose build` for this project.
+On the first empty deployment, `deployment-admin deployment init` must then
+publish the exact active release identity. An operator must not use
+`docker compose build` for this project.
+
+## Active release identity and startup gates
+
+`state/deployment` is a real `0700` directory owned by the runtime UID/GID.
+Its sole durable document is a non-symlink, single-link `0600` regular file no
+larger than 1 MiB, owned by that same identity:
+
+```json
+{"schema_version":1,"project_commit":"0123456789abcdef0123456789abcdef01234567","release":"RELEASE.2026-08-28T12-34-56Z-g0123456789ab","activated_at":"2026-08-28T12:34:56.789Z"}
+```
+
+The file is canonical one-line JSON followed by LF. Unknown or duplicate
+fields, trailing values, wrong JSON types, another schema version, a
+non-lowercase/full commit, a release that does not contain the matching first
+12 commit characters, and a non-UTC millisecond timestamp are invalid.
+
+`deployment init` requires one clean immutable build, an existing empty
+`data` directory, no active document, and no `state/upgrade/current` or
+`state/import/current`. It atomically creates the active document without
+replacement. Repeating the exact same identity returns `already_initialized`
+without changing `activated_at`, including after Vaultwarden has populated
+`data`; a different identity returns `conflict`. Missing, damaged, unsafe, or
+mismatched active state is never reconstructed from data, image tags, or the
+invoking binary.
+
+The Vaultwarden image contains a CGO-free entry gate and invokes it with
+exactly one Compose-owned mode: `normal`, `upgrade-candidate`, `rollback`,
+`drill`, or `import`. The gate validates the clean build identity before
+executing `/bin/vaultwarden`:
+
+- `normal` requires active commit and release to match the image and requires
+  the normal upgrade serving gate to accept current state;
+- `upgrade-candidate` requires immutable B, active A, and a frozen current
+  upgrade with valid rollback evidence and no terminal decision;
+- `rollback` requires the immutable rollback decision and active A;
+- `drill` requires the private recovery manifest commit to match the image;
+  while an upgrade is current, its content and archive identities must also
+  match B's verification evidence;
+- `import` requires no active document and exact current import preparation
+  for the image and candidate.
+
+An unavailable or incomplete mode fails closed. Normal backup and proxy serve
+paths independently require the exact active commit and release before they
+open data or accept traffic. `version`, `healthcheck`, `config validate`, and
+the explicit initialization workflow retain their narrower pre-active modes.
 
 ## YAML configuration and credentials
 
@@ -327,7 +374,8 @@ Every error is strict schema 1:
 The exhaustive stable codes are `usage_error`, `invalid_config`,
 `invalid_credentials`, `unsafe_path`, `not_ready`, `conflict`,
 `source_inconsistent`, `unsupported_schema`, `repository_failure`,
-`verification_failure`, `timeout`, `upgrade_state_invalid`, and
+`verification_failure`, `timeout`, `upgrade_state_invalid`,
+`deployment_state_invalid`, and
 `internal_error`. The message is safe human context and is not a stable parsing
 surface. No error has extra fields.
 
@@ -344,6 +392,8 @@ The complete success documents are:
 {"schema_version":1,"healthy":true}
 {"schema_version":1,"accepted":true}
 {"schema_version":1,"valid":true,"role":"backup","targets":["primary"],"warnings":[]}
+{"schema_version":1,"status":"initialized","project_commit":"0123456789abcdef0123456789abcdef01234567","release":"RELEASE.2026-08-27T12-34-56Z-g0123456789ab"}
+{"schema_version":1,"status":"already_initialized","project_commit":"0123456789abcdef0123456789abcdef01234567","release":"RELEASE.2026-08-27T12-34-56Z-g0123456789ab"}
 {"schema_version":1,"operation":"init","target":"primary","success":true}
 ```
 

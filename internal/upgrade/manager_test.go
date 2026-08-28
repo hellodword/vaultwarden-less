@@ -139,6 +139,71 @@ func TestPrepareWritesExactComposeEnvironment(t *testing.T) {
 	}
 }
 
+func TestCandidateAndUpgradeDrillServingGates(t *testing.T) {
+	fixture := newManagerFixture(t)
+	a := fixture.manager(testACommit, testARelease)
+	if _, err := a.Prepare(testBCommit, testBRelease); err != nil {
+		t.Fatal(err)
+	}
+	if err := CandidateServingAllowed(
+		fixture.state, testBCommit, testBRelease, testACommit, testARelease, fixture.deployment,
+	); !IsKind(err, ErrorInvalidState) {
+		t.Fatalf("unfrozen candidate gate = %v", err)
+	}
+	if _, err := a.Freeze(context.Background(), []string{"primary"}, fixedCollector(evidence([]string{"primary"}, "1"))); err != nil {
+		t.Fatal(err)
+	}
+	if err := CandidateServingAllowed(
+		fixture.state, testBCommit, testBRelease, testACommit, testARelease, fixture.deployment,
+	); err != nil {
+		t.Fatalf("frozen candidate gate = %v", err)
+	}
+	for _, identity := range []struct {
+		candidateCommit  string
+		candidateRelease string
+		activeCommit     string
+		activeRelease    string
+	}{
+		{testACommit, testARelease, testACommit, testARelease},
+		{testBCommit, testBRelease, testBCommit, testBRelease},
+		{testBCommit, "RELEASE.2026-08-27T13-00-00Z-gcccccccccccc", testACommit, testARelease},
+	} {
+		if err := CandidateServingAllowed(
+			fixture.state, identity.candidateCommit, identity.candidateRelease,
+			identity.activeCommit, identity.activeRelease, fixture.deployment,
+		); !IsKind(err, ErrorConflict) && !IsKind(err, ErrorInvalidState) {
+			t.Fatalf("mismatched candidate gate = %v", err)
+		}
+	}
+
+	b := fixture.manager(testBCommit, testBRelease)
+	if _, err := b.MigrateCheck(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	verifiedEvidence := evidence([]string{"primary"}, "2")
+	if _, err := b.Verify(context.Background(), []string{"primary"}, fixedCollector(verifiedEvidence)); err != nil {
+		t.Fatal(err)
+	}
+	if err := DrillServingAllowed(
+		fixture.state, testBCommit, testBRelease,
+		verifiedEvidence[0].ContentID, verifiedEvidence[0].ArchiveID, fixture.deployment,
+	); err != nil {
+		t.Fatalf("verified upgrade drill gate = %v", err)
+	}
+	if err := DrillServingAllowed(
+		fixture.state, testBCommit, testBRelease,
+		"sha256:"+strings.Repeat("f", 64), verifiedEvidence[0].ArchiveID, fixture.deployment,
+	); !IsKind(err, ErrorVerification) {
+		t.Fatalf("mismatched upgrade drill gate = %v", err)
+	}
+	if err := DrillServingAllowed(
+		fixture.state, testACommit, testARelease,
+		verifiedEvidence[0].ContentID, verifiedEvidence[0].ArchiveID, fixture.deployment,
+	); !IsKind(err, ErrorConflict) {
+		t.Fatalf("A upgrade drill gate = %v", err)
+	}
+}
+
 func TestExplicitRollbackExchangesAAndQuarantinesOpaqueB(t *testing.T) {
 	fixture := newManagerFixture(t)
 	a := fixture.manager(testACommit, testARelease)

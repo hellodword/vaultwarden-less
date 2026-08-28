@@ -13,6 +13,7 @@ import (
 
 	"github.com/hellodword/vaultwarden-less/internal/buildinfo"
 	"github.com/hellodword/vaultwarden-less/internal/config"
+	"github.com/hellodword/vaultwarden-less/internal/deployment"
 	"github.com/hellodword/vaultwarden-less/internal/privatefs"
 	"github.com/hellodword/vaultwarden-less/internal/restic"
 	restoretool "github.com/hellodword/vaultwarden-less/internal/restore"
@@ -47,6 +48,7 @@ type commandEnvironment struct {
 	validateFile      func(string) error
 	repository        func(*config.Backup) (repository, error)
 	restore           restoreFunc
+	requireActive     func(string, string, string) error
 	allowServe        func(string, string, config.Deployment) error
 	drillCheck        func(context.Context) error
 	httpClient        *http.Client
@@ -86,7 +88,11 @@ func defaultEnvironment(stderr io.Writer) commandEnvironment {
 			}
 			return nil
 		},
-		restore:    restoretool.Run,
+		restore: restoretool.Run,
+		requireActive: func(stateDir, projectCommit, release string) error {
+			_, err := deployment.RequireActive(stateDir, deployment.Identity{ProjectCommit: projectCommit, Release: release})
+			return err
+		},
 		allowServe: upgrade.ServingAllowed,
 		drillCheck: checkUpgradeDrill,
 		httpClient: &http.Client{

@@ -16,6 +16,7 @@ import (
 
 	"github.com/hellodword/vaultwarden-less/internal/buildinfo"
 	"github.com/hellodword/vaultwarden-less/internal/config"
+	deploymentstate "github.com/hellodword/vaultwarden-less/internal/deployment"
 	proxyserver "github.com/hellodword/vaultwarden-less/internal/proxy"
 	"github.com/hellodword/vaultwarden-less/internal/upgrade"
 )
@@ -50,6 +51,12 @@ func execute(ctx context.Context, arguments []string, stdout, stderr io.Writer) 
 		allowServe: func() error {
 			deployment, err := config.LoadDeployment(config.DeploymentEnvPath)
 			if err != nil {
+				return err
+			}
+			if _, err := deploymentstate.RequireActive(config.StateDir, deploymentstate.Identity{
+				ProjectCommit: buildinfo.ProjectCommit,
+				Release:       buildinfo.Release,
+			}); err != nil {
 				return err
 			}
 			return upgrade.ServingAllowed(config.StateDir, buildinfo.ProjectCommit, deployment)
