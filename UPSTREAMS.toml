@@ -50,8 +50,8 @@ audit_paths = [
 
 [go]
 repository = "https://go.googlesource.com/go"
-source_tag = "go1.26.5"
-source_commit = "c19862e5f8415b4f24b189d065ed739517c548ba"
+source_tag = "go1.26.7"
+source_commit = "e3336a22ad3f0a90bd252c95d8b5544e02674205"
 audit_paths = [
   "src/cmd/**",
   "src/crypto/**",
