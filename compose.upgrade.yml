@@ -125,6 +125,22 @@ services:
       - maintenance-outbound
       - drill
 
+  rollback-a:
+    <<: *upgrade-service-defaults
+    image: "vaultwarden-less-backup:${A_RELEASE:?A_RELEASE is required}"
+    pull_policy: never
+    profiles: [upgrade]
+    restart: "no"
+    network_mode: none
+    entrypoint: [/bin/vaultwarden-less-backup]
+    command: [--help]
+    volumes:
+      - type: bind
+        source: .
+        target: /deployment
+        bind:
+          create_host_path: false
+
   rollback-vaultwarden-a:
     <<: *upgrade-service-defaults
     image: "vaultwarden-less-vaultwarden:${A_RELEASE:?A_RELEASE is required}"
@@ -160,6 +176,12 @@ services:
     entrypoint: [/bin/vaultwarden-less-backup]
     command: [serve]
     volumes:
+      - type: bind
+        source: ./.env
+        target: /deployment/.env
+        read_only: true
+        bind:
+          create_host_path: false
       - type: bind
         source: ./config/backup.yaml
         target: /config/backup.yaml

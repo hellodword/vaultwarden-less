@@ -25,6 +25,7 @@ const ResultSchemaVersion = 1
 type repository interface {
 	VerifyVersion(context.Context) error
 	Ensure(context.Context, config.Target, snapshot.Manifest) (restic.SyncResult, error)
+	EnsureExact(context.Context, config.Target, snapshot.Manifest) (restic.SyncResult, error)
 	Snapshots(context.Context, config.Target, int) ([]restic.Snapshot, bool, error)
 	Init(context.Context, config.Target) error
 	Unlock(context.Context, config.Target) error

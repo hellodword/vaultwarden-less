@@ -282,6 +282,12 @@ services:
       - *restic-credentials-mount
       - *cache-mount
       - type: bind
+        source: ./.env
+        target: /deployment/.env
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
         source: ./data
         target: /data
         read_only: true

@@ -183,7 +183,7 @@ upgrade-rollback:
       {{upgrade_compose}} --profile drill stop proxy backup vaultwarden drill-vaultwarden; \
       {{upgrade_compose}} --profile drill rm --force proxy backup vaultwarden drill-vaultwarden drill-copy; \
       if docker volume inspect vaultwarden-less_drill-data >/dev/null 2>&1; then docker volume rm vaultwarden-less_drill-data; fi; \
-      {{upgrade_compose}} --profile upgrade run --rm --no-deps upgrade-a rollback apply; \
+      {{upgrade_compose}} --profile upgrade run --rm --no-deps rollback-a rollback apply; \
       {{upgrade_overlay}} --profile rollback up --detach rollback-vaultwarden-a rollback-backup-a rollback-proxy-a
 
 # Deterministically capture an audited Vaultwarden SQLite schema candidate.

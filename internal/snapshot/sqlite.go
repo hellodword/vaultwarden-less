@@ -14,9 +14,11 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"syscall"
 	"time"
 	"unicode/utf8"
 
+	"github.com/hellodword/vaultwarden-less/internal/privatefs"
 	"github.com/hellodword/vaultwarden-less/internal/upstream"
 	"github.com/mattn/go-sqlite3"
 )
@@ -46,6 +48,157 @@ func ValidateDatabaseContract(ctx context.Context, path string) (DatabaseContrac
 		return DatabaseContract{}, err
 	}
 	return DatabaseContract(validated), nil
+}
+
+// PrepareStoppedDatabase turns a stopped Vaultwarden WAL database into one
+// closed DELETE-journal database. It never removes a live sidecar directly:
+// SQLite must checkpoint and retire every sidecar itself before the database
+// contract is accepted.
+func PrepareStoppedDatabase(ctx context.Context, path string) error {
+	if path == "" || !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return fmt.Errorf("stopped database path must be clean and absolute")
+	}
+	if err := privatefs.ValidatePrivateDirectory(filepath.Dir(path)); err != nil {
+		return fmt.Errorf("validate stopped database directory: %w", err)
+	}
+	original, err := inspectOwnedSQLiteFile(path)
+	if err != nil {
+		return fmt.Errorf("inspect stopped database: %w", err)
+	}
+	if err := inspectOptionalSQLiteSidecars(path); err != nil {
+		return err
+	}
+
+	database, err := sql.Open("sqlite3", sqliteURI(path, "rw"))
+	if err != nil {
+		return fmt.Errorf("open stopped database: %w", err)
+	}
+	database.SetMaxOpenConns(1)
+	database.SetMaxIdleConns(1)
+	databaseClosed := false
+	defer func() {
+		if !databaseClosed {
+			_ = database.Close()
+		}
+	}()
+	connection, err := database.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("reserve stopped database connection: %w", err)
+	}
+	connectionClosed := false
+	defer func() {
+		if !connectionClosed {
+			_ = connection.Close()
+		}
+	}()
+
+	var busy, logPages, checkpointedPages int
+	if err := connection.QueryRowContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)").Scan(
+		&busy,
+		&logPages,
+		&checkpointedPages,
+	); err != nil {
+		return fmt.Errorf("checkpoint stopped database: %w", err)
+	}
+	checkpointedWAL := logPages == 0 && checkpointedPages == 0
+	noWAL := logPages == -1 && checkpointedPages == -1
+	if busy != 0 || (!checkpointedWAL && !noWAL) {
+		return fmt.Errorf("stopped database WAL checkpoint did not truncate cleanly")
+	}
+	var journalMode string
+	if err := connection.QueryRowContext(ctx, "PRAGMA journal_mode = DELETE").Scan(&journalMode); err != nil {
+		return fmt.Errorf("set stopped database journal mode: %w", err)
+	}
+	if strings.ToLower(journalMode) != "delete" {
+		return fmt.Errorf("stopped database did not enter DELETE journal mode")
+	}
+	if err := connection.Close(); err != nil {
+		return fmt.Errorf("close stopped database connection: %w", err)
+	}
+	connectionClosed = true
+	if err := database.Close(); err != nil {
+		return fmt.Errorf("close stopped database: %w", err)
+	}
+	databaseClosed = true
+
+	closed, err := inspectOwnedSQLiteFile(path)
+	if err != nil || !os.SameFile(original, closed) {
+		return fmt.Errorf("stopped database changed while closing")
+	}
+	if err := requireNoSQLiteSidecars(path); err != nil {
+		return err
+	}
+	if _, err := ValidateDatabaseContract(ctx, path); err != nil {
+		return fmt.Errorf("validate stopped database contract: %w", err)
+	}
+	if err := requireNoSQLiteSidecars(path); err != nil {
+		return err
+	}
+	if err := syncOwnedSQLiteFile(path, closed); err != nil {
+		return fmt.Errorf("sync stopped database: %w", err)
+	}
+	if err := privatefs.SyncDirectory(filepath.Dir(path)); err != nil {
+		return fmt.Errorf("sync stopped database directory: %w", err)
+	}
+	return nil
+}
+
+func inspectOwnedSQLiteFile(path string) (os.FileInfo, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 ||
+		stat.Uid != uint32(os.Geteuid()) || stat.Gid != uint32(os.Getegid()) || stat.Nlink != 1 {
+		return nil, fmt.Errorf("SQLite path is not one owned, regular, non-symlink file")
+	}
+	return info, nil
+}
+
+func inspectOptionalSQLiteSidecars(path string) error {
+	for _, suffix := range []string{"-wal", "-shm", "-journal"} {
+		sidecar := path + suffix
+		if _, err := inspectOwnedSQLiteFile(sidecar); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return fmt.Errorf("inspect stopped database sidecar: %w", err)
+		}
+	}
+	return nil
+}
+
+func requireNoSQLiteSidecars(path string) error {
+	for _, suffix := range []string{"-wal", "-shm", "-journal"} {
+		if _, err := os.Lstat(path + suffix); err == nil {
+			return fmt.Errorf("stopped database retained a live sidecar")
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("inspect stopped database sidecar: %w", err)
+		}
+	}
+	return nil
+}
+
+func syncOwnedSQLiteFile(path string, expected os.FileInfo) error {
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return err
+	}
+	file := os.NewFile(uintptr(fd), path)
+	if file == nil {
+		_ = syscall.Close(fd)
+		return fmt.Errorf("open stopped database handle")
+	}
+	defer func() { _ = file.Close() }()
+	opened, err := file.Stat()
+	if err != nil || !os.SameFile(expected, opened) {
+		return fmt.Errorf("stopped database changed while opening")
+	}
+	if _, err := inspectOwnedSQLiteFile(path); err != nil {
+		return err
+	}
+	return file.Sync()
 }
 
 var unsignedIntegerPattern = regexp.MustCompile(`^(0|[1-9][0-9]*)$`)

@@ -26,6 +26,137 @@ type treeFile struct {
 	info     os.FileInfo
 }
 
+type mutableTreeEntry struct {
+	path      string
+	info      os.FileInfo
+	directory bool
+}
+
+func normalizePrivateTree(root string) error {
+	if err := privatefs.ValidatePrivateDirectory(root); err != nil {
+		return err
+	}
+	entries := make([]mutableTreeEntry, 0)
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		info, err := os.Lstat(path)
+		if err != nil {
+			return err
+		}
+		stat, ok := info.Sys().(*syscall.Stat_t)
+		if !ok || stat.Uid != uint32(os.Geteuid()) || stat.Gid != uint32(os.Getegid()) ||
+			info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("rollback tree contains an unsafe owner or symlink")
+		}
+		if !info.IsDir() && (!info.Mode().IsRegular() || stat.Nlink != 1) {
+			return fmt.Errorf("rollback tree contains a special or hard-linked file")
+		}
+		relative, err := filepath.Rel(root, path)
+		if err != nil || filepath.IsAbs(relative) || filepath.Clean(relative) != relative {
+			return fmt.Errorf("rollback tree entry has an invalid path")
+		}
+		if relative != "." {
+			relative = filepath.ToSlash(relative)
+			if !utf8.ValidString(relative) || strings.ContainsRune(relative, 0) {
+				return fmt.Errorf("rollback tree entry path is not valid UTF-8")
+			}
+		}
+		entries = append(entries, mutableTreeEntry{path: path, info: info, directory: info.IsDir()})
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.directory {
+			continue
+		}
+		if err := normalizeTreeEntry(entry, 0o600); err != nil {
+			return err
+		}
+	}
+	for index := len(entries) - 1; index >= 0; index-- {
+		if !entries[index].directory {
+			continue
+		}
+		if err := normalizeTreeEntry(entries[index], 0o700); err != nil {
+			return err
+		}
+	}
+	_, _, err = inspectPrivateTree(root)
+	return err
+}
+
+func normalizeTreeEntry(entry mutableTreeEntry, mode os.FileMode) error {
+	flags := syscall.O_RDONLY | syscall.O_CLOEXEC | syscall.O_NOFOLLOW
+	if entry.directory {
+		flags |= syscall.O_DIRECTORY
+	}
+	fd, err := syscall.Open(entry.path, flags, 0)
+	if err != nil {
+		return err
+	}
+	file := os.NewFile(uintptr(fd), entry.path)
+	if file == nil {
+		_ = syscall.Close(fd)
+		return fmt.Errorf("open rollback tree entry handle")
+	}
+	closed := false
+	defer func() {
+		if !closed {
+			_ = file.Close()
+		}
+	}()
+	opened, err := file.Stat()
+	if err != nil || !os.SameFile(entry.info, opened) || opened.IsDir() != entry.directory {
+		return fmt.Errorf("rollback tree entry changed while opening")
+	}
+	if !entry.directory && !privatefs.SameFileVersion(entry.info, opened) {
+		return fmt.Errorf("rollback tree file changed while opening")
+	}
+	if err := validateMutableTreeEntry(opened, entry.directory); err != nil {
+		return err
+	}
+	if opened.Mode().Perm() != mode.Perm() {
+		if err := syscall.Fchmod(fd, uint32(mode.Perm())); err != nil {
+			return err
+		}
+		if err := file.Sync(); err != nil {
+			return err
+		}
+	}
+	after, err := file.Stat()
+	if err != nil || !os.SameFile(opened, after) || after.Mode().Perm() != mode.Perm() {
+		return fmt.Errorf("rollback tree entry changed while securing permissions")
+	}
+	if err := validateMutableTreeEntry(after, entry.directory); err != nil {
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	closed = true
+	latest, err := os.Lstat(entry.path)
+	if err != nil || !os.SameFile(after, latest) || latest.Mode().Perm() != mode.Perm() {
+		return fmt.Errorf("rollback tree entry changed after securing permissions")
+	}
+	return validateMutableTreeEntry(latest, entry.directory)
+}
+
+func validateMutableTreeEntry(info os.FileInfo, directory bool) error {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || stat.Uid != uint32(os.Geteuid()) || stat.Gid != uint32(os.Getegid()) ||
+		info.Mode()&os.ModeSymlink != 0 || info.IsDir() != directory {
+		return fmt.Errorf("rollback tree entry has an unsafe owner or type")
+	}
+	if !directory && (!info.Mode().IsRegular() || stat.Nlink != 1) {
+		return fmt.Errorf("rollback tree entry is special or hard-linked")
+	}
+	return nil
+}
+
 func rollbackTreeID(ctx context.Context, root string) (string, error) {
 	files, _, err := inspectPrivateTree(root)
 	if err != nil {

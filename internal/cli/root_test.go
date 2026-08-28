@@ -42,6 +42,9 @@ func (repository *fakeRepository) VerifyVersion(context.Context) error {
 func (repository *fakeRepository) Ensure(context.Context, config.Target, snapshot.Manifest) (restic.SyncResult, error) {
 	return restic.SyncResult{}, repository.record("ensure")
 }
+func (repository *fakeRepository) EnsureExact(context.Context, config.Target, snapshot.Manifest) (restic.SyncResult, error) {
+	return restic.SyncResult{}, repository.record("ensure-exact")
+}
 func (repository *fakeRepository) Snapshots(context.Context, config.Target, int) ([]restic.Snapshot, bool, error) {
 	return repository.snapshots, false, repository.record("snapshots")
 }
@@ -225,6 +228,28 @@ func TestUpgradeSyncRequiresBothExactRecoveryIdentities(t *testing.T) {
 	synchronized.ArchiveID = "sha256:" + strings.Repeat("d", 64)
 	if validUpgradeSync(manifest, synchronized) {
 		t.Fatal("mismatched archive identity was accepted")
+	}
+}
+
+func TestRollbackManagerUsesOneDeploymentRootMount(t *testing.T) {
+	environment := testEnvironment(nil, nil)
+	root := t.TempDir()
+	environment.deploymentPath = filepath.Join(root, ".env")
+	environment.dataDir = "/separate-data-mount"
+	environment.stateDir = "/separate-state-mount"
+	manager, err := rollbackManager(environment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manager.DataDir != filepath.Join(root, "data") || manager.StateDir != filepath.Join(root, "state") {
+		t.Fatalf("rollback paths = %q/%q", manager.DataDir, manager.StateDir)
+	}
+	regular, err := upgradeManager(environment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if regular.DataDir != environment.dataDir || regular.StateDir != environment.stateDir {
+		t.Fatalf("regular upgrade paths changed = %q/%q", regular.DataDir, regular.StateDir)
 	}
 }
 

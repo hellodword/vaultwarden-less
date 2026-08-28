@@ -337,6 +337,79 @@ func TestUpgradeRejectsCorruptStateWrongOwnerAndCandidateTampering(t *testing.T)
 }
 
 func TestFreezeFailurePathsDoNotPublishOrExchangeData(t *testing.T) {
+	t.Run("missing preparation", func(t *testing.T) {
+		fixture := newManagerFixture(t)
+		a := fixture.manager(testACommit, testARelease)
+		a.PrepareFreeze = nil
+		if _, err := a.Prepare(testBCommit, testBRelease); err != nil {
+			t.Fatal(err)
+		}
+		called := false
+		_, err := a.Freeze(context.Background(), []string{"primary"}, func(context.Context, string, []string) ([]TargetEvidence, error) {
+			called = true
+			return evidence([]string{"primary"}, "1"), nil
+		})
+		if !IsKind(err, ErrorSourceInconsistent) || called {
+			t.Fatalf("missing preparation = %v/called=%t", err, called)
+		}
+		if _, err := os.Lstat(paths(fixture.state).rollback); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("rollback tree published after missing preparation: %v", err)
+		}
+	})
+	t.Run("preparation failure", func(t *testing.T) {
+		fixture := newManagerFixture(t)
+		a := fixture.manager(testACommit, testARelease)
+		a.PrepareFreeze = func(context.Context, string) error { return errors.New("database is still live") }
+		if _, err := a.Prepare(testBCommit, testBRelease); err != nil {
+			t.Fatal(err)
+		}
+		called := false
+		_, err := a.Freeze(context.Background(), []string{"primary"}, func(context.Context, string, []string) ([]TargetEvidence, error) {
+			called = true
+			return evidence([]string{"primary"}, "2"), nil
+		})
+		if !IsKind(err, ErrorSourceInconsistent) || called {
+			t.Fatalf("preparation failure = %v/called=%t", err, called)
+		}
+		if _, err := os.Lstat(paths(fixture.state).rollback); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("rollback tree published after preparation failure: %v", err)
+		}
+	})
+	t.Run("normalizes stopped tree before evidence", func(t *testing.T) {
+		fixture := newManagerFixture(t)
+		directory := filepath.Join(fixture.data, "tmp")
+		if err := os.Mkdir(directory, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		file := filepath.Join(directory, "runtime")
+		if err := os.WriteFile(file, []byte("runtime"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(filepath.Join(fixture.data, "rsa_key.pem"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		a := fixture.manager(testACommit, testARelease)
+		if _, err := a.Prepare(testBCommit, testBRelease); err != nil {
+			t.Fatal(err)
+		}
+		called := false
+		_, err := a.Freeze(context.Background(), []string{"primary"}, func(context.Context, string, []string) ([]TargetEvidence, error) {
+			called = true
+			for path, mode := range map[string]os.FileMode{
+				directory: 0o700,
+				file:      0o600,
+				filepath.Join(fixture.data, "rsa_key.pem"): 0o600,
+			} {
+				if info, statErr := os.Lstat(path); statErr != nil || info.Mode().Perm() != mode {
+					t.Fatalf("normalized mode %s = %v/%v", path, info, statErr)
+				}
+			}
+			return evidence([]string{"primary"}, "3"), nil
+		})
+		if err != nil || !called {
+			t.Fatalf("normalized freeze = %v/called=%t", err, called)
+		}
+	})
 	t.Run("collector failure", func(t *testing.T) {
 		fixture := newManagerFixture(t)
 		a := fixture.manager(testACommit, testARelease)
@@ -575,6 +648,7 @@ func (fixture managerFixture) manager(commit, release string) Manager {
 			contract, err := snapshot.ValidateDatabaseContract(ctx, path)
 			return DatabaseContract(contract), err
 		},
+		PrepareFreeze: func(context.Context, string) error { return nil },
 	}
 }
 

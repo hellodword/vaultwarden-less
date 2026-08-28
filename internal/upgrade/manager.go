@@ -25,6 +25,7 @@ type Manager struct {
 	Exchange      func(string, string) error
 	Device        func(string) (uint64, error)
 	Database      func(context.Context, string) (DatabaseContract, error)
+	PrepareFreeze func(context.Context, string) error
 }
 
 func (manager Manager) Prepare(toCommit, toRelease string) (Result, error) {
@@ -164,7 +165,16 @@ func (manager Manager) Freeze(ctx context.Context, targetNames []string, collect
 	if err := privatefs.ValidatePrivateDirectory(manager.DataDir); err != nil {
 		return Result{}, stateError(ErrorSourceInconsistent, err)
 	}
+	if manager.PrepareFreeze == nil {
+		return Result{}, stateError(ErrorSourceInconsistent, fmt.Errorf("freeze preparation is unavailable"))
+	}
+	if err := manager.PrepareFreeze(ctx, manager.DataDir); err != nil {
+		return Result{}, stateError(ErrorSourceInconsistent, err)
+	}
 	if err := rejectLiveDatabaseSidecars(manager.DataDir); err != nil {
+		return Result{}, stateError(ErrorSourceInconsistent, err)
+	}
+	if err := normalizePrivateTree(manager.DataDir); err != nil {
 		return Result{}, stateError(ErrorSourceInconsistent, err)
 	}
 	before, err := rollbackTreeID(ctx, manager.DataDir)

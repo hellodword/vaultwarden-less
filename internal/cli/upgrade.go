@@ -134,7 +134,7 @@ func rollbackCommand(environment commandEnvironment) *cobra.Command {
 	command.AddCommand(&cobra.Command{
 		Use: "apply", Short: "Atomically restore A and quarantine failed B data", Args: noArguments,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			manager, err := upgradeManager(environment)
+			manager, err := rollbackManager(environment)
 			if err != nil {
 				return err
 			}
@@ -148,6 +148,17 @@ func rollbackCommand(environment commandEnvironment) *cobra.Command {
 		},
 	})
 	return command
+}
+
+func rollbackManager(environment commandEnvironment) (upgrade.Manager, error) {
+	manager, err := upgradeManager(environment)
+	if err != nil {
+		return upgrade.Manager{}, err
+	}
+	deploymentRoot := filepath.Dir(environment.deploymentPath)
+	manager.DataDir = filepath.Join(deploymentRoot, "data")
+	manager.StateDir = filepath.Join(deploymentRoot, "state")
+	return manager, nil
 }
 
 func upgradeManager(environment commandEnvironment) (upgrade.Manager, error) {
@@ -168,6 +179,9 @@ func upgradeManager(environment commandEnvironment) (upgrade.Manager, error) {
 		Database: func(ctx context.Context, path string) (upgrade.DatabaseContract, error) {
 			contract, err := snapshot.ValidateDatabaseContract(ctx, path)
 			return upgrade.DatabaseContract(contract), err
+		},
+		PrepareFreeze: func(ctx context.Context, dataDir string) error {
+			return snapshot.PrepareStoppedDatabase(ctx, filepath.Join(dataDir, "db.sqlite3"))
 		},
 	}, nil
 }
@@ -219,7 +233,7 @@ func collectUpgradeEvidence(
 		if !exists {
 			return nil, commandFailure(codeInvalidConfig, "Upgrade verification target is not configured", nil)
 		}
-		synchronized, err := repository.Ensure(ctx, target, manifest)
+		synchronized, err := repository.EnsureExact(ctx, target, manifest)
 		if err != nil {
 			return nil, commandFailure(codeRepositoryFailure, "Upgrade target snapshot failed", err)
 		}

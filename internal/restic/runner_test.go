@@ -168,6 +168,48 @@ func TestEnsureDeduplicatesByContentButRetainsTargetArchiveIdentity(t *testing.T
 	}
 }
 
+func TestEnsureExactBacksUpWhenArchiveIdentityDiffers(t *testing.T) {
+	manifest := manifestWithContent(t, strings.Repeat("c", 64))
+	manifest.ArchiveID = "sha256:" + strings.Repeat("9", 64)
+	runner, target, calls := testRunner(t, func(_ context.Context, _ string, arguments, _ []string, _ string) ([]byte, error) {
+		switch operation(arguments) {
+		case "snapshots":
+			return encodedSnapshots(t, rawRecoverySnapshot(firstSnapshotID, manifest.ContentID, "2026-08-25T12:00:00Z")), nil
+		case "backup":
+			return []byte(`{"message_type":"summary","snapshot_id":"` + secondSnapshotID + `"}` + "\n"), nil
+		default:
+			t.Fatalf("unexpected operation: %#v", arguments)
+			return nil, nil
+		}
+	})
+	result, err := runner.EnsureExact(context.Background(), target, manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Created || result.SnapshotID != secondSnapshotID || result.ContentID != manifest.ContentID ||
+		result.ArchiveID != manifest.ArchiveID || len(*calls) != 2 {
+		t.Fatalf("exact result/calls = %#v/%d", result, len(*calls))
+	}
+}
+
+func TestEnsureExactReusesAllMatchingIdentities(t *testing.T) {
+	manifest := manifestWithContent(t, strings.Repeat("c", 64))
+	runner, target, calls := testRunner(t, func(_ context.Context, _ string, arguments, _ []string, _ string) ([]byte, error) {
+		if operation(arguments) != "snapshots" {
+			t.Fatalf("unexpected operation: %#v", arguments)
+		}
+		return encodedSnapshots(t, rawRecoverySnapshot(firstSnapshotID, manifest.ContentID, "2026-08-25T12:00:00Z")), nil
+	})
+	result, err := runner.EnsureExact(context.Background(), target, manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Created || result.SnapshotID != firstSnapshotID || result.ContentID != manifest.ContentID ||
+		result.ArchiveID != manifest.ArchiveID || len(*calls) != 1 {
+		t.Fatalf("exact reused result/calls = %#v/%d", result, len(*calls))
+	}
+}
+
 func TestEnsureBacksUpDifferentContentOnceWithFixedIdentity(t *testing.T) {
 	manifest := manifestWithContent(t, strings.Repeat("d", 64))
 	runner, target, calls := testRunner(t, func(_ context.Context, _ string, arguments, environment []string, _ string) ([]byte, error) {

@@ -116,6 +116,14 @@ let
     '';
   };
 
+  vaultwardenEntrypoint = pkgs.writeShellApplication {
+    name = "vaultwarden-less-vaultwarden";
+    text = ''
+      umask 077
+      exec ${pkgs.vaultwarden}/bin/vaultwarden "$@"
+    '';
+  };
+
   vaultwardenImage = pkgs.dockerTools.buildLayeredImage {
     name = "vaultwarden-less-vaultwarden";
     tag = "local";
@@ -127,11 +135,12 @@ let
       pkgs.vaultwarden
       drillCopy
       vaultwardenHealthcheck
+      vaultwardenEntrypoint
       pkgs.cacert
       pkgs.tzdata
     ];
     config = commonImageConfig // {
-      Entrypoint = [ "/bin/vaultwarden" ];
+      Entrypoint = [ "/bin/vaultwarden-less-vaultwarden" ];
       Env = [
         "ROCKET_ADDRESS=0.0.0.0"
         "ROCKET_PORT=80"

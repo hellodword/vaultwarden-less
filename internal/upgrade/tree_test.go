@@ -81,6 +81,53 @@ func TestRollbackTreeRejectsUnsafeEntries(t *testing.T) {
 	})
 }
 
+func TestNormalizePrivateTreeSecuresOnlyValidatedEntries(t *testing.T) {
+	t.Run("normalizes", func(t *testing.T) {
+		root := filepath.Join(t.TempDir(), "tree")
+		if err := os.Mkdir(root, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		directory := filepath.Join(root, "nested")
+		if err := os.Mkdir(directory, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		file := filepath.Join(directory, "file")
+		if err := os.WriteFile(file, []byte("value"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := normalizePrivateTree(root); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := inspectPrivateTree(root); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("rejects before mutation", func(t *testing.T) {
+		root := filepath.Join(t.TempDir(), "tree")
+		if err := os.Mkdir(root, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		file := filepath.Join(root, "file")
+		if err := os.WriteFile(file, []byte("value"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		target := filepath.Join(t.TempDir(), "target")
+		writePrivateFile(t, target, []byte("target"))
+		if err := os.Symlink(target, filepath.Join(root, "unsafe")); err != nil {
+			t.Fatal(err)
+		}
+		if err := normalizePrivateTree(root); err == nil {
+			t.Fatal("unsafe tree was normalized")
+		}
+		if info, err := os.Lstat(file); err != nil || info.Mode().Perm() != 0o644 {
+			t.Fatalf("safe file was partially normalized: %v/%v", info, err)
+		}
+		if got, err := os.ReadFile(target); err != nil || string(got) != "target" {
+			t.Fatalf("symlink target changed = %q/%v", got, err)
+		}
+	})
+}
+
 func TestStrictUpgradeJSONRejectsDuplicateUnknownAndTrailingData(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "state")
 	if err := os.Mkdir(root, 0o700); err != nil {

@@ -107,6 +107,17 @@ func (r Runner) VerifyVersion(ctx context.Context) error {
 }
 
 func (r Runner) Ensure(ctx context.Context, target config.Target, manifest snapshot.Manifest) (SyncResult, error) {
+	return r.ensure(ctx, target, manifest, false)
+}
+
+// EnsureExact reuses a recovery snapshot only when its project, content, and
+// archive identities all match. Upgrade freeze/verification use this stricter
+// boundary; the resident worker continues to deduplicate by logical content.
+func (r Runner) EnsureExact(ctx context.Context, target config.Target, manifest snapshot.Manifest) (SyncResult, error) {
+	return r.ensure(ctx, target, manifest, true)
+}
+
+func (r Runner) ensure(ctx context.Context, target config.Target, manifest snapshot.Manifest, exact bool) (SyncResult, error) {
 	if err := manifest.Validate(); err != nil {
 		return SyncResult{}, &OperationError{Code: "invalid_manifest", ExitCode: -1}
 	}
@@ -114,7 +125,11 @@ func (r Runner) Ensure(ctx context.Context, target config.Target, manifest snaps
 	if err != nil {
 		return SyncResult{}, err
 	}
-	if latest != nil && latest.ContentID == manifest.ContentID {
+	reusable := latest != nil && latest.ContentID == manifest.ContentID
+	if exact && reusable {
+		reusable = latest.ProjectCommit == manifest.ProjectCommit && latest.ArchiveID == manifest.ArchiveID
+	}
+	if reusable {
 		return SyncResult{SnapshotID: latest.ID, ContentID: manifest.ContentID, ArchiveID: latest.ArchiveID, Created: false}, nil
 	}
 	base, environment, err := r.targetCommand(target)
