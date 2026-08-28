@@ -64,6 +64,12 @@ services:
     ports: !override
       - "127.0.0.1:${E2E_DRILL_PORT-}:80"
 
+  import-vaultwarden:
+    environment:
+      DOMAIN: ${E2E_DOMAIN:?E2E_DOMAIN is required}
+    ports: !override
+      - "127.0.0.1:${E2E_DRILL_PORT-}:80"
+
 networks:
   source-ingress: {}
   proxy-ingress:

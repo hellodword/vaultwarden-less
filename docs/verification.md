@@ -36,7 +36,8 @@ fixed environment isolation, Restic JSON/framing/redaction/cancellation,
 SQLite online backup during concurrent WAL writes, complete schema and
 projection validation, canonical content and archive identities, stable-copy
 races, exact restore verification, proxy event policy, worker retry/degraded
-state, upgrade state/tamper/idempotency, deterministic crypto vectors, and pure
+state, import source/WAL/exchange/resumption, upgrade state/tamper/idempotency,
+deterministic crypto vectors, and pure
 port boundaries.
 
 ## Security and products
@@ -131,6 +132,53 @@ This proves the exercised API/CLI paths for the exact project-managed and
 audited component set. It is not a full Vaultwarden feature test, browser UI
 test, email/push test, production TLS edge test, or evidence for a substituted
 Vaultwarden or Bitwarden CLI version.
+
+## Initial SQLite import lifecycle
+
+The release-candidate gate runs the focused scenario equivalently to:
+
+```sh
+nix develop --command python3 scripts/verify_go_test.py \
+  --require github.com/hellodword/vaultwarden-less/tests/e2e:TestInitialImportLifecycle \
+  -- go test -json ./tests/e2e -run '^TestInitialImportLifecycle$' -args -run-import-e2e
+```
+
+Required identity:
+
+```text
+github.com/hellodword/vaultwarden-less/tests/e2e:TestInitialImportLifecycle
+```
+
+The scenario uses the exact clean production images, current pinned
+Vaultwarden, Moto/Restic, the official pinned `bw` CLI, and a test-owned HTTPS
+edge. It creates one external stopped source with a real login, a small
+attachment, a small file Send, the old RSA identity, and a committed persistent
+WAL marker. It then proves:
+
+1. prepare leaves the external/project source tree byte-identical, absorbs the
+   WAL transaction through Online Backup, and leaves no candidate sidecar or
+   old RSA file;
+2. the import gate starts only the candidate on loopback, the old official-CLI
+   session fails after RSA rotation, and a new login through HTTPS reads the
+   login, attachment, and Send exactly;
+3. missing client confirmation and accept-before-verification fail with the
+   exact structured codes;
+4. stopped-candidate verification records real client confirmation, the
+   audited migration/schema and snapshot closure, private modes, no sidecars,
+   and a different RSA digest;
+5. terminal accept atomically promotes the verified tree, starts the exact
+   normal three-service runtime, finalizes history, and an exact rerun reports
+   `already_complete`;
+6. source remains unchanged through finalize, the newly authenticated session
+   survives promotion, the old session remains invalid, and another fresh
+   normal HTTPS login reads every test object byte-for-byte;
+7. only the scenario's Compose resources, credentials, client stores, and
+   temporary trees are removed.
+
+This is evidence for the fixed initial-import contract and current pinned
+Vaultwarden migration boundary. It does not authorize importing a live source,
+merging into active data, substituting another upstream version, or deleting
+the external original.
 
 ## Two-repository degradation and catch-up
 

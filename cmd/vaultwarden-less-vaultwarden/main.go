@@ -17,6 +17,7 @@ import (
 	"github.com/hellodword/vaultwarden-less/internal/buildinfo"
 	"github.com/hellodword/vaultwarden-less/internal/config"
 	"github.com/hellodword/vaultwarden-less/internal/deployment"
+	"github.com/hellodword/vaultwarden-less/internal/importer"
 	"github.com/hellodword/vaultwarden-less/internal/privatefs"
 	"github.com/hellodword/vaultwarden-less/internal/upgrade"
 )
@@ -52,11 +53,12 @@ type gateEnvironment struct {
 	readDrillManifest func(context.Context, string) (drillManifest, error)
 	allowDrill        func(string, string, string, string, string, config.Deployment) error
 	allowRollback     func(context.Context, string, string, deployment.Identity, config.Deployment) error
-	allowImport       func(string, deployment.Identity, config.Deployment) error
+	allowImport       func(context.Context, string, string, string, deployment.Identity, config.Deployment) error
 	start             func() error
 	deploymentPath    string
 	stateDir          string
 	dataDir           string
+	importSourceDir   string
 	recoveryRoot      string
 }
 
@@ -76,20 +78,27 @@ func defaultGateEnvironment() gateEnvironment {
 		loadDeployment: config.LoadDeployment,
 		requireActive:  deployment.RequireActive,
 		readActive:     deployment.ReadActive,
-		allowNormal:    upgrade.ServingAllowed,
+		allowNormal: func(ctx context.Context, stateDir, dataDir string, identity deployment.Identity, configured config.Deployment) error {
+			if err := importer.NormalServingAllowed(stateDir, identity); err != nil {
+				return err
+			}
+			return upgrade.ServingAllowed(ctx, stateDir, dataDir, identity, configured)
+		},
 		allowCandidate: upgrade.CandidateServingAllowed,
 		readDrillManifest: func(ctx context.Context, root string) (drillManifest, error) {
 			return readDrillManifest(ctx, root)
 		},
 		allowDrill:    upgrade.DrillServingAllowed,
 		allowRollback: upgrade.RollbackServingAllowed,
+		allowImport:   importer.CandidateServingAllowed,
 		start: func() error {
 			return syscall.Exec(vaultwardenBinary, []string{vaultwardenBinary}, os.Environ())
 		},
-		deploymentPath: config.DeploymentEnvPath,
-		stateDir:       config.StateDir,
-		dataDir:        config.DataDir,
-		recoveryRoot:   recoveryRoot,
+		deploymentPath:  config.DeploymentEnvPath,
+		stateDir:        config.StateDir,
+		dataDir:         config.DataDir,
+		importSourceDir: filepath.Join(config.ImportRoot, "source"),
+		recoveryRoot:    recoveryRoot,
 	}
 }
 
@@ -179,7 +188,14 @@ func evaluateGate(ctx context.Context, mode string, identity deployment.Identity
 		if environment.allowImport == nil {
 			return fmt.Errorf("import gate is unavailable")
 		}
-		return environment.allowImport(environment.stateDir, identity, configured)
+		return environment.allowImport(
+			ctx,
+			environment.stateDir,
+			environment.importSourceDir,
+			environment.dataDir,
+			identity,
+			configured,
+		)
 	default:
 		return fmt.Errorf("unsupported gate mode")
 	}

@@ -14,6 +14,7 @@ import (
 	"github.com/hellodword/vaultwarden-less/internal/buildinfo"
 	"github.com/hellodword/vaultwarden-less/internal/config"
 	"github.com/hellodword/vaultwarden-less/internal/deployment"
+	"github.com/hellodword/vaultwarden-less/internal/importer"
 	"github.com/hellodword/vaultwarden-less/internal/privatefs"
 	"github.com/hellodword/vaultwarden-less/internal/restic"
 	restoretool "github.com/hellodword/vaultwarden-less/internal/restore"
@@ -54,6 +55,7 @@ type commandEnvironment struct {
 	httpClient        *http.Client
 	workerURL         string
 	deploymentPath    string
+	deploymentRoot    string
 	vaultwardenPath   string
 	credentialsPath   string
 	notifierPath      string
@@ -93,7 +95,12 @@ func defaultEnvironment(stderr io.Writer) commandEnvironment {
 			_, err := deployment.RequireActive(stateDir, deployment.Identity{ProjectCommit: projectCommit, Release: release})
 			return err
 		},
-		allowServe: upgrade.ServingAllowed,
+		allowServe: func(ctx context.Context, stateDir, dataDir string, identity deployment.Identity, configured config.Deployment) error {
+			if err := importer.NormalServingAllowed(stateDir, identity); err != nil {
+				return err
+			}
+			return upgrade.ServingAllowed(ctx, stateDir, dataDir, identity, configured)
+		},
 		drillCheck: checkUpgradeDrill,
 		httpClient: &http.Client{
 			Timeout: 5 * time.Second,
@@ -103,6 +110,7 @@ func defaultEnvironment(stderr io.Writer) commandEnvironment {
 		},
 		workerURL:       config.WorkerURL,
 		deploymentPath:  config.DeploymentEnvPath,
+		deploymentRoot:  config.DeploymentRoot,
 		vaultwardenPath: config.VaultwardenEnvPath,
 		credentialsPath: config.RoleCredentialsPath,
 		notifierPath:    config.NotifierCredentialsPath,

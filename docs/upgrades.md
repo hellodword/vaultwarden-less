@@ -16,6 +16,9 @@ Before `prepare`:
 
 - A is an exact clean schema-1 release and its three production services are
   healthy; `state/deployment/active.json` exactly names A.
+- No initial import is current; a prepared, verified, decided, or incomplete
+  `state/import/current` must be cancelled before decision or completed before
+  any upgrade preparation.
 - A has recent verified snapshots on every configured upgrade-verification
   target, and a latest restore plus drill has passed.
 - B is an exact clean schema-1 commit with a separately generated and checked

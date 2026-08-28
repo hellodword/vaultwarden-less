@@ -67,6 +67,9 @@ credentials/
     primary.example
     primary
 data/
+import/
+  source/
+  candidate/
 staging/
 cache/
 restore/
@@ -103,8 +106,8 @@ decimal `1..4294967294`; each port is canonical decimal `1024..65535`; the two
 ports differ. A leading plus, sign, leading zero, exponent, or surrounding
 whitespace is invalid.
 
-`config`, `credentials`, `credentials/restic`, `data`, `staging`, `cache`,
-`restore`, and `state`, including every required runtime subdirectory, are real
+`config`, `credentials`, `credentials/restic`, `data`, `import`, `staging`,
+`cache`, `restore`, and `state`, including every required runtime subdirectory, are real
 non-symlink directories owned by the runtime UID/GID with mode `0700`. Every
 private configuration, credential, password, manifest, and upgrade-state file
 is a real non-symlink regular file owned by that identity with mode `0600`.
@@ -113,7 +116,7 @@ templates and are not subject to private-file ownership checks until copied to
 their private names.
 
 `compose.yml` is the production topology and defines the `deployment`,
-`maintenance`, `restore`, and `drill` profiles. `compose.upgrade.yml` is used only as an
+`maintenance`, `restore`, `drill`, and `import` profiles. `compose.upgrade.yml` is used only as an
 overlay during an upgrade or rollback. Both files are normative. They use only
 the three `vaultwarden-less-*:local` production aliases in normal operation,
 contain no `build:` key, set `pull_policy: never`, publish only the proxy and
@@ -346,6 +349,12 @@ repo check --target <name>
 repo unlock --target <name>
 repo prune --target <name> [--apply]
 restore --target <name> [--snapshot latest|<64-lowercase-hex>] --output <name>
+deployment init
+deployment import prepare
+deployment import verify --confirm-client-login
+deployment import accept
+deployment import cancel
+deployment import finalize
 upgrade prepare --to-commit <full-commit> --to-release <immutable-release>
 upgrade freeze
 upgrade migrate-check
@@ -383,7 +392,7 @@ The exhaustive stable codes are `usage_error`, `invalid_config`,
 `invalid_credentials`, `unsafe_path`, `not_ready`, `conflict`,
 `source_inconsistent`, `unsupported_schema`, `repository_failure`,
 `verification_failure`, `timeout`, `upgrade_state_invalid`,
-`deployment_state_invalid`, and
+`import_state_invalid`, `deployment_state_invalid`, and
 `internal_error`. The message is safe human context and is not a stable parsing
 surface. No error has extra fields.
 
@@ -939,6 +948,163 @@ managed schema 1 releases whose actual Vaultwarden versions differ. Neither
 result promises compatibility for an upstream version or build that the
 project does not manage.
 
+## One-time external SQLite import
+
+Import is available only before the first active identity exists. It accepts a
+complete copy of a fully stopped external Vaultwarden data directory; it is not
+an online copy, merge, repeat import, or restore-promotion interface. The
+operator retains the original tree outside the deployment clone and copies it
+into `import/source`. The external original is never mounted into a project
+container. Project code treats `import/source` as immutable and never writes or
+deletes it.
+
+The fixed layout is:
+
+```text
+import/source/
+import/candidate/
+state/import/current/
+  prepare.json
+  verification.json
+  decision.json
+state/import/history/initial/
+```
+
+The deployment root, `data`, `import`, `import/source`, `state`, and all import
+state directories are real, owned `0700` directories. Every source directory
+is owned `0700`; every source file is an owned, single-link `0600` regular
+file. Symlinks, hard-link aliases, sockets, devices, FIFOs, path escape,
+cross-device entries, invalid UTF-8 paths, or a changing entry fail before a
+candidate is published. `data`, `import/source`, and `import/candidate` must be
+on the same nonzero filesystem device. Import state JSON follows the canonical,
+single-value, duplicate/unknown-field-rejecting, 1 MiB, owned `0600` rules used
+by active and upgrade state.
+
+`deployment import prepare` requires no active identity, completely empty
+`data`, no current upgrade/import, a root `db.sqlite3`, and a root
+`rsa_key.pem`. It hashes the complete stopped source, copies ordinary files
+into a private temporary candidate, and excludes the source database,
+SQLite sidecars, and all three RSA files. It first stable-copies the source
+database plus any `-wal`, `-shm`, or `-journal` sidecar into candidate-private
+scratch, then uses the SQLite Online Backup API against that scratch to create
+one closed `candidate/db.sqlite3`. Thus committed WAL content is absorbed
+without opening or changing `import/source`; the candidate retains no SQLite
+sidecar and no old RSA identity. Directories and files are normalized to
+`0700`/`0600`. Before publishing state, prepare exchanges two disposable
+sibling directories with Linux `renameat2(RENAME_EXCHANGE)` and rejects a
+filesystem that cannot perform the required atomic promotion.
+
+`source_tree_id` and `candidate_tree_id` use
+`vaultwarden-less-import-tree-v1\0`, a big-endian entry count, then sorted
+UTF-8 slash-relative entries. Each entry contributes a length-framed path, a
+`d` or `f` byte, and a big-endian uint64 permission mode; each file then
+contributes its big-endian uint64 size and exact bytes. `source_rsa_key_id`
+uses the same size-plus-bytes file digest. All IDs are lowercase SHA-256 with
+the `sha256:` prefix.
+
+Immutable `prepare.json` has exactly:
+
+```json
+{
+  "schema_version": 1,
+  "import_id": "initial",
+  "phase": "prepared",
+  "project_commit": "<B-full-commit>",
+  "release": "<B-immutable-release>",
+  "source_path": "import/source",
+  "candidate_path": "import/candidate",
+  "data_path": "data",
+  "filesystem_device": 1,
+  "source_tree_id": "sha256:<64-lowercase-hex>",
+  "candidate_tree_id": "sha256:<64-lowercase-hex>",
+  "source_rsa_key_id": "sha256:<64-lowercase-hex>",
+  "prepared_at": "2026-08-28T12:34:56.789Z"
+}
+```
+
+Repeating prepare resumes only that exact immutable state and source. It may
+recover a matching private temporary candidate or deterministically rebuild
+one whose tree ID equals the preparation. A changed source, identity, device,
+candidate, active document, or unrelated candidate path is a hard failure.
+
+`import-vaultwarden` is the current production Vaultwarden image in the
+explicit `import` gate mode. It mounts only `import/candidate` as writable
+`/data`, mounts `import/source` and state read-only, disables registration,
+push, icons, and the Web Vault, and publishes container port 80 only on
+loopback `DRILL_PORT`. The operator routes the existing trusted HTTPS edge to
+that loopback endpoint and logs in with a real Bitwarden client. Direct
+plaintext HTTP probing is not client-login evidence. Vaultwarden owns its
+upstream migration and generates a new RSA identity in the candidate.
+
+After the candidate is stopped, `deployment import verify
+--confirm-client-login` rehashes the unchanged source, normalizes the candidate,
+requires its `rsa_key.pem` digest to differ from the source, closes/removes
+SQLite sidecars, runs `integrity_check`, `foreign_key_check`, the exact audited
+migration and schema fingerprint checks, and the ordinary snapshot closure for
+database rows, attachments, and file Sends. The flag is mandatory usage input;
+without a real successful HTTPS client login the operator must not supply it.
+Immutable `verification.json` has exactly:
+
+```json
+{
+  "schema_version": 1,
+  "import_id": "initial",
+  "phase": "verified",
+  "project_commit": "<B-full-commit>",
+  "release": "<B-immutable-release>",
+  "source_tree_id": "sha256:<64-lowercase-hex>",
+  "candidate_tree_id": "sha256:<64-lowercase-hex>",
+  "database_migration": "<audited-B-migration>",
+  "database_schema_fingerprint": "sha256:<64-lowercase-hex>",
+  "content_id": "sha256:<64-lowercase-hex>",
+  "archive_id": "sha256:<64-lowercase-hex>",
+  "client_login_confirmed": true,
+  "verified_at": "2026-08-28T13:34:56.789Z"
+}
+```
+
+`deployment import accept` first revalidates source, candidate, empty data,
+device, verification, and absent active identity, then atomically creates:
+
+```json
+{
+  "schema_version": 1,
+  "import_id": "initial",
+  "decision": "accept",
+  "active_project_commit": "<B-full-commit>",
+  "active_release": "<B-immutable-release>",
+  "decided_at": "2026-08-28T14:34:56.789Z"
+}
+```
+
+After that immutable boundary, cancel is permanently rejected. Accept uses the
+verified candidate tree ID and exact empty-tree state to decide whether
+`RENAME_EXCHANGE(data, import/candidate)` has not happened or already happened;
+it never blindly exchanges twice. It then verifies live `data`, verifies that
+the exchanged candidate is exactly empty, and publishes the first active B
+identity no earlier than `decided_at`. An interruption after decision can only
+repeat accept.
+
+`scripts/deployment.py import accept` stops and removes the candidate service,
+resumes the Go accept operation, starts and waits for the three normal B
+services, proves each running image ID and OCI identity, and invokes
+`deployment import finalize`. Finalize accepts only the exact active/decision
+ordering and an empty exchanged candidate, removes that empty directory, and
+atomically archives current as `state/import/history/initial`. Repeating the
+host command revalidates the active healthy runtime and returns
+`already_complete`. `deployment import cancel` is available only before a
+decision and removes only the exact disposable candidate, matching candidate
+temporaries, and current state; it never removes source or data.
+
+Every import command returns the ordinary one-line success/error contract.
+The import success document has `schema_version`, `import_id`, `phase`, exact
+project identity, source/candidate tree IDs, and
+`client_login_confirmed`. Phases exposed by those commands are `prepared`,
+`verified`, `accepted`, `cancelled`, and `finalized`. Unsafe or malformed state
+uses `import_state_invalid`; changed/unsafe source uses `source_inconsistent`;
+tree, RSA, database, or closure failure uses `verification_failure`; durable
+state conflicts use `conflict`.
+
 ## Development scripts
 
 The only durable Python scripts are `capture_vaultwarden_schema.py`,
@@ -954,6 +1120,7 @@ Their exact command surfaces are:
 ```text
 capture_vaultwarden_schema.py --database <sqlite-file> [--upstreams UPSTREAMS.toml] [--output internal/upstream/vaultwarden-schema.json]
 deployment.py [--deployment-root <directory>] [--project-name <name>] upgrade <accept|rollback>
+deployment.py [--deployment-root <directory>] [--project-name <name>] import accept
 release.py create --output-root <ignored-directory>
 release.py load <release-directory>
 upstream_diff.py <vaultwarden|bitwarden-cli|restic|moto|go> <candidate-tag> [--upstreams UPSTREAMS.toml]
@@ -966,7 +1133,7 @@ active/prepare/decision/Compose state, never reads the database, and passes
 only structured argv to Docker. It never uses a shell, `sed`, an exported
 release variable, a socket mount, or a prune command. Success is one canonical
 schema-1 JSON line with `status` equal to `completed` or `already_complete`,
-the workflow/decision, upgrade ID, and exact active identity. Usage and runtime
+the workflow/decision, upgrade ID or initial import ID, and exact active identity. Usage and runtime
 failures use bounded `usage_error` or `deployment_orchestration_failed` JSON
 errors and exit 2 or 1 respectively.
 

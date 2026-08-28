@@ -341,6 +341,11 @@ services:
     command: [--help]
     volumes:
       - type: bind
+        source: .
+        target: /deployment-root
+        bind:
+          create_host_path: false
+      - type: bind
         source: ./.env
         target: /deployment/.env
         read_only: true
@@ -357,6 +362,64 @@ services:
         target: /state
         bind:
           create_host_path: false
+
+  import-vaultwarden:
+    <<: *service-defaults
+    image: vaultwarden-less-vaultwarden:local
+    pull_policy: never
+    profiles: [import]
+    restart: "no"
+    hostname: import-vaultwarden
+    command: [import]
+    env_file:
+      - ./config/vaultwarden.env
+    environment:
+      DATA_FOLDER: /data
+      DATABASE_URL: sqlite:///data/db.sqlite3
+      RSA_KEY_FILENAME: /data/rsa_key
+      ATTACHMENTS_FOLDER: /data/attachments
+      SENDS_FOLDER: /data/sends
+      WEB_VAULT_ENABLED: "false"
+      ENABLE_WEBSOCKET: "false"
+      PUSH_ENABLED: "false"
+      SIGNUPS_ALLOWED: "false"
+      INVITATIONS_ALLOWED: "false"
+      DISABLE_ICON_DOWNLOAD: "true"
+    volumes:
+      - type: bind
+        source: ./.env
+        target: /deployment/.env
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./import/source
+        target: /import/source
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./import/candidate
+        target: /data
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./state
+        target: /state
+        read_only: true
+        bind:
+          create_host_path: false
+    ports:
+      - "127.0.0.1:${DRILL_PORT:?DRILL_PORT is required}:80"
+    networks:
+      - import
+      - import-ingress
+    healthcheck:
+      test: [CMD, /healthcheck.sh]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
 
   restore:
     <<: *service-defaults
@@ -483,6 +546,11 @@ networks:
   drill:
     internal: true
   drill-ingress:
+    driver_opts:
+      com.docker.network.bridge.enable_ip_masquerade: "false"
+  import:
+    internal: true
+  import-ingress:
     driver_opts:
       com.docker.network.bridge.enable_ip_masquerade: "false"
 

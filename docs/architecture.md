@@ -56,10 +56,13 @@ points that were never stored there.
 | `maintenance-outbound` | one-shot maintenance/restore/upgrade services | Repository egress without joining application networks. |
 | `drill` | drill Vaultwarden and upgrade verifier | Internal recovery-drill traffic. |
 | `drill-ingress` | drill Vaultwarden | Separate loopback publication for a disposable drill. |
+| `import` | initial-import Vaultwarden candidate | Internal candidate traffic, isolated from the active application. |
+| `import-ingress` | initial-import Vaultwarden candidate | Separate loopback publication for trusted HTTPS client verification. |
 
 No production container receives the container-engine socket. Normal Compose
 uses only local image aliases and `pull_policy: never`; it cannot build or pull
-an image. Only the proxy and drill endpoints are published, both on loopback.
+an image. Only the proxy, drill, and initial-import candidate endpoints are
+published, all on loopback and never simultaneously as ordinary serving paths.
 
 ## Filesystem and identity boundaries
 
@@ -71,6 +74,7 @@ ignored private/runtime state:
 config/                      private product and Vaultwarden configuration
 credentials/                 isolated backup/maintenance/notifier/password inputs
 data/                        live Vaultwarden data
+import/                      immutable import copy and disposable candidate
 staging/                     disposable recovery-point construction
 cache/                       disposable Restic cache
 restore/                     verified, operator-named restore outputs
@@ -191,6 +195,33 @@ Rollback uses the frozen tree ID to resume a single same-filesystem exchange,
 starts ordinary A services, and then archives the complete current record with
 exchanged B data to quarantine. See [Upgrades](upgrades.md).
 
+## Initial import ownership
+
+Initial import is a separate pre-active state machine. The operator keeps the
+stopped external original outside the clone and supplies only a private copy at
+`import/source`. Go owns source/type/permission/device validation, stable tree
+identities, SQLite Online Backup, RSA exclusion/rotation evidence, schema and
+snapshot-closure verification, the immutable accept decision, the single
+same-filesystem directory exchange, active publication, cancel, and finalize.
+
+The candidate uses the existing production Vaultwarden image in explicit
+`import` gate mode and mounts only `import/candidate` as writable `/data`. The
+source and state mounts are read-only. It has separate internal/ingress
+networks and only the drill port is published on loopback, so the operator can
+route the trusted HTTPS edge for an official-client login without exposing the
+candidate as the normal service. The old RSA files never enter the candidate;
+Vaultwarden generates the new identity.
+
+The networkless non-root deployment-admin sees the deployment root because
+Linux can atomically exchange `data` and `import/candidate` only through one
+common mount. Its code treats source as immutable, validates it again across
+every boundary, and has no container-engine socket. The host Python
+orchestrator owns only candidate stop/removal, structured Compose argv, exact
+normal image/health verification, and finalize resumption. A decision is made
+only in Go. Before decision cancel removes only disposable state; after
+decision the only legal direction is accept/start/finalize. The empty exchanged
+candidate is the only data directory finalize may remove.
+
 ## Failure semantics
 
 - Health proves only that a process can answer its local health check.
@@ -200,7 +231,7 @@ exchanged B data to quarantine. See [Upgrades](upgrades.md).
   good point.
 - A target failure does not convert partial success into complete success.
 - Notification queues are bounded, best effort, and non-durable.
-- Restore, drill, upgrade, and rollback validate exact owners before side
+- Restore, drill, import, upgrade, and rollback validate exact owners before side
   effects and never infer permission to overwrite a real destination.
 - Moto acceptance validates the Restic/S3 protocol boundary, not a cloud
   provider's production behavior.

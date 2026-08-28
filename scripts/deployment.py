@@ -29,6 +29,7 @@ RELEASE_PATTERN = re.compile(
 PROJECT_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
 CONTAINER_PATTERN = re.compile(r"^[0-9a-f]{12,64}$")
 IMAGE_ID_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
+DIGEST_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 DECIMAL_PATTERN = re.compile(r"^[1-9][0-9]*$")
 
 
@@ -60,6 +61,14 @@ class UpgradeContext:
     source: Identity
     target: Identity
     decision: str | None
+
+
+@dataclass(frozen=True)
+class ImportContext:
+    directory: Path
+    import_id: str
+    identity: Identity
+    decision: bool
 
 
 RunCommand = Callable[..., subprocess.CompletedProcess[str]]
@@ -370,6 +379,128 @@ def _read_upgrade_context(root: Path, directory: Path) -> UpgradeContext:
     )
 
 
+def _digest(value: Any) -> None:
+    if not isinstance(value, str) or DIGEST_PATTERN.fullmatch(value) is None:
+        raise DeploymentError("deployment state digest is invalid")
+
+
+def _read_import_context(root: Path, directory: Path) -> ImportContext:
+    _private_directory(root / "state")
+    _private_directory(root / "state" / "import")
+    _private_directory(root / "state" / "import" / "history")
+    _private_directory(directory)
+    prepare = _private_json(directory / "prepare.json")
+    _exact_fields(
+        prepare,
+        (
+            "schema_version",
+            "import_id",
+            "phase",
+            "project_commit",
+            "release",
+            "source_path",
+            "candidate_path",
+            "data_path",
+            "filesystem_device",
+            "source_tree_id",
+            "candidate_tree_id",
+            "source_rsa_key_id",
+            "prepared_at",
+        ),
+    )
+    if (
+        type(prepare["schema_version"]) is not int
+        or prepare["schema_version"] != SCHEMA_VERSION
+        or prepare["import_id"] != "initial"
+        or prepare["phase"] != "prepared"
+        or prepare["source_path"] != "import/source"
+        or prepare["candidate_path"] != "import/candidate"
+        or prepare["data_path"] != "data"
+        or type(prepare["filesystem_device"]) is not int
+        or prepare["filesystem_device"] < 1
+    ):
+        raise DeploymentError("import preparation is invalid")
+    identity = _identity(prepare["project_commit"], prepare["release"])
+    for field in ("source_tree_id", "candidate_tree_id", "source_rsa_key_id"):
+        _digest(prepare[field])
+    _timestamp(prepare["prepared_at"])
+
+    verification = _private_json(directory / "verification.json")
+    _exact_fields(
+        verification,
+        (
+            "schema_version",
+            "import_id",
+            "phase",
+            "project_commit",
+            "release",
+            "source_tree_id",
+            "candidate_tree_id",
+            "database_migration",
+            "database_schema_fingerprint",
+            "content_id",
+            "archive_id",
+            "client_login_confirmed",
+            "verified_at",
+        ),
+    )
+    if (
+        type(verification["schema_version"]) is not int
+        or verification["schema_version"] != SCHEMA_VERSION
+        or verification["import_id"] != "initial"
+        or verification["phase"] != "verified"
+        or verification["project_commit"] != identity.commit
+        or verification["release"] != identity.release
+        or verification["source_tree_id"] != prepare["source_tree_id"]
+        or not isinstance(verification["database_migration"], str)
+        or not verification["database_migration"]
+        or verification["client_login_confirmed"] is not True
+    ):
+        raise DeploymentError("import verification is invalid")
+    for field in (
+        "candidate_tree_id",
+        "database_schema_fingerprint",
+        "content_id",
+        "archive_id",
+    ):
+        _digest(verification[field])
+    _timestamp(verification["verified_at"])
+
+    decision_path = directory / "decision.json"
+    decision = False
+    try:
+        decision_path.lstat()
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        raise DeploymentError("import decision path is unsafe") from error
+    else:
+        document = _private_json(decision_path)
+        _exact_fields(
+            document,
+            (
+                "schema_version",
+                "import_id",
+                "decision",
+                "active_project_commit",
+                "active_release",
+                "decided_at",
+            ),
+        )
+        if (
+            type(document["schema_version"]) is not int
+            or document["schema_version"] != SCHEMA_VERSION
+            or document["import_id"] != "initial"
+            or document["decision"] != "accept"
+            or _identity(document["active_project_commit"], document["active_release"])
+            != identity
+        ):
+            raise DeploymentError("import decision is invalid")
+        _timestamp(document["decided_at"])
+        decision = True
+    return ImportContext(directory, "initial", identity, decision)
+
+
 class Orchestrator:
     def __init__(
         self,
@@ -412,6 +543,49 @@ class Orchestrator:
             raise DeploymentError("unsupported terminal upgrade decision")
         archived = self._completed_context(requested)
         return self._result("completed", archived, requested)
+
+    def terminal_import(self) -> dict[str, Any]:
+        current = self.root / "state" / "import" / "current"
+        try:
+            metadata = current.lstat()
+        except FileNotFoundError:
+            context = self._completed_import_context()
+            self._verify_import_runtime(context)
+            self._assert_import_candidate_absent()
+            return self._import_result("already_complete", context)
+        except OSError as error:
+            raise DeploymentError("import current state is unsafe") from error
+        if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+            raise DeploymentError("import current state is unsafe")
+        context = _read_import_context(self.root, current)
+        compose = self._compose(self.root / ".env", overlay=False)
+        self._run([*compose, "--profile", "import", "stop", "import-vaultwarden"])
+        self._run(
+            [
+                *compose,
+                "--profile",
+                "import",
+                "rm",
+                "--force",
+                "--stop",
+                "import-vaultwarden",
+            ]
+        )
+        if not context.decision:
+            self._import_cli("accept")
+            context = _read_import_context(self.root, current)
+        if not context.decision or _read_active(self.root) != context.identity:
+            raise DeploymentError(
+                "import accept did not publish the exact active identity"
+            )
+        self._run(
+            [*compose, "up", "--detach", "--wait", "--wait-timeout", "180", *SERVICES]
+        )
+        self._verify_services(compose, context.identity, immutable=False)
+        self._import_cli("finalize")
+        archived = self._completed_import_context()
+        self._assert_import_candidate_absent()
+        return self._import_result("completed", archived)
 
     def _accept(self, context: UpgradeContext) -> None:
         self._upgrade_cli(context, "upgrade-b", "upgrade", "accept")
@@ -492,6 +666,55 @@ class Orchestrator:
                 "active identity does not have one matching terminal upgrade archive"
             )
         return matches[0]
+
+    def _completed_import_context(self) -> ImportContext:
+        history = self.root / "state" / "import" / "history" / "initial"
+        context = _read_import_context(self.root, history)
+        if not context.decision or _read_active(self.root) != context.identity:
+            raise DeploymentError("completed import does not match the active identity")
+        return context
+
+    def _verify_import_runtime(self, context: ImportContext) -> None:
+        if _read_active(self.root) != context.identity:
+            raise DeploymentError("active identity does not match completed import")
+        compose = self._compose(self.root / ".env", overlay=False)
+        self._verify_services(compose, context.identity, immutable=False)
+
+    def _import_cli(self, action: str) -> None:
+        compose = self._compose(self.root / ".env", overlay=False)
+        self._run(
+            [
+                *compose,
+                "--profile",
+                "deployment",
+                "run",
+                "--rm",
+                "--no-deps",
+                "deployment-admin",
+                "deployment",
+                "import",
+                action,
+            ]
+        )
+
+    def _assert_import_candidate_absent(self) -> None:
+        candidate = self.root / "import" / "candidate"
+        if candidate.exists() or candidate.is_symlink():
+            raise DeploymentError("finalized import candidate was not removed")
+        compose = self._compose(self.root / ".env", overlay=False)
+        result = self._run(
+            [
+                *compose,
+                "--profile",
+                "import",
+                "ps",
+                "--quiet",
+                "import-vaultwarden",
+            ],
+            capture=True,
+        )
+        if result.stdout.strip():
+            raise DeploymentError("import candidate service was not removed")
 
     def _upgrade_cli(
         self, context: UpgradeContext, service: str, *arguments: str
@@ -730,6 +953,18 @@ class Orchestrator:
             "active_release": identity.release,
         }
 
+    @staticmethod
+    def _import_result(status: str, context: ImportContext) -> dict[str, Any]:
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "status": status,
+            "workflow": "import",
+            "decision": "accept",
+            "import_id": context.import_id,
+            "active_project_commit": context.identity.commit,
+            "active_release": context.identity.release,
+        }
+
 
 def parser() -> Parser:
     root = Parser(description=__doc__)
@@ -738,6 +973,8 @@ def parser() -> Parser:
     workflows = root.add_subparsers(dest="workflow", required=True, parser_class=Parser)
     upgrade = workflows.add_parser("upgrade")
     upgrade.add_argument("decision", choices=("accept", "rollback"))
+    initial_import = workflows.add_parser("import")
+    initial_import.add_argument("decision", choices=("accept",))
     return root
 
 
@@ -753,11 +990,13 @@ def _write_error(code: str, message: str) -> None:
 def main(arguments: Sequence[str] | None = None) -> int:
     try:
         parsed = parser().parse_args(arguments)
-        if parsed.workflow != "upgrade":
+        orchestrator = Orchestrator(parsed.deployment_root, parsed.project_name)
+        if parsed.workflow == "upgrade":
+            result = orchestrator.terminal_upgrade(parsed.decision)
+        elif parsed.workflow == "import" and parsed.decision == "accept":
+            result = orchestrator.terminal_import()
+        else:
             raise UsageError("unsupported workflow")
-        result = Orchestrator(
-            parsed.deployment_root, parsed.project_name
-        ).terminal_upgrade(parsed.decision)
     except UsageError:
         _write_error("usage_error", "Invalid deployment arguments")
         return 2

@@ -203,6 +203,13 @@ func syncOwnedSQLiteFile(path string, expected os.FileInfo) error {
 
 var unsignedIntegerPattern = regexp.MustCompile(`^(0|[1-9][0-9]*)$`)
 
+// OnlineBackup creates one consistent, closed SQLite database from a source
+// database and any committed WAL contents without modifying the source. The
+// destination must not exist.
+func OnlineBackup(ctx context.Context, sourcePath, destinationPath string) error {
+	return onlineBackup(ctx, sourcePath, destinationPath)
+}
+
 func onlineBackup(ctx context.Context, sourcePath, destinationPath string) error {
 	sourceInfo, err := os.Lstat(sourcePath)
 	if err != nil {

@@ -2,7 +2,7 @@
 
 These procedures run on an ordinary Linux/amd64 deployment host with Git,
 Python 3, Docker Engine, and the Docker Compose plugin. Python is needed only
-for the standard-library terminal upgrade orchestrator. Nix is needed only to
+for the standard-library terminal upgrade/import orchestrator. Nix is needed only to
 build or verify source and create releases. Run commands from the exact
 deployment clone; Compose bind paths are relative to it.
 
@@ -67,6 +67,82 @@ private inputs remain:
 ```sh
 docker compose --env-file .env --file compose.yml down
 ```
+
+## One-time external SQLite import
+
+Use this workflow instead of `deployment init` when the first deployment takes
+ownership of an existing Vaultwarden data directory. It is unavailable after
+an active identity exists and never merges with nonempty `data`.
+
+First stop the external Vaultwarden completely. Keep that original directory
+outside this clone as the recovery copy. Create owned mode-`0700`
+`import/source`, then use an offline copy mechanism to copy the complete data
+tree into it, including `db.sqlite3`, any stopped WAL/SHM files, attachments,
+Sends, and RSA files. The copied source must contain only owned `0700`
+directories and owned, single-link `0600` regular files; do not repair a
+rejected symlink, hard link, special file, owner, or permission blindly.
+`data`, `import`, and `import/source` must be on the same filesystem.
+
+With normal services stopped, `data` empty, no active identity, and no current
+upgrade, prepare the candidate:
+
+```sh
+docker compose --env-file .env --file compose.yml --profile deployment run --rm --no-deps deployment-admin deployment import prepare
+```
+
+Record the returned tree IDs. A repeated exact command resumes preparation;
+do not delete state to force another result. Preparation absorbs committed WAL
+through SQLite Online Backup, preserves `import/source` byte-for-byte, and
+publishes a private candidate without the old RSA identity or SQLite sidecars.
+
+Start only the candidate:
+
+```sh
+docker compose --env-file .env --file compose.yml --profile import up --detach --wait --wait-timeout 180 import-vaultwarden
+```
+
+Temporarily route the existing trusted HTTPS edge to loopback `DRILL_PORT`.
+Use the official Bitwarden client to log in again and verify representative
+logins, attachments, and file Sends. Do not treat `/alive`, direct plaintext
+HTTP, database inspection, or an old session as client-login confirmation.
+Then stop the candidate and record verification:
+
+```sh
+docker compose --env-file .env --file compose.yml --profile import stop import-vaultwarden
+docker compose --env-file .env --file compose.yml --profile deployment run --rm --no-deps deployment-admin deployment import verify --confirm-client-login
+```
+
+Supply `--confirm-client-login` only after that real HTTPS login succeeds.
+Verification checks the unchanged source, rotated RSA identity, exact audited
+schema/migration, SQLite integrity/foreign keys, and the complete
+database/attachment/Send snapshot closure. Without verification, accept fails.
+
+Accept and finish through the resumable host orchestrator:
+
+```sh
+python3 scripts/deployment.py import accept
+```
+
+The command records the immutable accept decision before exchanging the
+verified candidate with empty `data`, publishes the active release, starts and
+verifies Vaultwarden/backup/proxy, removes only the empty exchanged candidate,
+and archives the state. If it exits after the decision, exchange, active write,
+service start, or before finalize, run the identical command again. A completed
+repeat returns `already_complete`. Confirm the normal HTTPS path with a fresh
+client login; the pre-import session must fail because RSA was rotated. Retain
+the external original and `import/source` until the deployment and backups have
+been independently accepted.
+
+Before any accept decision, cancellation is explicit:
+
+```sh
+docker compose --env-file .env --file compose.yml --profile deployment run --rm --no-deps deployment-admin deployment import cancel
+```
+
+Cancel removes only disposable candidate/current state and never source or
+data. Once `decision.json` exists, cancel is permanently invalid; continue the
+same `python3 scripts/deployment.py import accept` workflow. Never edit import
+JSON, exchange directories manually, or replace a missing active document.
 
 ## Status and backup demand
 

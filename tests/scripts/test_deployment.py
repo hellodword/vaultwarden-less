@@ -131,6 +131,114 @@ class Fixture:
         self.current.rename(destination)
 
 
+class ImportFixture:
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.current = root / "state" / "import" / "current"
+        self.candidate = root / "import" / "candidate"
+        for directory in (
+            root / "state",
+            root / "state" / "import",
+            root / "state" / "import" / "history",
+            self.current,
+            root / "import",
+            self.candidate,
+        ):
+            directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+            directory.chmod(0o700)
+        self.write_file(
+            root / ".env",
+            "DEPLOYMENT_SCHEMA_VERSION=1\n"
+            f"RUNTIME_UID={os.geteuid()}\n"
+            f"RUNTIME_GID={os.getegid()}\n"
+            "LISTEN_PORT=8080\n"
+            "DRILL_PORT=8081\n",
+        )
+        self.write_file(self.candidate / "synthetic", "verified candidate\n")
+        self.write_json(
+            self.current / "prepare.json",
+            {
+                "schema_version": 1,
+                "import_id": "initial",
+                "phase": "prepared",
+                "project_commit": B_COMMIT,
+                "release": B_RELEASE,
+                "source_path": "import/source",
+                "candidate_path": "import/candidate",
+                "data_path": "data",
+                "filesystem_device": 1,
+                "source_tree_id": "sha256:" + "1" * 64,
+                "candidate_tree_id": "sha256:" + "2" * 64,
+                "source_rsa_key_id": "sha256:" + "3" * 64,
+                "prepared_at": "2026-08-28T12:30:00.000Z",
+            },
+        )
+        self.write_json(
+            self.current / "verification.json",
+            {
+                "schema_version": 1,
+                "import_id": "initial",
+                "phase": "verified",
+                "project_commit": B_COMMIT,
+                "release": B_RELEASE,
+                "source_tree_id": "sha256:" + "1" * 64,
+                "candidate_tree_id": "sha256:" + "4" * 64,
+                "database_migration": "20260828000000",
+                "database_schema_fingerprint": "sha256:" + "5" * 64,
+                "content_id": "sha256:" + "6" * 64,
+                "archive_id": "sha256:" + "7" * 64,
+                "client_login_confirmed": True,
+                "verified_at": "2026-08-28T13:30:00.000Z",
+            },
+        )
+
+    @staticmethod
+    def write_file(path: Path, value: str) -> None:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path.parent.chmod(0o700)
+        path.write_text(value, encoding="utf-8")
+        path.chmod(0o600)
+
+    def write_json(self, path: Path, value: dict[str, object]) -> None:
+        self.write_file(path, json.dumps(value, separators=(",", ":")) + "\n")
+
+    def decide(self) -> None:
+        decision = self.current / "decision.json"
+        if decision.exists():
+            return
+        self.write_json(
+            decision,
+            {
+                "schema_version": 1,
+                "import_id": "initial",
+                "decision": "accept",
+                "active_project_commit": B_COMMIT,
+                "active_release": B_RELEASE,
+                "decided_at": "2026-08-28T14:00:00.000Z",
+            },
+        )
+        deployment_state = self.root / "state" / "deployment"
+        deployment_state.mkdir(mode=0o700, exist_ok=True)
+        deployment_state.chmod(0o700)
+        self.write_json(
+            deployment_state / "active.json",
+            {
+                "schema_version": 1,
+                "project_commit": B_COMMIT,
+                "release": B_RELEASE,
+                "activated_at": "2026-08-28T14:00:00.000Z",
+            },
+        )
+        shutil.rmtree(self.candidate)
+        self.candidate.mkdir(mode=0o700)
+        self.candidate.chmod(0o700)
+
+    def archive(self) -> None:
+        if self.candidate.exists():
+            self.candidate.rmdir()
+        self.current.rename(self.root / "state" / "import" / "history" / "initial")
+
+
 class FakeDocker:
     def __init__(self, fixture: Fixture, decision: str) -> None:
         self.fixture = fixture
@@ -235,6 +343,84 @@ class FakeDocker:
                         "Image": "sha256:" + digit * 64,
                         "Config": {"Image": f"vaultwarden-less-{product}:{tag}"},
                         "State": {"Running": True, "Health": {"Status": "healthy"}},
+                    }
+                ),
+            )
+        if "ps" in arguments and "--quiet" in arguments:
+            service = arguments[-1]
+            if service in deployment.SERVICES:
+                digit = str(deployment.SERVICES.index(service) + 1)
+                return completed(arguments, digit * 64 + "\n")
+            return completed(arguments)
+        return completed(arguments)
+
+
+class FakeImportDocker:
+    def __init__(self, fixture: ImportFixture) -> None:
+        self.fixture = fixture
+        self.calls: list[list[str]] = []
+        self.fail_suffix: tuple[str, ...] | None = None
+        self.failed = False
+
+    def __call__(
+        self,
+        arguments: list[str],
+        *,
+        cwd: Path,
+        check: bool,
+        text: bool,
+        capture_output: bool,
+    ) -> subprocess.CompletedProcess[str]:
+        self.calls.append(arguments)
+        if cwd != self.fixture.root or check or not text or not capture_output:
+            raise AssertionError("import orchestrator subprocess contract changed")
+        suffix = tuple(arguments[-len(self.fail_suffix) :]) if self.fail_suffix else ()
+        if self.fail_suffix and suffix == self.fail_suffix and not self.failed:
+            self.failed = True
+            return completed(arguments, returncode=1)
+
+        if arguments[-3:] == ["deployment", "import", "accept"]:
+            self.fixture.decide()
+        elif arguments[-3:] == ["deployment", "import", "finalize"]:
+            self.fixture.archive()
+
+        if arguments[:3] == ["docker", "image", "inspect"]:
+            reference = arguments[-1]
+            product = next(
+                product
+                for product in deployment.PRODUCTS
+                if f"-{product}:" in reference
+            )
+            digit = str(deployment.PRODUCTS.index(product) + 1)
+            return completed(
+                arguments,
+                json.dumps(
+                    {
+                        "Id": "sha256:" + digit * 64,
+                        "Config": {
+                            "Labels": {
+                                "org.opencontainers.image.revision": B_COMMIT,
+                                "org.opencontainers.image.version": B_RELEASE,
+                            }
+                        },
+                    }
+                ),
+            )
+        if arguments[:3] == ["docker", "container", "inspect"]:
+            identifier = arguments[-1]
+            product_index = int(identifier[0]) - 1
+            product = deployment.PRODUCTS[product_index]
+            digit = str(product_index + 1)
+            return completed(
+                arguments,
+                json.dumps(
+                    {
+                        "Image": "sha256:" + digit * 64,
+                        "Config": {"Image": f"vaultwarden-less-{product}:local"},
+                        "State": {
+                            "Running": True,
+                            "Health": {"Status": "healthy"},
+                        },
                     }
                 ),
             )
@@ -390,6 +576,113 @@ class DeploymentOrchestratorTest(unittest.TestCase):
         )
         with self.assertRaises(deployment.DeploymentError):
             self.orchestrator(fake).terminal_upgrade("accept")
+        self.assertEqual(fake.calls, [])
+
+
+class ImportOrchestratorTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.root.chmod(0o700)
+        self.fixture = ImportFixture(self.root)
+
+    def orchestrator(self, fake: FakeImportDocker) -> deployment.Orchestrator:
+        return deployment.Orchestrator(self.root, PROJECT, fake)
+
+    def test_accept_stops_candidate_starts_exact_runtime_and_is_repeatable(
+        self,
+    ) -> None:
+        fake = FakeImportDocker(self.fixture)
+        result = self.orchestrator(fake).terminal_import()
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["workflow"], "import")
+        self.assertEqual(result["active_project_commit"], B_COMMIT)
+        self.assertFalse(self.fixture.current.exists())
+        self.assertTrue(
+            (self.root / "state" / "import" / "history" / "initial").is_dir()
+        )
+        self.assertFalse(self.fixture.candidate.exists())
+        suffixes = [call[-3:] for call in fake.calls]
+        self.assertIn(["deployment", "import", "accept"], suffixes)
+        self.assertIn(["deployment", "import", "finalize"], suffixes)
+        self.assertTrue(
+            any(
+                call[-8:]
+                == [
+                    "up",
+                    "--detach",
+                    "--wait",
+                    "--wait-timeout",
+                    "180",
+                    "vaultwarden",
+                    "backup",
+                    "proxy",
+                ]
+                for call in fake.calls
+            )
+        )
+        for call in fake.calls:
+            self.assertIsInstance(call, list)
+            self.assertNotIn("sed", call)
+            self.assertNotIn("export", call)
+            self.assertNotIn("prune", call)
+            self.assertNotIn("/var/run/docker.sock", call)
+
+        repeated = self.orchestrator(fake).terminal_import()
+        self.assertEqual(repeated["status"], "already_complete")
+
+    def test_accept_resumes_after_decision_service_and_finalize_failures(self) -> None:
+        fake = FakeImportDocker(self.fixture)
+        fake.fail_suffix = ("deployment", "import", "accept")
+        with self.assertRaises(deployment.DeploymentError):
+            self.orchestrator(fake).terminal_import()
+        self.assertFalse((self.fixture.current / "decision.json").exists())
+
+        fake.fail_suffix = (
+            "up",
+            "--detach",
+            "--wait",
+            "--wait-timeout",
+            "180",
+            "vaultwarden",
+            "backup",
+            "proxy",
+        )
+        fake.failed = False
+        with self.assertRaises(deployment.DeploymentError):
+            self.orchestrator(fake).terminal_import()
+        decision_before = (self.fixture.current / "decision.json").read_bytes()
+        self.assertTrue(self.fixture.candidate.is_dir())
+        self.assertEqual(list(self.fixture.candidate.iterdir()), [])
+
+        fake.fail_suffix = ("deployment", "import", "finalize")
+        fake.failed = False
+        with self.assertRaises(deployment.DeploymentError):
+            self.orchestrator(fake).terminal_import()
+        self.assertEqual(
+            (self.fixture.current / "decision.json").read_bytes(), decision_before
+        )
+
+        fake.fail_suffix = None
+        result = self.orchestrator(fake).terminal_import()
+        self.assertEqual(result["status"], "completed")
+        accept_calls = [
+            call
+            for call in fake.calls
+            if call[-3:] == ["deployment", "import", "accept"]
+        ]
+        self.assertEqual(len(accept_calls), 2)
+
+    def test_tampered_import_state_is_rejected_before_docker(self) -> None:
+        document = json.loads(
+            (self.fixture.current / "verification.json").read_text(encoding="utf-8")
+        )
+        document["unexpected"] = True
+        self.fixture.write_json(self.fixture.current / "verification.json", document)
+        fake = FakeImportDocker(self.fixture)
+        with self.assertRaises(deployment.DeploymentError):
+            self.orchestrator(fake).terminal_import()
         self.assertEqual(fake.calls, [])
 
 

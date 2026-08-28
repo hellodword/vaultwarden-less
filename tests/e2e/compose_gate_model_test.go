@@ -27,7 +27,7 @@ type composeGateService struct {
 func TestComposeStartupGateModel(t *testing.T) {
 	repository := repositoryRoot(t)
 	root := t.TempDir()
-	for _, relative := range []string{"config", "data", "restore", "restore/drill", "state"} {
+	for _, relative := range []string{"config", "data", "import", "import/source", "import/candidate", "restore", "restore/drill", "state"} {
 		if err := os.MkdirAll(filepath.Join(root, relative), 0o700); err != nil {
 			t.Fatal(err)
 		}
@@ -43,7 +43,7 @@ func TestComposeStartupGateModel(t *testing.T) {
 	writePrivateFile(t, filepath.Join(root, "config", "vaultwarden.env"), "DOMAIN=https://vaultwarden.example.test\n")
 
 	base := renderComposeModel(t, root, filepath.Join(root, ".env"),
-		filepath.Join(repository, "compose.yml"), "--profile", "deployment", "--profile", "drill")
+		filepath.Join(repository, "compose.yml"), "--profile", "deployment", "--profile", "drill", "--profile", "import")
 	assertGateCommand(t, base["vaultwarden"], "normal")
 	assertGateMount(t, base["vaultwarden"], filepath.Join(root, ".env"), "/deployment/.env", true)
 	assertGateMount(t, base["vaultwarden"], filepath.Join(root, "state"), "/state", true)
@@ -53,14 +53,20 @@ func TestComposeStartupGateModel(t *testing.T) {
 	assertGateMount(t, base["drill-vaultwarden"], filepath.Join(root, ".env"), "/deployment/.env", true)
 	assertGateMount(t, base["drill-vaultwarden"], filepath.Join(root, "state"), "/state", true)
 	assertGateMount(t, base["drill-vaultwarden"], filepath.Join(root, "restore", "drill"), "/recovery", true)
+	assertGateCommand(t, base["import-vaultwarden"], "import")
+	assertGateMount(t, base["import-vaultwarden"], filepath.Join(root, ".env"), "/deployment/.env", true)
+	assertGateMount(t, base["import-vaultwarden"], filepath.Join(root, "import", "source"), "/import/source", true)
+	assertGateMount(t, base["import-vaultwarden"], filepath.Join(root, "import", "candidate"), "/data", false)
+	assertGateMount(t, base["import-vaultwarden"], filepath.Join(root, "state"), "/state", true)
 
 	admin, exists := base["deployment-admin"]
-	if !exists || admin.NetworkMode != "none" || len(admin.Volumes) != 3 {
+	if !exists || admin.NetworkMode != "none" || len(admin.Volumes) != 4 {
 		t.Fatalf("deployment-admin isolation = exists:%t network:%q volumes:%#v", exists, admin.NetworkMode, admin.Volumes)
 	}
 	assertGateMount(t, admin, filepath.Join(root, ".env"), "/deployment/.env", true)
 	assertGateMount(t, admin, filepath.Join(root, "data"), "/data", true)
 	assertGateMount(t, admin, filepath.Join(root, "state"), "/state", false)
+	assertGateMount(t, admin, root, "/deployment-root", false)
 
 	upgradeEnvironment := filepath.Join(root, "compose.env")
 	writePrivateFile(t, upgradeEnvironment, deploymentEnvironment+

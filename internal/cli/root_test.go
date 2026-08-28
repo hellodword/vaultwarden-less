@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,6 +23,7 @@ import (
 	"github.com/hellodword/vaultwarden-less/internal/restic"
 	restoretool "github.com/hellodword/vaultwarden-less/internal/restore"
 	"github.com/hellodword/vaultwarden-less/internal/snapshot"
+	"github.com/hellodword/vaultwarden-less/internal/upstream"
 	"github.com/hellodword/vaultwarden-less/internal/worker"
 )
 
@@ -109,6 +111,8 @@ func TestCLIUsageRuntimeAndDirtyFailuresHaveOneErrorDocument(t *testing.T) {
 		{"serve", "extra"},
 		{"config"},
 		{"deployment"},
+		{"deployment", "import"},
+		{"deployment", "import", "verify"},
 		{"deployment", "init", "extra"},
 		{"config", "validate"},
 		{"repo"},
@@ -189,6 +193,137 @@ func TestDeploymentInitGoldenAndActiveServeGate(t *testing.T) {
 		t.Fatalf("active-gated serve = %d/%q/%q/%t/%t/%t", code, stdout, stderr, activeChecked, upgradeChecked, backupLoaded)
 	}
 	assertErrorJSON(t, stderr, codeNotReady)
+}
+
+func TestDeploymentImportPrepareAndCancelCLI(t *testing.T) {
+	commit := strings.Repeat("a", 40)
+	release := "RELEASE.2026-08-27T12-34-56Z-gaaaaaaaaaaaa"
+	setBuildIdentity(t, commit, release, "true")
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stateDir := filepath.Join(root, "state")
+	dataDir := filepath.Join(root, "data")
+	importRoot := filepath.Join(root, "import")
+	sourceDir := filepath.Join(importRoot, "source")
+	for _, directory := range []string{stateDir, dataDir, importRoot, sourceDir} {
+		if err := os.MkdirAll(directory, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(directory, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	databasePath := filepath.Join(sourceDir, "db.sqlite3")
+	database, err := sql.Open("sqlite3", databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec("CREATE TABLE imported(id INTEGER PRIMARY KEY, value TEXT NOT NULL); INSERT INTO imported(value) VALUES ('synthetic')"); err != nil {
+		_ = database.Close()
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for path, data := range map[string][]byte{
+		databasePath:                            nil,
+		filepath.Join(sourceDir, "rsa_key.pem"): []byte("external-private-key"),
+	} {
+		if data != nil {
+			if err := os.WriteFile(path, data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := os.Chmod(path, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	environment := testEnvironment(nil, nil)
+	environment.deploymentRoot = root
+	stdout, stderr, code := executeCommand(environment, "deployment", "import", "prepare")
+	if code != 0 || stderr != "" {
+		t.Fatalf("import prepare = %d/%q/%q", code, stdout, stderr)
+	}
+	var prepared struct {
+		SchemaVersion int    `json:"schema_version"`
+		ImportID      string `json:"import_id"`
+		Phase         string `json:"phase"`
+		ProjectCommit string `json:"project_commit"`
+		Release       string `json:"release"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &prepared); err != nil || prepared.SchemaVersion != 1 || prepared.ImportID != "initial" ||
+		prepared.Phase != "prepared" || prepared.ProjectCommit != commit || prepared.Release != release {
+		t.Fatalf("import prepare JSON = %#v/%v", prepared, err)
+	}
+	stdout, stderr, code = executeCommand(environment, "deployment", "import", "verify")
+	if code != 2 || stdout != "" {
+		t.Fatalf("import verify confirmation = %d/%q/%q", code, stdout, stderr)
+	}
+	assertErrorJSON(t, stderr, codeUsageError)
+	stdout, stderr, code = executeCommand(environment, "deployment", "import", "cancel")
+	if code != 0 || stderr != "" || !strings.Contains(stdout, `"phase":"cancelled"`) {
+		t.Fatalf("import cancel = %d/%q/%q", code, stdout, stderr)
+	}
+	if _, err := os.Stat(databasePath); err != nil {
+		t.Fatalf("cancel removed source database: %v", err)
+	}
+	if entries, err := os.ReadDir(dataDir); err != nil || len(entries) != 0 {
+		t.Fatalf("cancel changed data: %#v/%v", entries, err)
+	}
+}
+
+func TestVerifyImportCandidateUsesAuditedSnapshotClosure(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	candidate := filepath.Join(root, "candidate")
+	staging := filepath.Join(root, "staging")
+	for _, directory := range []string{candidate, staging} {
+		if err := os.Mkdir(directory, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	contract, err := upstream.VaultwardenSchemaContract()
+	if err != nil {
+		t.Fatal(err)
+	}
+	databasePath := filepath.Join(candidate, "db.sqlite3")
+	database, err := sql.Open("sqlite3", databasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, object := range contract.Objects {
+		if _, err := database.Exec(object.SQL); err != nil {
+			_ = database.Close()
+			t.Fatal(err)
+		}
+	}
+	if _, err := database.Exec(
+		"INSERT INTO __diesel_schema_migrations(version, run_on) VALUES (?, '2026-08-28')",
+		contract.DatabaseMigration,
+	); err != nil {
+		_ = database.Close()
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(databasePath, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	evidence, err := verifyImportCandidate(context.Background(), candidate, staging, strings.Repeat("a", 40))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if evidence.DatabaseMigration != contract.DatabaseMigration ||
+		evidence.DatabaseSchemaFingerprint != contract.Fingerprint ||
+		!strings.HasPrefix(evidence.ContentID, "sha256:") ||
+		!strings.HasPrefix(evidence.ArchiveID, "sha256:") {
+		t.Fatalf("import candidate evidence = %#v", evidence)
+	}
 }
 
 func TestConfigValidateRoleGoldenAndFailureClassification(t *testing.T) {
@@ -422,7 +557,8 @@ func testEnvironment(repositoryClient repository, server *httptest.Server, resto
 		workerURL:     "http://127.0.0.1:1", deploymentPath: "/deployment/.env", vaultwardenPath: "/deployment/vaultwarden.env",
 		credentialsPath: "/credentials/role.yaml",
 		notifierPath:    "/credentials/notifiers.yaml", passwordRoot: "/credentials/restic", resticBinary: "restic",
-		dataDir: "/data", stagingDir: "/staging", cacheDir: "/cache", restoreRoot: "/restore", stateDir: "/state",
+		deploymentRoot: "/deployment-root",
+		dataDir:        "/data", stagingDir: "/staging", cacheDir: "/cache", restoreRoot: "/restore", stateDir: "/state",
 		now:   func() time.Time { return time.Date(2026, 8, 27, 12, 34, 56, 789_000_000, time.UTC) },
 		ready: func() bool { return true },
 	}

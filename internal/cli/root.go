@@ -26,6 +26,7 @@ const (
 	codeVerification       = "verification_failure"
 	codeTimeout            = "timeout"
 	codeUpgradeState       = "upgrade_state_invalid"
+	codeImportState        = "import_state_invalid"
 	codeDeploymentState    = "deployment_state_invalid"
 	codeInternal           = "internal_error"
 )
@@ -33,7 +34,7 @@ const (
 var stableErrorCodes = map[string]struct{}{
 	codeUsageError: {}, codeInvalidConfig: {}, codeInvalidCredentials: {}, codeUnsafePath: {}, codeNotReady: {},
 	codeConflict: {}, codeSourceInconsistent: {}, codeUnsupportedSchema: {}, codeRepositoryFailure: {},
-	codeVerification: {}, codeTimeout: {}, codeUpgradeState: {}, codeDeploymentState: {}, codeInternal: {},
+	codeVerification: {}, codeTimeout: {}, codeUpgradeState: {}, codeImportState: {}, codeDeploymentState: {}, codeInternal: {},
 }
 
 type CommandError struct {

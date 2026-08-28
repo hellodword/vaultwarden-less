@@ -37,6 +37,8 @@ const (
 	RoleCredentialsPath     = "/run/credentials/role.yaml"
 	ResticPasswordRoot      = "/run/credentials/restic"
 	NotifierCredentialsPath = "/run/credentials/notifiers.yaml"
+	DeploymentRoot          = "/deployment-root"
+	ImportRoot              = "/import"
 
 	ListenAddress     = "0.0.0.0:9090"
 	WorkerURL         = "http://backup:9090"

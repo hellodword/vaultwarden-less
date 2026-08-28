@@ -79,6 +79,7 @@ type e2eHarness struct {
 
 var (
 	runBackupE2E      = flag.Bool("run-backup-e2e", false, "run the real Vaultwarden backup/restore lifecycle")
+	runImportE2E      = flag.Bool("run-import-e2e", false, "run the real initial SQLite import lifecycle")
 	runMultiTargetE2E = flag.Bool("run-multitarget-e2e", false, "run the real multi-target degradation lifecycle")
 	runUpgradeE2E     = flag.Bool("run-upgrade-e2e", false, "run the real A/B upgrade and rollback lifecycle")
 	upgradeFromCommit = flag.String("upgrade-from-commit", "", "full clean A commit for the upgrade lifecycle")
@@ -324,7 +325,7 @@ func (h *e2eHarness) prepareDeployment() {
 		h.t.Fatal("E2E harness must run as an unprivileged identity")
 	}
 	for _, relative := range []string{
-		"config", "credentials", "credentials/restic", "cache", "data", "restore", "staging", "state",
+		"config", "credentials", "credentials/restic", "cache", "data", "import", "restore", "staging", "state",
 	} {
 		path := filepath.Join(h.localRoot, relative)
 		if err := os.MkdirAll(path, 0o700); err != nil {
@@ -762,6 +763,8 @@ func (h *e2eHarness) cleanup() {
 			"upgrade",
 			"--profile",
 			"rollback",
+			"--profile",
+			"import",
 			"down",
 			"--volumes",
 			"--remove-orphans",

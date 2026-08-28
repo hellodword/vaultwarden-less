@@ -201,6 +201,81 @@ func (manager Manager) Init() (InitResult, error) {
 	return initResult(StatusInitialized, identity), nil
 }
 
+// PublishInitialAtOrAfter publishes the first active identity after a caller
+// has atomically promoted verified initial data. Unlike Init, the data root is
+// expected to be non-empty; the owning workflow must prove that promotion
+// before calling this internal boundary.
+func (manager Manager) PublishInitialAtOrAfter(notBefore time.Time) (Active, error) {
+	identity := Identity{ProjectCommit: manager.ProjectCommit, Release: manager.Release}
+	if err := manager.validate(identity); err != nil || notBefore.IsZero() {
+		if err == nil {
+			err = fmt.Errorf("minimum activation time is required")
+		}
+		return Active{}, stateError(ErrorInvalidState, err)
+	}
+	if err := privatefs.ValidatePrivateDirectory(manager.StateDir); err != nil {
+		return Active{}, stateError(ErrorInvalidState, fmt.Errorf("validate state root: %w", err))
+	}
+	if err := privatefs.ValidatePrivateDirectory(manager.DataDir); err != nil {
+		return Active{}, stateError(ErrorInvalidState, fmt.Errorf("validate data root: %w", err))
+	}
+	deploymentDir, activePath := activePaths(manager.StateDir)
+	deploymentExists, err := pathExists(deploymentDir)
+	if err != nil {
+		return Active{}, stateError(ErrorInvalidState, err)
+	}
+	if deploymentExists {
+		if err := privatefs.ValidatePrivateDirectory(deploymentDir); err != nil {
+			return Active{}, stateError(ErrorInvalidState, fmt.Errorf("validate deployment state directory: %w", err))
+		}
+	}
+	activeExists, err := pathExists(activePath)
+	if err != nil {
+		return Active{}, stateError(ErrorInvalidState, err)
+	}
+	if activeExists {
+		active, readErr := ReadActive(manager.StateDir)
+		if readErr != nil {
+			return Active{}, readErr
+		}
+		activatedAt, parseErr := time.Parse(timestampLayout, active.ActivatedAt)
+		if active.Identity() != identity || parseErr != nil || activatedAt.Before(notBefore) {
+			return Active{}, stateError(ErrorConflict, fmt.Errorf("another or stale release is already active"))
+		}
+		return active, nil
+	}
+	if !deploymentExists {
+		if err := privatefs.EnsurePrivateDirectory(deploymentDir); err != nil {
+			return Active{}, stateError(ErrorInvalidState, fmt.Errorf("create deployment state directory: %w", err))
+		}
+		if err := privatefs.SyncDirectory(manager.StateDir); err != nil {
+			return Active{}, stateError(ErrorInvalidState, fmt.Errorf("sync deployment state directory: %w", err))
+		}
+	}
+	activatedAt := manager.now()
+	if activatedAt.Before(notBefore) {
+		activatedAt = notBefore.UTC()
+	}
+	active := Active{
+		SchemaVersion: SchemaVersion,
+		ProjectCommit: identity.ProjectCommit,
+		Release:       identity.Release,
+		ActivatedAt:   activatedAt.Format(timestampLayout),
+	}
+	if err := writeNewActive(activePath, active); err != nil {
+		published, readErr := ReadActive(manager.StateDir)
+		if readErr == nil {
+			publishedAt, parseErr := time.Parse(timestampLayout, published.ActivatedAt)
+			if published.Identity() == identity && parseErr == nil && !publishedAt.Before(notBefore) {
+				return published, nil
+			}
+			return Active{}, stateError(ErrorConflict, fmt.Errorf("another release is already active"))
+		}
+		return Active{}, stateError(ErrorInvalidState, fmt.Errorf("publish active identity: %w", err))
+	}
+	return active, nil
+}
+
 // Activate moves an existing active identity to the manager's exact identity.
 // The caller supplies the only identity from which the transition is allowed;
 // repeating a completed transition preserves the original activation time.

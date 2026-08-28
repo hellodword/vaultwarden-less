@@ -19,7 +19,7 @@ const (
 	gateRelease = "RELEASE.2026-08-28T12-34-56Z-g0123456789ab"
 )
 
-func TestGateRejectsUsageDirtyBuildAndUnavailableImportMode(t *testing.T) {
+func TestGateRejectsUsageAndDirtyBuild(t *testing.T) {
 	for _, arguments := range [][]string{nil, {modeNormal, "extra"}, {"unknown"}} {
 		var stderr bytes.Buffer
 		started := false
@@ -39,19 +39,10 @@ func TestGateRejectsUsageDirtyBuildAndUnavailableImportMode(t *testing.T) {
 		t.Fatalf("dirty gate = %d/%q/started=%t", code, stderr.String(), started)
 	}
 
-	for _, mode := range []string{modeImport} {
-		environment = gateTestEnvironment()
-		started = false
-		environment.start = func() error { started = true; return nil }
-		stderr.Reset()
-		if code := execute(context.Background(), []string{mode}, &stderr, environment); code != 1 || started {
-			t.Fatalf("unavailable %s gate = %d/%q/started=%t", mode, code, stderr.String(), started)
-		}
-	}
 }
 
-func TestNormalCandidateRollbackAndDrillGatesRunBeforeExec(t *testing.T) {
-	for _, mode := range []string{modeNormal, modeUpgradeCandidate, modeRollback, modeDrill} {
+func TestAllGatesRunBeforeExec(t *testing.T) {
+	for _, mode := range []string{modeNormal, modeUpgradeCandidate, modeRollback, modeDrill, modeImport} {
 		t.Run(mode, func(t *testing.T) {
 			environment := gateTestEnvironment()
 			gated, started := false, false
@@ -76,6 +67,11 @@ func TestNormalCandidateRollbackAndDrillGatesRunBeforeExec(t *testing.T) {
 					gated = dataDir == "/data" && identity.ProjectCommit == gateCommit && identity.Release == gateRelease
 					return nil
 				}
+			case modeImport:
+				environment.allowImport = func(_ context.Context, _, sourceDir, candidateDir string, identity deployment.Identity, _ config.Deployment) error {
+					gated = sourceDir == "/import/source" && candidateDir == "/data" && identity.ProjectCommit == gateCommit && identity.Release == gateRelease
+					return nil
+				}
 			}
 			environment.start = func() error { started = true; return nil }
 			var stderr bytes.Buffer
@@ -87,7 +83,7 @@ func TestNormalCandidateRollbackAndDrillGatesRunBeforeExec(t *testing.T) {
 }
 
 func TestGateFailureNeverStartsVaultwarden(t *testing.T) {
-	for _, mode := range []string{modeNormal, modeUpgradeCandidate, modeRollback, modeDrill} {
+	for _, mode := range []string{modeNormal, modeUpgradeCandidate, modeRollback, modeDrill, modeImport} {
 		t.Run(mode, func(t *testing.T) {
 			environment := gateTestEnvironment()
 			sentinel := errors.New("synthetic gate failure")
@@ -104,6 +100,10 @@ func TestGateFailureNeverStartsVaultwarden(t *testing.T) {
 				}
 			case modeRollback:
 				environment.allowRollback = func(context.Context, string, string, deployment.Identity, config.Deployment) error {
+					return sentinel
+				}
+			case modeImport:
+				environment.allowImport = func(context.Context, string, string, string, deployment.Identity, config.Deployment) error {
 					return sentinel
 				}
 			}
@@ -179,12 +179,16 @@ func gateTestEnvironment() gateEnvironment {
 				Files: []json.RawMessage{json.RawMessage(`{"path":"db.sqlite3"}`)},
 			}, nil
 		},
-		allowDrill:     func(string, string, string, string, string, config.Deployment) error { return nil },
-		allowRollback:  func(context.Context, string, string, deployment.Identity, config.Deployment) error { return nil },
-		start:          func() error { return nil },
-		deploymentPath: "/deployment/.env",
-		stateDir:       "/state",
-		dataDir:        "/data",
-		recoveryRoot:   "/recovery",
+		allowDrill:    func(string, string, string, string, string, config.Deployment) error { return nil },
+		allowRollback: func(context.Context, string, string, deployment.Identity, config.Deployment) error { return nil },
+		allowImport: func(context.Context, string, string, string, deployment.Identity, config.Deployment) error {
+			return nil
+		},
+		start:           func() error { return nil },
+		deploymentPath:  "/deployment/.env",
+		stateDir:        "/state",
+		dataDir:         "/data",
+		importSourceDir: "/import/source",
+		recoveryRoot:    "/recovery",
 	}
 }
