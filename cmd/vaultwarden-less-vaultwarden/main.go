@@ -47,15 +47,16 @@ type gateEnvironment struct {
 	loadDeployment    func(string) (config.Deployment, error)
 	requireActive     func(string, deployment.Identity) (deployment.Active, error)
 	readActive        func(string) (deployment.Active, error)
-	allowNormal       func(string, string, config.Deployment) error
+	allowNormal       func(context.Context, string, string, deployment.Identity, config.Deployment) error
 	allowCandidate    func(string, string, string, string, string, config.Deployment) error
 	readDrillManifest func(context.Context, string) (drillManifest, error)
 	allowDrill        func(string, string, string, string, string, config.Deployment) error
-	allowRollback     func(string, deployment.Identity, config.Deployment) error
+	allowRollback     func(context.Context, string, string, deployment.Identity, config.Deployment) error
 	allowImport       func(string, deployment.Identity, config.Deployment) error
 	start             func() error
 	deploymentPath    string
 	stateDir          string
+	dataDir           string
 	recoveryRoot      string
 }
 
@@ -80,12 +81,14 @@ func defaultGateEnvironment() gateEnvironment {
 		readDrillManifest: func(ctx context.Context, root string) (drillManifest, error) {
 			return readDrillManifest(ctx, root)
 		},
-		allowDrill: upgrade.DrillServingAllowed,
+		allowDrill:    upgrade.DrillServingAllowed,
+		allowRollback: upgrade.RollbackServingAllowed,
 		start: func() error {
 			return syscall.Exec(vaultwardenBinary, []string{vaultwardenBinary}, os.Environ())
 		},
 		deploymentPath: config.DeploymentEnvPath,
 		stateDir:       config.StateDir,
+		dataDir:        config.DataDir,
 		recoveryRoot:   recoveryRoot,
 	}
 }
@@ -131,7 +134,7 @@ func evaluateGate(ctx context.Context, mode string, identity deployment.Identity
 		if _, err := environment.requireActive(environment.stateDir, identity); err != nil {
 			return err
 		}
-		return environment.allowNormal(environment.stateDir, identity.ProjectCommit, configured)
+		return environment.allowNormal(ctx, environment.stateDir, environment.dataDir, identity, configured)
 	case modeUpgradeCandidate:
 		if environment.readActive == nil || environment.allowCandidate == nil {
 			return fmt.Errorf("candidate gate is unavailable")
@@ -152,7 +155,7 @@ func evaluateGate(ctx context.Context, mode string, identity deployment.Identity
 		if environment.allowRollback == nil {
 			return fmt.Errorf("rollback gate is unavailable")
 		}
-		return environment.allowRollback(environment.stateDir, identity, configured)
+		return environment.allowRollback(ctx, environment.stateDir, environment.dataDir, identity, configured)
 	case modeDrill:
 		if environment.readDrillManifest == nil || environment.allowDrill == nil {
 			return fmt.Errorf("drill gate is unavailable")

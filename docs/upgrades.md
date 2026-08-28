@@ -64,9 +64,11 @@ idempotent phase, invoke only:
 nix develop --command just upgrade-rollback
 ```
 
-The recipes are thin, reviewable Compose orchestration. The following sections
-state their order and give the equivalent archive-only commands for an ordinary
-deployment host without Nix.
+The phase recipes are thin Compose invocations. Terminal accept and rollback
+call the standard-library `scripts/deployment.py` orchestrator, which reads
+strict state and uses only structured Docker argv. The following sections give
+the equivalent commands for an ordinary deployment host without Nix; that host
+needs Python 3 only for the terminal orchestrator.
 
 ## 1. Prepare while A is serving
 
@@ -125,7 +127,7 @@ and wait for health:
 ```sh
 docker compose --env-file state/upgrade/current/compose.env --file compose.yml --file compose.upgrade.yml --profile maintenance run --rm --no-deps config-check-backup
 docker compose --env-file state/upgrade/current/compose.env --file compose.yml --file compose.upgrade.yml --profile maintenance run --rm --no-deps config-check-maintenance
-docker compose --env-file state/upgrade/current/compose.env --file compose.yml --file compose.upgrade.yml up --detach --no-deps --wait --wait-timeout 180 vaultwarden
+docker compose --env-file state/upgrade/current/compose.env --file compose.yml --file compose.upgrade.yml --profile upgrade up --detach --no-deps --wait --wait-timeout 180 upgrade-vaultwarden-b
 docker compose --env-file state/upgrade/current/compose.env --file compose.yml --file compose.upgrade.yml --profile upgrade run --rm --no-deps upgrade-b upgrade migrate-check
 ```
 
@@ -139,7 +141,7 @@ Stop active B, ask immutable B to create/restore its evidence, and start only
 the isolated B drill:
 
 ```sh
-docker compose --env-file state/upgrade/current/compose.env --file compose.yml --file compose.upgrade.yml stop proxy backup vaultwarden
+docker compose --env-file state/upgrade/current/compose.env --file compose.yml --file compose.upgrade.yml --profile upgrade stop proxy backup vaultwarden upgrade-vaultwarden-b
 docker compose --env-file state/upgrade/current/compose.env --file compose.yml --file compose.upgrade.yml --profile upgrade run --rm --no-deps upgrade-b upgrade verify
 docker compose --env-file state/upgrade/current/compose.env --file compose.yml --file compose.upgrade.yml --profile drill up --detach --wait --wait-timeout 180 drill-vaultwarden
 ```
@@ -158,26 +160,21 @@ the explicit rollback path below.
 ## 5A. Accept B
 
 Acceptance is an explicit terminal decision. It requires healthy B drill
-evidence and changes serving ownership to B. On an archive-only host, mirror
-the recipe exactly:
+evidence and changes serving ownership to B. On an ordinary deployment host,
+run the durable terminal orchestrator:
 
 ```sh
-A_RELEASE="$(sed -n 's/^A_RELEASE=//p' state/upgrade/current/compose.env)"
-B_RELEASE="$(sed -n 's/^B_RELEASE=//p' state/upgrade/current/compose.env)"
-test -n "$A_RELEASE"
-test -n "$B_RELEASE"
-export A_RELEASE B_RELEASE
-docker compose --env-file state/upgrade/current/compose.env --file compose.yml --file compose.upgrade.yml --profile upgrade --profile drill run --rm --no-deps upgrade-b upgrade accept
-docker compose --env-file .env --file compose.yml --file compose.upgrade.yml up --detach vaultwarden backup proxy
-docker compose --env-file .env --file compose.yml --file compose.upgrade.yml --profile drill stop drill-vaultwarden
-docker compose --env-file .env --file compose.yml --file compose.upgrade.yml --profile drill rm --force drill-vaultwarden drill-copy
-docker volume rm vaultwarden-less_drill-data
+python3 scripts/deployment.py upgrade accept
 ```
 
-After accept, the immutable evidence moves to history, B services may serve,
-and ordinary rollback for that upgrade is permanently rejected. To return to
-an older product after acceptance, plan a new audited forward upgrade; do not
-rewrite history or exchange data manually.
+The command first asks immutable B to create or resume the accept decision and
+active B identity. It then starts B's three normal services, waits for health,
+checks every container image ID against the immutable tag and OCI labels,
+cleans only the verified drill, and finally archives current state to history.
+If interrupted, repeat the same command. Once the decision exists, rollback is
+permanently rejected even when active writing or service startup had not yet
+finished. To return to an older product after acceptance, plan a new audited
+forward upgrade; do not rewrite history or exchange data manually.
 
 Immediately check B status, repository snapshots, and representative client
 operations. Retain A's immutable images and accepted evidence according to
@@ -186,28 +183,20 @@ local incident policy; removing them is not part of acceptance.
 ## 5B. Explicit rollback before accept
 
 Rollback is never automatic. It is owned by immutable A and may run only before
-accept. It stops and removes B services, validates A's prepare/ticket and exact
-rollback-tree identity without interpreting B's candidate document, atomically
-exchanges the tree, quarantines B state, records rolled-back evidence, and
-starts only A rollback services.
+accept. The host orchestrator stops B/drill, asks A to create or resume the
+rollback decision and tree-ID-driven exchange, verifies and retags only A's
+three immutable images as local, starts the three ordinary A services, removes
+the verified drill, and only then archives current state to quarantine.
 
 ```sh
-A_RELEASE="$(sed -n 's/^A_RELEASE=//p' state/upgrade/current/compose.env)"
-B_RELEASE="$(sed -n 's/^B_RELEASE=//p' state/upgrade/current/compose.env)"
-test -n "$A_RELEASE"
-test -n "$B_RELEASE"
-export A_RELEASE B_RELEASE
-docker compose --env-file state/upgrade/current/compose.env --file compose.yml --file compose.upgrade.yml --profile drill stop proxy backup vaultwarden drill-vaultwarden
-docker compose --env-file state/upgrade/current/compose.env --file compose.yml --file compose.upgrade.yml --profile drill rm --force proxy backup vaultwarden drill-vaultwarden drill-copy
-if docker volume inspect vaultwarden-less_drill-data >/dev/null 2>&1; then docker volume rm vaultwarden-less_drill-data; fi
-docker compose --env-file state/upgrade/current/compose.env --file compose.yml --file compose.upgrade.yml --profile upgrade run --rm --no-deps rollback-a rollback apply
-docker compose --env-file .env --file compose.yml --file compose.upgrade.yml --profile rollback up --detach rollback-vaultwarden-a rollback-backup-a rollback-proxy-a
+python3 scripts/deployment.py upgrade rollback
 ```
 
-After rollback, verify A through the rollback proxy, read worker status, list
-snapshots, and complete a fresh restore/drill. Preserve quarantine and history
-for review. A second rollback attempt returns a stable conflict; never delete
-history to force it.
+After rollback, verify A through the ordinary proxy, read worker status, list
+snapshots, and complete a fresh restore/drill. Preserve quarantine for review.
+Repeating the command returns `already_complete` after rechecking active A,
+the three running image identities, and drill cleanup; never delete quarantine
+to force another exchange.
 
 ## Failure and restart semantics
 
@@ -218,7 +207,9 @@ history to force it.
 - A rollback validates only A-owned canonical state and the framed rollback
   tree; future B schema cannot teach A how to authorize an exchange.
 - A crash or host restart does not infer the next phase. Inspect the strict
-  phase result and rerun only the matching supported command.
+  phase result and rerun only the matching supported command. A decision is
+  immutable; active identity update, service startup, cleanup, and finalize are
+  individually resumable after it.
 - A failure leaves ingress stopped unless the named phase itself completed.
   Never start a proxy merely because Vaultwarden's healthcheck is green.
 - Accept and rollback are mutually exclusive. There is no `--force`, hidden

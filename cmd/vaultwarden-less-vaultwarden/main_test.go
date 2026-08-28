@@ -19,7 +19,7 @@ const (
 	gateRelease = "RELEASE.2026-08-28T12-34-56Z-g0123456789ab"
 )
 
-func TestGateRejectsUsageDirtyBuildAndUnavailableTerminalModes(t *testing.T) {
+func TestGateRejectsUsageDirtyBuildAndUnavailableImportMode(t *testing.T) {
 	for _, arguments := range [][]string{nil, {modeNormal, "extra"}, {"unknown"}} {
 		var stderr bytes.Buffer
 		started := false
@@ -39,7 +39,7 @@ func TestGateRejectsUsageDirtyBuildAndUnavailableTerminalModes(t *testing.T) {
 		t.Fatalf("dirty gate = %d/%q/started=%t", code, stderr.String(), started)
 	}
 
-	for _, mode := range []string{modeRollback, modeImport} {
+	for _, mode := range []string{modeImport} {
 		environment = gateTestEnvironment()
 		started = false
 		environment.start = func() error { started = true; return nil }
@@ -50,15 +50,15 @@ func TestGateRejectsUsageDirtyBuildAndUnavailableTerminalModes(t *testing.T) {
 	}
 }
 
-func TestNormalCandidateAndDrillGatesRunBeforeExec(t *testing.T) {
-	for _, mode := range []string{modeNormal, modeUpgradeCandidate, modeDrill} {
+func TestNormalCandidateRollbackAndDrillGatesRunBeforeExec(t *testing.T) {
+	for _, mode := range []string{modeNormal, modeUpgradeCandidate, modeRollback, modeDrill} {
 		t.Run(mode, func(t *testing.T) {
 			environment := gateTestEnvironment()
 			gated, started := false, false
 			switch mode {
 			case modeNormal:
-				environment.allowNormal = func(_ string, commit string, _ config.Deployment) error {
-					gated = commit == gateCommit
+				environment.allowNormal = func(_ context.Context, _, dataDir string, identity deployment.Identity, _ config.Deployment) error {
+					gated = dataDir == "/data" && identity.ProjectCommit == gateCommit && identity.Release == gateRelease
 					return nil
 				}
 			case modeUpgradeCandidate:
@@ -69,6 +69,11 @@ func TestNormalCandidateAndDrillGatesRunBeforeExec(t *testing.T) {
 			case modeDrill:
 				environment.allowDrill = func(_, commit, release, contentID, archiveID string, _ config.Deployment) error {
 					gated = commit == gateCommit && release == gateRelease && validDigest(contentID) && validDigest(archiveID)
+					return nil
+				}
+			case modeRollback:
+				environment.allowRollback = func(_ context.Context, _, dataDir string, identity deployment.Identity, _ config.Deployment) error {
+					gated = dataDir == "/data" && identity.ProjectCommit == gateCommit && identity.Release == gateRelease
 					return nil
 				}
 			}
@@ -82,7 +87,7 @@ func TestNormalCandidateAndDrillGatesRunBeforeExec(t *testing.T) {
 }
 
 func TestGateFailureNeverStartsVaultwarden(t *testing.T) {
-	for _, mode := range []string{modeNormal, modeUpgradeCandidate, modeDrill} {
+	for _, mode := range []string{modeNormal, modeUpgradeCandidate, modeRollback, modeDrill} {
 		t.Run(mode, func(t *testing.T) {
 			environment := gateTestEnvironment()
 			sentinel := errors.New("synthetic gate failure")
@@ -96,6 +101,10 @@ func TestGateFailureNeverStartsVaultwarden(t *testing.T) {
 			case modeDrill:
 				environment.readDrillManifest = func(context.Context, string) (drillManifest, error) {
 					return drillManifest{}, sentinel
+				}
+			case modeRollback:
+				environment.allowRollback = func(context.Context, string, string, deployment.Identity, config.Deployment) error {
+					return sentinel
 				}
 			}
 			started := false
@@ -161,7 +170,7 @@ func gateTestEnvironment() gateEnvironment {
 		readActive: func(string) (deployment.Active, error) {
 			return deployment.Active{SchemaVersion: 1, ProjectCommit: gateCommit, Release: gateRelease}, nil
 		},
-		allowNormal:    func(string, string, config.Deployment) error { return nil },
+		allowNormal:    func(context.Context, string, string, deployment.Identity, config.Deployment) error { return nil },
 		allowCandidate: func(string, string, string, string, string, config.Deployment) error { return nil },
 		readDrillManifest: func(context.Context, string) (drillManifest, error) {
 			return drillManifest{
@@ -171,9 +180,11 @@ func gateTestEnvironment() gateEnvironment {
 			}, nil
 		},
 		allowDrill:     func(string, string, string, string, string, config.Deployment) error { return nil },
+		allowRollback:  func(context.Context, string, string, deployment.Identity, config.Deployment) error { return nil },
 		start:          func() error { return nil },
 		deploymentPath: "/deployment/.env",
 		stateDir:       "/state",
+		dataDir:        "/data",
 		recoveryRoot:   "/recovery",
 	}
 }

@@ -18,6 +18,7 @@ import (
 
 	"github.com/hellodword/vaultwarden-less/internal/buildinfo"
 	"github.com/hellodword/vaultwarden-less/internal/config"
+	"github.com/hellodword/vaultwarden-less/internal/deployment"
 	"github.com/hellodword/vaultwarden-less/internal/restic"
 	restoretool "github.com/hellodword/vaultwarden-less/internal/restore"
 	"github.com/hellodword/vaultwarden-less/internal/snapshot"
@@ -175,7 +176,7 @@ func TestDeploymentInitGoldenAndActiveServeGate(t *testing.T) {
 		}
 		return errors.New("mismatch")
 	}
-	environment.allowServe = func(string, string, config.Deployment) error {
+	environment.allowServe = func(context.Context, string, string, deployment.Identity, config.Deployment) error {
 		upgradeChecked = true
 		return nil
 	}
@@ -246,7 +247,9 @@ func TestUpgradePrepareGoldenAndServingGateClassification(t *testing.T) {
 	assertErrorJSON(t, stderr, codeUsageError)
 
 	called := false
-	environment.allowServe = func(string, string, config.Deployment) error { return errors.New("frozen") }
+	environment.allowServe = func(context.Context, string, string, deployment.Identity, config.Deployment) error {
+		return errors.New("frozen")
+	}
 	environment.loadBackup = func(string) (*config.Backup, error) {
 		called = true
 		return nil, errors.New("must not load")
@@ -283,7 +286,7 @@ func TestUpgradeSyncRequiresBothExactRecoveryIdentities(t *testing.T) {
 	}
 }
 
-func TestRollbackManagerUsesOneDeploymentRootMount(t *testing.T) {
+func TestRollbackManagerUsesExactConfiguredMounts(t *testing.T) {
 	environment := testEnvironment(nil, nil)
 	root := t.TempDir()
 	environment.deploymentPath = filepath.Join(root, ".env")
@@ -293,7 +296,7 @@ func TestRollbackManagerUsesOneDeploymentRootMount(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if manager.DataDir != filepath.Join(root, "data") || manager.StateDir != filepath.Join(root, "state") {
+	if manager.DataDir != environment.dataDir || manager.StateDir != environment.stateDir || manager.RestoreRoot != environment.restoreRoot {
 		t.Fatalf("rollback paths = %q/%q", manager.DataDir, manager.StateDir)
 	}
 	regular, err := upgradeManager(environment)
@@ -413,7 +416,7 @@ func testEnvironment(repositoryClient repository, server *httptest.Server, resto
 			return restoretool.Result{}, errors.New("restore should not be called")
 		},
 		requireActive: func(string, string, string) error { return nil },
-		allowServe:    func(string, string, config.Deployment) error { return nil },
+		allowServe:    func(context.Context, string, string, deployment.Identity, config.Deployment) error { return nil },
 		drillCheck:    func(context.Context) error { return nil },
 		httpClient:    &http.Client{Timeout: time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }},
 		workerURL:     "http://127.0.0.1:1", deploymentPath: "/deployment/.env", vaultwardenPath: "/deployment/vaultwarden.env",

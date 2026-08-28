@@ -434,25 +434,3 @@ func rejectLiveDatabaseSidecars(dataDir string) error {
 	}
 	return nil
 }
-
-func removeRSAState(dataDir string) error {
-	for _, name := range []string{"rsa_key.pem", "rsa_key.pub.pem"} {
-		path := filepath.Join(dataDir, name)
-		info, err := os.Lstat(path)
-		if errors.Is(err, os.ErrNotExist) {
-			continue
-		}
-		if err != nil {
-			return err
-		}
-		stat, ok := info.Sys().(*syscall.Stat_t)
-		if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o600 ||
-			!ok || stat.Uid != uint32(os.Geteuid()) || stat.Gid != uint32(os.Getegid()) || stat.Nlink != 1 {
-			return fmt.Errorf("RSA state is unsafe")
-		}
-		if err := os.Remove(path); err != nil {
-			return err
-		}
-	}
-	return privatefs.SyncDirectory(dataDir)
-}

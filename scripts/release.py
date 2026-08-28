@@ -9,6 +9,7 @@ import datetime as dt
 import errno
 import gzip
 import hashlib
+import io
 import json
 import os
 import re
@@ -227,12 +228,91 @@ def safe_member(member: tarfile.TarInfo) -> None:
         raise ValueError("Docker image archive contains a special entry")
 
 
-def canonicalize_archive(source_path: Path, destination_path: Path) -> None:
+def canonical_json(value: object) -> bytes:
+    return json.dumps(
+        value, ensure_ascii=True, separators=(",", ":"), sort_keys=True
+    ).encode("ascii")
+
+
+def canonical_manifest(data: bytes, expected_references: list[str]) -> bytes:
+    try:
+        document = json.loads(data)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("Docker image archive manifest is invalid") from error
+    if not isinstance(document, list):
+        raise TypeError("Docker image archive manifest is not an array")
+    positions = {
+        reference: index for index, reference in enumerate(expected_references)
+    }
+    normalized: list[dict[str, object]] = []
+    observed: list[str] = []
+    for entry in document:
+        tags = entry.get("RepoTags") if isinstance(entry, dict) else None
+        if (
+            not isinstance(tags, list)
+            or not tags
+            or not all(isinstance(tag, str) and tag in positions for tag in tags)
+        ):
+            raise ValueError("Docker image archive contains invalid references")
+        ordered_tags = sorted(tags, key=positions.__getitem__)
+        observed.extend(ordered_tags)
+        normalized_entry = dict(entry)
+        normalized_entry["RepoTags"] = ordered_tags
+        normalized.append(normalized_entry)
+    if len(observed) != len(set(observed)) or set(observed) != set(expected_references):
+        raise ValueError("Docker image archive references are not exact")
+    normalized.sort(key=lambda entry: positions[entry["RepoTags"][0]])
+    return canonical_json(normalized)
+
+
+def canonical_index(data: bytes, expected_references: list[str]) -> bytes:
+    try:
+        document = json.loads(data)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("Docker OCI image index is invalid") from error
+    manifests = document.get("manifests") if isinstance(document, dict) else None
+    if not isinstance(manifests, list):
+        raise TypeError("Docker OCI image index has no manifests array")
+    positions = {
+        reference: index for index, reference in enumerate(expected_references)
+    }
+    normalized: list[tuple[int, dict[str, object]]] = []
+    observed: list[str] = []
+    for descriptor in manifests:
+        annotations = (
+            descriptor.get("annotations") if isinstance(descriptor, dict) else None
+        )
+        image_name = (
+            annotations.get("io.containerd.image.name")
+            if isinstance(annotations, dict)
+            else None
+        )
+        reference = image_name.rsplit("/", 1)[-1] if isinstance(image_name, str) else ""
+        if reference not in positions:
+            raise ValueError("Docker OCI image index contains an unexpected reference")
+        observed.append(reference)
+        normalized.append((positions[reference], descriptor))
+    if len(observed) != len(set(observed)) or set(observed) != set(expected_references):
+        raise ValueError("Docker OCI image index references are not exact")
+    normalized.sort(key=lambda item: item[0])
+    result = dict(document)
+    result["manifests"] = [descriptor for _, descriptor in normalized]
+    return canonical_json(result)
+
+
+def canonicalize_archive(
+    source_path: Path,
+    destination_path: Path,
+    expected_references: list[str],
+) -> None:
     with (
         tarfile.open(source_path, "r:*") as source,
         destination_path.open("xb") as compressed,
     ):
         members = sorted(source.getmembers(), key=lambda item: item.name.encode())
+        names = [member.name for member in members]
+        if len(names) != len(set(names)) or "manifest.json" not in names:
+            raise ValueError("Docker image archive member names are not exact")
         for member in members:
             safe_member(member)
         with (
@@ -252,6 +332,25 @@ def canonicalize_archive(source_path: Path, destination_path: Path) -> None:
                 normalized.mtime = 0
                 normalized.pax_headers = {}
                 payload = source.extractfile(member) if member.isfile() else None
+                if member.isfile() and payload is None:
+                    raise ValueError("Docker image archive member is unreadable")
+                if payload is not None and member.name in {
+                    "manifest.json",
+                    "index.json",
+                    "oci-layout",
+                }:
+                    data = payload.read()
+                    if member.name == "manifest.json":
+                        data = canonical_manifest(data, expected_references)
+                    elif member.name == "index.json":
+                        data = canonical_index(data, expected_references)
+                    else:
+                        try:
+                            data = canonical_json(json.loads(data))
+                        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                            raise ValueError("Docker OCI layout is invalid") from error
+                    normalized.size = len(data)
+                    payload = io.BytesIO(data)
                 destination.addfile(normalized, payload)
 
 
@@ -350,9 +449,12 @@ def create_release(output_root: Path) -> None:
                 *expected,
             ]
         )
-        if archive_references(raw_archive) != expected:
+        archived = archive_references(raw_archive)
+        if len(archived) != len(expected) or set(archived) != set(expected):
             raise ValueError("Docker image archive references are not exact")
-        canonicalize_archive(raw_archive, temporary / "images.tar.gz")
+        canonicalize_archive(raw_archive, temporary / "images.tar.gz", expected)
+        if archive_references(temporary / "images.tar.gz") != expected:
+            raise ValueError("canonical Docker image references are not exact")
         raw_archive.unlink()
         write_checksum(temporary)
         if git_identity() != identity:

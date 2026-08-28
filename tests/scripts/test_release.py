@@ -55,10 +55,48 @@ def image_document(reference: str, *, required: bool = True) -> dict[str, object
 def write_docker_archive(
     path: Path, references: list[str], *, reverse: bool = False
 ) -> None:
-    manifest = json.dumps(
-        [{"Config": "config.json", "RepoTags": references, "Layers": []}]
+    manifest_entries = []
+    index_entries = []
+    members: list[tuple[str, bytes]] = []
+    for index in range(0, len(references), 2):
+        tags = references[index : index + 2]
+        config = f"config-{index // 2}.json"
+        manifest_entries.append({"Config": config, "RepoTags": tags, "Layers": []})
+        members.append((config, b"{}"))
+        for reference in tags:
+            index_entries.append(
+                {
+                    "digest": "sha256:" + f"{index + len(index_entries) + 1:064x}",
+                    "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+                    "size": 1,
+                    "annotations": {
+                        "io.containerd.image.name": f"docker.io/library/{reference}",
+                        "org.opencontainers.image.ref.name": reference.rsplit(":", 1)[
+                            1
+                        ],
+                    },
+                }
+            )
+    if reverse:
+        manifest_entries.reverse()
+        index_entries.reverse()
+        for entry in manifest_entries:
+            entry["RepoTags"].reverse()
+    manifest = json.dumps(manifest_entries).encode()
+    index_document = json.dumps(
+        {
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "manifests": index_entries,
+        }
     ).encode()
-    members = [("manifest.json", manifest), ("config.json", b"{}")]
+    members.extend(
+        [
+            ("manifest.json", manifest),
+            ("index.json", index_document),
+            ("oci-layout", b'{"imageLayoutVersion":"1.0.0"}'),
+        ]
+    )
     if reverse:
         members.reverse()
     with tarfile.open(path, "w") as archive:
@@ -145,8 +183,10 @@ class ReleaseScriptTest(unittest.TestCase):
         second = self.root / "second"
         first.mkdir()
         second.mkdir()
-        release.canonicalize_archive(first_source, first / "images.tar.gz")
-        release.canonicalize_archive(second_source, second / "images.tar.gz")
+        release.canonicalize_archive(first_source, first / "images.tar.gz", references)
+        release.canonicalize_archive(
+            second_source, second / "images.tar.gz", references
+        )
         release.write_checksum(first)
         release.write_checksum(second)
 

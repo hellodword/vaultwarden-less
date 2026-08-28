@@ -120,3 +120,30 @@ func TestAtomicRenamePrimitivesNeverOverwriteByAccident(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestRenameExchangeSwapsTwoDisposableSiblingDirectories(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	left := filepath.Join(root, "left")
+	right := filepath.Join(root, "right")
+	for path, value := range map[string]string{left: "left", right: "right"} {
+		if err := os.Mkdir(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(path, "identity"), []byte(value), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := RenameExchange(left, right); err != nil {
+		t.Fatal(err)
+	}
+	if data, err := os.ReadFile(filepath.Join(left, "identity")); err != nil || string(data) != "right" {
+		t.Fatalf("left after exchange = %q/%v", data, err)
+	}
+	if data, err := os.ReadFile(filepath.Join(right, "identity")); err != nil || string(data) != "left" {
+		t.Fatalf("right after exchange = %q/%v", data, err)
+	}
+	if err := SyncDirectory(root); err != nil {
+		t.Fatal(err)
+	}
+}

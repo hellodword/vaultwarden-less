@@ -19,6 +19,9 @@ const (
 	PhaseVerified   = "verified"
 	PhaseAccepted   = "accepted"
 	PhaseRolledBack = "rolled_back"
+
+	DecisionAccept   = "accept"
+	DecisionRollback = "rollback"
 )
 
 const timestampLayout = "2006-01-02T15:04:05.000Z"
@@ -114,8 +117,16 @@ type Candidate struct {
 	DatabaseMigration         string           `json:"database_migration"`
 	DatabaseSchemaFingerprint string           `json:"database_schema_fingerprint"`
 	UpdatedAt                 string           `json:"updated_at"`
-	AcceptedAt                *string          `json:"accepted_at"`
 	Targets                   []TargetEvidence `json:"targets"`
+}
+
+type Decision struct {
+	SchemaVersion       int    `json:"schema_version"`
+	UpgradeID           string `json:"upgrade_id"`
+	Decision            string `json:"decision"`
+	ActiveProjectCommit string `json:"active_project_commit"`
+	ActiveRelease       string `json:"active_release"`
+	DecidedAt           string `json:"decided_at"`
 }
 
 func (prepare Prepare) validate() error {
@@ -150,21 +161,34 @@ func (candidate Candidate) validate(prepare Prepare) error {
 	}
 	switch candidate.Phase {
 	case PhaseMigrated:
-		if len(candidate.Targets) != 0 || candidate.AcceptedAt != nil {
+		if len(candidate.Targets) != 0 {
 			return fmt.Errorf("migrated candidate is invalid")
 		}
 	case PhaseVerified:
-		if len(candidate.Targets) == 0 || candidate.AcceptedAt != nil {
+		if len(candidate.Targets) == 0 {
 			return fmt.Errorf("verified candidate is invalid")
-		}
-	case PhaseAccepted:
-		if len(candidate.Targets) == 0 || candidate.AcceptedAt == nil || !validTimestamp(*candidate.AcceptedAt) {
-			return fmt.Errorf("accepted candidate is invalid")
 		}
 	default:
 		return fmt.Errorf("candidate phase is invalid")
 	}
 	return validateEvidence(candidate.Targets, nil)
+}
+
+func (decision Decision) validate(prepare Prepare) error {
+	if decision.SchemaVersion != SchemaVersion || decision.UpgradeID != prepare.UpgradeID ||
+		!validTimestamp(decision.DecidedAt) {
+		return fmt.Errorf("upgrade decision is invalid")
+	}
+	wantCommit, wantRelease := prepare.ToCommit, prepare.ToRelease
+	if decision.Decision == DecisionRollback {
+		wantCommit, wantRelease = prepare.FromCommit, prepare.FromRelease
+	} else if decision.Decision != DecisionAccept {
+		return fmt.Errorf("upgrade decision is invalid")
+	}
+	if decision.ActiveProjectCommit != wantCommit || decision.ActiveRelease != wantRelease {
+		return fmt.Errorf("upgrade decision identity is invalid")
+	}
+	return nil
 }
 
 func validateEvidence(evidence []TargetEvidence, names []string) error {

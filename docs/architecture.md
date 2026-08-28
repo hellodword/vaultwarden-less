@@ -96,7 +96,9 @@ mismatched identity. The Vaultwarden gate runs before `/bin/vaultwarden`, so a
 rejected image cannot open or migrate `/data/db.sqlite3` or create SQLite/WAL
 or RSA state. Upgrade, rollback, drill, and import use explicit Compose argv
 and their narrower durable workflow evidence; no mode is inferred from tags or
-the presence of a database.
+the presence of a database. The host-side Python orchestrator owns only
+structured Docker argv, exact image/runtime verification, drill cleanup, and
+resumption; Go remains the sole owner of decisions and data-state transitions.
 
 Role credentials are intentionally duplicated and checked independently:
 
@@ -175,13 +177,19 @@ An upgrade is an explicit A/B state machine, not `docker compose pull`:
   verification, and accept;
 - B cannot expose its proxy or start its resident worker before accept;
 - A never interprets B candidate evidence when rolling back;
-- accept and rollback are mutually exclusive terminal states.
+- immutable `decision.json` makes accept and rollback mutually exclusive;
+- active identity, service startup and health, verified drill cleanup, and
+  final archive publication are resumable parts of the chosen terminal path.
 
 Freeze stops writes, records same-filesystem rollback data owned by A, and
 binds it to immutable release identities. B must migrate, create and restore
 evidence, verify configured repositories, and pass an isolated drill before an
 operator can accept. On any pre-accept failure the operator invokes explicit A
-rollback; there is no automatic data exchange. See [Upgrades](upgrades.md).
+rollback; there is no automatic data exchange. Accept archives the complete
+current record to history only after healthy B services and drill cleanup.
+Rollback uses the frozen tree ID to resume a single same-filesystem exchange,
+starts ordinary A services, and then archives the complete current record with
+exchanged B data to quarantine. See [Upgrades](upgrades.md).
 
 ## Failure semantics
 

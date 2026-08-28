@@ -20,7 +20,7 @@ nix develop --command just check
 `check` runs:
 
 - repository formatting verification;
-- every ordinary Go test and all four Python script contract-test files;
+- every ordinary Go test and all five Python script contract-test files;
 - all Go packages under the race detector;
 - `go vet`, GolangCI-Lint, Ruff lint, and Ruff formatting checks;
 - all declared flake checks, including package/toolchain, Compose contract,
@@ -254,7 +254,7 @@ Before final acceptance:
   service, profile, command, flag, and output against the current tree;
 - render all Compose profiles and the upgrade overlay with ignored private
   fixtures;
-- prove `scripts/` and `tests/scripts/` contain exactly the four documented
+- prove `scripts/` and `tests/scripts/` contain exactly the five documented
   same-named files and each has a live command/test reference;
 - search for obsolete schema, bundle, generated deployment, patch, command,
   test, and compatibility terminology;

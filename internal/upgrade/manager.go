@@ -10,14 +10,17 @@ import (
 	"time"
 
 	"github.com/hellodword/vaultwarden-less/internal/config"
+	"github.com/hellodword/vaultwarden-less/internal/deployment"
 	"github.com/hellodword/vaultwarden-less/internal/privatefs"
 )
 
 type EvidenceCollector func(context.Context, string, []string) ([]TargetEvidence, error)
+type DrillCleaner func(context.Context, string, string) error
 
 type Manager struct {
 	StateDir      string
 	DataDir       string
+	RestoreRoot   string
 	Deployment    config.Deployment
 	ProjectCommit string
 	Release       string
@@ -26,6 +29,8 @@ type Manager struct {
 	Device        func(string) (uint64, error)
 	Database      func(context.Context, string) (DatabaseContract, error)
 	PrepareFreeze func(context.Context, string) error
+	Activate      func(deployment.Identity, deployment.Identity, time.Time) error
+	RemoveDrill   DrillCleaner
 }
 
 func (manager Manager) Prepare(toCommit, toRelease string) (Result, error) {
@@ -50,6 +55,9 @@ func (manager Manager) Prepare(toCommit, toRelease string) (Result, error) {
 		if err := privatefs.ValidatePrivateDirectory(state.current); err != nil {
 			return Result{}, stateError(ErrorInvalidState, err)
 		}
+		if err := cleanupCurrentWriteTransients(state.current); err != nil {
+			return Result{}, stateError(ErrorInvalidState, err)
+		}
 		if err := validateCurrentEntries(state.current); err != nil {
 			return Result{}, stateError(ErrorInvalidState, err)
 		}
@@ -61,7 +69,7 @@ func (manager Manager) Prepare(toCommit, toRelease string) (Result, error) {
 			prepare.ToCommit != toCommit || prepare.ToRelease != toRelease {
 			return Result{}, stateError(ErrorConflict, fmt.Errorf("another upgrade is already current"))
 		}
-		for _, path := range []string{state.ticket, state.candidate, state.rollback} {
+		for _, path := range []string{state.ticket, state.candidate, state.decision, state.rollback} {
 			if exists, err := pathExists(path); err != nil {
 				return Result{}, stateError(ErrorInvalidState, err)
 			} else if exists {
@@ -266,6 +274,9 @@ func (manager Manager) MigrateCheck(ctx context.Context) (Result, error) {
 	} else if exists {
 		return Result{}, stateError(ErrorConflict, fmt.Errorf("candidate state already exists"))
 	}
+	if err := requireDecisionAbsent(state); err != nil {
+		return Result{}, err
+	}
 	if err := manager.validateFrozenTree(ctx, state.rollback, ticket); err != nil {
 		return Result{}, err
 	}
@@ -282,7 +293,6 @@ func (manager Manager) MigrateCheck(ctx context.Context) (Result, error) {
 		DatabaseMigration:         database.Migration,
 		DatabaseSchemaFingerprint: database.SchemaFingerprint,
 		UpdatedAt:                 formatTimestamp(manager.now()),
-		AcceptedAt:                nil,
 		Targets:                   []TargetEvidence{},
 	}
 	if err := candidate.validate(prepare); err != nil {
@@ -301,6 +311,9 @@ func (manager Manager) Verify(ctx context.Context, targetNames []string, collect
 	}
 	if err := validateTargetNames(targetNames); err != nil {
 		return Result{}, stateError(ErrorInvalidState, err)
+	}
+	if err := requireDecisionAbsent(state); err != nil {
+		return Result{}, err
 	}
 	if err := validateEvidence(ticket.Targets, targetNames); err != nil {
 		return Result{}, stateError(ErrorConflict, fmt.Errorf("verification targets do not match frozen evidence"))
@@ -350,6 +363,20 @@ func (manager Manager) Accept(ctx context.Context, drillCheck func(context.Conte
 	if err != nil {
 		return Result{}, err
 	}
+	decisionExists, err := pathExists(state.decision)
+	if err != nil {
+		return Result{}, stateError(ErrorInvalidState, err)
+	}
+	var decision Decision
+	if decisionExists {
+		decision, err = readDecision(state, prepare)
+		if err != nil {
+			return Result{}, err
+		}
+		if decision.Decision != DecisionAccept {
+			return Result{}, stateError(ErrorConflict, fmt.Errorf("rollback is already the terminal decision"))
+		}
+	}
 	if err := manager.validateFrozenTree(ctx, state.rollback, ticket); err != nil {
 		return Result{}, err
 	}
@@ -357,7 +384,7 @@ func (manager Manager) Accept(ctx context.Context, drillCheck func(context.Conte
 	if err != nil {
 		return Result{}, err
 	}
-	if candidate.Phase != PhaseVerified && candidate.Phase != PhaseAccepted {
+	if candidate.Phase != PhaseVerified {
 		return Result{}, stateError(ErrorConflict, fmt.Errorf("candidate is not verified"))
 	}
 	targetNames := make([]string, len(ticket.Targets))
@@ -366,12 +393,6 @@ func (manager Manager) Accept(ctx context.Context, drillCheck func(context.Conte
 	}
 	if err := validateEvidence(candidate.Targets, targetNames); err != nil {
 		return Result{}, stateError(ErrorInvalidState, fmt.Errorf("candidate targets do not match frozen evidence"))
-	}
-	if drillCheck == nil {
-		return Result{}, stateError(ErrorVerification, fmt.Errorf("drill verification is unavailable"))
-	}
-	if err := drillCheck(ctx); err != nil {
-		return Result{}, stateError(ErrorVerification, err)
 	}
 	historyPath := filepath.Join(state.history, prepare.UpgradeID)
 	if exists, err := pathExists(historyPath); err != nil {
@@ -384,26 +405,48 @@ func (manager Manager) Accept(ctx context.Context, drillCheck func(context.Conte
 	} else if exists {
 		return Result{}, stateError(ErrorConflict, fmt.Errorf("rollback quarantine already exists"))
 	}
-	if candidate.Phase == PhaseVerified {
-		acceptedAt := formatTimestamp(manager.now())
-		candidate.Phase = PhaseAccepted
-		candidate.UpdatedAt = acceptedAt
-		candidate.AcceptedAt = &acceptedAt
-		if err := candidate.validate(prepare); err != nil {
+	if !decisionExists {
+		active, err := deployment.RequireActive(manager.StateDir, deployment.Identity{
+			ProjectCommit: prepare.FromCommit, Release: prepare.FromRelease,
+		})
+		if err != nil {
+			return Result{}, deploymentUpgradeError(err)
+		}
+		if drillCheck == nil {
+			return Result{}, stateError(ErrorVerification, fmt.Errorf("drill verification is unavailable"))
+		}
+		if err := drillCheck(ctx); err != nil {
+			return Result{}, stateError(ErrorVerification, err)
+		}
+		decidedAt, err := decisionTimeAfter(active, manager.now())
+		if err != nil {
+			return Result{}, err
+		}
+		decision = Decision{
+			SchemaVersion:       SchemaVersion,
+			UpgradeID:           prepare.UpgradeID,
+			Decision:            DecisionAccept,
+			ActiveProjectCommit: prepare.ToCommit,
+			ActiveRelease:       prepare.ToRelease,
+			DecidedAt:           formatTimestamp(decidedAt),
+		}
+		if err := decision.validate(prepare); err != nil {
 			return Result{}, stateError(ErrorInvalidState, err)
 		}
-		if err := replaceJSON(state.candidate, candidate); err != nil {
-			return Result{}, stateError(ErrorInvalidState, err)
+		if err := writeNewJSON(state.decision, decision); err != nil {
+			return Result{}, stateError(ErrorConflict, err)
 		}
 	}
-	if err := privatefs.RenameNoReplace(state.current, historyPath); err != nil {
-		return Result{}, stateError(ErrorConflict, err)
+	decidedAt, err := time.Parse(timestampLayout, decision.DecidedAt)
+	if err != nil {
+		return Result{}, stateError(ErrorInvalidState, fmt.Errorf("accept decision timestamp is invalid"))
 	}
-	if err := privatefs.SyncDirectory(state.history); err != nil {
-		return Result{}, stateError(ErrorInvalidState, err)
-	}
-	if err := privatefs.SyncDirectory(state.upgrade); err != nil {
-		return Result{}, stateError(ErrorInvalidState, err)
+	if err := manager.activate(
+		deployment.Identity{ProjectCommit: prepare.FromCommit, Release: prepare.FromRelease},
+		deployment.Identity{ProjectCommit: prepare.ToCommit, Release: prepare.ToRelease},
+		decidedAt,
+	); err != nil {
+		return Result{}, deploymentUpgradeError(err)
 	}
 	return result(PhaseAccepted, prepare, nil), nil
 }
@@ -413,81 +456,87 @@ func (manager Manager) Rollback(ctx context.Context) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
+	decisionExists, err := pathExists(state.decision)
+	if err != nil {
+		return Result{}, stateError(ErrorInvalidState, err)
+	}
+	var decision Decision
+	if decisionExists {
+		decision, err = readDecision(state, prepare)
+		if err != nil {
+			return Result{}, err
+		}
+		if decision.Decision != DecisionRollback {
+			return Result{}, stateError(ErrorConflict, fmt.Errorf("accept is already the terminal decision"))
+		}
+	}
 	historyPath := filepath.Join(state.history, prepare.UpgradeID)
 	if exists, err := pathExists(historyPath); err != nil {
 		return Result{}, stateError(ErrorInvalidState, err)
 	} else if exists {
 		return Result{}, stateError(ErrorConflict, fmt.Errorf("upgrade history already exists"))
 	}
-	candidateExists, err := validateOpaqueCandidate(state.candidate)
-	if err != nil {
+	if exists, err := pathExists(filepath.Join(state.quarantine, prepare.UpgradeID)); err != nil {
+		return Result{}, stateError(ErrorInvalidState, err)
+	} else if exists {
+		return Result{}, stateError(ErrorConflict, fmt.Errorf("rollback quarantine already exists"))
+	}
+	if _, err := validateOpaqueCandidate(state.candidate); err != nil {
 		return Result{}, stateError(ErrorInvalidState, err)
 	}
+	activeIdentity := deployment.Identity{ProjectCommit: prepare.FromCommit, Release: prepare.FromRelease}
+	active, err := deployment.RequireActive(manager.StateDir, activeIdentity)
+	if err != nil {
+		return Result{}, deploymentUpgradeError(err)
+	}
 	activeDevice, err := manager.device()(manager.DataDir)
-	if err != nil || activeDevice != ticket.ActiveDevice {
+	if err != nil {
+		return Result{}, stateError(ErrorConflict, fmt.Errorf("inspect active filesystem device: %w", err))
+	}
+	if activeDevice != ticket.ActiveDevice {
 		return Result{}, stateError(ErrorConflict, fmt.Errorf("active filesystem device changed"))
 	}
 	rollbackExists, err := pathExists(state.rollback)
 	if err != nil {
 		return Result{}, stateError(ErrorInvalidState, err)
 	}
-	quarantinePath := filepath.Join(state.quarantine, prepare.UpgradeID)
-	quarantineData := filepath.Join(quarantinePath, "data")
-	quarantineCandidate := filepath.Join(quarantinePath, candidateName)
-	quarantineExists, err := pathExists(quarantinePath)
-	if err != nil {
-		return Result{}, stateError(ErrorInvalidState, err)
+	if !rollbackExists {
+		return Result{}, stateError(ErrorInvalidState, fmt.Errorf("rollback tree is missing before finalization"))
 	}
-	if quarantineExists {
-		if err := validateQuarantineDirectory(quarantinePath); err != nil {
-			return Result{}, stateError(ErrorInvalidState, err)
+	rollbackDevice, err := manager.device()(state.rollback)
+	if err != nil || rollbackDevice != ticket.RollbackDevice {
+		return Result{}, stateError(ErrorConflict, fmt.Errorf("rollback filesystem device changed"))
+	}
+	rollbackID, rollbackErr := rollbackTreeID(ctx, state.rollback)
+	if !decisionExists {
+		if rollbackErr != nil || rollbackID != ticket.RollbackTreeID {
+			return Result{}, stateError(ErrorVerification, fmt.Errorf("frozen A data is not in the rollback position"))
 		}
-	}
-	quarantineDataExists, err := pathExists(quarantineData)
-	if err != nil {
-		return Result{}, stateError(ErrorInvalidState, err)
-	}
-	quarantineCandidateExists, err := validateOpaqueCandidate(quarantineCandidate)
-	if err != nil {
-		return Result{}, stateError(ErrorInvalidState, err)
-	}
-	if rollbackExists && quarantineDataExists {
-		return Result{}, stateError(ErrorInvalidState, fmt.Errorf("rollback data exists in both current and quarantine"))
-	}
-	if candidateExists && quarantineCandidateExists {
-		return Result{}, stateError(ErrorInvalidState, fmt.Errorf("candidate exists in both current and quarantine"))
-	}
-	exchanged := false
-	activeID := ""
-	if rollbackExists {
-		rollbackDevice, err := manager.device()(state.rollback)
-		if err != nil || rollbackDevice != ticket.RollbackDevice {
-			return Result{}, stateError(ErrorConflict, fmt.Errorf("rollback filesystem device changed"))
-		}
-		rollbackID, rollbackErr := rollbackTreeID(ctx, state.rollback)
-		if rollbackErr == nil && rollbackID == ticket.RollbackTreeID {
-			exchanged = false
-		} else if activeID, err = rollbackTreeID(ctx, manager.DataDir); err == nil && activeID == ticket.RollbackTreeID {
-			exchanged = true
-		} else {
-			return Result{}, stateError(ErrorVerification, fmt.Errorf("neither rollback position contains frozen A data"))
-		}
-	} else {
-		activeID, err = rollbackTreeID(ctx, manager.DataDir)
+		decidedAt, err := decisionTimeAfter(active, manager.now())
 		if err != nil {
-			return Result{}, stateError(ErrorVerification, err)
+			return Result{}, err
 		}
-		if !quarantineDataExists || activeID != ticket.RollbackTreeID {
-			return Result{}, stateError(ErrorInvalidState, fmt.Errorf("rollback exchange state is incomplete"))
+		decision = Decision{
+			SchemaVersion:       SchemaVersion,
+			UpgradeID:           prepare.UpgradeID,
+			Decision:            DecisionRollback,
+			ActiveProjectCommit: prepare.FromCommit,
+			ActiveRelease:       prepare.FromRelease,
+			DecidedAt:           formatTimestamp(decidedAt),
 		}
-		exchanged = true
+		if err := decision.validate(prepare); err != nil {
+			return Result{}, stateError(ErrorInvalidState, err)
+		}
+		if err := writeNewJSON(state.decision, decision); err != nil {
+			return Result{}, stateError(ErrorConflict, err)
+		}
 	}
-	if !quarantineExists {
-		if err := os.Mkdir(quarantinePath, 0o700); err != nil {
-			return Result{}, stateError(ErrorInvalidState, err)
-		}
-		if err := privatefs.SyncDirectory(state.quarantine); err != nil {
-			return Result{}, stateError(ErrorInvalidState, err)
+	exchanged := rollbackErr != nil || rollbackID != ticket.RollbackTreeID
+	activeID := ""
+	if exchanged {
+		activeID, err = rollbackTreeID(ctx, manager.DataDir)
+		if err != nil || activeID != ticket.RollbackTreeID {
+			return Result{}, stateError(ErrorVerification, fmt.Errorf("neither rollback position contains frozen A data"))
 		}
 	}
 	if !exchanged {
@@ -502,37 +551,173 @@ func (manager Manager) Rollback(ctx context.Context) (Result, error) {
 			return Result{}, stateError(ErrorVerification, fmt.Errorf("atomic exchange did not restore A data"))
 		}
 	}
-	if rollbackExists {
-		if err := privatefs.RenameNoReplace(state.rollback, quarantineData); err != nil {
-			return Result{}, stateError(ErrorInvalidState, err)
-		}
+	decidedAt, err := time.Parse(timestampLayout, decision.DecidedAt)
+	if err != nil {
+		return Result{}, stateError(ErrorInvalidState, fmt.Errorf("rollback decision timestamp is invalid"))
 	}
-	if candidateExists {
-		if err := privatefs.RenameNoReplace(state.candidate, quarantineCandidate); err != nil {
-			return Result{}, stateError(ErrorInvalidState, err)
-		}
+	if err := manager.activate(activeIdentity, activeIdentity, decidedAt); err != nil {
+		return Result{}, deploymentUpgradeError(err)
 	}
-	if err := privatefs.SyncDirectory(quarantinePath); err != nil {
+	return result(PhaseRolledBack, prepare, nil), nil
+}
+
+func (manager Manager) Finalize(ctx context.Context) (Result, error) {
+	if err := manager.validate(); err != nil {
+		return Result{}, err
+	}
+	state, err := validateStateLayout(manager.StateDir)
+	if err != nil {
+		return Result{}, err
+	}
+	if err := cleanupCurrentWriteTransients(state.current); err != nil {
 		return Result{}, stateError(ErrorInvalidState, err)
 	}
-	if err := removeRSAState(manager.DataDir); err != nil {
-		return Result{}, stateError(ErrorVerification, err)
+	if err := validateCurrentEntries(state.current); err != nil {
+		return Result{}, stateError(ErrorInvalidState, err)
 	}
-	if err := privatefs.RenameNoReplace(state.current, historyPath); err != nil {
+	prepare, err := readPrepare(state, manager.Deployment)
+	if err != nil {
+		return Result{}, err
+	}
+	ticket, err := readTicket(state, prepare)
+	if err != nil {
+		return Result{}, err
+	}
+	decision, err := readDecision(state, prepare)
+	if err != nil {
+		return Result{}, err
+	}
+	target := deployment.Identity{ProjectCommit: decision.ActiveProjectCommit, Release: decision.ActiveRelease}
+	if manager.ProjectCommit != target.ProjectCommit || manager.Release != target.Release {
+		return Result{}, stateError(ErrorConflict, fmt.Errorf("finalize is owned by the terminal release"))
+	}
+	active, err := deployment.RequireActive(manager.StateDir, target)
+	if err != nil {
+		return Result{}, deploymentUpgradeError(err)
+	}
+	if err := requireDecisionActivation(active, decision); err != nil {
+		return Result{}, err
+	}
+	if err := manager.requireDrillRemoved(); err != nil {
+		return Result{}, err
+	}
+
+	historyPath := filepath.Join(state.history, prepare.UpgradeID)
+	quarantinePath := filepath.Join(state.quarantine, prepare.UpgradeID)
+	for _, destination := range []string{historyPath, quarantinePath} {
+		if exists, err := pathExists(destination); err != nil {
+			return Result{}, stateError(ErrorInvalidState, err)
+		} else if exists {
+			return Result{}, stateError(ErrorConflict, fmt.Errorf("upgrade archive destination already exists"))
+		}
+	}
+
+	destination := historyPath
+	phase := PhaseAccepted
+	if decision.Decision == DecisionAccept {
+		candidate, err := readCandidate(state, prepare)
+		if err != nil {
+			return Result{}, err
+		}
+		if candidate.Phase != PhaseVerified {
+			return Result{}, stateError(ErrorConflict, fmt.Errorf("accepted candidate is not verified"))
+		}
+		if err := manager.validateFrozenTree(ctx, state.rollback, ticket); err != nil {
+			return Result{}, err
+		}
+	} else {
+		if _, err := validateOpaqueCandidate(state.candidate); err != nil {
+			return Result{}, stateError(ErrorInvalidState, err)
+		}
+		activeDevice, err := manager.device()(manager.DataDir)
+		if err != nil || activeDevice != ticket.ActiveDevice {
+			return Result{}, stateError(ErrorConflict, fmt.Errorf("active filesystem device changed"))
+		}
+		rollbackDevice, err := manager.device()(state.rollback)
+		if err != nil || rollbackDevice != ticket.RollbackDevice {
+			return Result{}, stateError(ErrorConflict, fmt.Errorf("rollback filesystem device changed"))
+		}
+		destination = quarantinePath
+		phase = PhaseRolledBack
+	}
+	if err := privatefs.RenameNoReplace(state.current, destination); err != nil {
 		return Result{}, stateError(ErrorConflict, err)
 	}
-	if err := privatefs.SyncDirectory(state.history); err != nil {
+	if err := privatefs.SyncDirectory(filepath.Dir(destination)); err != nil {
 		return Result{}, stateError(ErrorInvalidState, err)
 	}
 	if err := privatefs.SyncDirectory(state.upgrade); err != nil {
 		return Result{}, stateError(ErrorInvalidState, err)
 	}
-	return result(PhaseRolledBack, prepare, nil), nil
+	return result(phase, prepare, nil), nil
 }
 
-func ServingAllowed(stateDir, projectCommit string, deployment config.Deployment) error {
-	if !ValidCommit(projectCommit) {
+func (manager Manager) CleanupDrill(ctx context.Context) (Result, error) {
+	if err := manager.validate(); err != nil {
+		return Result{}, err
+	}
+	state, err := validateStateLayout(manager.StateDir)
+	if err != nil {
+		return Result{}, err
+	}
+	if err := cleanupCurrentWriteTransients(state.current); err != nil {
+		return Result{}, stateError(ErrorInvalidState, err)
+	}
+	if err := validateCurrentEntries(state.current); err != nil {
+		return Result{}, stateError(ErrorInvalidState, err)
+	}
+	prepare, err := readPrepare(state, manager.Deployment)
+	if err != nil {
+		return Result{}, err
+	}
+	decision, err := readDecision(state, prepare)
+	if err != nil {
+		return Result{}, err
+	}
+	target := deployment.Identity{ProjectCommit: decision.ActiveProjectCommit, Release: decision.ActiveRelease}
+	if manager.ProjectCommit != target.ProjectCommit || manager.Release != target.Release {
+		return Result{}, stateError(ErrorConflict, fmt.Errorf("drill cleanup is owned by the terminal release"))
+	}
+	if _, err := deployment.RequireActive(manager.StateDir, target); err != nil {
+		return Result{}, deploymentUpgradeError(err)
+	}
+	if manager.RestoreRoot == "" || !filepath.IsAbs(manager.RestoreRoot) || filepath.Clean(manager.RestoreRoot) != manager.RestoreRoot {
+		return Result{}, stateError(ErrorInvalidState, fmt.Errorf("restore root is invalid"))
+	}
+	if err := privatefs.ValidatePrivateDirectory(manager.RestoreRoot); err != nil {
+		return Result{}, stateError(ErrorInvalidState, fmt.Errorf("validate restore root: %w", err))
+	}
+	drill := filepath.Join(manager.RestoreRoot, "drill")
+	exists, err := pathExists(drill)
+	if err != nil {
+		return Result{}, stateError(ErrorInvalidState, err)
+	}
+	if exists {
+		if manager.RemoveDrill == nil {
+			return Result{}, stateError(ErrorVerification, fmt.Errorf("drill cleanup is unavailable"))
+		}
+		if err := manager.RemoveDrill(ctx, drill, prepare.ToCommit); err != nil {
+			return Result{}, stateError(ErrorVerification, err)
+		}
+	}
+	phase := PhaseAccepted
+	if decision.Decision == DecisionRollback {
+		phase = PhaseRolledBack
+	}
+	return result(phase, prepare, nil), nil
+}
+
+func ServingAllowed(
+	ctx context.Context,
+	stateDir, dataDir string,
+	identity deployment.Identity,
+	configured config.Deployment,
+) error {
+	if err := identity.Validate(); err != nil {
 		return stateError(ErrorInvalidState, fmt.Errorf("serving identity is invalid"))
+	}
+	if _, err := deployment.RequireActive(stateDir, identity); err != nil {
+		return deploymentUpgradeError(err)
 	}
 	state := paths(stateDir)
 	currentExists, err := pathExists(state.current)
@@ -542,44 +727,124 @@ func ServingAllowed(stateDir, projectCommit string, deployment config.Deployment
 	if !currentExists {
 		return nil
 	}
-	if err := privatefs.ValidatePrivateDirectory(state.current); err != nil {
-		return stateError(ErrorInvalidState, err)
+	state, err = validateStateLayout(stateDir)
+	if err != nil {
+		return err
 	}
 	if err := validateCurrentEntries(state.current); err != nil {
 		return stateError(ErrorInvalidState, err)
 	}
-	prepare, err := readPrepare(state, deployment)
+	prepare, err := readPrepare(state, configured)
 	if err != nil {
-		return stateError(ErrorInvalidState, fmt.Errorf("prepare state is invalid"))
+		return err
 	}
 	ticketExists, err := pathExists(state.ticket)
 	if err != nil {
 		return stateError(ErrorInvalidState, err)
 	}
-	candidateExists, err := pathExists(state.candidate)
-	if err != nil {
-		return stateError(ErrorInvalidState, err)
-	}
-	rollbackExists, err := pathExists(state.rollback)
-	if err != nil {
-		return stateError(ErrorInvalidState, err)
-	}
-	if ticketExists {
-		if _, err := readTicket(state, prepare); err != nil {
-			return err
+	if !ticketExists {
+		for _, path := range []string{state.candidate, state.decision, state.rollback} {
+			exists, pathErr := pathExists(path)
+			if pathErr != nil {
+				return stateError(ErrorInvalidState, pathErr)
+			}
+			if exists {
+				return stateError(ErrorInvalidState, fmt.Errorf("prepared upgrade contains later-phase state"))
+			}
 		}
-		return stateError(ErrorConflict, fmt.Errorf("serving is frozen pending accept or rollback"))
-	}
-	if candidateExists || rollbackExists {
-		return stateError(ErrorInvalidState, fmt.Errorf("upgrade state is incomplete"))
-	}
-	if projectCommit == prepare.FromCommit {
+		if identity.ProjectCommit != prepare.FromCommit || identity.Release != prepare.FromRelease {
+			return stateError(ErrorConflict, fmt.Errorf("prepared upgrade is owned by active A"))
+		}
 		return nil
 	}
-	if projectCommit == prepare.ToCommit {
-		return stateError(ErrorConflict, fmt.Errorf("candidate serving is not accepted"))
+	return terminalServingAllowed(ctx, stateDir, dataDir, identity, configured, "")
+}
+
+func RollbackServingAllowed(
+	ctx context.Context,
+	stateDir, dataDir string,
+	identity deployment.Identity,
+	configured config.Deployment,
+) error {
+	return terminalServingAllowed(ctx, stateDir, dataDir, identity, configured, DecisionRollback)
+}
+
+func terminalServingAllowed(
+	ctx context.Context,
+	stateDir, dataDir string,
+	identity deployment.Identity,
+	configured config.Deployment,
+	requiredDecision string,
+) error {
+	if err := identity.Validate(); err != nil {
+		return stateError(ErrorInvalidState, fmt.Errorf("serving identity is invalid"))
 	}
-	return stateError(ErrorInvalidState, fmt.Errorf("serving identity is unrelated to current upgrade"))
+	active, err := deployment.RequireActive(stateDir, identity)
+	if err != nil {
+		return deploymentUpgradeError(err)
+	}
+	manager := Manager{
+		StateDir: stateDir, DataDir: dataDir, Deployment: configured,
+		ProjectCommit: identity.ProjectCommit, Release: identity.Release,
+	}
+	if err := manager.validate(); err != nil {
+		return err
+	}
+	state, err := validateStateLayout(stateDir)
+	if err != nil {
+		return err
+	}
+	if err := validateCurrentEntries(state.current); err != nil {
+		return stateError(ErrorInvalidState, err)
+	}
+	prepare, err := readPrepare(state, configured)
+	if err != nil {
+		return err
+	}
+	ticket, err := readTicket(state, prepare)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return stateError(ErrorConflict, fmt.Errorf("upgrade is not terminal"))
+		}
+		return err
+	}
+	decision, err := readDecision(state, prepare)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return stateError(ErrorConflict, fmt.Errorf("upgrade has no terminal decision"))
+		}
+		return err
+	}
+	if requiredDecision != "" && decision.Decision != requiredDecision {
+		return stateError(ErrorConflict, fmt.Errorf("startup mode does not match the terminal decision"))
+	}
+	if identity.ProjectCommit != decision.ActiveProjectCommit || identity.Release != decision.ActiveRelease {
+		return stateError(ErrorConflict, fmt.Errorf("serving identity does not match the terminal decision"))
+	}
+	if err := requireDecisionActivation(active, decision); err != nil {
+		return err
+	}
+	if decision.Decision == DecisionAccept {
+		candidate, err := readCandidate(state, prepare)
+		if err != nil {
+			return err
+		}
+		if candidate.Phase != PhaseVerified {
+			return stateError(ErrorConflict, fmt.Errorf("accepted candidate is not verified"))
+		}
+		if err := manager.validateFrozenTree(ctx, state.rollback, ticket); err != nil {
+			return err
+		}
+		return nil
+	}
+	if _, err := validateOpaqueCandidate(state.candidate); err != nil {
+		return stateError(ErrorInvalidState, err)
+	}
+	rollbackDevice, err := manager.device()(state.rollback)
+	if err != nil || rollbackDevice != ticket.RollbackDevice {
+		return stateError(ErrorConflict, fmt.Errorf("rollback filesystem device changed"))
+	}
+	return nil
 }
 
 // CandidateServingAllowed permits only immutable B while active identity still
@@ -609,6 +874,9 @@ func CandidateServingAllowed(
 		return stateError(ErrorConflict, fmt.Errorf("candidate and active identities do not match current upgrade"))
 	}
 	if _, err := readTicket(state, prepare); err != nil {
+		return err
+	}
+	if err := requireDecisionAbsent(state); err != nil {
 		return err
 	}
 	rollbackExists, err := pathExists(state.rollback)
@@ -666,6 +934,9 @@ func DrillServingAllowed(
 	if _, err := readTicket(state, prepare); err != nil {
 		return err
 	}
+	if err := requireDecisionAbsent(state); err != nil {
+		return err
+	}
 	candidate, err := readCandidate(state, prepare)
 	if err != nil {
 		return err
@@ -708,6 +979,9 @@ func (manager Manager) currentForRole(candidate bool) (statePaths, Prepare, erro
 			return state, Prepare{}, stateError(ErrorConflict, err)
 		}
 		return state, Prepare{}, err
+	}
+	if err := cleanupCurrentWriteTransients(state.current); err != nil {
+		return state, Prepare{}, stateError(ErrorInvalidState, err)
 	}
 	if err := validateCurrentEntries(state.current); err != nil {
 		return state, Prepare{}, stateError(ErrorInvalidState, err)
@@ -771,6 +1045,17 @@ func validateTargetNames(names []string) error {
 	return nil
 }
 
+func requireDecisionAbsent(state statePaths) error {
+	exists, err := pathExists(state.decision)
+	if err != nil {
+		return stateError(ErrorInvalidState, err)
+	}
+	if exists {
+		return stateError(ErrorConflict, fmt.Errorf("upgrade already has a terminal decision"))
+	}
+	return nil
+}
+
 func absentTemporaryDirectory(parent, pattern string) (string, error) {
 	temporary, err := os.MkdirTemp(parent, pattern)
 	if err != nil {
@@ -782,27 +1067,73 @@ func absentTemporaryDirectory(parent, pattern string) (string, error) {
 	return temporary, nil
 }
 
-func validateQuarantineDirectory(path string) error {
-	if err := privatefs.ValidatePrivateDirectory(path); err != nil {
-		return err
-	}
-	entries, err := os.ReadDir(path)
-	if err != nil {
-		return err
-	}
-	for _, entry := range entries {
-		if entry.Name() != "data" && entry.Name() != candidateName {
-			return fmt.Errorf("quarantine contains an unexpected entry")
-		}
-	}
-	return nil
-}
-
 func (manager Manager) now() time.Time {
 	if manager.Now != nil {
 		return manager.Now().UTC()
 	}
 	return time.Now().UTC()
+}
+
+func (manager Manager) activate(expected, target deployment.Identity, notBefore time.Time) error {
+	if manager.Activate != nil {
+		return manager.Activate(expected, target, notBefore)
+	}
+	deploymentManager := deployment.Manager{
+		StateDir: manager.StateDir, DataDir: manager.DataDir,
+		ProjectCommit: target.ProjectCommit, Release: target.Release,
+		Now: manager.Now,
+	}
+	if notBefore.IsZero() {
+		_, err := deploymentManager.Activate(expected)
+		return err
+	}
+	_, err := deploymentManager.ActivateAtOrAfter(expected, notBefore)
+	return err
+}
+
+func requireDecisionActivation(active deployment.Active, decision Decision) error {
+	activatedAt, activeErr := time.Parse(timestampLayout, active.ActivatedAt)
+	decidedAt, decisionErr := time.Parse(timestampLayout, decision.DecidedAt)
+	if activeErr != nil || decisionErr != nil || activatedAt.Before(decidedAt) {
+		return stateError(ErrorConflict, fmt.Errorf("active identity predates the terminal data transition"))
+	}
+	return nil
+}
+
+func decisionTimeAfter(active deployment.Active, now time.Time) (time.Time, error) {
+	activatedAt, err := time.Parse(timestampLayout, active.ActivatedAt)
+	if err != nil {
+		return time.Time{}, stateError(ErrorInvalidState, fmt.Errorf("active timestamp is invalid"))
+	}
+	decidedAt := now.UTC().Truncate(time.Millisecond)
+	if !decidedAt.After(activatedAt) {
+		decidedAt = activatedAt.Add(time.Millisecond)
+	}
+	return decidedAt, nil
+}
+
+func (manager Manager) requireDrillRemoved() error {
+	if manager.RestoreRoot == "" || !filepath.IsAbs(manager.RestoreRoot) || filepath.Clean(manager.RestoreRoot) != manager.RestoreRoot {
+		return stateError(ErrorInvalidState, fmt.Errorf("restore root is invalid"))
+	}
+	if err := privatefs.ValidatePrivateDirectory(manager.RestoreRoot); err != nil {
+		return stateError(ErrorInvalidState, fmt.Errorf("validate restore root: %w", err))
+	}
+	exists, err := pathExists(filepath.Join(manager.RestoreRoot, "drill"))
+	if err != nil {
+		return stateError(ErrorInvalidState, err)
+	}
+	if exists {
+		return stateError(ErrorConflict, fmt.Errorf("verified drill cleanup is incomplete"))
+	}
+	return nil
+}
+
+func deploymentUpgradeError(err error) error {
+	if deployment.IsKind(err, deployment.ErrorConflict) {
+		return stateError(ErrorConflict, err)
+	}
+	return stateError(ErrorInvalidState, err)
 }
 
 func (manager Manager) exchange() func(string, string) error {

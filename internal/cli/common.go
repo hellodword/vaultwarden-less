@@ -49,7 +49,7 @@ type commandEnvironment struct {
 	repository        func(*config.Backup) (repository, error)
 	restore           restoreFunc
 	requireActive     func(string, string, string) error
-	allowServe        func(string, string, config.Deployment) error
+	allowServe        func(context.Context, string, string, deployment.Identity, config.Deployment) error
 	drillCheck        func(context.Context) error
 	httpClient        *http.Client
 	workerURL         string

@@ -156,7 +156,7 @@ upgrade-freeze: config-validate
 upgrade-start-b:
     {{upgrade_compose}} --profile maintenance run --rm --no-deps config-check-backup
     {{upgrade_compose}} --profile maintenance run --rm --no-deps config-check-maintenance
-    {{upgrade_compose}} up --detach --no-deps --wait --wait-timeout 180 vaultwarden
+    {{upgrade_compose}} --profile upgrade up --detach --no-deps --wait --wait-timeout 180 upgrade-vaultwarden-b
 
 # Record B's exact audited migration and schema after Vaultwarden migration.
 upgrade-migrate-check:
@@ -164,31 +164,17 @@ upgrade-migrate-check:
 
 # Stop active B, create and really restore B evidence, then start the isolated B drill.
 upgrade-verify:
-    {{upgrade_compose}} stop proxy backup vaultwarden
+    {{upgrade_compose}} --profile upgrade stop proxy backup vaultwarden upgrade-vaultwarden-b
     {{upgrade_compose}} --profile upgrade run --rm --no-deps upgrade-b upgrade verify
     {{upgrade_compose}} --profile drill up --detach --wait --wait-timeout 180 drill-vaultwarden
 
 # Accept only while upgrade-b can reach the healthy drill, then expose B and remove disposable drill runtime state.
 upgrade-accept:
-    A_RELEASE="$(sed -n 's/^A_RELEASE=//p' state/upgrade/current/compose.env)"; \
-      B_RELEASE="$(sed -n 's/^B_RELEASE=//p' state/upgrade/current/compose.env)"; \
-      test -n "$A_RELEASE"; test -n "$B_RELEASE"; export A_RELEASE B_RELEASE; \
-      {{upgrade_compose}} --profile upgrade --profile drill run --rm --no-deps upgrade-b upgrade accept; \
-      {{upgrade_overlay}} up --detach vaultwarden backup proxy; \
-      {{upgrade_overlay}} --profile drill stop drill-vaultwarden; \
-      {{upgrade_overlay}} --profile drill rm --force drill-vaultwarden drill-copy; \
-      docker volume rm vaultwarden-less_drill-data
+    nix develop --command python3 scripts/deployment.py upgrade accept
 
-# Stop every B service, explicitly exchange A data, and start only immutable A rollback services.
+# Stop every B service, resume A's exchange, retag exact A images, and start ordinary A services.
 upgrade-rollback:
-    A_RELEASE="$(sed -n 's/^A_RELEASE=//p' state/upgrade/current/compose.env)"; \
-      B_RELEASE="$(sed -n 's/^B_RELEASE=//p' state/upgrade/current/compose.env)"; \
-      test -n "$A_RELEASE"; test -n "$B_RELEASE"; export A_RELEASE B_RELEASE; \
-      {{upgrade_compose}} --profile drill stop proxy backup vaultwarden drill-vaultwarden; \
-      {{upgrade_compose}} --profile drill rm --force proxy backup vaultwarden drill-vaultwarden drill-copy; \
-      if docker volume inspect vaultwarden-less_drill-data >/dev/null 2>&1; then docker volume rm vaultwarden-less_drill-data; fi; \
-      {{upgrade_compose}} --profile upgrade run --rm --no-deps rollback-a rollback apply; \
-      {{upgrade_overlay}} --profile rollback up --detach rollback-vaultwarden-a rollback-backup-a rollback-proxy-a
+    nix develop --command python3 scripts/deployment.py upgrade rollback
 
 # Deterministically capture an audited Vaultwarden SQLite schema candidate.
 schema-capture database output="internal/upstream/vaultwarden-schema.json":

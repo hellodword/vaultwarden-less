@@ -1,0 +1,397 @@
+"""Fault-matrix tests for the resumable deployment host orchestrator."""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+REPOSITORY = Path(__file__).resolve().parents[2]
+sys.path.insert(0, os.fspath(REPOSITORY / "scripts"))
+
+import deployment
+
+A_COMMIT = "a" * 40
+B_COMMIT = "b" * 40
+A_RELEASE = "RELEASE.2026-08-28T12-00-00Z-gaaaaaaaaaaaa"
+B_RELEASE = "RELEASE.2026-08-28T13-00-00Z-gbbbbbbbbbbbb"
+UPGRADE_ID = f"{A_COMMIT}..{B_COMMIT}"
+PROJECT = "vwless-deployment-test"
+
+
+def completed(
+    arguments: list[str], stdout: str = "", returncode: int = 0
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.CompletedProcess(arguments, returncode, stdout=stdout, stderr="")
+
+
+class Fixture:
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.current = root / "state" / "upgrade" / "current"
+        for directory in (
+            root / "state",
+            root / "state" / "deployment",
+            root / "state" / "upgrade",
+            self.current,
+            root / "state" / "upgrade" / "history",
+            root / "state" / "upgrade" / "quarantine",
+            root / "restore",
+            root / "restore" / "drill",
+        ):
+            directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+            directory.chmod(0o700)
+        self.write_file(
+            root / ".env",
+            "DEPLOYMENT_SCHEMA_VERSION=1\n"
+            f"RUNTIME_UID={os.geteuid()}\n"
+            f"RUNTIME_GID={os.getegid()}\n"
+            "LISTEN_PORT=8080\n"
+            "DRILL_PORT=8081\n",
+        )
+        self.write_json(
+            self.current / "prepare.json",
+            {
+                "schema_version": 1,
+                "upgrade_id": UPGRADE_ID,
+                "phase": "prepared",
+                "from_commit": A_COMMIT,
+                "from_release": A_RELEASE,
+                "to_commit": B_COMMIT,
+                "to_release": B_RELEASE,
+                "prepared_at": "2026-08-28T12:30:00.000Z",
+            },
+        )
+        self.write_file(
+            self.current / "compose.env",
+            (root / ".env").read_text(encoding="utf-8")
+            + f"A_RELEASE={A_RELEASE}\nB_RELEASE={B_RELEASE}\n",
+        )
+        self.write_active("accept", initial=True)
+        self.write_file(root / "restore" / "drill" / "manifest.json", "synthetic\n")
+
+    @staticmethod
+    def write_file(path: Path, value: str) -> None:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path.parent.chmod(0o700)
+        path.write_text(value, encoding="utf-8")
+        path.chmod(0o600)
+
+    def write_json(self, path: Path, value: dict[str, object]) -> None:
+        self.write_file(path, json.dumps(value, separators=(",", ":")) + "\n")
+
+    def write_active(self, decision: str, *, initial: bool = False) -> None:
+        if initial or decision == "rollback":
+            commit, release = A_COMMIT, A_RELEASE
+        else:
+            commit, release = B_COMMIT, B_RELEASE
+        self.write_json(
+            self.root / "state" / "deployment" / "active.json",
+            {
+                "schema_version": 1,
+                "project_commit": commit,
+                "release": release,
+                "activated_at": "2026-08-28T14:00:00.000Z",
+            },
+        )
+
+    def decide(self, decision: str) -> None:
+        path = self.current / "decision.json"
+        if path.exists():
+            return
+        commit, release = (
+            (B_COMMIT, B_RELEASE) if decision == "accept" else (A_COMMIT, A_RELEASE)
+        )
+        self.write_json(
+            path,
+            {
+                "schema_version": 1,
+                "upgrade_id": UPGRADE_ID,
+                "decision": decision,
+                "active_project_commit": commit,
+                "active_release": release,
+                "decided_at": "2026-08-28T14:00:00.000Z",
+            },
+        )
+        self.write_active(decision)
+
+    def archive(self, decision: str) -> None:
+        destination = (
+            self.root
+            / "state"
+            / "upgrade"
+            / ("history" if decision == "accept" else "quarantine")
+            / UPGRADE_ID
+        )
+        self.current.rename(destination)
+
+
+class FakeDocker:
+    def __init__(self, fixture: Fixture, decision: str) -> None:
+        self.fixture = fixture
+        self.decision = decision
+        self.calls: list[list[str]] = []
+        self.volume_present = True
+        self.fail_suffix: tuple[str, ...] | None = None
+        self.failed = False
+
+    def __call__(
+        self,
+        arguments: list[str],
+        *,
+        cwd: Path,
+        check: bool,
+        text: bool,
+        capture_output: bool,
+    ) -> subprocess.CompletedProcess[str]:
+        self.calls.append(arguments)
+        if cwd != self.fixture.root or check or not text:
+            raise AssertionError("orchestrator subprocess contract changed")
+        if not capture_output:
+            raise AssertionError("orchestrator subprocess output must stay bounded")
+        suffix = tuple(arguments[-len(self.fail_suffix) :]) if self.fail_suffix else ()
+        if self.fail_suffix and suffix == self.fail_suffix and not self.failed:
+            self.failed = True
+            return completed(arguments, returncode=1)
+
+        if arguments[-3:] == ["upgrade-b", "upgrade", "accept"]:
+            self.fixture.decide("accept")
+        elif arguments[-3:] == ["rollback-a", "rollback", "apply"]:
+            self.fixture.decide("rollback")
+        elif arguments[-3:] in (
+            ["upgrade-b", "upgrade", "cleanup-drill"],
+            ["rollback-a", "upgrade", "cleanup-drill"],
+        ):
+            drill = self.fixture.root / "restore" / "drill"
+            if drill.exists():
+                shutil.rmtree(drill)
+        elif arguments[-3:] in (
+            ["upgrade-b", "upgrade", "finalize"],
+            ["rollback-a", "upgrade", "finalize"],
+        ):
+            self.fixture.archive(self.decision)
+
+        if arguments[:3] == ["docker", "volume", "ls"]:
+            value = f"{PROJECT}_drill-data\n" if self.volume_present else ""
+            return completed(arguments, value)
+        if arguments[:3] == ["docker", "volume", "inspect"]:
+            return completed(
+                arguments,
+                json.dumps(
+                    {
+                        "Name": f"{PROJECT}_drill-data",
+                        "Labels": {
+                            "com.docker.compose.project": PROJECT,
+                            "com.docker.compose.volume": "drill-data",
+                        },
+                    }
+                ),
+            )
+        if arguments[:3] == ["docker", "volume", "rm"]:
+            self.volume_present = False
+            return completed(arguments)
+        if arguments[:3] == ["docker", "image", "inspect"]:
+            reference = arguments[-1]
+            product = next(
+                product
+                for product in deployment.PRODUCTS
+                if f"-{product}:" in reference
+            )
+            digit = str(deployment.PRODUCTS.index(product) + 1)
+            identity = (
+                deployment.Identity(B_COMMIT, B_RELEASE)
+                if self.decision == "accept"
+                else deployment.Identity(A_COMMIT, A_RELEASE)
+            )
+            return completed(
+                arguments,
+                json.dumps(
+                    {
+                        "Id": "sha256:" + digit * 64,
+                        "Config": {
+                            "Labels": {
+                                "org.opencontainers.image.revision": identity.commit,
+                                "org.opencontainers.image.version": identity.release,
+                            }
+                        },
+                    }
+                ),
+            )
+        if arguments[:3] == ["docker", "container", "inspect"]:
+            identifier = arguments[-1]
+            product_index = int(identifier[0]) - 1
+            product = deployment.PRODUCTS[product_index]
+            digit = str(product_index + 1)
+            tag = B_RELEASE if self.decision == "accept" else "local"
+            return completed(
+                arguments,
+                json.dumps(
+                    {
+                        "Image": "sha256:" + digit * 64,
+                        "Config": {"Image": f"vaultwarden-less-{product}:{tag}"},
+                        "State": {"Running": True, "Health": {"Status": "healthy"}},
+                    }
+                ),
+            )
+        if "ps" in arguments and "--quiet" in arguments:
+            service = arguments[-1]
+            if service in deployment.SERVICES:
+                digit = str(deployment.SERVICES.index(service) + 1)
+                return completed(arguments, digit * 64 + "\n")
+            return completed(arguments)
+        return completed(arguments)
+
+
+class DeploymentOrchestratorTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.root.chmod(0o700)
+        self.fixture = Fixture(self.root)
+
+    def orchestrator(self, fake: FakeDocker) -> deployment.Orchestrator:
+        return deployment.Orchestrator(self.root, PROJECT, fake)
+
+    def test_accept_uses_exact_argv_and_is_already_complete_after_finalize(
+        self,
+    ) -> None:
+        fake = FakeDocker(self.fixture, "accept")
+        result = self.orchestrator(fake).terminal_upgrade("accept")
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["active_project_commit"], B_COMMIT)
+        self.assertFalse(self.fixture.current.exists())
+        self.assertTrue(
+            (self.root / "state" / "upgrade" / "history" / UPGRADE_ID).is_dir()
+        )
+        self.assertIn(
+            [
+                "upgrade-b",
+                "upgrade",
+                "accept",
+            ],
+            [call[-3:] for call in fake.calls],
+        )
+        for call in fake.calls:
+            self.assertIsInstance(call, list)
+            self.assertNotIn("sed", call)
+            self.assertNotIn("export", call)
+            self.assertNotIn("prune", call)
+
+        repeated = self.orchestrator(fake).terminal_upgrade("accept")
+        self.assertEqual(repeated["status"], "already_complete")
+
+    def test_accept_resumes_across_service_cleanup_and_finalize_failures(self) -> None:
+        fake = FakeDocker(self.fixture, "accept")
+        fake.fail_suffix = (
+            "up",
+            "--detach",
+            "--wait",
+            "--wait-timeout",
+            "180",
+            "vaultwarden",
+            "backup",
+            "proxy",
+        )
+        with self.assertRaises(deployment.DeploymentError):
+            self.orchestrator(fake).terminal_upgrade("accept")
+        decision_before = (self.fixture.current / "decision.json").read_bytes()
+        self.assertTrue((self.root / "restore" / "drill").is_dir())
+
+        fake.fail_suffix = ("--profile", "drill", "stop", "drill-vaultwarden")
+        fake.failed = False
+        with self.assertRaises(deployment.DeploymentError):
+            self.orchestrator(fake).terminal_upgrade("accept")
+        self.assertEqual(
+            (self.fixture.current / "decision.json").read_bytes(), decision_before
+        )
+        self.assertTrue((self.root / "restore" / "drill").is_dir())
+
+        fake.fail_suffix = ("upgrade-b", "upgrade", "finalize")
+        fake.failed = False
+        with self.assertRaises(deployment.DeploymentError):
+            self.orchestrator(fake).terminal_upgrade("accept")
+        self.assertEqual(
+            (self.fixture.current / "decision.json").read_bytes(), decision_before
+        )
+        self.assertFalse((self.root / "restore" / "drill").exists())
+        self.assertFalse(fake.volume_present)
+
+        fake.fail_suffix = None
+        result = self.orchestrator(fake).terminal_upgrade("accept")
+        self.assertEqual(result["status"], "completed")
+
+    def test_failure_before_decision_and_opposite_decision_have_no_later_effects(
+        self,
+    ) -> None:
+        fake = FakeDocker(self.fixture, "accept")
+        fake.fail_suffix = ("upgrade-b", "upgrade", "accept")
+        with self.assertRaises(deployment.DeploymentError):
+            self.orchestrator(fake).terminal_upgrade("accept")
+        self.assertFalse((self.fixture.current / "decision.json").exists())
+        self.assertTrue((self.root / "restore" / "drill").is_dir())
+
+        self.fixture.decide("rollback")
+        call_count = len(fake.calls)
+        with self.assertRaises(deployment.DeploymentError):
+            self.orchestrator(fake).terminal_upgrade("accept")
+        self.assertEqual(len(fake.calls), call_count)
+
+    def test_rollback_retags_only_three_images_and_resumes_completed_state(
+        self,
+    ) -> None:
+        fake = FakeDocker(self.fixture, "rollback")
+        result = self.orchestrator(fake).terminal_upgrade("rollback")
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["active_project_commit"], A_COMMIT)
+        tags = [call for call in fake.calls if call[:3] == ["docker", "image", "tag"]]
+        self.assertEqual(len(tags), 3)
+        self.assertEqual(
+            {call[-1] for call in tags},
+            {f"vaultwarden-less-{product}:local" for product in deployment.PRODUCTS},
+        )
+        self.assertTrue(
+            (self.root / "state" / "upgrade" / "quarantine" / UPGRADE_ID).is_dir()
+        )
+        repeated = self.orchestrator(fake).terminal_upgrade("rollback")
+        self.assertEqual(repeated["status"], "already_complete")
+
+    def test_tampered_state_is_rejected_before_docker(self) -> None:
+        self.fixture.write_json(
+            self.fixture.current / "decision.json",
+            {
+                "schema_version": 1,
+                "upgrade_id": UPGRADE_ID,
+                "decision": "accept",
+                "active_project_commit": B_COMMIT,
+                "active_release": B_RELEASE,
+                "decided_at": "2026-08-28T14:00:00.000Z",
+                "unexpected": True,
+            },
+        )
+        fake = FakeDocker(self.fixture, "accept")
+        with self.assertRaises(deployment.DeploymentError):
+            self.orchestrator(fake).terminal_upgrade("accept")
+        self.assertEqual(fake.calls, [])
+
+        (self.fixture.current / "decision.json").unlink()
+        self.fixture.write_file(
+            self.root / ".env",
+            "DEPLOYMENT_SCHEMA_VERSION=1\n"
+            f"RUNTIME_UID=0{os.geteuid()}\n"
+            f"RUNTIME_GID={os.getegid()}\n"
+            "LISTEN_PORT=8080\n"
+            "DRILL_PORT=8081\n",
+        )
+        with self.assertRaises(deployment.DeploymentError):
+            self.orchestrator(fake).terminal_upgrade("accept")
+        self.assertEqual(fake.calls, [])
+
+
+if __name__ == "__main__":
+    unittest.main()

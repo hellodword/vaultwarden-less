@@ -201,6 +201,68 @@ func (manager Manager) Init() (InitResult, error) {
 	return initResult(StatusInitialized, identity), nil
 }
 
+// Activate moves an existing active identity to the manager's exact identity.
+// The caller supplies the only identity from which the transition is allowed;
+// repeating a completed transition preserves the original activation time.
+func (manager Manager) Activate(expected Identity) (Active, error) {
+	return manager.activateAtOrAfter(expected, time.Time{})
+}
+
+// ActivateAtOrAfter also refreshes an unchanged identity when its activation
+// predates notBefore. Terminal workflows use this to publish completion only
+// after their data transition while preserving idempotency on every rerun.
+func (manager Manager) ActivateAtOrAfter(expected Identity, notBefore time.Time) (Active, error) {
+	if notBefore.IsZero() {
+		return Active{}, stateError(ErrorInvalidState, fmt.Errorf("minimum activation time is required"))
+	}
+	return manager.activateAtOrAfter(expected, notBefore.UTC())
+}
+
+func (manager Manager) activateAtOrAfter(expected Identity, notBefore time.Time) (Active, error) {
+	target := Identity{ProjectCommit: manager.ProjectCommit, Release: manager.Release}
+	if err := manager.validate(target); err != nil {
+		return Active{}, stateError(ErrorInvalidState, err)
+	}
+	if err := expected.Validate(); err != nil {
+		return Active{}, stateError(ErrorInvalidState, err)
+	}
+	active, err := ReadActive(manager.StateDir)
+	if err != nil {
+		return Active{}, err
+	}
+	if active.Identity() == target {
+		activatedAt, parseErr := time.Parse(timestampLayout, active.ActivatedAt)
+		if parseErr != nil {
+			return Active{}, stateError(ErrorInvalidState, fmt.Errorf("activation timestamp is invalid"))
+		}
+		if notBefore.IsZero() || !activatedAt.Before(notBefore) {
+			return active, nil
+		}
+	}
+	if active.Identity() != expected {
+		return Active{}, stateError(ErrorConflict, fmt.Errorf("active identity is not the expected transition source"))
+	}
+	activatedAt := manager.now()
+	if activatedAt.Before(notBefore) {
+		activatedAt = notBefore
+	}
+
+	next := Active{
+		SchemaVersion: SchemaVersion,
+		ProjectCommit: target.ProjectCommit,
+		Release:       target.Release,
+		ActivatedAt:   activatedAt.Format(timestampLayout),
+	}
+	if err := replaceActive(filepath.Join(manager.StateDir, "deployment", "active.json"), next); err != nil {
+		published, readErr := ReadActive(manager.StateDir)
+		if readErr == nil && published.Identity() == target {
+			return published, nil
+		}
+		return Active{}, stateError(ErrorInvalidState, fmt.Errorf("replace active identity: %w", err))
+	}
+	return next, nil
+}
+
 func ReadActive(stateDir string) (Active, error) {
 	deploymentDir, activePath := activePaths(stateDir)
 	if err := privatefs.ValidatePrivateDirectory(stateDir); err != nil {
@@ -385,13 +447,9 @@ func walkJSONValue(decoder *json.Decoder) error {
 }
 
 func writeNewActive(path string, active Active) error {
-	data, err := json.Marshal(active)
+	data, err := activeBytes(active)
 	if err != nil {
 		return err
-	}
-	data = append(data, '\n')
-	if len(data) == 0 || int64(len(data)) > MaxStateBytes {
-		return fmt.Errorf("active state has invalid size")
 	}
 	parent := filepath.Dir(path)
 	if err := privatefs.ValidatePrivateDirectory(parent); err != nil {
@@ -427,6 +485,62 @@ func writeNewActive(path string, active Active) error {
 		return err
 	}
 	return privatefs.SyncDirectory(parent)
+}
+
+func replaceActive(path string, active Active) error {
+	if _, err := readActiveBytes(path); err != nil {
+		return err
+	}
+	data, err := activeBytes(active)
+	if err != nil {
+		return err
+	}
+	parent := filepath.Dir(path)
+	file, err := os.CreateTemp(parent, ".active.json-")
+	if err != nil {
+		return err
+	}
+	temporary := file.Name()
+	open := true
+	defer func() {
+		if open {
+			_ = file.Close()
+		}
+		_ = os.Remove(temporary)
+	}()
+	if err := file.Chmod(0o600); err != nil {
+		return err
+	}
+	if _, err := file.Write(data); err != nil {
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		return err
+	}
+	if err := file.Close(); err != nil {
+		open = false
+		return err
+	}
+	open = false
+	if err := os.Rename(temporary, path); err != nil {
+		return err
+	}
+	return privatefs.SyncDirectory(parent)
+}
+
+func activeBytes(active Active) ([]byte, error) {
+	if err := active.validate(); err != nil {
+		return nil, err
+	}
+	data, err := json.Marshal(active)
+	if err != nil {
+		return nil, err
+	}
+	data = append(data, '\n')
+	if len(data) == 0 || int64(len(data)) > MaxStateBytes {
+		return nil, fmt.Errorf("active state has invalid size")
+	}
+	return data, nil
 }
 
 func pathExists(path string) (bool, error) {

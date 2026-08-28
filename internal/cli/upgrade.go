@@ -122,7 +122,39 @@ func upgradeCommand(configPath *string, environment commandEnvironment) *cobra.C
 			return writeJSON(cmd.OutOrStdout(), result)
 		},
 	}
-	command.AddCommand(prepare, freeze, migrateCheck, verify, accept)
+	cleanupDrill := &cobra.Command{
+		Use: "cleanup-drill", Short: "Remove only the verified terminal upgrade drill", Args: noArguments,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			manager, err := upgradeManager(environment)
+			if err != nil {
+				return err
+			}
+			ctx, cancel := context.WithTimeout(cmd.Context(), config.MaintenanceTimeout)
+			defer cancel()
+			result, err := manager.CleanupDrill(ctx)
+			if err != nil {
+				return classifyUpgradeFailure(err)
+			}
+			return writeJSON(cmd.OutOrStdout(), result)
+		},
+	}
+	finalize := &cobra.Command{
+		Use: "finalize", Short: "Archive a decided upgrade after service and drill cleanup checks", Args: noArguments,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			manager, err := upgradeManager(environment)
+			if err != nil {
+				return err
+			}
+			ctx, cancel := context.WithTimeout(cmd.Context(), config.MaintenanceTimeout)
+			defer cancel()
+			result, err := manager.Finalize(ctx)
+			if err != nil {
+				return classifyUpgradeFailure(err)
+			}
+			return writeJSON(cmd.OutOrStdout(), result)
+		},
+	}
+	command.AddCommand(prepare, freeze, migrateCheck, verify, accept, cleanupDrill, finalize)
 	return command
 }
 
@@ -151,14 +183,7 @@ func rollbackCommand(environment commandEnvironment) *cobra.Command {
 }
 
 func rollbackManager(environment commandEnvironment) (upgrade.Manager, error) {
-	manager, err := upgradeManager(environment)
-	if err != nil {
-		return upgrade.Manager{}, err
-	}
-	deploymentRoot := filepath.Dir(environment.deploymentPath)
-	manager.DataDir = filepath.Join(deploymentRoot, "data")
-	manager.StateDir = filepath.Join(deploymentRoot, "state")
-	return manager, nil
+	return upgradeManager(environment)
 }
 
 func upgradeManager(environment commandEnvironment) (upgrade.Manager, error) {
@@ -172,6 +197,7 @@ func upgradeManager(environment commandEnvironment) (upgrade.Manager, error) {
 	return upgrade.Manager{
 		StateDir:      environment.stateDir,
 		DataDir:       environment.dataDir,
+		RestoreRoot:   environment.restoreRoot,
 		Deployment:    deployment,
 		ProjectCommit: buildinfo.ProjectCommit,
 		Release:       buildinfo.Release,
@@ -182,6 +208,22 @@ func upgradeManager(environment commandEnvironment) (upgrade.Manager, error) {
 		},
 		PrepareFreeze: func(ctx context.Context, dataDir string) error {
 			return snapshot.PrepareStoppedDatabase(ctx, filepath.Join(dataDir, "db.sqlite3"))
+		},
+		RemoveDrill: func(ctx context.Context, output, projectCommit string) error {
+			if output != filepath.Join(environment.restoreRoot, "drill") {
+				return fmt.Errorf("upgrade drill cleanup path is not exact")
+			}
+			manifest, err := snapshot.Verify(ctx, output)
+			if err != nil {
+				return err
+			}
+			if manifest.ProjectCommit != projectCommit {
+				return fmt.Errorf("upgrade drill belongs to another project commit")
+			}
+			if err := os.RemoveAll(output); err != nil {
+				return err
+			}
+			return privatefs.SyncDirectory(environment.restoreRoot)
 		},
 	}, nil
 }

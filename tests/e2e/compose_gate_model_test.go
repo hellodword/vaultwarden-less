@@ -72,9 +72,13 @@ func TestComposeStartupGateModel(t *testing.T) {
 		upgradeEnvironment,
 		filepath.Join(repository, "compose.yml"),
 		"--file", filepath.Join(repository, "compose.upgrade.yml"),
+		"--profile", "upgrade",
 		"--profile", "rollback",
 	)
-	assertGateCommand(t, upgradeModel["vaultwarden"], "upgrade-candidate")
+	assertGateCommand(t, upgradeModel["vaultwarden"], "normal")
+	assertGateCommand(t, upgradeModel["upgrade-vaultwarden-b"], "upgrade-candidate")
+	assertGateMount(t, upgradeModel["upgrade-vaultwarden-b"], filepath.Join(root, ".env"), "/deployment/.env", true)
+	assertGateMount(t, upgradeModel["upgrade-vaultwarden-b"], filepath.Join(root, "state"), "/state", true)
 	assertGateCommand(t, upgradeModel["rollback-vaultwarden-a"], "rollback")
 	assertGateMount(t, upgradeModel["rollback-vaultwarden-a"], filepath.Join(root, ".env"), "/deployment/.env", true)
 	assertGateMount(t, upgradeModel["rollback-vaultwarden-a"], filepath.Join(root, "state"), "/state", true)

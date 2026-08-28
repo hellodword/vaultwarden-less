@@ -1,6 +1,7 @@
 package deployment
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
@@ -263,6 +264,75 @@ func TestConcurrentInitPublishesOneIdentity(t *testing.T) {
 	}
 	if counts[StatusInitialized] != 1 || counts[StatusAlreadyInitialized] != 1 {
 		t.Fatalf("concurrent statuses = %#v", counts)
+	}
+}
+
+func TestActivateTransitionsOnlyExpectedIdentityAndIsIdempotent(t *testing.T) {
+	manager := deploymentFixture(t)
+	if _, err := manager.Init(); err != nil {
+		t.Fatal(err)
+	}
+	expected := Identity{ProjectCommit: testCommit, Release: testRelease}
+	targetCommit := strings.Repeat("f", 40)
+	targetRelease := "RELEASE.2026-08-28T13-34-56Z-gffffffffffff"
+	manager.ProjectCommit = targetCommit
+	manager.Release = targetRelease
+	manager.Now = func() time.Time { return testNow.Add(time.Hour) }
+
+	active, err := manager.Activate(expected)
+	if err != nil || active.Identity() != (Identity{ProjectCommit: targetCommit, Release: targetRelease}) ||
+		active.ActivatedAt != "2026-08-28T13:34:56.789Z" {
+		t.Fatalf("activate = %#v/%v", active, err)
+	}
+	bytesAfterTransition, err := os.ReadFile(filepath.Join(manager.StateDir, "deployment", "active.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.Now = func() time.Time { return testNow.Add(2 * time.Hour) }
+	repeated, err := manager.Activate(expected)
+	if err != nil || repeated != active {
+		t.Fatalf("repeat activate = %#v/%v", repeated, err)
+	}
+	bytesAfterRepeat, err := os.ReadFile(filepath.Join(manager.StateDir, "deployment", "active.json"))
+	if err != nil || string(bytesAfterRepeat) != string(bytesAfterTransition) {
+		t.Fatalf("repeat rewrote active = %q/%v", bytesAfterRepeat, err)
+	}
+
+	conflicting := manager
+	conflicting.ProjectCommit = strings.Repeat("e", 40)
+	conflicting.Release = "RELEASE.2026-08-28T14-34-56Z-geeeeeeeeeeee"
+	if _, err := conflicting.Activate(expected); !IsKind(err, ErrorConflict) {
+		t.Fatalf("unexpected transition source error = %v", err)
+	}
+}
+
+func TestActivateAtOrAfterReaffirmsSameIdentityOnce(t *testing.T) {
+	manager := deploymentFixture(t)
+	if _, err := manager.Init(); err != nil {
+		t.Fatal(err)
+	}
+	identity := Identity{ProjectCommit: testCommit, Release: testRelease}
+	minimum := testNow.Add(time.Hour)
+	manager.Now = func() time.Time { return minimum }
+	active, err := manager.ActivateAtOrAfter(identity, minimum)
+	if err != nil || active.Identity() != identity || active.ActivatedAt != "2026-08-28T13:34:56.789Z" {
+		t.Fatalf("reaffirm = %#v/%v", active, err)
+	}
+	before, err := os.ReadFile(filepath.Join(manager.StateDir, "deployment", "active.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.Now = func() time.Time { return minimum.Add(time.Hour) }
+	repeated, err := manager.ActivateAtOrAfter(identity, minimum)
+	if err != nil || repeated != active {
+		t.Fatalf("repeat reaffirm = %#v/%v", repeated, err)
+	}
+	after, err := os.ReadFile(filepath.Join(manager.StateDir, "deployment", "active.json"))
+	if err != nil || !bytes.Equal(before, after) {
+		t.Fatalf("repeat reaffirm rewrote active = %q/%v", after, err)
+	}
+	if _, err := manager.ActivateAtOrAfter(identity, time.Time{}); !IsKind(err, ErrorInvalidState) {
+		t.Fatalf("zero minimum error = %v", err)
 	}
 }
 

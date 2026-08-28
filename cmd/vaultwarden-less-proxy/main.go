@@ -59,7 +59,10 @@ func execute(ctx context.Context, arguments []string, stdout, stderr io.Writer) 
 			}); err != nil {
 				return err
 			}
-			return upgrade.ServingAllowed(config.StateDir, buildinfo.ProjectCommit, deployment)
+			return upgrade.ServingAllowed(ctx, config.StateDir, config.DataDir, deploymentstate.Identity{
+				ProjectCommit: buildinfo.ProjectCommit,
+				Release:       buildinfo.Release,
+			}, deployment)
 		},
 		healthURL: "http://127.0.0.1:8080" + proxyserver.HealthPath,
 		serve:     serve,

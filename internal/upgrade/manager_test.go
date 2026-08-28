@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/hellodword/vaultwarden-less/internal/config"
+	"github.com/hellodword/vaultwarden-less/internal/deployment"
 	"github.com/hellodword/vaultwarden-less/internal/snapshot"
 	"github.com/hellodword/vaultwarden-less/internal/upstream"
 	_ "github.com/mattn/go-sqlite3"
@@ -29,6 +30,7 @@ const (
 type managerFixture struct {
 	state      string
 	data       string
+	restore    string
 	deployment config.Deployment
 	now        time.Time
 }
@@ -72,10 +74,10 @@ func TestUpgradeAcceptedPathIsDurableAcrossManagerRestarts(t *testing.T) {
 	if _, err := fixture.manager(testACommit, testARelease).Prepare(testBCommit, testBRelease); !IsKind(err, ErrorConflict) {
 		t.Fatalf("prepare repeated after freeze = %v", err)
 	}
-	if err := ServingAllowed(fixture.state, testACommit, fixture.deployment); !IsKind(err, ErrorConflict) {
+	if err := fixture.serving(testACommit, testARelease); !IsKind(err, ErrorConflict) {
 		t.Fatalf("frozen A serve = %v", err)
 	}
-	if err := ServingAllowed(fixture.state, testBCommit, fixture.deployment); !IsKind(err, ErrorConflict) {
+	if err := fixture.serving(testBCommit, testBRelease); !IsKind(err, ErrorConflict) {
 		t.Fatalf("frozen B serve = %v", err)
 	}
 
@@ -110,14 +112,262 @@ func TestUpgradeAcceptedPathIsDurableAcrossManagerRestarts(t *testing.T) {
 		t.Fatalf("accept = %#v/%v", accepted, err)
 	}
 	state := paths(fixture.state)
-	if _, err := os.Lstat(state.current); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("current remains after accept: %v", err)
+	if _, err := os.Lstat(state.current); err != nil {
+		t.Fatalf("current was archived before services and cleanup: %v", err)
 	}
-	if err := ServingAllowed(fixture.state, testBCommit, fixture.deployment); err != nil {
+	if err := fixture.serving(testBCommit, testBRelease); err != nil {
 		t.Fatalf("accepted B serve: %v", err)
 	}
 	if _, err := fixture.manager(testACommit, testARelease).Rollback(context.Background()); !IsKind(err, ErrorConflict) {
 		t.Fatalf("post-accept rollback error = %v", err)
+	}
+	finalized, err := fixture.manager(testBCommit, testBRelease).Finalize(context.Background())
+	if err != nil || finalized.Phase != PhaseAccepted {
+		t.Fatalf("accept finalize = %#v/%v", finalized, err)
+	}
+	if _, err := os.Lstat(state.current); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("current remains after finalize: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(state.history, prepared.UpgradeID, decisionName)); err != nil {
+		t.Fatalf("accepted decision was not archived: %v", err)
+	}
+}
+
+func TestTerminalDecisionFaultMatrixIsResumableAndConflictingDecisionIsRejected(t *testing.T) {
+	t.Run("accept decision survives activation failure", func(t *testing.T) {
+		fixture := newManagerFixture(t)
+		prepareAndMigrate(t, fixture)
+		b := fixture.manager(testBCommit, testBRelease)
+		if _, err := b.Verify(context.Background(), []string{"primary"}, fixedCollector(evidence([]string{"primary"}, "a"))); err != nil {
+			t.Fatal(err)
+		}
+		drillCalls := 0
+		b.Activate = func(expected, target deployment.Identity, notBefore time.Time) error {
+			drillCalls++
+			if expected.ProjectCommit != testACommit || target.ProjectCommit != testBCommit {
+				t.Fatalf("activation identities = %#v/%#v", expected, target)
+			}
+			if notBefore.IsZero() {
+				t.Fatal("accept activation did not carry the decision instant")
+			}
+			return errors.New("synthetic activation interruption")
+		}
+		if _, err := b.Accept(context.Background(), func(context.Context) error { return nil }); !IsKind(err, ErrorInvalidState) {
+			t.Fatalf("interrupted accept = %v", err)
+		}
+		state := paths(fixture.state)
+		decisionBefore, err := os.ReadFile(state.decision)
+		if err != nil {
+			t.Fatal(err)
+		}
+		prepare, err := readPrepare(state, fixture.deployment)
+		if err != nil {
+			t.Fatal(err)
+		}
+		decision, err := readDecision(state, prepare)
+		if err != nil || decision.Decision != DecisionAccept {
+			t.Fatalf("accept decision = %#v/%v", decision, err)
+		}
+		active, err := deployment.ReadActive(fixture.state)
+		if err != nil || active.ProjectCommit != testACommit {
+			t.Fatalf("active before resumed accept = %#v/%v", active, err)
+		}
+		if decision.DecidedAt <= active.ActivatedAt {
+			t.Fatalf("decision instant %q did not follow prior activation %q", decision.DecidedAt, active.ActivatedAt)
+		}
+		if _, err := fixture.manager(testACommit, testARelease).Rollback(context.Background()); !IsKind(err, ErrorConflict) {
+			t.Fatalf("rollback after accept decision = %v", err)
+		}
+
+		resumed := fixture.manager(testBCommit, testBRelease)
+		result, err := resumed.Accept(context.Background(), func(context.Context) error {
+			t.Fatal("resumed accept repeated the pre-decision drill")
+			return nil
+		})
+		if err != nil || result.Phase != PhaseAccepted || drillCalls != 1 {
+			t.Fatalf("resumed accept = %#v/%v activation calls=%d", result, err, drillCalls)
+		}
+		active, err = deployment.ReadActive(fixture.state)
+		if err != nil || active.ProjectCommit != testBCommit || active.Release != testBRelease {
+			t.Fatalf("active after resumed accept = %#v/%v", active, err)
+		}
+		if active.ActivatedAt < decision.DecidedAt {
+			t.Fatalf("terminal activation %q predates decision %q", active.ActivatedAt, decision.DecidedAt)
+		}
+		decisionAfter, err := os.ReadFile(state.decision)
+		if err != nil || !bytes.Equal(decisionBefore, decisionAfter) {
+			t.Fatalf("accept decision was rewritten = %q/%v", decisionAfter, err)
+		}
+	})
+
+	t.Run("rollback exchange survives activation failure", func(t *testing.T) {
+		fixture := newManagerFixture(t)
+		a := fixture.manager(testACommit, testARelease)
+		if _, err := a.Prepare(testBCommit, testBRelease); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := a.Freeze(context.Background(), []string{"primary"}, fixedCollector(evidence([]string{"primary"}, "b"))); err != nil {
+			t.Fatal(err)
+		}
+		writePrivateFile(t, filepath.Join(fixture.data, "b-only"), []byte("candidate B"))
+		rollback := fixture.manager(testACommit, testARelease)
+		activationCalls := 0
+		rollback.Activate = func(expected, target deployment.Identity, notBefore time.Time) error {
+			activationCalls++
+			if expected != target || target.ProjectCommit != testACommit {
+				t.Fatalf("rollback activation identities = %#v/%#v", expected, target)
+			}
+			if notBefore.IsZero() {
+				t.Fatal("rollback activation did not carry the decision instant")
+			}
+			return errors.New("synthetic post-exchange interruption")
+		}
+		if _, err := rollback.Rollback(context.Background()); !IsKind(err, ErrorInvalidState) {
+			t.Fatalf("interrupted rollback = %v", err)
+		}
+		state := paths(fixture.state)
+		decisionBefore, err := os.ReadFile(state.decision)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if data, err := os.ReadFile(filepath.Join(state.rollback, "b-only")); err != nil || string(data) != "candidate B" {
+			t.Fatalf("post-exchange B tree = %q/%v", data, err)
+		}
+		if err := fixture.serving(testACommit, testARelease); !IsKind(err, ErrorConflict) {
+			t.Fatalf("A served before rollback activation was reaffirmed: %v", err)
+		}
+		resumed := fixture.manager(testACommit, testARelease)
+		resumed.Exchange = func(string, string) error {
+			t.Fatal("resumed rollback repeated the exchange")
+			return nil
+		}
+		result, err := resumed.Rollback(context.Background())
+		if err != nil || result.Phase != PhaseRolledBack || activationCalls != 1 {
+			t.Fatalf("resumed rollback = %#v/%v activation calls=%d", result, err, activationCalls)
+		}
+		decisionAfter, err := os.ReadFile(state.decision)
+		if err != nil || !bytes.Equal(decisionBefore, decisionAfter) {
+			t.Fatalf("rollback decision was rewritten = %q/%v", decisionAfter, err)
+		}
+		if _, err := fixture.manager(testBCommit, testBRelease).Accept(context.Background(), func(context.Context) error {
+			t.Fatal("conflicting accept performed a drill check")
+			return nil
+		}); !IsKind(err, ErrorConflict) {
+			t.Fatalf("accept after rollback decision = %v", err)
+		}
+	})
+}
+
+func TestTerminalStateWriteTransientsAreValidatedAndRecovered(t *testing.T) {
+	t.Run("accept", func(t *testing.T) {
+		fixture := newManagerFixture(t)
+		prepareAndMigrate(t, fixture)
+		b := fixture.manager(testBCommit, testBRelease)
+		if _, err := b.Verify(context.Background(), []string{"primary"}, fixedCollector(evidence([]string{"primary"}, "a"))); err != nil {
+			t.Fatal(err)
+		}
+		state := paths(fixture.state)
+		operatorEntry := filepath.Join(state.current, stateWritePrefix+decisionName+"-operator")
+		writePrivateFile(t, operatorEntry, []byte("not upgrade-owned"))
+		if _, err := b.Accept(context.Background(), func(context.Context) error { return nil }); !IsKind(err, ErrorInvalidState) {
+			t.Fatalf("similarly named unexpected entry = %v", err)
+		}
+		if data, err := os.ReadFile(operatorEntry); err != nil || string(data) != "not upgrade-owned" {
+			t.Fatalf("unexpected entry was removed or changed: %q/%v", data, err)
+		}
+		if err := os.Remove(operatorEntry); err != nil {
+			t.Fatal(err)
+		}
+
+		transient, err := createSyncedTemporary(state.current, decisionName, []byte("partial decision"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := CandidateServingAllowed(
+			fixture.state, testBCommit, testBRelease, testACommit, testARelease, fixture.deployment,
+		); err != nil {
+			t.Fatalf("safe interrupted write blocked candidate gate: %v", err)
+		}
+		if err := os.Chmod(transient, 0o640); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := b.Accept(context.Background(), func(context.Context) error { return nil }); !IsKind(err, ErrorInvalidState) {
+			t.Fatalf("unsafe reserved transient = %v", err)
+		}
+		if _, err := os.Lstat(transient); err != nil {
+			t.Fatalf("unsafe reserved transient was removed: %v", err)
+		}
+		if err := os.Chmod(transient, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		accepted, err := b.Accept(context.Background(), func(context.Context) error { return nil })
+		if err != nil || accepted.Phase != PhaseAccepted {
+			t.Fatalf("accept after interrupted state write = %#v/%v", accepted, err)
+		}
+		if _, err := os.Lstat(transient); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("decision transient survived accept retry: %v", err)
+		}
+	})
+
+	t.Run("rollback", func(t *testing.T) {
+		fixture := newManagerFixture(t)
+		a := fixture.manager(testACommit, testARelease)
+		if _, err := a.Prepare(testBCommit, testBRelease); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := a.Freeze(context.Background(), []string{"primary"}, fixedCollector(evidence([]string{"primary"}, "b"))); err != nil {
+			t.Fatal(err)
+		}
+		writePrivateFile(t, filepath.Join(fixture.data, "b-only"), []byte("candidate B"))
+		state := paths(fixture.state)
+		transient, err := createSyncedTemporary(state.current, decisionName, []byte("partial decision"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		rolledBack, err := a.Rollback(context.Background())
+		if err != nil || rolledBack.Phase != PhaseRolledBack {
+			t.Fatalf("rollback after interrupted state write = %#v/%v", rolledBack, err)
+		}
+		if _, err := os.Lstat(transient); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("decision transient survived rollback retry: %v", err)
+		}
+	})
+}
+
+func TestFinalizeRequiresExactDrillCleanup(t *testing.T) {
+	fixture := newManagerFixture(t)
+	prepareAndMigrate(t, fixture)
+	b := fixture.manager(testBCommit, testBRelease)
+	if _, err := b.Verify(context.Background(), []string{"primary"}, fixedCollector(evidence([]string{"primary"}, "c"))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Accept(context.Background(), func(context.Context) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	drill := filepath.Join(fixture.restore, "drill")
+	if err := os.Mkdir(drill, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writePrivateFile(t, filepath.Join(drill, "manifest.json"), []byte("synthetic verified drill"))
+	if _, err := b.Finalize(context.Background()); !IsKind(err, ErrorConflict) {
+		t.Fatalf("finalize before cleanup = %v", err)
+	}
+	cleaned := false
+	b.RemoveDrill = func(_ context.Context, path, projectCommit string) error {
+		if path != drill || projectCommit != testBCommit {
+			t.Fatalf("cleanup boundary = %q/%q", path, projectCommit)
+		}
+		cleaned = true
+		return os.RemoveAll(path)
+	}
+	if result, err := b.CleanupDrill(context.Background()); err != nil || result.Phase != PhaseAccepted || !cleaned {
+		t.Fatalf("cleanup = %#v/%v cleaned=%t", result, err, cleaned)
+	}
+	if _, err := b.CleanupDrill(context.Background()); err != nil {
+		t.Fatalf("idempotent cleanup = %v", err)
+	}
+	if _, err := b.Finalize(context.Background()); err != nil {
+		t.Fatalf("finalize after cleanup = %v", err)
 	}
 }
 
@@ -223,23 +473,44 @@ func TestExplicitRollbackExchangesAAndQuarantinesOpaqueB(t *testing.T) {
 		t.Fatalf("rollback = %#v/%v", rolledBack, err)
 	}
 	for _, rsa := range []string{"rsa_key.pem", "rsa_key.pub.pem"} {
-		if _, err := os.Lstat(filepath.Join(fixture.data, rsa)); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("RSA state remains at %s: %v", rsa, err)
+		if _, err := os.Lstat(filepath.Join(fixture.data, rsa)); err != nil {
+			t.Fatalf("restored A RSA state is missing at %s: %v", rsa, err)
 		}
 	}
 	state := paths(fixture.state)
 	quarantine := filepath.Join(state.quarantine, upgradeID(testACommit, testBCommit))
-	if data, err := os.ReadFile(filepath.Join(quarantine, "data", "b-only")); err != nil || string(data) != "failed B data" {
+	if data, err := os.ReadFile(filepath.Join(state.rollback, "b-only")); err != nil || string(data) != "failed B data" {
+		t.Fatalf("exchanged B data = %q/%v", data, err)
+	}
+	for _, current := range []string{state.current, state.candidate, state.decision} {
+		if _, err := os.Lstat(current); err != nil {
+			t.Fatalf("terminal current state was removed before finalize at %s: %v", current, err)
+		}
+	}
+	if err := fixture.serving(testACommit, testARelease); err != nil {
+		t.Fatalf("rolled-back A serve: %v", err)
+	}
+	if err := RollbackServingAllowed(
+		context.Background(), fixture.state, fixture.data,
+		deployment.Identity{ProjectCommit: testACommit, Release: testARelease}, fixture.deployment,
+	); err != nil {
+		t.Fatalf("rollback A gate: %v", err)
+	}
+	writePrivateFile(t, filepath.Join(fixture.data, "post-start"), []byte("ordinary A runtime mutation"))
+	if err := fixture.serving(testACommit, testARelease); err != nil {
+		t.Fatalf("restarted A service after runtime mutation: %v", err)
+	}
+	finalized, err := fixture.manager(testACommit, testARelease).Finalize(context.Background())
+	if err != nil || finalized.Phase != PhaseRolledBack {
+		t.Fatalf("rollback finalize = %#v/%v", finalized, err)
+	}
+	if data, err := os.ReadFile(filepath.Join(quarantine, rollbackDataName, "b-only")); err != nil || string(data) != "failed B data" {
 		t.Fatalf("quarantined B data = %q/%v", data, err)
 	}
-	if _, err := os.Lstat(filepath.Join(quarantine, candidateName)); err != nil {
-		t.Fatalf("opaque candidate was not moved: %v", err)
-	}
-	if _, err := os.Lstat(filepath.Join(state.history, upgradeID(testACommit, testBCommit), ticketName)); err != nil {
-		t.Fatalf("rollback history missing ticket: %v", err)
-	}
-	if err := ServingAllowed(fixture.state, testACommit, fixture.deployment); err != nil {
-		t.Fatalf("rolled-back A serve: %v", err)
+	for _, archived := range []string{candidateName, decisionName, ticketName} {
+		if _, err := os.Lstat(filepath.Join(quarantine, archived)); err != nil {
+			t.Fatalf("rollback archive missing %s: %v", archived, err)
+		}
 	}
 }
 
@@ -260,6 +531,9 @@ func TestRollbackDoesNotDecodeOpaqueCandidate(t *testing.T) {
 	result, err := fixture.manager(testACommit, testARelease).Rollback(context.Background())
 	if err != nil || result.Phase != PhaseRolledBack {
 		t.Fatalf("opaque rollback = %#v/%v", result, err)
+	}
+	if _, err := fixture.manager(testACommit, testARelease).Finalize(context.Background()); err != nil {
+		t.Fatal(err)
 	}
 	quarantined := filepath.Join(state.quarantine, upgradeID(testACommit, testBCommit), candidateName)
 	got, err := os.ReadFile(quarantined)
@@ -291,7 +565,10 @@ func TestRollbackQuarantinesFutureBTreeWithoutTraversingIt(t *testing.T) {
 	if data, err := os.ReadFile(sentinel); err != nil || string(data) != "must remain untouched" {
 		t.Fatalf("external sentinel = %q/%v", data, err)
 	}
-	quarantined := filepath.Join(paths(fixture.state).quarantine, upgradeID(testACommit, testBCommit), "data", "future-b-link")
+	if _, err := fixture.manager(testACommit, testARelease).Finalize(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	quarantined := filepath.Join(paths(fixture.state).quarantine, upgradeID(testACommit, testBCommit), rollbackDataName, "future-b-link")
 	info, err := os.Lstat(quarantined)
 	if err != nil || info.Mode()&os.ModeSymlink == 0 {
 		t.Fatalf("quarantined future entry = %v/%v", info, err)
@@ -591,7 +868,7 @@ func TestRollbackPreconditionFailuresNeverExchange(t *testing.T) {
 					t.Fatal(err)
 				}
 			},
-			wantError: ErrorInvalidState,
+			wantError: ErrorConflict,
 		},
 	}
 	for _, test := range tests {
@@ -614,7 +891,7 @@ func TestRollbackPreconditionFailuresNeverExchange(t *testing.T) {
 			if _, err := rollback.Rollback(context.Background()); !IsKind(err, test.wantError) || exchanges != 0 {
 				t.Fatalf("rollback error/exchanges = %v/%d", err, exchanges)
 			}
-			if err := ServingAllowed(fixture.state, testACommit, fixture.deployment); !IsKind(err, ErrorConflict) && !IsKind(err, ErrorInvalidState) {
+			if err := fixture.serving(testACommit, testARelease); !IsKind(err, ErrorConflict) && !IsKind(err, ErrorInvalidState) && !IsKind(err, ErrorVerification) {
 				t.Fatalf("serving gate after failed rollback = %v", err)
 			}
 		})
@@ -623,17 +900,17 @@ func TestRollbackPreconditionFailuresNeverExchange(t *testing.T) {
 
 func TestServingGateAllowsAOnlyBeforeFreezeAndFailsClosed(t *testing.T) {
 	fixture := newManagerFixture(t)
-	if err := ServingAllowed(fixture.state, testACommit, fixture.deployment); err != nil {
+	if err := fixture.serving(testACommit, testARelease); err != nil {
 		t.Fatalf("fresh serve = %v", err)
 	}
 	a := fixture.manager(testACommit, testARelease)
 	if _, err := a.Prepare(testBCommit, testBRelease); err != nil {
 		t.Fatal(err)
 	}
-	if err := ServingAllowed(fixture.state, testACommit, fixture.deployment); err != nil {
+	if err := fixture.serving(testACommit, testARelease); err != nil {
 		t.Fatalf("prepared A serve = %v", err)
 	}
-	if err := ServingAllowed(fixture.state, testBCommit, fixture.deployment); !IsKind(err, ErrorConflict) {
+	if err := fixture.serving(testBCommit, testBRelease); !IsKind(err, ErrorConflict) {
 		t.Fatalf("prepared B serve = %v", err)
 	}
 	state := paths(fixture.state)
@@ -642,12 +919,12 @@ func TestServingGateAllowsAOnlyBeforeFreezeAndFailsClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 	writePrivateFile(t, state.compose, bytes.Replace(compose, []byte("LISTEN_PORT=8080"), []byte("LISTEN_PORT=8082"), 1))
-	if err := ServingAllowed(fixture.state, testACommit, fixture.deployment); !IsKind(err, ErrorInvalidState) {
+	if err := fixture.serving(testACommit, testARelease); !IsKind(err, ErrorInvalidState) {
 		t.Fatalf("tampered compose serve = %v", err)
 	}
 	writePrivateFile(t, state.compose, compose)
 	writePrivateFile(t, state.ticket, []byte(`{"schema_version":1}`+"\n"))
-	if err := ServingAllowed(fixture.state, testACommit, fixture.deployment); !IsKind(err, ErrorInvalidState) {
+	if err := fixture.serving(testACommit, testARelease); !IsKind(err, ErrorInvalidState) {
 		t.Fatalf("corrupt frozen serve = %v", err)
 	}
 }
@@ -662,7 +939,7 @@ func TestServingGateRejectsHardLinkedAndOversizedState(t *testing.T) {
 		if err := os.Link(state.prepare, filepath.Join(state.current, "prepare-link")); err != nil {
 			t.Fatal(err)
 		}
-		if err := ServingAllowed(fixture.state, testACommit, fixture.deployment); !IsKind(err, ErrorInvalidState) {
+		if err := fixture.serving(testACommit, testARelease); !IsKind(err, ErrorInvalidState) {
 			t.Fatalf("hard-linked state serve = %v", err)
 		}
 	})
@@ -672,7 +949,7 @@ func TestServingGateRejectsHardLinkedAndOversizedState(t *testing.T) {
 			t.Fatal(err)
 		}
 		writePrivateFile(t, paths(fixture.state).prepare, bytes.Repeat([]byte("x"), MaxStateBytes+1))
-		if err := ServingAllowed(fixture.state, testACommit, fixture.deployment); !IsKind(err, ErrorInvalidState) {
+		if err := fixture.serving(testACommit, testARelease); !IsKind(err, ErrorInvalidState) {
 			t.Fatalf("oversized state serve = %v", err)
 		}
 	})
@@ -683,17 +960,27 @@ func newManagerFixture(t *testing.T) managerFixture {
 	root := t.TempDir()
 	state := filepath.Join(root, "state")
 	data := filepath.Join(root, "data")
-	for _, directory := range []string{state, data} {
+	restore := filepath.Join(root, "restore")
+	for _, directory := range []string{state, data, restore} {
 		if err := os.Mkdir(directory, 0o700); err != nil {
 			t.Fatal(err)
 		}
+	}
+	active := deployment.Manager{
+		StateDir: state, DataDir: data,
+		ProjectCommit: testACommit, Release: testARelease,
+		Now: func() time.Time { return time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC) },
+	}
+	if _, err := active.Init(); err != nil {
+		t.Fatal(err)
 	}
 	createContractDatabase(t, filepath.Join(data, "db.sqlite3"))
 	writePrivateFile(t, filepath.Join(data, "rsa_key.pem"), []byte("private"))
 	writePrivateFile(t, filepath.Join(data, "rsa_key.pub.pem"), []byte("public"))
 	return managerFixture{
-		state: state,
-		data:  data,
+		state:   state,
+		data:    data,
+		restore: restore,
 		deployment: config.Deployment{
 			SchemaVersion: config.SchemaVersion,
 			RuntimeUID:    uint32(os.Geteuid()),
@@ -705,9 +992,16 @@ func newManagerFixture(t *testing.T) managerFixture {
 	}
 }
 
+func (fixture managerFixture) serving(commit, release string) error {
+	return ServingAllowed(
+		context.Background(), fixture.state, fixture.data,
+		deployment.Identity{ProjectCommit: commit, Release: release}, fixture.deployment,
+	)
+}
+
 func (fixture managerFixture) manager(commit, release string) Manager {
 	return Manager{
-		StateDir: fixture.state, DataDir: fixture.data, Deployment: fixture.deployment,
+		StateDir: fixture.state, DataDir: fixture.data, RestoreRoot: fixture.restore, Deployment: fixture.deployment,
 		ProjectCommit: commit, Release: release, Now: func() time.Time { return fixture.now },
 		Database: func(ctx context.Context, path string) (DatabaseContract, error) {
 			contract, err := snapshot.ValidateDatabaseContract(ctx, path)

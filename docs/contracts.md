@@ -145,6 +145,9 @@ The file is canonical one-line JSON followed by LF. Unknown or duplicate
 fields, trailing values, wrong JSON types, another schema version, a
 non-lowercase/full commit, a release that does not contain the matching first
 12 commit characters, and a non-UTC millisecond timestamp are invalid.
+For a terminal workflow, immutable `decided_at` is chosen strictly after the
+prior active instant. The resulting `activated_at` is also the publication
+boundary for the completed data transition and must not predate that decision.
 
 `deployment init` requires one clean immutable build, an existing empty
 `data` directory, no active document, and no `state/upgrade/current` or
@@ -160,8 +163,11 @@ exactly one Compose-owned mode: `normal`, `upgrade-candidate`, `rollback`,
 `drill`, or `import`. The gate validates the clean build identity before
 executing `/bin/vaultwarden`:
 
-- `normal` requires active commit and release to match the image and requires
-  the normal upgrade serving gate to accept current state;
+- `normal` requires active commit and release to match the image. It permits A
+  during prepare before freeze; afterwards current must contain an immutable
+  terminal decision for that same identity. Rollback proves live `data` has
+  A's frozen tree ID before publishing the terminal active instant and before
+  any normal process opens it;
 - `upgrade-candidate` requires immutable B, active A, and a frozen current
   upgrade with valid rollback evidence and no terminal decision;
 - `rollback` requires the immutable rollback decision and active A;
@@ -345,6 +351,8 @@ upgrade freeze
 upgrade migrate-check
 upgrade verify
 upgrade accept
+upgrade cleanup-drill
+upgrade finalize
 rollback apply
 healthcheck
 version
@@ -736,6 +744,7 @@ state/upgrade/current/
   prepare.json
   rollback-ticket.json
   candidate.json
+  decision.json
   compose.env
   rollback-data/
 state/upgrade/history/<upgrade-id>/
@@ -826,7 +835,6 @@ closed and has no live sidecar before this copy is accepted.
   "database_migration": "<audited-B-migration>",
   "database_schema_fingerprint": "sha256:<64-lowercase-hex>",
   "updated_at": "2026-08-27T12:34:56.789Z",
-  "accepted_at": null,
   "targets": [{
     "target": "primary",
     "snapshot_id": "<64-lowercase-hex>",
@@ -836,10 +844,27 @@ closed and has no live sidecar before this copy is accepted.
 }
 ```
 
-Phase is `migrated`, `verified`, or `accepted`. `targets` is empty while
-migrated and equals the configured verification-target order after verify.
-`accepted_at` is null before accept and is the acceptance instant after it.
-All other fields are always present.
+Phase is only `migrated` or `verified`. `targets` is empty while migrated and
+equals the configured verification-target order after verify. Acceptance never
+rewrites this evidence document and the old `accepted`/`accepted_at` shape is
+invalid schema 1 state.
+
+`decision.json` is created once and is immutable. It has exactly:
+
+```json
+{
+  "schema_version": 1,
+  "upgrade_id": "<A>..<B>",
+  "decision": "accept",
+  "active_project_commit": "<B>",
+  "active_release": "<B-immutable-release>",
+  "decided_at": "2026-08-27T12:34:56.789Z"
+}
+```
+
+`decision` is `accept` with B's exact identity or `rollback` with A's exact
+identity. A conflicting decision can never replace it. Once it exists, only
+the matching terminal command may continue.
 
 The required production sequence is:
 
@@ -856,13 +881,17 @@ The required production sequence is:
    remain stopped.
 6. B checks exact schema/migration, snapshots only verification targets,
    restores each through Restic, and starts an isolated B drill.
-7. `upgrade accept` is explicit. Before it, B proxy and resident backup refuse
-   to serve. A successful accept is the only state transition that permits the
-   tracked orchestration to start them.
-8. Accept moves the complete current directory to
-   `history/<upgrade-id>` with accepted candidate evidence. The rollback copy
-   is retained as history, but ordinary rollback is permanently rejected
-   because external writes may now exist.
+7. `upgrade accept` is explicit. It validates the healthy B drill, atomically
+   creates the accept decision, and then idempotently changes active identity
+   from A to B. An interruption after the decision can only resume accept and
+   does not repeat the pre-decision drill authorization.
+8. `scripts/deployment.py upgrade accept` starts B's three normal services,
+   waits for health, proves every container image ID matches its immutable B
+   tag and OCI identity, removes only the verified drill containers, volume,
+   and restore, then invokes `upgrade finalize`. Finalize moves the complete
+   current directory to `history/<upgrade-id>` only after active B and drill
+   cleanup are consistent. The rollback copy remains in history, while
+   ordinary rollback is permanently rejected once accept is decided.
 
 Evidence can be reused only when A snapshot ID, content ID, archive ID, project
 commit, B commit, configured target order, and state-file bytes all match.
@@ -873,16 +902,27 @@ mismatch, cross-filesystem layout, or changed evidence returns `conflict` or
 `upgrade_state_invalid` before side effects.
 
 No pre-accept failure automatically rolls back. Proxy remains stopped. The
-operator invokes immutable A `rollback apply`. A validates only its prepare and
-ticket, the exact active and rollback paths, device IDs, and rollback tree. It
-uses Linux `renameat2(RENAME_EXCHANGE)` to exchange active B data with A
-rollback data atomically, moves the exchanged B tree to
-`quarantine/<upgrade-id>/data`, moves `candidate.json` there without reading
-it, records immutable rolled-back evidence in `history/<upgrade-id>`, and
-removes RSA state from active A data. Tracked orchestration then starts only
-the immutable A rollback services. Any failure leaves proxy stopped and does
-not delete either data tree. After accept, current A ticket is absent and A
-rollback returns `conflict` without reading history candidate data.
+operator invokes immutable A `rollback apply`. A validates only its prepare,
+ticket, exact active/rollback paths, device IDs, and frozen A tree; it treats a
+safe `candidate.json` as opaque. It first atomically creates the rollback
+decision, then uses Linux `renameat2(RENAME_EXCHANGE)` only when the tree IDs
+show A is still in `rollback-data`. If `data` already has A's tree ID, a rerun
+does not exchange again. The command finally idempotently confirms active A;
+after verifying the exchange it refreshes A's `activated_at` no earlier than
+the rollback decision. That refresh is the startup marker which lets all three
+ordinary A services open the now-mutable tree without repeatedly hashing it;
+an interruption before the refresh leaves every service gate closed. A rerun
+preserves the refreshed instant. The command does not rewrite A data or remove
+RSA state.
+
+`scripts/deployment.py upgrade rollback` stops B and drill services, invokes
+that resumable A command, verifies and retags only A's three immutable images
+as local, starts and verifies the three ordinary A services, removes only the
+verified drill resources, and invokes A `upgrade finalize`. Until then current
+retains the decision, candidate, and exchanged B tree. Finalize moves that
+complete directory to `quarantine/<upgrade-id>`. Any interruption can repeat
+the same terminal command; neither data tree is deleted and the opposite
+decision remains impossible.
 
 Migration, repository verification, and drill failures are induced in tests by
 real read-only permissions, an invalid disposable target, and corrupted
@@ -901,23 +941,34 @@ project does not manage.
 
 ## Development scripts
 
-The only durable Python scripts are
-`capture_vaultwarden_schema.py`, `release.py`, `upstream_diff.py`, and
-`verify_go_test.py`; each uses only the standard library and has a same-named
-contract test. They are development tools, not the product CLI. Schema capture,
-release, and upstream diff may print one result path followed by LF. The Go
-verifier relays `go test -json` evidence and prints its single verification
-result. They do not use the product JSON envelope.
+The only durable Python scripts are `capture_vaultwarden_schema.py`,
+`deployment.py`, `release.py`, `upstream_diff.py`, and `verify_go_test.py`;
+each uses only the standard library and has a same-named contract test.
+`deployment.py` is the host terminal-workflow orchestrator; the others are
+development/verification tools. Schema capture, release, and upstream diff may
+print one result path followed by LF. The Go verifier relays `go test -json`
+evidence and prints its single verification result.
 
 Their exact command surfaces are:
 
 ```text
 capture_vaultwarden_schema.py --database <sqlite-file> [--upstreams UPSTREAMS.toml] [--output internal/upstream/vaultwarden-schema.json]
+deployment.py [--deployment-root <directory>] [--project-name <name>] upgrade <accept|rollback>
 release.py create --output-root <ignored-directory>
 release.py load <release-directory>
 upstream_diff.py <vaultwarden|bitwarden-cli|restic|moto|go> <candidate-tag> [--upstreams UPSTREAMS.toml]
 verify_go_test.py --require <package>:<test> [--require ...] -- <go test -json command>
 ```
+
+`deployment.py` accepts only a real deployment root, a bounded Compose project
+name, and the named terminal workflow. It strictly reads canonical private
+active/prepare/decision/Compose state, never reads the database, and passes
+only structured argv to Docker. It never uses a shell, `sed`, an exported
+release variable, a socket mount, or a prune command. Success is one canonical
+schema-1 JSON line with `status` equal to `completed` or `already_complete`,
+the workflow/decision, upgrade ID, and exact active identity. Usage and runtime
+failures use bounded `usage_error` or `deployment_orchestration_failed` JSON
+errors and exit 2 or 1 respectively.
 
 Schema capture refuses a symlink database or output/parent, opens SQLite
 read-only with WAL-aware semantics, checks `quick_check`, exact audited latest

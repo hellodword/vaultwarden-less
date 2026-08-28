@@ -10,6 +10,7 @@ import (
 
 	"github.com/hellodword/vaultwarden-less/internal/buildinfo"
 	"github.com/hellodword/vaultwarden-less/internal/config"
+	deploymentstate "github.com/hellodword/vaultwarden-less/internal/deployment"
 	"github.com/hellodword/vaultwarden-less/internal/notify"
 	"github.com/hellodword/vaultwarden-less/internal/snapshot"
 	"github.com/hellodword/vaultwarden-less/internal/worker"
@@ -31,14 +32,18 @@ func serveCommand(configPath *string, environment commandEnvironment) *cobra.Com
 			if environment.loadDeployment == nil {
 				return commandFailure(codeInternal, "Deployment validation is unavailable", nil)
 			}
-			deployment, err := environment.loadDeployment(environment.deploymentPath)
+			configured, err := environment.loadDeployment(environment.deploymentPath)
 			if err != nil {
 				return commandFailure(codeInvalidConfig, "The deployment environment is invalid", err)
 			}
 			if err := environment.requireActive(environment.stateDir, buildinfo.ProjectCommit, buildinfo.Release); err != nil {
 				return commandFailure(codeNotReady, "Backup serving requires the exact active release", err)
 			}
-			if err := environment.allowServe(environment.stateDir, buildinfo.ProjectCommit, deployment); err != nil {
+			if err := environment.allowServe(
+				cmd.Context(), environment.stateDir, environment.dataDir,
+				deploymentstate.Identity{ProjectCommit: buildinfo.ProjectCommit, Release: buildinfo.Release},
+				configured,
+			); err != nil {
 				return commandFailure(codeNotReady, "Backup serving is frozen pending upgrade completion", err)
 			}
 			cfg, err := environment.backup(*configPath)

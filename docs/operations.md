@@ -1,9 +1,10 @@
 # Operations and recovery
 
 These procedures run on an ordinary Linux/amd64 deployment host with Git,
-Docker Engine, and the Docker Compose plugin. Nix is needed only to build or
-verify source and create releases. Run commands from the exact deployment
-clone; Compose bind paths are relative to it.
+Python 3, Docker Engine, and the Docker Compose plugin. Python is needed only
+for the standard-library terminal upgrade orchestrator. Nix is needed only to
+build or verify source and create releases. Run commands from the exact
+deployment clone; Compose bind paths are relative to it.
 
 Never run `git clean -x` or `git clean -X` in a deployment clone. Do not delete
 or overwrite `data`, `restore`, `state`, credentials, or a repository merely to

@@ -75,7 +75,6 @@ x-upgrade-maintenance-volumes: &upgrade-maintenance-volumes
 services:
   vaultwarden:
     image: "vaultwarden-less-vaultwarden:${B_RELEASE:?B_RELEASE is required}"
-    command: [upgrade-candidate]
 
   backup:
     image: "vaultwarden-less-backup:${B_RELEASE:?B_RELEASE is required}"
@@ -100,6 +99,44 @@ services:
 
   drill-vaultwarden:
     image: "vaultwarden-less-vaultwarden:${B_RELEASE:?B_RELEASE is required}"
+
+  upgrade-vaultwarden-b:
+    <<: *upgrade-service-defaults
+    image: "vaultwarden-less-vaultwarden:${B_RELEASE:?B_RELEASE is required}"
+    pull_policy: never
+    profiles: [upgrade]
+    restart: "no"
+    hostname: vaultwarden
+    command: [upgrade-candidate]
+    env_file:
+      - ./config/vaultwarden.env
+    volumes:
+      - type: bind
+        source: ./.env
+        target: /deployment/.env
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./data
+        target: /data
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./state
+        target: /state
+        read_only: true
+        bind:
+          create_host_path: false
+    networks:
+      app:
+        aliases: [vaultwarden]
+    healthcheck:
+      test: [CMD, /healthcheck.sh]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
 
   upgrade-a:
     <<: *upgrade-service-defaults
@@ -137,8 +174,24 @@ services:
     command: [--help]
     volumes:
       - type: bind
-        source: .
-        target: /deployment
+        source: ./.env
+        target: /deployment/.env
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./data
+        target: /data
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./restore
+        target: /restore
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./state
+        target: /state
         bind:
           create_host_path: false
 

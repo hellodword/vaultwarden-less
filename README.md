@@ -14,9 +14,10 @@ releases with the same actual Vaultwarden version can fully verify the upgrade
 orchestrator without leaving a cross-version support gap. See the normative
 [supported component set](docs/contracts.md#supported-component-set).
 
-The deployment host needs only Git, Docker Engine, the Docker Compose plugin,
-and a release directory containing `images.tar.gz` and `SHA256SUMS`. It does
-not need Nix, Go, Python, Restic, or a registry.
+The deployment host needs only Git, Python 3, Docker Engine, the Docker Compose
+plugin, and a release directory containing `images.tar.gz` and `SHA256SUMS`.
+Python runs the standard-library-only terminal upgrade orchestrator; the host
+does not need Nix, Go, Restic, or a registry.
 
 ## Ten-minute local start
 

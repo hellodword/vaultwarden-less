@@ -21,8 +21,11 @@ const (
 	prepareName      = "prepare.json"
 	ticketName       = "rollback-ticket.json"
 	candidateName    = "candidate.json"
+	decisionName     = "decision.json"
 	composeName      = "compose.env"
 	rollbackDataName = "rollback-data"
+	stateWritePrefix = ".vaultwarden-less-upgrade-state-"
+	stateWriteSuffix = ".tmp"
 )
 
 type statePaths struct {
@@ -34,6 +37,7 @@ type statePaths struct {
 	prepare    string
 	ticket     string
 	candidate  string
+	decision   string
 	compose    string
 	rollback   string
 }
@@ -50,6 +54,7 @@ func paths(stateDir string) statePaths {
 		prepare:    filepath.Join(current, prepareName),
 		ticket:     filepath.Join(current, ticketName),
 		candidate:  filepath.Join(current, candidateName),
+		decision:   filepath.Join(current, decisionName),
 		compose:    filepath.Join(current, composeName),
 		rollback:   filepath.Join(current, rollbackDataName),
 	}
@@ -116,6 +121,17 @@ func readCandidate(state statePaths, prepare Prepare) (Candidate, error) {
 		return Candidate{}, stateError(ErrorInvalidState, err)
 	}
 	return candidate, nil
+}
+
+func readDecision(state statePaths, prepare Prepare) (Decision, error) {
+	var decision Decision
+	if err := readStrictJSON(state.decision, &decision); err != nil {
+		return Decision{}, stateError(ErrorInvalidState, fmt.Errorf("read upgrade decision: %w", err))
+	}
+	if err := decision.validate(prepare); err != nil {
+		return Decision{}, stateError(ErrorInvalidState, err)
+	}
+	return decision, nil
 }
 
 func readStrictJSON(path string, destination any) error {
@@ -255,7 +271,7 @@ func replaceJSON(path string, value any) error {
 	if _, err := readStateBytes(path); err != nil {
 		return fmt.Errorf("validate replaced state file: %w", err)
 	}
-	temporary, err := createSyncedTemporary(filepath.Dir(path), "."+filepath.Base(path)+"-", data)
+	temporary, err := createSyncedTemporary(filepath.Dir(path), filepath.Base(path), data)
 	if err != nil {
 		return err
 	}
@@ -274,7 +290,7 @@ func writeNewFile(path string, data []byte) error {
 	if err := privatefs.ValidatePrivateDirectory(parent); err != nil {
 		return err
 	}
-	temporary, err := createSyncedTemporary(parent, "."+filepath.Base(path)+"-", data)
+	temporary, err := createSyncedTemporary(parent, filepath.Base(path), data)
 	if err != nil {
 		return err
 	}
@@ -285,8 +301,11 @@ func writeNewFile(path string, data []byte) error {
 	return privatefs.SyncDirectory(parent)
 }
 
-func createSyncedTemporary(parent, pattern string, data []byte) (string, error) {
-	file, err := os.CreateTemp(parent, pattern)
+func createSyncedTemporary(parent, target string, data []byte) (string, error) {
+	if !stateWriteTarget(target) {
+		return "", fmt.Errorf("upgrade state write target is invalid")
+	}
+	file, err := os.CreateTemp(parent, stateWritePrefix+target+"-*"+stateWriteSuffix)
 	if err != nil {
 		return "", err
 	}
@@ -347,12 +366,75 @@ func validateCurrentEntries(current string) error {
 		return err
 	}
 	allowed := map[string]struct{}{
-		prepareName: {}, ticketName: {}, candidateName: {}, composeName: {}, rollbackDataName: {},
+		prepareName: {}, ticketName: {}, candidateName: {}, decisionName: {}, composeName: {}, rollbackDataName: {},
 	}
 	for _, entry := range entries {
-		if _, ok := allowed[entry.Name()]; !ok {
+		if _, ok := allowed[entry.Name()]; ok {
+			continue
+		}
+		if !stateWriteTemporary(entry.Name()) {
 			return fmt.Errorf("upgrade current contains an unexpected entry")
 		}
+		if err := validateStateWriteTemporary(current, entry.Name()); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func cleanupCurrentWriteTransients(current string) error {
+	if err := privatefs.ValidatePrivateDirectory(current); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(current)
+	if err != nil {
+		return err
+	}
+	removed := false
+	for _, entry := range entries {
+		if !stateWriteTemporary(entry.Name()) {
+			continue
+		}
+		if err := validateStateWriteTemporary(current, entry.Name()); err != nil {
+			return err
+		}
+		if err := os.Remove(filepath.Join(current, entry.Name())); err != nil {
+			return err
+		}
+		removed = true
+	}
+	if removed {
+		return privatefs.SyncDirectory(current)
+	}
+	return nil
+}
+
+func stateWriteTarget(name string) bool {
+	return name == prepareName || name == ticketName || name == candidateName || name == decisionName || name == composeName
+}
+
+func stateWriteTemporary(name string) bool {
+	if !strings.HasSuffix(name, stateWriteSuffix) {
+		return false
+	}
+	for _, target := range []string{prepareName, ticketName, candidateName, decisionName, composeName} {
+		prefix := stateWritePrefix + target + "-"
+		if strings.HasPrefix(name, prefix) && len(name) > len(prefix)+len(stateWriteSuffix) {
+			return true
+		}
+	}
+	return false
+}
+
+func validateStateWriteTemporary(current, name string) error {
+	info, err := os.Lstat(filepath.Join(current, name))
+	if err != nil {
+		return err
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o600 ||
+		!ok || stat.Uid != uint32(os.Geteuid()) || stat.Gid != uint32(os.Getegid()) || stat.Nlink != 1 || info.Size() > MaxStateBytes {
+		return fmt.Errorf("upgrade current contains an unsafe state-write transient")
 	}
 	return nil
 }
