@@ -31,9 +31,12 @@ Before `prepare`:
   the decision owner for accept versus rollback.
 
 Framework acceptance needs different clean product commits and immutable tags.
-It is **not** real cross-version compatibility evidence unless the actual
-Vaultwarden versions in A and B differ and the complete scenario runs with
-both.
+It is complete orchestration evidence for that exact managed release pair even
+when both releases contain the same actual Vaultwarden version; that outcome
+does not leave a compatibility gap. Exact-pair cross-version compatibility is
+a separate claim available only when the actual Vaultwarden versions differ
+and the complete scenario runs with both. Neither claim covers substituted or
+independently upgraded components outside the project-managed set.
 
 ## Supported orchestrator
 
@@ -233,7 +236,10 @@ For every product upgrade, record:
 8. restart/idempotency behavior at every phase;
 9. post-terminal service, repository, history/quarantine, and resource state.
 
-Only claim real Vaultwarden cross-version compatibility when items 1–9 ran
-with two genuinely different Vaultwarden versions. Two commits that package
-the same Vaultwarden version prove the orchestration framework, not that
-version boundary.
+Only claim exact-pair Vaultwarden cross-version compatibility when items 1–9
+ran with two genuinely different versions managed by the corresponding project
+releases. Two commits that package the same Vaultwarden version completely
+prove the orchestration framework for their exact pair without creating a
+pending cross-version promise. Neither outcome supports arbitrary Vaultwarden,
+Restic, Bitwarden CLI, or other component builds outside the project-managed
+set.

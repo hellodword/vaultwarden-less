@@ -16,6 +16,31 @@ fractional digits, for example `2026-08-27T12:34:56.789Z`. A full commit is 40
 lowercase hexadecimal characters. A digest is `sha256:` followed by 64
 lowercase hexadecimal characters.
 
+## Supported component set
+
+Compatibility and support claims are scoped to one exact clean project commit
+and its immutable release. The supported component set is exactly the project
+binaries, images, Compose files, and audited upstream packages selected by that
+commit's `flake.nix`, tool-generated `flake.lock`, and `UPSTREAMS.toml`. This
+includes the selected Vaultwarden and unmodified Restic packages and, for
+development and acceptance, the selected Bitwarden CLI, Moto, and Go toolchain.
+
+Replacing, rebuilding, relabelling, or independently upgrading any of those
+components is outside the contract, even if its name, CLI, protocol, schema, or
+version appears compatible. A candidate upstream version enters the supported
+set only through a reviewed project commit, project-produced immutable release,
+and the acceptance required by this contract. The project makes no support or
+compatibility promise for arbitrary Vaultwarden, Restic, Bitwarden CLI, Moto,
+Go, image, or wrapper versions outside that managed set.
+
+Support evidence is exact-set and exact-pair evidence, not a general upstream
+compatibility matrix. Two managed project releases that contain the same actual
+Vaultwarden version can completely verify the A/B orchestration contract
+without creating an unverified cross-version obligation. If two managed
+releases intentionally contain different actual Vaultwarden versions,
+cross-version compatibility may be claimed only for that exact pair after the
+complete upgrade scenario passes.
+
 ## Deployment clone
 
 The deployment directory is an ordinary Git clone. There is no generated
@@ -139,8 +164,9 @@ array of at most 64 objects with exactly `name` and `value`. An option name is
 1 to 256 bytes, unique within the target, and contains no NUL, CR, LF, or `=`.
 Its value is a string of at most 4096 bytes with no NUL, CR, or LF. Each option
 becomes the two arguments `--option` and `name=value`, in configured order.
-Restic, not this product, decides whether the repository and options are
-supported.
+Within the project-managed Restic package, Restic decides whether the
+repository and options are supported. This delegation does not extend project
+support to another Restic build or version.
 
 `upgrade_verification_targets` contains 1 to 32 unique target names, preserves
 order, and is a subset (including the possible full set) of `targets`.
@@ -815,9 +841,13 @@ restart after every phase must yield either a valid idempotent continuation or
 a stable refusal, never an inferred transition.
 
 Framework verification requires different A/B clean commits and immutable
-tags. It is reported separately from real cross-version verification. The
-latter is true only after the same scenario runs with two schema 1 releases
-whose actual Vaultwarden versions differ.
+tags and covers that exact managed release pair. When both releases contain the
+same actual Vaultwarden version, this is complete framework evidence and not an
+unverified compatibility obligation. Exact-pair cross-version verification is
+an additional claim available only after the same scenario runs with two
+managed schema 1 releases whose actual Vaultwarden versions differ. Neither
+result promises compatibility for an upstream version or build that the
+project does not manage.
 
 ## Development scripts
 

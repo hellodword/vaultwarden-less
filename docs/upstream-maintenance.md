@@ -4,6 +4,13 @@ Upstream changes are deliberate, one-component reviews. The goal is not to
 follow the newest tag; it is to preserve the implemented schema-1 behavior with
 auditable evidence, exact inputs, a small diff, and a complete rollback path.
 
+An upstream candidate is outside the project's compatibility and support scope
+until a reviewed project commit locks it, records it in the audited inventory,
+builds the project-owned products, and passes the required acceptance. Running
+the project with an independently substituted Vaultwarden, Restic, Bitwarden
+CLI, Moto, Go, image, or wrapper version is diagnostic only and creates no
+support promise.
+
 [`UPSTREAMS.toml`](../UPSTREAMS.toml) is the human-reviewed inventory for
 Vaultwarden, Bitwarden CLI, Restic, Moto, and Go. It records source repository,
 tag, commit, and relevant audit paths; Vaultwarden also records the accepted
@@ -81,7 +88,9 @@ Acceptance requires the complete local gate, release reproducibility, real
 backup/restore/drill lifecycle, two-target degradation/catch-up, and the A/B
 upgrade suite with the prior actual Vaultwarden version as A and the candidate
 actual version as B. If those versions do not differ, the result is only
-framework evidence.
+framework evidence for that exact managed release pair; it is complete for
+that claim and does not create a pending cross-version obligation. If they do
+differ, a passing suite supports only that exact managed pair.
 
 ## Bitwarden CLI checklist
 
@@ -224,7 +233,9 @@ Then repeat the archive-only cold deployment acceptance in
 For an actual Vaultwarden change, the upgrade suite must cover migration
 permission failure, invalid verification target, corrupt drill, isolated
 evidence/accept, explicit rollback for each pre-accept failure, and success with
-two genuinely different Vaultwarden versions.
+two genuinely different project-managed Vaultwarden versions. The resulting
+compatibility claim applies only to that exact release pair, not to other
+upstream versions or independently built images.
 
 ## Final review
 

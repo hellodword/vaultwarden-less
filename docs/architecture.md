@@ -187,5 +187,7 @@ rollback; there is no automatic data exchange. See [Upgrades](upgrades.md).
   effects and never infer permission to overwrite a real destination.
 - Moto acceptance validates the Restic/S3 protocol boundary, not a cloud
   provider's production behavior.
-- Framework A/B acceptance with two commits is not real cross-version evidence
-  unless the actual Vaultwarden versions differ.
+- Framework A/B acceptance completely covers its exact project-managed release
+  pair. Same-version pairs create no pending compatibility obligation;
+  cross-version claims require two different managed Vaultwarden versions and
+  apply only to that exact pair.

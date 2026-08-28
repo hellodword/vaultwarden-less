@@ -6,6 +6,14 @@ successful writes and logins into backup demand. The worker creates a verified
 SQLite recovery point, includes only database-referenced attachments and file
 Sends, and writes it to one or more Restic repositories.
 
+Compatibility and support claims apply only to the exact clean project commit,
+immutable release, and upstream component set locked and audited by this
+repository. Substituting or independently upgrading Vaultwarden, Restic,
+Bitwarden CLI, or another audited component is outside that scope. Two project
+releases with the same actual Vaultwarden version can fully verify the upgrade
+orchestrator without leaving a cross-version support gap. See the normative
+[supported component set](docs/contracts.md#supported-component-set).
+
 The deployment host needs only Git, Docker Engine, the Docker Compose plugin,
 and a release directory containing `images.tar.gz` and `SHA256SUMS`. It does
 not need Nix, Go, Python, Restic, or a registry.

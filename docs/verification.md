@@ -127,9 +127,10 @@ It proves:
 7. task-scoped containers, networks, volumes, credentials, appdata, and temp
    outputs are removed.
 
-This proves supported API/CLI paths in the audited version. It is not a full
-Vaultwarden feature test, browser UI test, email/push test, or production TLS
-edge test.
+This proves the exercised API/CLI paths for the exact project-managed and
+audited component set. It is not a full Vaultwarden feature test, browser UI
+test, email/push test, production TLS edge test, or evidence for a substituted
+Vaultwarden or Bitwarden CLI version.
 
 ## Two-repository degradation and catch-up
 
@@ -178,11 +179,14 @@ releases. The suite proves:
 - an isolated evidence/accept success path;
 - tamper, wrong-owner, terminal conflict, restart, and cleanup boundaries.
 
-Different commits and tags prove the framework. Real cross-version
-compatibility is true only if the images report different actual Vaultwarden
-versions and the entire suite ran with that pair. If both report the same
-version, record the boundary as unverified rather than inferring it from commit
-identity.
+Different clean commits and immutable tags prove the framework for that exact
+managed release pair. If both images report the same actual Vaultwarden
+version, the framework result is complete and creates no pending cross-version
+support obligation. Exact-pair cross-version compatibility may additionally be
+claimed only when two project-managed releases report different actual
+Vaultwarden versions and the entire suite ran with that pair. No result extends
+to a Vaultwarden, Restic, Bitwarden CLI, or other component version that the
+project does not manage.
 
 ## Aggregated non-upgrade gate
 
