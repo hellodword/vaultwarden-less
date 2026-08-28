@@ -1,6 +1,7 @@
 package snapshot
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -78,6 +79,20 @@ func copyStableFile(ctx context.Context, dataDir, destinationRoot string, ref re
 	if err != nil || !privatefs.SameFileVersion(before, after) || written != before.Size() {
 		return File{}, &ConsistencyError{Path: ref.Path, Reason: "changed_during_copy"}
 	}
+	digest := hash.Sum(nil)
+	if _, err := source.Seek(0, io.SeekStart); err != nil {
+		return File{}, fmt.Errorf("rewind contained source file: %w", err)
+	}
+	verificationHash := sha256.New()
+	verified, err := copyWithContext(ctx, verificationHash, source)
+	if err != nil {
+		return File{}, fmt.Errorf("verify copied source file: %w", err)
+	}
+	verifiedAfter, err := source.Stat()
+	if err != nil || !privatefs.SameFileVersion(after, verifiedAfter) || verified != written ||
+		!bytes.Equal(digest, verificationHash.Sum(nil)) {
+		return File{}, &ConsistencyError{Path: ref.Path, Reason: "changed_during_copy"}
+	}
 	latest, err := openSourceFile(dataDir, ref.Path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -97,7 +112,7 @@ func copyStableFile(ctx context.Context, dataDir, destinationRoot string, ref re
 		return File{}, fmt.Errorf("close destination file: %w", err)
 	}
 	keep = true
-	return File{Path: ref.Path, Size: written, SHA256: "sha256:" + hex.EncodeToString(hash.Sum(nil))}, nil
+	return File{Path: ref.Path, Size: written, SHA256: "sha256:" + hex.EncodeToString(digest)}, nil
 }
 
 func openSourceFile(dataDir, relative string) (*os.File, error) {
