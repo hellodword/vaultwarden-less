@@ -571,9 +571,11 @@ class Orchestrator:
                 "import-vaultwarden",
             ]
         )
-        if not context.decision:
-            self._import_cli("accept")
-            context = _read_import_context(self.root, current)
+        # Decision, exchange, and active publication are separate durable
+        # boundaries inside the idempotent Go operation, so replay it even
+        # when a prior process already wrote decision.json.
+        self._import_cli("accept")
+        context = _read_import_context(self.root, current)
         if not context.decision or _read_active(self.root) != context.identity:
             raise DeploymentError(
                 "import accept did not publish the exact active identity"

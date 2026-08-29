@@ -202,7 +202,7 @@ class ImportFixture:
     def write_json(self, path: Path, value: dict[str, object]) -> None:
         self.write_file(path, json.dumps(value, separators=(",", ":")) + "\n")
 
-    def decide(self) -> None:
+    def write_decision(self) -> None:
         decision = self.current / "decision.json"
         if decision.exists():
             return
@@ -217,6 +217,9 @@ class ImportFixture:
                 "decided_at": "2026-08-28T14:00:00.000Z",
             },
         )
+
+    def complete_accept(self) -> None:
+        self.write_decision()
         deployment_state = self.root / "state" / "deployment"
         deployment_state.mkdir(mode=0o700, exist_ok=True)
         deployment_state.chmod(0o700)
@@ -380,7 +383,7 @@ class FakeImportDocker:
             return completed(arguments, returncode=1)
 
         if arguments[-3:] == ["deployment", "import", "accept"]:
-            self.fixture.decide()
+            self.fixture.complete_accept()
         elif arguments[-3:] == ["deployment", "import", "finalize"]:
             self.fixture.archive()
 
@@ -632,6 +635,23 @@ class ImportOrchestratorTest(unittest.TestCase):
         repeated = self.orchestrator(fake).terminal_import()
         self.assertEqual(repeated["status"], "already_complete")
 
+    def test_accept_replays_a_preexisting_decision_before_exchange(self) -> None:
+        self.fixture.write_decision()
+        self.assertFalse((self.root / "state" / "deployment").exists())
+        self.assertTrue(any(self.fixture.candidate.iterdir()))
+        fake = FakeImportDocker(self.fixture)
+
+        result = self.orchestrator(fake).terminal_import()
+
+        self.assertEqual(result["status"], "completed")
+        accept_calls = [
+            call
+            for call in fake.calls
+            if call[-3:] == ["deployment", "import", "accept"]
+        ]
+        self.assertEqual(len(accept_calls), 1)
+        self.assertFalse(self.fixture.candidate.exists())
+
     def test_accept_resumes_after_decision_service_and_finalize_failures(self) -> None:
         fake = FakeImportDocker(self.fixture)
         fake.fail_suffix = ("deployment", "import", "accept")
@@ -672,7 +692,7 @@ class ImportOrchestratorTest(unittest.TestCase):
             for call in fake.calls
             if call[-3:] == ["deployment", "import", "accept"]
         ]
-        self.assertEqual(len(accept_calls), 2)
+        self.assertEqual(len(accept_calls), 4)
 
     def test_tampered_import_state_is_rejected_before_docker(self) -> None:
         document = json.loads(
