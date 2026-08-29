@@ -443,12 +443,48 @@ func TestRollbackManagerUsesOneCommonDeploymentRoot(t *testing.T) {
 	if loadedPath != filepath.Join(root, ".env") {
 		t.Fatalf("rollback deployment path = %q", loadedPath)
 	}
+	terminal, err := terminalUpgradeManager(environment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if terminal.DataDir != filepath.Join(root, "data") || terminal.StateDir != filepath.Join(root, "state") ||
+		terminal.RestoreRoot != filepath.Join(root, "restore") {
+		t.Fatalf("terminal rollback paths = %q/%q/%q", terminal.DataDir, terminal.StateDir, terminal.RestoreRoot)
+	}
 	regular, err := upgradeManager(environment)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if regular.DataDir != environment.dataDir || regular.StateDir != environment.stateDir {
 		t.Fatalf("regular upgrade paths changed = %q/%q", regular.DataDir, regular.StateDir)
+	}
+}
+
+func TestTerminalUpgradeManagerKeepsRegularMountsWithoutCommonRoot(t *testing.T) {
+	environment := testEnvironment(nil, nil)
+	environment.deploymentRoot = filepath.Join(t.TempDir(), "not-mounted")
+	manager, err := terminalUpgradeManager(environment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manager.DataDir != environment.dataDir || manager.StateDir != environment.stateDir ||
+		manager.RestoreRoot != environment.restoreRoot {
+		t.Fatalf("regular terminal paths changed = %q/%q/%q", manager.DataDir, manager.StateDir, manager.RestoreRoot)
+	}
+}
+
+func TestTerminalUpgradeManagerRejectsUnsafeCommonRoot(t *testing.T) {
+	environment := testEnvironment(nil, nil)
+	root := t.TempDir()
+	unsafe := filepath.Join(root, "not-a-directory")
+	if err := os.WriteFile(unsafe, []byte("unsafe\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	environment.deploymentRoot = unsafe
+	_, err := terminalUpgradeManager(environment)
+	var commandError *CommandError
+	if !errors.As(err, &commandError) || commandError.Code != codeInternal {
+		t.Fatalf("unsafe terminal root = %#v", err)
 	}
 }
 

@@ -125,7 +125,7 @@ func upgradeCommand(configPath *string, environment commandEnvironment) *cobra.C
 	cleanupDrill := &cobra.Command{
 		Use: "cleanup-drill", Short: "Remove only the verified terminal upgrade drill", Args: noArguments,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			manager, err := upgradeManager(environment)
+			manager, err := terminalUpgradeManager(environment)
 			if err != nil {
 				return err
 			}
@@ -141,7 +141,7 @@ func upgradeCommand(configPath *string, environment commandEnvironment) *cobra.C
 	finalize := &cobra.Command{
 		Use: "finalize", Short: "Archive a decided upgrade after service and drill cleanup checks", Args: noArguments,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			manager, err := upgradeManager(environment)
+			manager, err := terminalUpgradeManager(environment)
 			if err != nil {
 				return err
 			}
@@ -183,16 +183,41 @@ func rollbackCommand(environment commandEnvironment) *cobra.Command {
 }
 
 func rollbackManager(environment commandEnvironment) (upgrade.Manager, error) {
-	root := filepath.Clean(environment.deploymentRoot)
-	if environment.deploymentRoot == "" || !filepath.IsAbs(environment.deploymentRoot) ||
-		root != environment.deploymentRoot || root == string(filepath.Separator) {
-		return upgrade.Manager{}, commandFailure(codeInternal, "The rollback filesystem boundary is invalid", nil)
+	root, err := commonDeploymentRoot(environment)
+	if err != nil {
+		return upgrade.Manager{}, err
+	}
+	metadata, err := os.Lstat(root)
+	if err != nil || !metadata.IsDir() || metadata.Mode()&os.ModeSymlink != 0 {
+		return upgrade.Manager{}, commandFailure(codeInternal, "The rollback filesystem boundary is invalid", err)
 	}
 	environment.deploymentPath = filepath.Join(root, ".env")
 	environment.dataDir = filepath.Join(root, "data")
 	environment.restoreRoot = filepath.Join(root, "restore")
 	environment.stateDir = filepath.Join(root, "state")
 	return upgradeManager(environment)
+}
+
+func terminalUpgradeManager(environment commandEnvironment) (upgrade.Manager, error) {
+	root, err := commonDeploymentRoot(environment)
+	if err != nil {
+		return upgrade.Manager{}, err
+	}
+	if _, err := os.Lstat(root); errors.Is(err, os.ErrNotExist) {
+		return upgradeManager(environment)
+	} else if err != nil {
+		return upgrade.Manager{}, commandFailure(codeInternal, "The rollback filesystem boundary is invalid", err)
+	}
+	return rollbackManager(environment)
+}
+
+func commonDeploymentRoot(environment commandEnvironment) (string, error) {
+	root := filepath.Clean(environment.deploymentRoot)
+	if environment.deploymentRoot == "" || !filepath.IsAbs(environment.deploymentRoot) ||
+		root != environment.deploymentRoot || root == string(filepath.Separator) {
+		return "", commandFailure(codeInternal, "The rollback filesystem boundary is invalid", nil)
+	}
+	return root, nil
 }
 
 func upgradeManager(environment commandEnvironment) (upgrade.Manager, error) {
