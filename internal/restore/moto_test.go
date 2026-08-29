@@ -32,6 +32,7 @@ const motoProjectCommit = "1111111111111111111111111111111111111111"
 
 var (
 	runMotoIntegration = flag.Bool("run-moto-integration", false, "run the real Moto and Restic integration test")
+	preloadedMotoImage = flag.Bool("preloaded-moto-image", false, "use the already loaded Nix-built Moto image")
 	motoHostPort       = flag.Int("moto-host-port", 0, "fixed host port for Moto; zero asks Docker for an ephemeral port")
 )
 
@@ -56,7 +57,13 @@ func TestMotoResticIntegration(t *testing.T) {
 	if _, err := docker.run(ctx, "info"); err != nil {
 		t.Fatalf("Docker daemon is required for the integration test: %v", err)
 	}
-	loadMotoImage(ctx, t, docker)
+	if *preloadedMotoImage {
+		if output, err := docker.run(ctx, "image", "inspect", motoServerImage); err != nil {
+			t.Fatalf("preloaded Moto image is unavailable: %v: %s", err, output)
+		}
+	} else {
+		loadMotoImage(ctx, t, docker)
+	}
 
 	containerName := fmt.Sprintf("vaultwarden-less-moto-%d-%d", os.Getpid(), time.Now().UnixNano())
 	publish := "127.0.0.1::5000"
@@ -108,6 +115,13 @@ func TestMotoResticIntegration(t *testing.T) {
 	}
 	if err := runner.Init(ctx, target); err != nil {
 		t.Fatal(err)
+	}
+	repositoryVersion, err := rawResticRepositoryVersion(ctx, resticBinary, cacheDir, passwordFile, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repositoryVersion != 2 {
+		t.Fatalf("repository format version = %d, want 2", repositoryVersion)
 	}
 
 	if !t.Run("backup_deduplicate_check_unlock_and_restore", func(t *testing.T) {
@@ -401,6 +415,34 @@ func testResticEnvironment() []string {
 		"AWS_ACCESS_KEY_ID=test",
 		"AWS_SECRET_ACCESS_KEY=test",
 	}
+}
+
+func rawResticRepositoryVersion(
+	ctx context.Context,
+	binary, cacheDir, passwordFile string,
+	target config.Target,
+) (int, error) {
+	arguments := []string{
+		"--repo", target.Repository,
+		"--password-file", passwordFile,
+		"--cache-dir", filepath.Join(cacheDir, target.Name),
+		"--option", "s3.bucket-lookup=path",
+		"--option", "s3.region=us-east-1",
+		"cat", "config",
+	}
+	command := exec.CommandContext(ctx, binary, arguments...)
+	command.Env = testResticEnvironment()
+	output, err := command.Output()
+	if err != nil {
+		return 0, fmt.Errorf("read repository config: %w", err)
+	}
+	var document struct {
+		Version int `json:"version"`
+	}
+	if err := json.Unmarshal(output, &document); err != nil {
+		return 0, fmt.Errorf("decode repository config: %w", err)
+	}
+	return document.Version, nil
 }
 
 func rawResticSnapshotIDs(

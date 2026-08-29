@@ -6,9 +6,11 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -23,7 +25,10 @@ type upgradeRelease struct {
 	commit             string
 	release            string
 	vaultwardenVersion string
+	resticVersion      string
 }
+
+var resticReleaseVersionPattern = regexp.MustCompile(`^[0-9]+[.][0-9]+[.][0-9]+(?:[-+][0-9A-Za-z.-]+)?$`)
 
 type upgradeFixture struct {
 	t               *testing.T
@@ -61,6 +66,14 @@ func TestUpgradeRollbackLifecycle(t *testing.T) {
 	} else {
 		t.Logf("upgrade framework uses distinct real Vaultwarden versions A=%q B=%q", from.vaultwardenVersion, to.vaultwardenVersion)
 	}
+	if resticCrossVersionRequired(from, to) {
+		t.Logf("release pair uses distinct real Restic versions A=%q B=%q", from.resticVersion, to.resticVersion)
+	} else {
+		t.Logf("release pair uses one real Restic version %q; cross-version Restic matrix is not applicable", from.resticVersion)
+	}
+	t.Run("restic-release-compatibility", func(t *testing.T) {
+		verifyResticReleaseCompatibility(t, imageHarness, from, to)
+	})
 
 	t.Run("migration-permission-failure-explicit-rollback", func(t *testing.T) {
 		fixture := newUpgradeFixture(t, ctx, from, to, false)
@@ -218,6 +231,7 @@ func prepareUpgradeImages(
 	for _, release := range []*upgradeRelease{from, to} {
 		validateUpgradeReleaseImages(t, harness, release)
 		release.vaultwardenVersion = vaultwardenImageVersion(t, harness, *release)
+		release.resticVersion = resticImageVersion(t, harness, *release)
 	}
 	if output, err := harness.docker("image", "inspect", "vaultwarden-less-moto:local"); err != nil {
 		t.Fatalf("preloaded Moto image is unavailable: %v: %s", err, harnessDiagnostics(output))
@@ -259,6 +273,261 @@ func vaultwardenImageVersion(t *testing.T, harness *e2eHarness, release upgradeR
 		t.Fatalf("read immutable Vaultwarden version: %v: %s", err, harnessDiagnostics(output))
 	}
 	return strings.TrimSpace(output)
+}
+
+func resticImageVersion(t *testing.T, harness *e2eHarness, release upgradeRelease) string {
+	t.Helper()
+	output, err := harness.docker(
+		"run", "--rm", "--pull", "never", "--network", "none", "--user", "1000:1000",
+		"--read-only", "--security-opt", "no-new-privileges:true", "--cap-drop", "ALL",
+		"--entrypoint", "/bin/restic", "vaultwarden-less-backup:"+release.release, "version", "--json",
+	)
+	if err != nil {
+		t.Fatalf("read immutable Restic version: %v: %s", err, harnessDiagnostics(output))
+	}
+	var document struct {
+		MessageType string `json:"message_type"`
+		Version     string `json:"version"`
+	}
+	if err := json.Unmarshal([]byte(output), &document); err != nil || document.MessageType != "version" ||
+		!resticReleaseVersionPattern.MatchString(document.Version) {
+		t.Fatalf("immutable Restic version output is invalid: %v", err)
+	}
+	return document.Version
+}
+
+func resticCrossVersionRequired(from, to upgradeRelease) bool {
+	return from.resticVersion != to.resticVersion
+}
+
+type resticReleaseMount struct {
+	source   string
+	target   string
+	readOnly bool
+}
+
+func verifyResticReleaseCompatibility(t *testing.T, harness *e2eHarness, from, to upgradeRelease) {
+	t.Helper()
+	if !resticCrossVersionRequired(from, to) {
+		return
+	}
+
+	root := filepath.Join(harness.localRoot, "restic-release-compatibility")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	directory := func(name string) string {
+		path := filepath.Join(root, name)
+		if err := os.Mkdir(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	repository := directory("repository")
+	cacheA := directory("cache-a")
+	cacheB := directory("cache-b")
+	dataA := directory("data-a")
+	dataB := directory("data-b")
+	restoreBA := directory("restore-b-from-a")
+	restoreAB := directory("restore-a-from-b")
+	password := filepath.Join(root, "password")
+	writePrivateFile(t, password, "synthetic-restic-release-password\n")
+	writePrivateFile(t, filepath.Join(dataA, "a.txt"), "written by release A\n")
+	writePrivateFile(t, filepath.Join(dataB, "a.txt"), "written by release A\n")
+	writePrivateFile(t, filepath.Join(dataB, "b.txt"), "written by release B\n")
+
+	containerName := harness.project + "-restic-release"
+	t.Cleanup(func() {
+		cleanupContext, cancel := context.WithTimeout(context.WithoutCancel(harness.ctx), 30*time.Second)
+		defer cancel()
+		_, _ = harness.dockerContext(cleanupContext, "rm", "--force", containerName)
+		if _, err := harness.dockerContext(cleanupContext, "container", "inspect", containerName); err == nil {
+			t.Error("Restic release compatibility container survived exact cleanup")
+		}
+	})
+	run := func(release upgradeRelease, cache string, mounts []resticReleaseMount, arguments ...string) string {
+		t.Helper()
+		uid := strconv.Itoa(os.Geteuid())
+		gid := strconv.Itoa(os.Getegid())
+		dockerArguments := []string{
+			"run", "--rm", "--pull", "never", "--name", containerName,
+			"--label", "vaultwarden-less.e2e.project=" + harness.project,
+			"--network", "none", "--user", uid + ":" + gid, "--read-only",
+			"--security-opt", "no-new-privileges:true", "--cap-drop", "ALL",
+			"--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=16m,mode=0700,uid=" + uid + ",gid=" + gid,
+			"--env", "HOME=/nonexistent", "--env", "TMPDIR=/tmp",
+			"--mount", "type=bind,src=" + repository + ",dst=/repository",
+			"--mount", "type=bind,src=" + password + ",dst=/credentials/password,readonly",
+			"--mount", "type=bind,src=" + cache + ",dst=/cache",
+		}
+		for _, mount := range mounts {
+			value := "type=bind,src=" + mount.source + ",dst=" + mount.target
+			if mount.readOnly {
+				value += ",readonly"
+			}
+			dockerArguments = append(dockerArguments, "--mount", value)
+		}
+		dockerArguments = append(
+			dockerArguments,
+			"--entrypoint", "/bin/restic", "vaultwarden-less-backup:"+release.release,
+			"--repo", "/repository", "--password-file", "/credentials/password", "--cache-dir", "/cache",
+		)
+		dockerArguments = append(dockerArguments, arguments...)
+		output, err := harness.docker(dockerArguments...)
+		if err != nil {
+			t.Fatalf("Restic %s command failed: %v: %s", arguments[0], err, harnessDiagnostics(output))
+		}
+		return output
+	}
+
+	run(from, cacheA, nil, "init", "--repository-version", "2", "--json")
+	var repositoryConfig struct {
+		Version int `json:"version"`
+	}
+	configOutput := run(from, cacheA, nil, "cat", "config")
+	if err := json.Unmarshal([]byte(configOutput), &repositoryConfig); err != nil || repositoryConfig.Version != 2 {
+		t.Fatalf("release A repository config = %#v/%v, want version 2", repositoryConfig, err)
+	}
+	aSnapshot := resticReleaseBackupID(t, run(
+		from, cacheA,
+		[]resticReleaseMount{{source: dataA, target: "/source", readOnly: true}},
+		"backup", "--json", "--host", "vaultwarden-less-release-compatibility", "--tag", "writer=a", "--", "/source",
+	))
+	assertResticReleaseSnapshots(t, run(to, cacheB, nil, "snapshots", "--json"), aSnapshot)
+	run(to, cacheB, nil, "check", "--json")
+	run(
+		to, cacheB,
+		[]resticReleaseMount{{source: restoreBA, target: "/restore"}},
+		"restore", "--json", "--verify", "--target", "/restore", aSnapshot,
+	)
+	assertResticReleaseRestore(t, restoreBA, map[string]string{"source/a.txt": "written by release A\n"})
+
+	bSnapshot := resticReleaseBackupID(t, run(
+		to, cacheB,
+		[]resticReleaseMount{{source: dataB, target: "/source", readOnly: true}},
+		"backup", "--json", "--host", "vaultwarden-less-release-compatibility", "--tag", "writer=b", "--", "/source",
+	))
+	if bSnapshot == aSnapshot {
+		t.Fatal("release B did not create a distinct snapshot")
+	}
+	assertResticReleaseSnapshots(t, run(from, cacheA, nil, "snapshots", "--json"), aSnapshot, bSnapshot)
+	run(from, cacheA, nil, "check", "--json")
+	run(
+		from, cacheA,
+		[]resticReleaseMount{{source: restoreAB, target: "/restore"}},
+		"restore", "--json", "--verify", "--target", "/restore", bSnapshot,
+	)
+	assertResticReleaseRestore(t, restoreAB, map[string]string{
+		"source/a.txt": "written by release A\n",
+		"source/b.txt": "written by release B\n",
+	})
+}
+
+func resticReleaseBackupID(t *testing.T, output string) string {
+	t.Helper()
+	result := ""
+	for _, line := range strings.Split(output, "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var message struct {
+			MessageType string `json:"message_type"`
+			SnapshotID  string `json:"snapshot_id"`
+		}
+		if err := json.Unmarshal([]byte(line), &message); err != nil {
+			t.Fatalf("decode Restic backup output: %v", err)
+		}
+		if message.MessageType == "summary" {
+			if result != "" || !lowerHex64Pattern.MatchString(message.SnapshotID) {
+				t.Fatal("Restic backup returned an invalid summary")
+			}
+			result = message.SnapshotID
+		}
+	}
+	if result == "" {
+		t.Fatal("Restic backup returned no summary")
+	}
+	return result
+}
+
+func assertResticReleaseSnapshots(t *testing.T, output string, expected ...string) {
+	t.Helper()
+	var documents []struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal([]byte(output), &documents); err != nil {
+		t.Fatalf("decode Restic snapshots: %v", err)
+	}
+	actual := make(map[string]bool, len(documents))
+	for _, document := range documents {
+		if !lowerHex64Pattern.MatchString(document.ID) || actual[document.ID] {
+			t.Fatal("Restic snapshots returned an invalid identity set")
+		}
+		actual[document.ID] = true
+	}
+	if len(actual) != len(expected) {
+		t.Fatalf("Restic snapshots = %#v, want %v", actual, expected)
+	}
+	for _, id := range expected {
+		if !actual[id] {
+			t.Fatalf("Restic snapshots omitted %s", id)
+		}
+	}
+}
+
+func assertResticReleaseRestore(t *testing.T, root string, expected map[string]string) {
+	t.Helper()
+	actual := map[string]string{}
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkError error) error {
+		if walkError != nil {
+			return walkError
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		if entry.Type()&os.ModeType != 0 {
+			return fmt.Errorf("restored special entry %s", entry.Name())
+		}
+		relative, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		actual[filepath.ToSlash(relative)] = string(content)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !maps.Equal(actual, expected) {
+		t.Fatalf("restored files = %#v, want %#v", actual, expected)
+	}
+}
+
+func TestResticCrossVersionDecisionAndOutputParsers(t *testing.T) {
+	from := upgradeRelease{resticVersion: "0.19.1"}
+	to := upgradeRelease{resticVersion: "0.19.1"}
+	if resticCrossVersionRequired(from, to) {
+		t.Fatal("equal actual Restic versions selected a cross-version matrix")
+	}
+	to.resticVersion = "0.20.0"
+	if !resticCrossVersionRequired(from, to) {
+		t.Fatal("distinct actual Restic versions did not select a cross-version matrix")
+	}
+	first := strings.Repeat("a", 64)
+	second := strings.Repeat("b", 64)
+	backup := `{"message_type":"status"}` + "\n" + `{"message_type":"summary","snapshot_id":"` + first + `"}`
+	if got := resticReleaseBackupID(t, backup); got != first {
+		t.Fatalf("backup ID = %s", got)
+	}
+	snapshots, err := json.Marshal([]map[string]string{{"id": first}, {"id": second}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertResticReleaseSnapshots(t, string(snapshots), first, second)
 }
 
 func (h *e2eHarness) selectProductionRelease(release upgradeRelease) {

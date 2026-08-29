@@ -254,7 +254,7 @@ func (r Runner) snapshotQuery(ctx context.Context, target config.Target, additio
 }
 
 func (r Runner) Init(ctx context.Context, target config.Target) error {
-	output, err := r.maintenance(ctx, target, []string{"init", "--json"})
+	output, err := r.maintenance(ctx, target, []string{"init", "--repository-version", "2", "--json"})
 	if err != nil {
 		return err
 	}

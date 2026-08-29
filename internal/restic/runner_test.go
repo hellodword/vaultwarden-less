@@ -433,6 +433,30 @@ func TestRestoreUsesExactSnapshotSubfolderAndCallerContext(t *testing.T) {
 	}
 }
 
+func TestInitUsesExactRepositoryVersionTwoArguments(t *testing.T) {
+	runner, target, calls := testRunner(t, func(_ context.Context, _ string, arguments, environment []string, _ string) ([]byte, error) {
+		if operation(arguments) != "init" {
+			t.Fatalf("unexpected operation: %#v", arguments)
+		}
+		assertExactCredentialEnvironment(t, environment)
+		return []byte(`{"message_type":"initialized","id":"` + firstSnapshotID + `","repository":"redacted"}` + "\n"), nil
+	})
+	if err := runner.Init(context.Background(), target); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"--repo", target.Repository,
+		"--password-file", filepath.Join(runner.PasswordRoot, target.Name),
+		"--cache-dir", filepath.Join(runner.CacheDir, target.Name),
+		"--option", "s3.region=ap-singapore",
+		"--option", "s3.bucket-lookup=path",
+		"init", "--repository-version", "2", "--json",
+	}
+	if len(*calls) != 1 || !slices.Equal((*calls)[0].arguments, want) {
+		t.Fatalf("init calls = %#v, want one call with %#v", *calls, want)
+	}
+}
+
 func TestMalformedMetadataAndNonzeroExitFailWithoutGuessingStderr(t *testing.T) {
 	runner, target, _ := testRunner(t, func(_ context.Context, _ string, arguments, _ []string, _ string) ([]byte, error) {
 		if operation(arguments) == "snapshots" {
