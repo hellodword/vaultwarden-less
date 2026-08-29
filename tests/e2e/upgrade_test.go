@@ -19,6 +19,7 @@ import (
 
 	productcli "github.com/hellodword/vaultwarden-less/internal/cli"
 	productdeployment "github.com/hellodword/vaultwarden-less/internal/deployment"
+	productsnapshot "github.com/hellodword/vaultwarden-less/internal/snapshot"
 	productupgrade "github.com/hellodword/vaultwarden-less/internal/upgrade"
 )
 
@@ -72,7 +73,7 @@ func TestUpgradeRollbackLifecycle(t *testing.T) {
 	fixture := newUpgradeFixture(t, ctx, from, to)
 	fixture.startCandidateAndRecordMigration()
 	fixture.verifyCandidate()
-	fixture.forceCorruptDrillFailure()
+	fixture.forceFinalDrillHealthFailure()
 	fixture.rollbackAfterExchangeInterruption()
 }
 
@@ -905,16 +906,38 @@ func (fixture *upgradeFixture) verifyCandidate() {
 	}
 }
 
-func (fixture *upgradeFixture) forceCorruptDrillFailure() {
+func (fixture *upgradeFixture) forceFinalDrillHealthFailure() {
 	fixture.t.Helper()
-	manifest := filepath.Join(fixture.harness.localRoot, "restore", "drill", "manifest.json")
-	writePrivateFile(fixture.t, manifest, "{\"schema_version\":1,\"corrupt\":true}\n")
-	fixture.harness.resetUpgradeDrill()
-	_, _ = fixture.harness.tryUpgradeCompose(
-		fixture.ctx, true, "--profile", "drill", "up", "--detach", "drill-vaultwarden",
+	fixture.startVerifiedDrill()
+	drill := filepath.Join(fixture.harness.localRoot, "restore", "drill")
+	manifestPath := filepath.Join(drill, "manifest.json")
+	manifestBefore, err := os.ReadFile(manifestPath)
+	if err != nil {
+		fixture.t.Fatalf("read verified drill manifest: %v", err)
+	}
+	verifiedBefore, err := productsnapshot.Verify(fixture.ctx, drill)
+	if err != nil || verifiedBefore.ProjectCommit != fixture.to.commit {
+		fixture.t.Fatalf("verify retained B drill before health failure: %#v/%v", verifiedBefore, err)
+	}
+
+	fixture.harness.upgradeComposeCommand(
+		true, "--profile", "drill", "stop", "drill-vaultwarden",
 	)
-	_ = fixture.harness.waitComposeServiceFailure("drill-copy", 90*time.Second)
+	fixture.harness.assertProxyClosed()
 	fixture.expectUpgradeFailure("verification_failure", "upgrade-b", "upgrade", "accept")
+	decision := filepath.Join(fixture.harness.localRoot, "state", "upgrade", "current", "decision.json")
+	if _, err := os.Lstat(decision); !os.IsNotExist(err) {
+		fixture.t.Fatalf("failed drill health check created a terminal decision: %v", err)
+	}
+	manifestAfter, err := os.ReadFile(manifestPath)
+	if err != nil || !bytes.Equal(manifestAfter, manifestBefore) {
+		fixture.t.Fatalf("failed drill health check changed the retained manifest: %v", err)
+	}
+	verifiedAfter, err := productsnapshot.Verify(fixture.ctx, drill)
+	if err != nil || verifiedAfter.ProjectCommit != fixture.to.commit ||
+		verifiedAfter.ContentID != verifiedBefore.ContentID || verifiedAfter.ArchiveID != verifiedBefore.ArchiveID {
+		fixture.t.Fatalf("retained B drill changed after health failure: %#v/%v", verifiedAfter, err)
+	}
 	_, _ = fixture.harness.tryUpgradeCompose(
 		fixture.ctx, true, "--profile", "drill", "rm", "--force", "--stop", "drill-vaultwarden", "drill-copy",
 	)
@@ -1298,34 +1321,6 @@ func (h *e2eHarness) waitComposeServiceHealthy(service string, timeout time.Dura
 		}
 	}
 	h.t.Fatalf("Compose service %s did not become healthy: %s", service, harnessDiagnostics(last))
-}
-
-func (h *e2eHarness) waitComposeServiceFailure(service string, timeout time.Duration) string {
-	h.t.Helper()
-	deadline := time.Now().Add(timeout)
-	last := ""
-	for time.Now().Before(deadline) {
-		container := h.composeServiceContainer(service, false)
-		if container != "" {
-			output, _ := h.docker("inspect", "--format", "{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}", container)
-			last = output
-			if strings.TrimSpace(output) == "running healthy" {
-				h.t.Fatalf("Compose service %s unexpectedly became healthy", service)
-			}
-			fields := strings.Fields(output)
-			if len(fields) > 0 && (fields[0] == "exited" || fields[0] == "restarting" || strings.Contains(output, "unhealthy")) {
-				logs, _ := h.docker("logs", "--tail", "100", container)
-				return logs
-			}
-		}
-		select {
-		case <-h.ctx.Done():
-			h.t.Fatal(h.ctx.Err())
-		case <-time.After(time.Second):
-		}
-	}
-	h.t.Fatalf("Compose service %s did not reach a failed state: %s", service, harnessDiagnostics(last))
-	return ""
 }
 
 func (h *e2eHarness) mappedComposeServiceEndpoint(service string, port int) string {
