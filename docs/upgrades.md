@@ -193,6 +193,9 @@ accept. The host orchestrator stops B/drill, asks A to create or resume the
 rollback decision and tree-ID-driven exchange, verifies and retags only A's
 three immutable images as local, starts the three ordinary A services, removes
 the verified drill, and only then archives current state to quarantine.
+The one-shot A role is networkless, non-root, capability-free, and uses one
+deployment-root bind so both exchange directories remain beneath the same
+mount; split `data`/`state` binds would make Linux reject the atomic exchange.
 
 ```sh
 python3 scripts/deployment.py upgrade rollback

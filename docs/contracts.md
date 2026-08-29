@@ -972,6 +972,14 @@ an interruption before the refresh leaves every service gate closed. A rerun
 preserves the refreshed instant. The command does not rewrite A data or remove
 RSA state.
 
+`rollback-a` is the immutable-A, networkless, non-root administrative role. It
+has one writable deployment-root bind at `/deployment-root` because Linux
+returns `EXDEV` when `data` and `rollback-data` are exposed as separate mount
+points. The command derives only `.env`, `data`, `restore`, and `state` paths
+under that fixed root; its container root filesystem is read-only, all
+capabilities are dropped, `no-new-privileges` is set, and no engine socket is
+mounted.
+
 `scripts/deployment.py upgrade rollback` stops B and drill services, invokes
 that resumable A command, verifies and retags only A's three immutable images
 as local, starts and verifies the three ordinary A services, removes only the

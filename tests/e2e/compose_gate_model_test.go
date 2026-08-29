@@ -170,11 +170,8 @@ func assertRollbackAdminIsolation(t *testing.T, service composeGateService, root
 	expectedUser := fmt.Sprintf("%d:%d", os.Geteuid(), os.Getegid())
 	if service.User != expectedUser || service.NetworkMode != "none" || !service.ReadOnly ||
 		!slices.Equal(service.CapDrop, []string{"ALL"}) ||
-		!slices.Equal(service.SecurityOpt, []string{"no-new-privileges:true"}) || len(service.Volumes) != 4 {
+		!slices.Equal(service.SecurityOpt, []string{"no-new-privileges:true"}) || len(service.Volumes) != 1 {
 		t.Fatalf("rollback service isolation is invalid: %#v", service)
 	}
-	assertGateMount(t, service, filepath.Join(root, ".env"), "/deployment/.env", true)
-	assertGateMount(t, service, filepath.Join(root, "data"), "/data", false)
-	assertGateMount(t, service, filepath.Join(root, "restore"), "/restore", false)
-	assertGateMount(t, service, filepath.Join(root, "state"), "/state", false)
+	assertGateMount(t, service, root, "/deployment-root", false)
 }

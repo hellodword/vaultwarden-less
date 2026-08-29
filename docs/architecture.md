@@ -198,6 +198,13 @@ Rollback uses the frozen tree ID to resume a single same-filesystem exchange,
 starts ordinary A services, and then archives the complete current record with
 exchanged B data to quarantine. See [Upgrades](upgrades.md).
 
+The networkless non-root `rollback-a` role receives one writable deployment-root
+bind because Linux cannot exchange `data` and
+`state/upgrade/current/rollback-data` through separate mount points. It derives
+its `.env`, data, restore, and state paths under that exact root, uses immutable
+A, has a read-only container root filesystem, no capabilities, and no container
+engine socket or network.
+
 ## Initial import ownership
 
 Initial import is a separate pre-active state machine. The operator keeps the

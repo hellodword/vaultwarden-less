@@ -496,6 +496,19 @@ func TestExplicitRollbackExchangesAAndQuarantinesOpaqueB(t *testing.T) {
 	); err != nil {
 		t.Fatalf("rollback A gate: %v", err)
 	}
+	unmounted := fixture.data + "-unmounted-after-rollback"
+	if err := os.Rename(fixture.data, unmounted); err != nil {
+		t.Fatal(err)
+	}
+	if err := StateOnlyServingAllowed(
+		context.Background(), fixture.state,
+		deployment.Identity{ProjectCommit: testACommit, Release: testARelease}, fixture.deployment,
+	); err != nil {
+		t.Fatalf("rollback state-only gate required data: %v", err)
+	}
+	if err := os.Rename(unmounted, fixture.data); err != nil {
+		t.Fatal(err)
+	}
 	writePrivateFile(t, filepath.Join(fixture.data, "post-start"), []byte("ordinary A runtime mutation"))
 	if err := fixture.serving(testACommit, testARelease); err != nil {
 		t.Fatalf("restarted A service after runtime mutation: %v", err)
