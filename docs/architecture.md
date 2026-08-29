@@ -98,7 +98,10 @@ private `state/deployment/active.json` is the only serving authority: normal
 Vaultwarden, backup, and proxy independently reject a missing, damaged, or
 mismatched identity. The Vaultwarden gate runs before `/bin/vaultwarden`, so a
 rejected image cannot open or migrate `/data/db.sqlite3` or create SQLite/WAL
-or RSA state. Upgrade, rollback, drill, and import use explicit Compose argv
+or RSA state. Proxy remains data-blind and validates terminal import/upgrade
+state plus frozen rollback evidence without gaining a `/data` mount; roles that
+open data additionally validate the live data filesystem device. Upgrade,
+rollback, drill, and import use explicit Compose argv
 and their narrower durable workflow evidence; no mode is inferred from tags or
 the presence of a database. The host-side Python orchestrator owns only
 structured Docker argv, exact image/runtime verification, drill cleanup, and

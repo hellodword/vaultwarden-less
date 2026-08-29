@@ -17,6 +17,7 @@ import (
 	"github.com/hellodword/vaultwarden-less/internal/buildinfo"
 	"github.com/hellodword/vaultwarden-less/internal/config"
 	deploymentstate "github.com/hellodword/vaultwarden-less/internal/deployment"
+	"github.com/hellodword/vaultwarden-less/internal/importer"
 	proxyserver "github.com/hellodword/vaultwarden-less/internal/proxy"
 	"github.com/hellodword/vaultwarden-less/internal/upgrade"
 )
@@ -59,10 +60,14 @@ func execute(ctx context.Context, arguments []string, stdout, stderr io.Writer) 
 			}); err != nil {
 				return err
 			}
-			return upgrade.ServingAllowed(ctx, config.StateDir, config.DataDir, deploymentstate.Identity{
+			identity := deploymentstate.Identity{
 				ProjectCommit: buildinfo.ProjectCommit,
 				Release:       buildinfo.Release,
-			}, deployment)
+			}
+			if err := importer.NormalServingAllowed(config.StateDir, identity); err != nil {
+				return err
+			}
+			return upgrade.StateOnlyServingAllowed(ctx, config.StateDir, identity, deployment)
 		},
 		healthURL: "http://127.0.0.1:8080" + proxyserver.HealthPath,
 		serve:     serve,

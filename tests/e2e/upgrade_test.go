@@ -837,29 +837,16 @@ func (h *e2eHarness) validateUpgradeRollbackComposeModel() {
 		h.t.Fatalf("render upgrade Compose model: %v: %s", err, harnessDiagnostics(output))
 	}
 	var model struct {
-		Services map[string]struct {
-			User        string `json:"user"`
-			NetworkMode string `json:"network_mode"`
-			Volumes     []struct {
-				Type     string `json:"type"`
-				Source   string `json:"source"`
-				Target   string `json:"target"`
-				ReadOnly bool   `json:"read_only"`
-			} `json:"volumes"`
-		} `json:"services"`
+		Services map[string]composeGateService `json:"services"`
 	}
 	if err := json.Unmarshal([]byte(output), &model); err != nil {
 		h.t.Fatalf("decode upgrade Compose model: %v: %s", err, harnessDiagnostics(output))
 	}
 	service, exists := model.Services["rollback-a"]
-	if !exists || service.User != strconv.Itoa(os.Geteuid())+":"+strconv.Itoa(os.Getegid()) ||
-		service.NetworkMode != "none" || len(service.Volumes) != 1 {
-		h.t.Fatalf("rollback service isolation is invalid")
+	if !exists {
+		h.t.Fatal("rollback service is missing")
 	}
-	volume := service.Volumes[0]
-	if volume.Type != "bind" || filepath.Clean(volume.Source) != h.localRoot || volume.Target != "/deployment" || volume.ReadOnly {
-		h.t.Fatalf("rollback service does not use one writable deployment-root mount")
-	}
+	assertRollbackAdminIsolation(h.t, service, h.localRoot)
 }
 
 func runUpgradeResult(

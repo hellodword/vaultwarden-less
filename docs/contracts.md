@@ -183,8 +183,12 @@ executing `/bin/vaultwarden`:
 
 An unavailable or incomplete mode fails closed. Normal backup and proxy serve
 paths independently require the exact active commit and release before they
-open data or accept traffic. `version`, `healthcheck`, `config validate`, and
-the explicit initialization workflow retain their narrower pre-active modes.
+open data or accept traffic. The data-opening Vaultwarden and backup roles also
+validate the live data filesystem against accepted upgrade evidence. Proxy has
+no data mount: its state-only gate still validates import state, the complete
+upgrade decision/activation, verified candidate, and frozen rollback device and
+tree identity. `version`, `healthcheck`, `config validate`, and the explicit
+initialization workflow retain their narrower pre-active modes.
 
 ## YAML configuration and credentials
 
