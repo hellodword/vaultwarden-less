@@ -2,6 +2,7 @@ package e2e_test
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -11,12 +12,75 @@ import (
 	productworker "github.com/hellodword/vaultwarden-less/internal/worker"
 )
 
-func TestMultiTargetDegradationAndCatchUp(t *testing.T) {
-	if !*runMultiTargetE2E {
-		t.Skip("pass -run-multitarget-e2e to run the real multi-target lifecycle")
+var (
+	runMultiTargetFastE2E = flag.Bool("run-multitarget-fast-e2e", false, "run the fast real multi-target catch-up lifecycle")
+	runMultiTargetSoakE2E = flag.Bool("run-multitarget-soak-e2e", false, "run the real 30-minute multi-target degradation soak")
+)
+
+type multiTargetFixture struct {
+	t                 *testing.T
+	ctx               context.Context
+	harness           *e2eHarness
+	email             string
+	itemID            string
+	client            *bitwardenCLI
+	restoreSecondary  func()
+	contentID         string
+	secondaryStatus   productworker.TargetStatus
+	primarySnapshotID string
+}
+
+func TestMultiTargetFastCatchUp(t *testing.T) {
+	if !*runMultiTargetFastE2E {
+		t.Skip("pass -run-multitarget-fast-e2e to run the fast real multi-target lifecycle")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 70*time.Minute)
-	defer cancel()
+	fixture := newMultiTargetFixture(t, 25*time.Minute)
+	primarySnapshots, secondarySnapshots := fixture.recoverSecondary()
+	fixture.verifyBothRestores(primarySnapshots, secondarySnapshots)
+}
+
+func TestMultiTargetSoak(t *testing.T) {
+	if !*runMultiTargetSoakE2E {
+		t.Skip("pass -run-multitarget-soak-e2e to run the real 30-minute multi-target degradation soak")
+	}
+	fixture := newMultiTargetFixture(t, 50*time.Minute)
+	degraded := waitMultiTargetStatus(t, fixture.harness, 37*time.Minute, func(status productworker.Status) bool {
+		primary, secondary := exactTwoTargets(t, status)
+		return status.State == "degraded" && primary.State == "healthy" &&
+			secondary.State == "degraded" && secondary.ErrorCode != nil
+	})
+	degradedPrimary, degradedSecondary := exactTwoTargets(t, degraded)
+	if degradedPrimary.SnapshotID == nil || *degradedPrimary.SnapshotID != fixture.primarySnapshotID ||
+		degradedSecondary.ErrorCode == nil || fixture.secondaryStatus.ErrorCode == nil ||
+		*degradedSecondary.ErrorCode != *fixture.secondaryStatus.ErrorCode {
+		t.Fatalf("degraded status changed the wrong target: %#v", degraded)
+	}
+	fixture.harness.waitNotificationContains(30*time.Second, "target secondary is degraded", *degradedSecondary.ErrorCode)
+	fixture.assertOneDegradedNotification()
+
+	// Observe one complete real retry interval after degradation. This is the
+	// wall-clock soak boundary: there is deliberately no product clock hook.
+	observationDeadline := time.Now().Add(6 * time.Minute)
+	for time.Now().Before(observationDeadline) {
+		primary, err := fixture.harness.targetSnapshots("primary")
+		if err != nil || len(primary.Snapshots) != 1 || primary.Snapshots[0].ID != fixture.primarySnapshotID ||
+			primary.Snapshots[0].ContentID != fixture.contentID {
+			t.Fatalf("soak created a duplicate primary snapshot: %#v/%v", primary, err)
+		}
+		select {
+		case <-fixture.ctx.Done():
+			t.Fatal(fixture.ctx.Err())
+		case <-time.After(15 * time.Second):
+		}
+	}
+	fixture.assertOneDegradedNotification()
+	fixture.recoverSecondary()
+}
+
+func newMultiTargetFixture(t *testing.T, timeout time.Duration) *multiTargetFixture {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	t.Cleanup(cancel)
 	harness := newE2EHarness(t, ctx, "primary", "secondary")
 	harness.startMotoAndRepository()
 	harness.startVaultwarden()
@@ -50,78 +114,108 @@ func TestMultiTargetDegradationAndCatchUp(t *testing.T) {
 	if primarySnapshots.Snapshots[0].ContentID != contentID {
 		t.Fatalf("primary snapshot content ID = %q, want %q", primarySnapshots.Snapshots[0].ContentID, contentID)
 	}
-
-	// The product contract fixes degradation at 30 minutes. Keep the real
-	// endpoint down through normal five-minute retries; no clock override or
-	// product test hook is permitted here.
-	degraded := waitMultiTargetStatus(t, harness, 37*time.Minute, func(status productworker.Status) bool {
-		primary, secondary := exactTwoTargets(t, status)
-		return status.State == "degraded" && primary.State == "healthy" &&
-			secondary.State == "degraded" && secondary.ErrorCode != nil
-	})
-	degradedPrimary, degradedSecondary := exactTwoTargets(t, degraded)
-	if degradedPrimary.SnapshotID == nil || *degradedPrimary.SnapshotID != *primaryStatus.SnapshotID ||
-		degradedSecondary.ErrorCode == nil || secondaryStatus.ErrorCode == nil ||
-		*degradedSecondary.ErrorCode != *secondaryStatus.ErrorCode {
-		t.Fatalf("degraded status changed the wrong target: %#v", degraded)
+	if primaryStatus.SnapshotID == nil {
+		t.Fatalf("partial primary snapshot identity is missing: %#v", primaryStatus)
 	}
-	harness.waitNotificationContains(30*time.Second, "target secondary is degraded", *degradedSecondary.ErrorCode)
+	return &multiTargetFixture{
+		t: t, ctx: ctx, harness: harness, email: email, itemID: itemID, client: client,
+		restoreSecondary: restoreSecondary, contentID: contentID,
+		secondaryStatus:   secondaryStatus,
+		primarySnapshotID: *primaryStatus.SnapshotID,
+	}
+}
 
-	// Restoring only the failed endpoint must catch it up to the already-known
+func (fixture *multiTargetFixture) recoverSecondary() (snapshotList, snapshotList) {
+	fixture.t.Helper()
+	// Restore only the failed endpoint and catch it up to the already-known
 	// logical content without requiring another Vaultwarden mutation.
-	restoreSecondary()
-	harness.createMotoBucket("secondary")
-	harness.initRepository("secondary")
-	harness.requestBackup()
-	recovered := waitMultiTargetStatus(t, harness, 8*time.Minute, func(status productworker.Status) bool {
-		primary, secondary := exactTwoTargets(t, status)
+	fixture.restoreSecondary()
+	fixture.harness.createMotoBucket("secondary")
+	fixture.harness.initRepository("secondary")
+	fixture.harness.requestBackup()
+	recovered := waitMultiTargetStatus(fixture.t, fixture.harness, 8*time.Minute, func(status productworker.Status) bool {
+		primary, secondary := exactTwoTargets(fixture.t, status)
 		return status.State == "idle" && status.LastCheck != nil && status.LastCheck.Result == "created" &&
 			primary.State == "healthy" && secondary.State == "healthy" &&
 			primary.ContentID != nil && secondary.ContentID != nil &&
-			*primary.ContentID == contentID && *secondary.ContentID == contentID &&
+			*primary.ContentID == fixture.contentID && *secondary.ContentID == fixture.contentID &&
 			secondary.SnapshotID != nil
 	})
-	recoveredPrimary, recoveredSecondary := exactTwoTargets(t, recovered)
-	if recoveredPrimary.SnapshotID == nil || *recoveredPrimary.SnapshotID != *primaryStatus.SnapshotID {
-		t.Fatalf("catch-up replaced the primary recovery point: %#v", recoveredPrimary)
+	recoveredPrimary, recoveredSecondary := exactTwoTargets(fixture.t, recovered)
+	if recoveredPrimary.SnapshotID == nil || *recoveredPrimary.SnapshotID != fixture.primarySnapshotID {
+		fixture.t.Fatalf("catch-up replaced the primary recovery point: %#v", recoveredPrimary)
 	}
-	harness.waitNotificationContains(30*time.Second, "target secondary has recovered")
-	harness.waitNotificationContains(30*time.Second, "synced=[primary]", "created=[secondary]", "failed=[]")
+	fixture.harness.waitNotificationContains(30*time.Second, "target secondary has recovered")
+	fixture.harness.waitNotificationContains(30*time.Second, "synced=[primary]", "created=[secondary]", "failed=[]")
 
-	primarySnapshots = harness.waitSnapshotCount(1, 2*time.Minute)
-	secondarySnapshots := waitTargetSnapshotCount(t, harness, "secondary", 1, 2*time.Minute)
+	primarySnapshots := fixture.harness.waitSnapshotCount(1, 2*time.Minute)
+	secondarySnapshots := waitTargetSnapshotCount(fixture.t, fixture.harness, "secondary", 1, 2*time.Minute)
 	primarySnapshot := primarySnapshots.Snapshots[0]
 	secondarySnapshot := secondarySnapshots.Snapshots[0]
-	if primarySnapshot.ContentID != contentID || secondarySnapshot.ContentID != contentID ||
+	if primarySnapshot.ContentID != fixture.contentID || secondarySnapshot.ContentID != fixture.contentID ||
 		primarySnapshot.ID != *recoveredPrimary.SnapshotID || secondarySnapshot.ID != *recoveredSecondary.SnapshotID {
-		t.Fatalf("repositories did not converge to one logical content: primary=%#v secondary=%#v", primarySnapshot, secondarySnapshot)
+		fixture.t.Fatalf("repositories did not converge to one logical content: primary=%#v secondary=%#v", primarySnapshot, secondarySnapshot)
 	}
 	for _, target := range []string{"primary", "secondary"} {
-		harness.repositoryCheckTarget(target)
+		fixture.harness.repositoryCheckTarget(target)
 	}
+	return primarySnapshots, secondarySnapshots
+}
 
-	primaryRestore := harness.restoreTarget("primary", primarySnapshot.ID, "multi-primary")
-	secondaryRestore := harness.restoreTarget("secondary", secondarySnapshot.ID, "multi-secondary")
-	assertRestoreMatchesSnapshot(t, primaryRestore, primarySnapshot)
-	assertRestoreMatchesSnapshot(t, secondaryRestore, secondarySnapshot)
+func (fixture *multiTargetFixture) verifyBothRestores(primarySnapshots, secondarySnapshots snapshotList) {
+	fixture.t.Helper()
+	primarySnapshot := primarySnapshots.Snapshots[0]
+	secondarySnapshot := secondarySnapshots.Snapshots[0]
+	primaryRestore := fixture.harness.restoreTarget("primary", primarySnapshot.ID, "multi-primary")
+	secondaryRestore := fixture.harness.restoreTarget("secondary", secondarySnapshot.ID, "multi-secondary")
+	assertRestoreMatchesSnapshot(fixture.t, primaryRestore, primarySnapshot)
+	assertRestoreMatchesSnapshot(fixture.t, secondaryRestore, secondarySnapshot)
 
-	harness.stopProduction()
-	harness.startDrill("multi-primary")
-	client.expectSyncFailure(ctx)
-	primaryClient := newBitwardenCLI(t, filepath.Join(harness.localRoot, "bw-multitarget-primary-restore"), harness.publicTLS, harness.tlsCAFile, email)
-	primaryClient.login(ctx)
-	if itemPassword(t, primaryClient.getItem(ctx, itemID)) != initialItemPassword {
-		t.Fatal("primary target drill did not restore the source item")
+	fixture.harness.stopProduction()
+	fixture.harness.startDrill("multi-primary")
+	fixture.client.expectSyncFailure(fixture.ctx)
+	primaryClient := newBitwardenCLI(
+		fixture.t,
+		filepath.Join(fixture.harness.localRoot, "bw-multitarget-primary-restore"),
+		fixture.harness.publicTLS,
+		fixture.harness.tlsCAFile,
+		fixture.email,
+	)
+	primaryClient.login(fixture.ctx)
+	if itemPassword(fixture.t, primaryClient.getItem(fixture.ctx, fixture.itemID)) != initialItemPassword {
+		fixture.t.Fatal("primary target drill did not restore the source item")
 	}
-	harness.stopDrill()
+	fixture.harness.stopDrill()
 
-	harness.startDrill("multi-secondary")
-	secondaryClient := newBitwardenCLI(t, filepath.Join(harness.localRoot, "bw-multitarget-secondary-restore"), harness.publicTLS, harness.tlsCAFile, email)
-	secondaryClient.login(ctx)
-	if itemPassword(t, secondaryClient.getItem(ctx, itemID)) != initialItemPassword {
-		t.Fatal("secondary target drill did not restore the source item")
+	fixture.harness.startDrill("multi-secondary")
+	secondaryClient := newBitwardenCLI(
+		fixture.t,
+		filepath.Join(fixture.harness.localRoot, "bw-multitarget-secondary-restore"),
+		fixture.harness.publicTLS,
+		fixture.harness.tlsCAFile,
+		fixture.email,
+	)
+	secondaryClient.login(fixture.ctx)
+	if itemPassword(fixture.t, secondaryClient.getItem(fixture.ctx, fixture.itemID)) != initialItemPassword {
+		fixture.t.Fatal("secondary target drill did not restore the source item")
 	}
-	harness.stopDrill()
+	fixture.harness.stopDrill()
+}
+
+func (fixture *multiTargetFixture) assertOneDegradedNotification() {
+	fixture.t.Helper()
+	fixture.harness.notificationMu.Lock()
+	messages := append([]string(nil), fixture.harness.notifications...)
+	fixture.harness.notificationMu.Unlock()
+	count := 0
+	for _, message := range messages {
+		if strings.Contains(message, "target secondary is degraded") {
+			count++
+		}
+	}
+	if count != 1 {
+		fixture.t.Fatalf("degraded notification count = %d, want 1", count)
+	}
 }
 
 const rejectingS3Endpoint = `from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -216,6 +310,9 @@ func rejectSecondaryEndpoint(t *testing.T, harness *e2eHarness) func() {
 		}
 		if output, err := harness.docker("rm", "--force", rejector); err != nil {
 			t.Fatalf("remove rejecting secondary endpoint: %v: %s", err, harnessDiagnostics(output))
+		}
+		if _, err := harness.docker("container", "inspect", rejector); err == nil {
+			t.Fatal("rejecting secondary endpoint survived exact cleanup")
 		}
 		if output, err := harness.docker("network", "connect", "--alias", service, network, container); err != nil {
 			t.Fatalf("reconnect secondary endpoint: %v: %s", err, harnessDiagnostics(output))

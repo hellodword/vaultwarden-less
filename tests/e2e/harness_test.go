@@ -47,28 +47,29 @@ var (
 )
 
 type e2eHarness struct {
-	t                 *testing.T
-	ctx               context.Context
-	repository        string
-	localRoot         string
-	project           string
-	publishedHost     string
-	proxyHostPort     int
-	drillHostPort     int
-	dockerConfig      string
-	dockerPath        string
-	dockerEnv         []string
-	productionCompose string
-	upgradeCompose    string
-	testCompose       string
-	targets           []string
-	publicHTTP        string
-	publicTLS         string
-	tlsCAFile         string
-	tlsServer         *httptest.Server
-	notifierCAFile    string
-	notifierWebhook   string
-	notifierServer    *httptest.Server
+	t                  *testing.T
+	ctx                context.Context
+	repository         string
+	localRoot          string
+	project            string
+	publishedHost      string
+	proxyHostPort      int
+	drillHostPort      int
+	dockerConfig       string
+	dockerPath         string
+	dockerEnv          []string
+	productionCompose  string
+	upgradeCompose     string
+	testCompose        string
+	upgradeTestCompose string
+	targets            []string
+	publicHTTP         string
+	publicTLS          string
+	tlsCAFile          string
+	tlsServer          *httptest.Server
+	notifierCAFile     string
+	notifierWebhook    string
+	notifierServer     *httptest.Server
 
 	backendMu sync.RWMutex
 	backend   *url.URL
@@ -78,15 +79,15 @@ type e2eHarness struct {
 }
 
 var (
-	runBackupE2E      = flag.Bool("run-backup-e2e", false, "run the real Vaultwarden backup/restore lifecycle")
-	runImportE2E      = flag.Bool("run-import-e2e", false, "run the real initial SQLite import lifecycle")
-	runMultiTargetE2E = flag.Bool("run-multitarget-e2e", false, "run the real multi-target degradation lifecycle")
-	runUpgradeE2E     = flag.Bool("run-upgrade-e2e", false, "run the real A/B upgrade and rollback lifecycle")
-	upgradeFromCommit = flag.String("upgrade-from-commit", "", "full clean A commit for the upgrade lifecycle")
-	upgradeToCommit   = flag.String("upgrade-to-commit", "", "full clean B commit for the upgrade lifecycle")
-	proxyPort         = flag.Int("proxy-host-port", 0, "fixed proxy host port; zero asks Docker for an ephemeral port")
-	drillPort         = flag.Int("drill-host-port", 0, "fixed drill host port; zero asks Docker for an ephemeral port")
-	preloadedImages   = flag.Bool("preloaded-images", false, "use already loaded local test images")
+	runBackupE2E          = flag.Bool("run-backup-e2e", false, "run the real Vaultwarden backup/restore lifecycle")
+	runImportE2E          = flag.Bool("run-import-e2e", false, "run the real initial SQLite import lifecycle")
+	runUpgradeAcceptE2E   = flag.Bool("run-upgrade-accept-e2e", false, "run the real A/B accept lifecycle")
+	runUpgradeRollbackE2E = flag.Bool("run-upgrade-rollback-e2e", false, "run the real A/B deepest rollback lifecycle")
+	upgradeFromCommit     = flag.String("upgrade-from-commit", "", "full clean A commit for the upgrade lifecycle")
+	upgradeToCommit       = flag.String("upgrade-to-commit", "", "full clean B commit for the upgrade lifecycle")
+	proxyPort             = flag.Int("proxy-host-port", 0, "fixed proxy host port; zero asks Docker for an ephemeral port")
+	drillPort             = flag.Int("drill-host-port", 0, "fixed drill host port; zero asks Docker for an ephemeral port")
+	preloadedImages       = flag.Bool("preloaded-images", false, "use already loaded local test images")
 )
 
 func newE2EHarness(t *testing.T, ctx context.Context, targets ...string) *e2eHarness {
@@ -136,6 +137,7 @@ func newE2EHarnessWithImages(t *testing.T, ctx context.Context, prepareImages bo
 	harness.productionCompose = filepath.Join(repository, "compose.yml")
 	harness.upgradeCompose = filepath.Join(repository, "compose.upgrade.yml")
 	harness.testCompose = filepath.Join(repository, "tests", "e2e", "compose.override.yml")
+	harness.upgradeTestCompose = filepath.Join(repository, "tests", "e2e", "compose.upgrade.override.yml")
 	t.Cleanup(harness.cleanup)
 	if output, err := harness.docker("info"); err != nil {
 		t.Fatalf("Docker daemon is required: %v: %s", err, truncateDiagnostic(output, 2000))

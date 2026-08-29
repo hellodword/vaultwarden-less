@@ -112,15 +112,6 @@ func (client *bitwardenCLI) expectSyncFailure(ctx context.Context) {
 	}
 }
 
-func (client *bitwardenCLI) createFolder(ctx context.Context, name string) string {
-	object := map[string]any{"name": name}
-	return client.createEncodedObject(ctx, "folder", object)
-}
-
-func (client *bitwardenCLI) getFolder(ctx context.Context, id string) map[string]any {
-	return decodeJSONObject(client.t, client.run(ctx, nil, "--raw", "get", "folder", id), "folder")
-}
-
 func (client *bitwardenCLI) createItem(ctx context.Context, name, password, folderID string) string {
 	item := map[string]any{
 		"organizationId": nil,
@@ -138,81 +129,6 @@ func (client *bitwardenCLI) createItem(ctx context.Context, name, password, fold
 		"fields": []any{}, "secureNote": nil, "card": nil,
 	}
 	return client.createEncodedObject(ctx, "item", item)
-}
-
-func (client *bitwardenCLI) createOrganizationItem(ctx context.Context, name, password, organizationID, collectionID string) string {
-	item := map[string]any{
-		"organizationId": organizationID,
-		"collectionIds":  []string{collectionID},
-		"folderId":       nil,
-		"type":           1,
-		"reprompt":       0,
-		"name":           name,
-		"notes":          "organization recovery E2E note",
-		"favorite":       false,
-		"login": map[string]any{
-			"username": "organization@example.com",
-			"password": password,
-			"uris":     []any{},
-		},
-		"fields": []any{}, "secureNote": nil, "card": nil,
-	}
-	return client.createEncodedObject(ctx, "item", item)
-}
-
-func (client *bitwardenCLI) getOrganization(ctx context.Context, id string) map[string]any {
-	return decodeJSONObject(client.t, client.run(ctx, nil, "--raw", "get", "organization", id), "organization")
-}
-
-func (client *bitwardenCLI) organizationMembers(ctx context.Context, organizationID string) []map[string]any {
-	client.t.Helper()
-	var members []map[string]any
-	data := client.run(ctx, nil, "--raw", "list", "org-members", "--organizationid", organizationID)
-	if err := json.Unmarshal(data, &members); err != nil || members == nil {
-		client.t.Fatal("Bitwarden CLI returned an invalid organization member list")
-	}
-	return members
-}
-
-func (client *bitwardenCLI) collectionByName(ctx context.Context, organizationID, name string) map[string]any {
-	client.t.Helper()
-	var collections []map[string]any
-	data := client.run(ctx, nil, "--raw", "list", "org-collections", "--organizationid", organizationID)
-	if err := json.Unmarshal(data, &collections); err != nil {
-		client.t.Fatal("Bitwarden CLI returned an invalid organization collection list")
-	}
-	for _, collection := range collections {
-		if stringValue(collection["name"]) == name && stringValue(collection["id"]) != "" {
-			return collection
-		}
-	}
-	client.t.Fatalf("organization collection %q was not found", name)
-	return nil
-}
-
-func (client *bitwardenCLI) createOrganizationCollection(ctx context.Context, organizationID, name string) string {
-	object := map[string]any{
-		"organizationId": organizationID,
-		"name":           name,
-		"externalId":     nil,
-		"groups":         []any{},
-		"users":          []any{},
-	}
-	data, err := json.Marshal(object)
-	if err != nil {
-		client.t.Fatal(err)
-	}
-	encoded := strings.TrimSpace(string(client.run(ctx, data, "encode")))
-	created := decodeJSONObject(
-		client.t,
-		client.run(ctx, nil, "--raw", "create", "org-collection", encoded, "--organizationid", organizationID),
-		"organization collection",
-	)
-	id := stringValue(created["id"])
-	if id == "" {
-		client.t.Fatal("created organization collection has no ID")
-	}
-	return id
 }
 
 func (client *bitwardenCLI) createEncodedObject(ctx context.Context, objectType string, object map[string]any) string {

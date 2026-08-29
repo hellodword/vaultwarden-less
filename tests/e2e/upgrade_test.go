@@ -18,6 +18,7 @@ import (
 	"time"
 
 	productcli "github.com/hellodword/vaultwarden-less/internal/cli"
+	productdeployment "github.com/hellodword/vaultwarden-less/internal/deployment"
 	productupgrade "github.com/hellodword/vaultwarden-less/internal/upgrade"
 )
 
@@ -42,17 +43,45 @@ type upgradeFixture struct {
 	client          *bitwardenCLI
 	originalRSA     [sha256.Size]byte
 	ticket          []byte
+	rollbackTreeID  string
 	markerName      string
-	backupConfig    string
-	expectCandidate bool
+	orchestratorEnv []string
+}
+
+func TestUpgradeAcceptLifecycle(t *testing.T) {
+	if !*runUpgradeAcceptE2E {
+		t.Skip("pass -run-upgrade-accept-e2e with two full clean commits to run the real accept lifecycle")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Minute)
+	defer cancel()
+	from, to := prepareUpgradePair(t, ctx, true)
+	fixture := newUpgradeFixture(t, ctx, from, to)
+	fixture.startCandidateAndRecordMigration()
+	fixture.verifyCandidate()
+	fixture.startVerifiedDrill()
+	fixture.acceptAfterDecisionInterruption()
 }
 
 func TestUpgradeRollbackLifecycle(t *testing.T) {
-	if !*runUpgradeE2E {
-		t.Skip("pass -run-upgrade-e2e with two full clean commits to run the real upgrade lifecycle")
+	if !*runUpgradeRollbackE2E {
+		t.Skip("pass -run-upgrade-rollback-e2e with two full clean commits to run the real deepest rollback lifecycle")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 105*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Minute)
 	defer cancel()
+	from, to := prepareUpgradePair(t, ctx, false)
+	fixture := newUpgradeFixture(t, ctx, from, to)
+	fixture.startCandidateAndRecordMigration()
+	fixture.verifyCandidate()
+	fixture.forceCorruptDrillFailure()
+	fixture.rollbackAfterExchangeInterruption()
+}
+
+func prepareUpgradePair(
+	t *testing.T,
+	ctx context.Context,
+	verifyRestic bool,
+) (upgradeRelease, upgradeRelease) {
+	t.Helper()
 	imageHarness := newE2EHarnessWithImages(t, ctx, false)
 	from := resolveUpgradeRelease(t, imageHarness, *upgradeFromCommit)
 	to := resolveUpgradeRelease(t, imageHarness, *upgradeToCommit)
@@ -71,34 +100,10 @@ func TestUpgradeRollbackLifecycle(t *testing.T) {
 	} else {
 		t.Logf("release pair uses one real Restic version %q; cross-version Restic matrix is not applicable", from.resticVersion)
 	}
-	t.Run("restic-release-compatibility", func(t *testing.T) {
+	if verifyRestic {
 		verifyResticReleaseCompatibility(t, imageHarness, from, to)
-	})
-
-	t.Run("migration-permission-failure-explicit-rollback", func(t *testing.T) {
-		fixture := newUpgradeFixture(t, ctx, from, to, false)
-		fixture.forceMigrationPermissionFailure()
-		fixture.verifyFailureAndRollback(false)
-	})
-	t.Run("invalid-target-verification-failure-explicit-rollback", func(t *testing.T) {
-		fixture := newUpgradeFixture(t, ctx, from, to, false)
-		fixture.startCandidateAndRecordMigration()
-		fixture.forceInvalidTargetVerificationFailure()
-		fixture.verifyFailureAndRollback(true)
-	})
-	t.Run("corrupt-drill-failure-explicit-rollback", func(t *testing.T) {
-		fixture := newUpgradeFixture(t, ctx, from, to, false)
-		fixture.startCandidateAndRecordMigration()
-		fixture.verifyCandidate()
-		fixture.forceCorruptDrillFailure()
-		fixture.verifyFailureAndRollback(true)
-	})
-	t.Run("isolated-evidence-and-accept-boundary", func(t *testing.T) {
-		fixture := newUpgradeFixture(t, ctx, from, to, true)
-		fixture.startCandidateAndRecordMigration()
-		fixture.verifyCandidate()
-		fixture.acceptAndVerifyBoundary()
-	})
+	}
+	return from, to
 }
 
 func resolveUpgradeRelease(t *testing.T, harness *e2eHarness, commit string) upgradeRelease {
@@ -545,7 +550,6 @@ func newUpgradeFixture(
 	t *testing.T,
 	ctx context.Context,
 	from, to upgradeRelease,
-	preflight bool,
 ) *upgradeFixture {
 	t.Helper()
 	harness := newE2EHarnessWithImages(t, ctx, false)
@@ -563,28 +567,8 @@ func newUpgradeFixture(
 	client.login(ctx)
 	itemID := client.createItem(ctx, "Upgrade Recovery Item", initialItemPassword, "")
 	harness.startBackup()
-	snapshots := harness.waitSnapshotCount(1, 5*time.Minute)
+	_ = harness.waitSnapshotCount(1, 5*time.Minute)
 	harness.startProxy()
-
-	if preflight {
-		restored := harness.restore(snapshots.Snapshots[0].ID, "upgrade-preflight")
-		assertRestoreMatchesSnapshot(t, restored, snapshots.Snapshots[0])
-		harness.selectProductionRelease(to)
-		harness.startDrill("upgrade-preflight")
-		preflightClient := newBitwardenCLI(t, filepath.Join(harness.localRoot, "bw-upgrade-preflight"), harness.publicTLS, harness.tlsCAFile, email)
-		preflightClient.login(ctx)
-		if itemPassword(t, preflightClient.getItem(ctx, itemID)) != initialItemPassword {
-			t.Fatal("isolated B migration did not preserve A data")
-		}
-		_ = preflightClient.createItem(ctx, "Disposable B Preflight Write", secondPassword, "")
-		harness.stopDrill()
-		if output, err := harness.docker("volume", "rm", harness.project+"_drill-data"); err != nil {
-			t.Fatalf("remove disposable preflight volume: %v: %s", err, harnessDiagnostics(output))
-		}
-		harness.selectProductionRelease(from)
-		harness.setBackend(harness.mappedEndpoint("proxy", 8080))
-		harness.waitHTTP(harness.publicHTTP+"/.vaultwarden-less/healthz", 204, time.Minute)
-	}
 
 	rsaPath := filepath.Join(harness.localRoot, "data", "rsa_key.pem")
 	rsaBytes, err := os.ReadFile(rsaPath)
@@ -631,8 +615,8 @@ func newUpgradeFixture(
 	return &upgradeFixture{
 		t: t, ctx: ctx, harness: harness, from: from, to: to,
 		upgradeID: prepare.UpgradeID, email: email, itemID: itemID, client: client,
-		originalRSA: sha256.Sum256(rsaBytes), ticket: ticket, markerName: markerName,
-		backupConfig: readPrivateText(t, filepath.Join(harness.localRoot, "config", "backup.yaml")),
+		originalRSA: sha256.Sum256(rsaBytes), ticket: ticket, rollbackTreeID: ticketDocument.RollbackTreeID,
+		markerName: markerName, orchestratorEnv: harness.prepareDeploymentOrchestrator(),
 	}
 }
 
@@ -688,6 +672,126 @@ func readPrivateText(t *testing.T, path string) string {
 	return string(data)
 }
 
+func (h *e2eHarness) prepareDeploymentOrchestrator() []string {
+	h.t.Helper()
+	for _, source := range []string{h.productionCompose, h.upgradeCompose} {
+		content, err := os.ReadFile(source)
+		if err != nil {
+			h.t.Fatalf("read orchestrator Compose source: %v", err)
+		}
+		writePrivateFile(h.t, filepath.Join(h.localRoot, filepath.Base(source)), string(content))
+	}
+
+	pythonPath, err := exec.LookPath("python3")
+	if err != nil {
+		h.t.Fatalf("Python 3 is required for the deployment orchestrator: %v", err)
+	}
+	literal := func(value string) string {
+		h.t.Helper()
+		encoded, encodeErr := json.Marshal(value)
+		if encodeErr != nil {
+			h.t.Fatalf("encode orchestrator wrapper path: %v", encodeErr)
+		}
+		return string(encoded)
+	}
+	wrapperDirectory := filepath.Join(h.localRoot, "orchestrator-bin")
+	if err := os.Mkdir(wrapperDirectory, 0o700); err != nil {
+		h.t.Fatalf("create orchestrator wrapper directory: %v", err)
+	}
+	wrapper := filepath.Join(wrapperDirectory, "docker")
+	source := fmt.Sprintf(`#!%s
+import os
+import sys
+
+real_docker = %s
+base_override = %s
+upgrade_override = %s
+arguments = sys.argv[1:]
+if not arguments or arguments[0] != "compose":
+    os.execv(real_docker, [real_docker, *arguments])
+compose = arguments[1:]
+value_options = {"--project-name", "--project-directory", "--env-file", "--file", "--profile"}
+index = 0
+while index < len(compose) and compose[index] in value_options:
+    if index + 1 >= len(compose):
+        raise SystemExit(2)
+    index += 2
+if index >= len(compose):
+    raise SystemExit(2)
+overrides = ["--file", base_override]
+if any(os.path.basename(value) == "compose.upgrade.yml" for value in compose):
+    overrides.extend(("--file", upgrade_override))
+os.execv(real_docker, [real_docker, "compose", *compose[:index], *overrides, *compose[index:]])
+`, pythonPath, literal(h.dockerPath), literal(h.testCompose), literal(h.upgradeTestCompose))
+	writePrivateFile(h.t, wrapper, source)
+	if err := os.Chmod(wrapper, 0o700); err != nil {
+		h.t.Fatalf("make orchestrator Docker wrapper executable: %v", err)
+	}
+
+	environment := slices.Clone(h.dockerEnv)
+	set := func(name, value string) {
+		prefix := name + "="
+		for index, entry := range environment {
+			if strings.HasPrefix(entry, prefix) {
+				environment[index] = prefix + value
+				return
+			}
+		}
+		environment = append(environment, prefix+value)
+	}
+	set("PATH", wrapperDirectory+string(os.PathListSeparator)+os.Getenv("PATH"))
+	set("PYTHONDONTWRITEBYTECODE", "1")
+	return environment
+}
+
+type deploymentTerminalResult struct {
+	SchemaVersion       int    `json:"schema_version"`
+	Status              string `json:"status"`
+	Workflow            string `json:"workflow"`
+	Decision            string `json:"decision"`
+	UpgradeID           string `json:"upgrade_id"`
+	ActiveProjectCommit string `json:"active_project_commit"`
+	ActiveRelease       string `json:"active_release"`
+}
+
+func (fixture *upgradeFixture) runDeploymentOrchestrator(decision, status string) {
+	fixture.t.Helper()
+	pythonPath, err := exec.LookPath("python3")
+	if err != nil {
+		fixture.t.Fatalf("Python 3 is required for the deployment orchestrator: %v", err)
+	}
+	output, err := runCommandWithEnvironment(
+		fixture.ctx,
+		fixture.harness.localRoot,
+		nil,
+		fixture.orchestratorEnv,
+		pythonPath,
+		filepath.Join(fixture.harness.repository, "scripts", "deployment.py"),
+		"--deployment-root",
+		fixture.harness.localRoot,
+		"--project-name",
+		fixture.harness.project,
+		"upgrade",
+		decision,
+	)
+	if err != nil {
+		fixture.t.Fatalf("deployment orchestrator %s failed: %v: %s", decision, err, harnessDiagnostics(output))
+	}
+	var result deploymentTerminalResult
+	if err := decodeExactJSON(output, &result); err != nil ||
+		result.SchemaVersion != 1 || result.Status != status || result.Workflow != "upgrade" ||
+		result.Decision != decision || result.UpgradeID != fixture.upgradeID {
+		fixture.t.Fatalf("deployment orchestrator returned invalid %s result: %v: %s", decision, err, harnessDiagnostics(output))
+	}
+	expected := fixture.to
+	if decision == productupgrade.DecisionRollback {
+		expected = fixture.from
+	}
+	if result.ActiveProjectCommit != expected.commit || result.ActiveRelease != expected.release {
+		fixture.t.Fatalf("deployment orchestrator %s identity is invalid", decision)
+	}
+}
+
 func (h *e2eHarness) tryUpgradeCompose(ctx context.Context, generatedEnvironment bool, arguments ...string) (string, error) {
 	environment := filepath.Join(h.localRoot, ".env")
 	if generatedEnvironment {
@@ -696,7 +800,7 @@ func (h *e2eHarness) tryUpgradeCompose(ctx context.Context, generatedEnvironment
 	base := []string{
 		"compose", "--env-file", environment, "--project-directory", h.localRoot,
 		"--project-name", h.project, "--file", h.productionCompose, "--file", h.upgradeCompose,
-		"--file", h.testCompose,
+		"--file", h.testCompose, "--file", h.upgradeTestCompose,
 	}
 	return h.dockerContext(ctx, append(base, arguments...)...)
 }
@@ -774,9 +878,17 @@ func runUpgradeResult(
 
 func (fixture *upgradeFixture) startCandidateAndRecordMigration() {
 	fixture.t.Helper()
-	fixture.harness.upgradeComposeCommand(true, "up", "--detach", "vaultwarden")
-	fixture.harness.waitComposeServiceHealthy("vaultwarden", 3*time.Minute)
-	fixture.harness.setBackend(fixture.harness.mappedComposeServiceEndpoint("vaultwarden", 80))
+	fixture.harness.upgradeComposeCommand(
+		true,
+		"--profile",
+		"upgrade",
+		"up",
+		"--detach",
+		"--no-deps",
+		"upgrade-vaultwarden-b",
+	)
+	fixture.harness.waitComposeServiceHealthy("upgrade-vaultwarden-b", 3*time.Minute)
+	fixture.harness.setBackend(fixture.harness.mappedComposeServiceEndpoint("upgrade-vaultwarden-b", 80))
 	fixture.harness.waitHTTP(fixture.harness.publicHTTP+"/alive", 200, time.Minute)
 	result := runUpgradeResult(
 		fixture.t,
@@ -788,8 +900,7 @@ func (fixture *upgradeFixture) startCandidateAndRecordMigration() {
 	if len(result.Targets) != 0 {
 		fixture.t.Fatalf("migrate-check unexpectedly returned targets: %#v", result.Targets)
 	}
-	fixture.expectCandidate = true
-	fixture.harness.upgradeComposeCommand(true, "stop", "vaultwarden")
+	fixture.harness.upgradeComposeCommand(true, "--profile", "upgrade", "stop", "upgrade-vaultwarden-b")
 }
 
 func (fixture *upgradeFixture) verifyCandidate() {
@@ -804,46 +915,6 @@ func (fixture *upgradeFixture) verifyCandidate() {
 	if len(result.Targets) != 1 || result.Targets[0].Target != "primary" {
 		fixture.t.Fatalf("candidate verification evidence is incomplete: %#v", result.Targets)
 	}
-}
-
-func (fixture *upgradeFixture) forceMigrationPermissionFailure() {
-	fixture.t.Helper()
-	database := filepath.Join(fixture.harness.localRoot, "data", "db.sqlite3")
-	if err := os.Chmod(database, 0o400); err != nil {
-		fixture.t.Fatal(err)
-	}
-	info, err := os.Stat(database)
-	if err != nil || info.Mode().Perm() != 0o400 {
-		fixture.t.Fatalf("database did not become read-only: %v", err)
-	}
-	fixture.harness.upgradeComposeCommand(true, "up", "--detach", "vaultwarden")
-	logs := fixture.harness.waitComposeServiceFailure("vaultwarden", 90*time.Second)
-	lower := strings.ToLower(logs)
-	if !strings.Contains(lower, "permission") && !strings.Contains(lower, "read-only") &&
-		!strings.Contains(lower, "readonly") && !strings.Contains(lower, "unable to open database") {
-		fixture.t.Fatalf("candidate migration failed without a permission diagnostic: %s", harnessDiagnostics(logs))
-	}
-	fixture.harness.upgradeComposeCommand(true, "stop", "vaultwarden")
-	if err := os.Chmod(database, 0o600); err != nil {
-		fixture.t.Fatal(err)
-	}
-}
-
-func (fixture *upgradeFixture) forceInvalidTargetVerificationFailure() {
-	fixture.t.Helper()
-	path := filepath.Join(fixture.harness.localRoot, "config", "backup.yaml")
-	invalid := strings.Replace(
-		fixture.backupConfig,
-		"repository: s3:http://moto-primary:5000/vaultwarden-less-e2e-primary/repository",
-		"repository: unsupported://upgrade-e2e",
-		1,
-	)
-	if invalid == fixture.backupConfig {
-		fixture.t.Fatal("could not replace the verification target with an invalid backend")
-	}
-	writePrivateFile(fixture.t, path, invalid)
-	fixture.expectUpgradeFailure("repository_failure", "upgrade-b", "upgrade", "verify")
-	writePrivateFile(fixture.t, path, fixture.backupConfig)
 }
 
 func (fixture *upgradeFixture) forceCorruptDrillFailure() {
@@ -900,26 +971,6 @@ func exactCommandErrorCode(t *testing.T, output string) string {
 	return codes[0]
 }
 
-func (fixture *upgradeFixture) verifyFailureAndRollback(expectCandidate bool) {
-	fixture.t.Helper()
-	if fixture.expectCandidate != expectCandidate {
-		fixture.t.Fatalf("candidate expectation = %v, want %v", fixture.expectCandidate, expectCandidate)
-	}
-	fixture.assertFrozenFailureState()
-	result := runUpgradeResult(
-		fixture.t,
-		fixture.harness.upgradeCommand("rollback-a", "rollback", "apply"),
-		productupgrade.PhaseRolledBack,
-		fixture.from,
-		fixture.to,
-	)
-	if len(result.Targets) != 0 {
-		fixture.t.Fatalf("rollback unexpectedly returned targets: %#v", result.Targets)
-	}
-	fixture.assertRollbackFiles(expectCandidate)
-	fixture.startRollbackServicesAndReadData()
-}
-
 func (fixture *upgradeFixture) assertFrozenFailureState() {
 	fixture.t.Helper()
 	activeMarker := filepath.Join(fixture.harness.localRoot, "data", fixture.markerName)
@@ -940,70 +991,146 @@ func (fixture *upgradeFixture) assertFrozenFailureState() {
 	fixture.harness.assertProxyClosed()
 }
 
-func (fixture *upgradeFixture) assertRollbackFiles(expectCandidate bool) {
+func (fixture *upgradeFixture) startVerifiedDrill() {
 	fixture.t.Helper()
-	current := filepath.Join(fixture.harness.localRoot, "state", "upgrade", "current")
-	if _, err := os.Lstat(current); !os.IsNotExist(err) {
-		fixture.t.Fatalf("current upgrade state remained after rollback: %v", err)
-	}
-	history := filepath.Join(fixture.harness.localRoot, "state", "upgrade", "history", fixture.upgradeID)
-	if info, err := os.Stat(history); err != nil || !info.IsDir() {
-		fixture.t.Fatalf("rollback history is unavailable: %v", err)
-	}
-	activeMarker := filepath.Join(fixture.harness.localRoot, "data", fixture.markerName)
-	if _, err := os.Lstat(activeMarker); !os.IsNotExist(err) {
-		fixture.t.Fatalf("candidate-only marker remained active after rollback: %v", err)
-	}
-	quarantine := filepath.Join(
-		fixture.harness.localRoot, "state", "upgrade", "quarantine", fixture.upgradeID,
-	)
-	if value, err := os.ReadFile(filepath.Join(quarantine, "data", fixture.markerName)); err != nil || string(value) != "candidate-only\n" {
-		fixture.t.Fatalf("candidate data was not quarantined: %q/%v", value, err)
-	}
-	candidate := filepath.Join(quarantine, "candidate.json")
-	if _, err := os.Lstat(candidate); expectCandidate && err != nil || !expectCandidate && !os.IsNotExist(err) {
-		fixture.t.Fatalf("quarantined candidate state mismatch: %v", err)
-	}
-}
-
-func (fixture *upgradeFixture) startRollbackServicesAndReadData() {
-	fixture.t.Helper()
+	fixture.harness.resetUpgradeDrill()
 	fixture.harness.upgradeComposeCommand(
-		false, "--profile", "rollback", "up", "--detach",
-		"rollback-vaultwarden-a", "rollback-backup-a", "rollback-proxy-a",
+		true,
+		"--profile",
+		"drill",
+		"up",
+		"--detach",
+		"drill-vaultwarden",
 	)
-	fixture.harness.waitComposeServiceHealthy("rollback-proxy-a", 4*time.Minute)
-	fixture.harness.setBackend(fixture.harness.mappedComposeServiceEndpoint("rollback-proxy-a", 8080))
-	fixture.harness.waitHTTP(fixture.harness.publicHTTP+"/.vaultwarden-less/healthz", 204, time.Minute)
-	fixture.client.expectSyncFailure(fixture.ctx)
-	restored := newBitwardenCLI(
+	fixture.harness.waitComposeServiceHealthy("drill-vaultwarden", 4*time.Minute)
+	fixture.harness.setBackend(fixture.harness.mappedComposeServiceEndpoint("drill-vaultwarden", 80))
+	fixture.harness.waitHTTP(fixture.harness.publicHTTP+"/alive", 200, time.Minute)
+	client := newBitwardenCLI(
 		fixture.t,
-		filepath.Join(fixture.harness.localRoot, "bw-upgrade-rolled-back"),
+		filepath.Join(fixture.harness.localRoot, "bw-upgrade-drill"),
 		fixture.harness.publicTLS,
 		fixture.harness.tlsCAFile,
 		fixture.email,
 	)
-	restored.login(fixture.ctx)
-	if itemPassword(fixture.t, restored.getItem(fixture.ctx, fixture.itemID)) != initialItemPassword {
-		fixture.t.Fatal("A data was not readable after explicit rollback")
+	client.login(fixture.ctx)
+	if itemPassword(fixture.t, client.getItem(fixture.ctx, fixture.itemID)) != initialItemPassword {
+		fixture.t.Fatal("verified B drill could not read A data")
 	}
-	rsaPath := filepath.Join(fixture.harness.localRoot, "data", "rsa_key.pem")
-	deadline := time.Now().Add(time.Minute)
-	for time.Now().Before(deadline) {
-		data, err := os.ReadFile(rsaPath)
-		if err == nil && len(data) != 0 && sha256.Sum256(data) != fixture.originalRSA {
-			return
-		}
-		time.Sleep(250 * time.Millisecond)
-	}
-	fixture.t.Fatal("A rollback did not regenerate the RSA identity")
 }
 
-func (fixture *upgradeFixture) acceptAndVerifyBoundary() {
+func (fixture *upgradeFixture) assertTerminalDecision(decision string) {
 	fixture.t.Helper()
-	fixture.harness.resetUpgradeDrill()
-	fixture.harness.upgradeComposeCommand(true, "--profile", "drill", "up", "--detach", "drill-vaultwarden")
-	fixture.harness.waitComposeServiceHealthy("drill-vaultwarden", 4*time.Minute)
+	expected := fixture.to
+	if decision == productupgrade.DecisionRollback {
+		expected = fixture.from
+	}
+	active, err := productdeployment.ReadActive(filepath.Join(fixture.harness.localRoot, "state"))
+	if err != nil || active.ProjectCommit != expected.commit || active.Release != expected.release {
+		fixture.t.Fatalf("terminal %s active identity is invalid: %#v/%v", decision, active, err)
+	}
+	decisionPath := filepath.Join(
+		fixture.harness.localRoot,
+		"state",
+		"upgrade",
+		"current",
+		"decision.json",
+	)
+	var document productupgrade.Decision
+	if err := decodeExactJSON(readPrivateText(fixture.t, decisionPath), &document); err != nil ||
+		document.SchemaVersion != productupgrade.SchemaVersion || document.UpgradeID != fixture.upgradeID ||
+		document.Decision != decision || document.ActiveProjectCommit != expected.commit ||
+		document.ActiveRelease != expected.release || document.DecidedAt == "" {
+		fixture.t.Fatalf("terminal %s decision is invalid: %#v/%v", decision, document, err)
+	}
+}
+
+func (fixture *upgradeFixture) assertTerminalServices(release upgradeRelease, immutable bool) {
+	fixture.t.Helper()
+	validateUpgradeReleaseImages(fixture.t, fixture.harness, &release)
+	for index, service := range []string{"vaultwarden", "backup", "proxy"} {
+		fixture.harness.waitComposeServiceHealthy(service, 4*time.Minute)
+		product := []string{"vaultwarden", "backup", "proxy"}[index]
+		tag := "local"
+		if immutable {
+			tag = release.release
+		}
+		reference := "vaultwarden-less-" + product + ":" + tag
+		imageOutput, err := fixture.harness.docker("image", "inspect", reference)
+		if err != nil {
+			fixture.t.Fatalf("inspect terminal %s image: %v: %s", service, err, harnessDiagnostics(imageOutput))
+		}
+		var images []struct {
+			ID     string `json:"Id"`
+			Config struct {
+				Labels map[string]string `json:"Labels"`
+			} `json:"Config"`
+		}
+		if err := json.Unmarshal([]byte(imageOutput), &images); err != nil || len(images) != 1 ||
+			images[0].Config.Labels["org.opencontainers.image.revision"] != release.commit ||
+			images[0].Config.Labels["org.opencontainers.image.version"] != release.release {
+			fixture.t.Fatalf("terminal %s image identity is invalid: %v", service, err)
+		}
+		container := fixture.harness.composeServiceContainer(service, true)
+		containerOutput, err := fixture.harness.docker("container", "inspect", container)
+		if err != nil {
+			fixture.t.Fatalf("inspect terminal %s container: %v: %s", service, err, harnessDiagnostics(containerOutput))
+		}
+		var containers []struct {
+			Image  string `json:"Image"`
+			Config struct {
+				Image string `json:"Image"`
+			} `json:"Config"`
+			State struct {
+				Running bool `json:"Running"`
+				Health  struct {
+					Status string `json:"Status"`
+				} `json:"Health"`
+			} `json:"State"`
+		}
+		if err := json.Unmarshal([]byte(containerOutput), &containers); err != nil || len(containers) != 1 ||
+			containers[0].Image != images[0].ID || containers[0].Config.Image != reference ||
+			!containers[0].State.Running || containers[0].State.Health.Status != "healthy" {
+			fixture.t.Fatalf("terminal %s container identity or health is invalid: %v", service, err)
+		}
+	}
+}
+
+func (fixture *upgradeFixture) assertArchived(decision string) string {
+	fixture.t.Helper()
+	current := filepath.Join(fixture.harness.localRoot, "state", "upgrade", "current")
+	if _, err := os.Lstat(current); !os.IsNotExist(err) {
+		fixture.t.Fatalf("current upgrade state remained after terminal %s: %v", decision, err)
+	}
+	archiveName := "history"
+	oppositeName := "quarantine"
+	if decision == productupgrade.DecisionRollback {
+		archiveName, oppositeName = oppositeName, archiveName
+	}
+	archive := filepath.Join(
+		fixture.harness.localRoot,
+		"state",
+		"upgrade",
+		archiveName,
+		fixture.upgradeID,
+	)
+	if info, err := os.Stat(archive); err != nil || !info.IsDir() {
+		fixture.t.Fatalf("terminal %s archive is unavailable: %v", decision, err)
+	}
+	opposite := filepath.Join(
+		fixture.harness.localRoot,
+		"state",
+		"upgrade",
+		oppositeName,
+		fixture.upgradeID,
+	)
+	if _, err := os.Lstat(opposite); !os.IsNotExist(err) {
+		fixture.t.Fatalf("terminal %s created the opposite archive: %v", decision, err)
+	}
+	return archive
+}
+
+func (fixture *upgradeFixture) acceptAfterDecisionInterruption() {
+	fixture.t.Helper()
 	accepted := runUpgradeResult(
 		fixture.t,
 		fixture.harness.upgradeCommand("upgrade-b", "upgrade", "accept"),
@@ -1014,11 +1141,21 @@ func (fixture *upgradeFixture) acceptAndVerifyBoundary() {
 	if len(accepted.Targets) != 0 {
 		fixture.t.Fatalf("accept unexpectedly returned targets: %#v", accepted.Targets)
 	}
-	_, _ = fixture.harness.tryUpgradeCompose(
-		fixture.ctx, false, "--profile", "drill", "rm", "--force", "--stop", "drill-vaultwarden", "drill-copy",
-	)
-	fixture.harness.upgradeComposeCommand(false, "up", "--detach", "vaultwarden", "backup", "proxy")
-	fixture.harness.waitComposeServiceHealthy("proxy", 4*time.Minute)
+	fixture.assertTerminalDecision(productupgrade.DecisionAccept)
+	if _, err := os.Stat(filepath.Join(fixture.harness.localRoot, "state", "upgrade", "current")); err != nil {
+		fixture.t.Fatalf("accept decision did not retain current state for resumption: %v", err)
+	}
+	for _, service := range []string{"vaultwarden", "backup", "proxy"} {
+		if container := fixture.harness.composeServiceContainer(service, true); container != "" {
+			fixture.t.Fatalf("accept decision unexpectedly started terminal service %s", service)
+		}
+	}
+
+	fixture.runDeploymentOrchestrator(productupgrade.DecisionAccept, "completed")
+	fixture.runDeploymentOrchestrator(productupgrade.DecisionAccept, "already_complete")
+	fixture.assertTerminalServices(fixture.to, true)
+	fixture.assertArchived(productupgrade.DecisionAccept)
+	validateUpgradeReleaseImages(fixture.t, fixture.harness, &fixture.from)
 	fixture.harness.setBackend(fixture.harness.mappedComposeServiceEndpoint("proxy", 8080))
 	fixture.harness.waitHTTP(fixture.harness.publicHTTP+"/.vaultwarden-less/healthz", 204, time.Minute)
 	client := newBitwardenCLI(
@@ -1036,21 +1173,80 @@ func (fixture *upgradeFixture) acceptAndVerifyBoundary() {
 	if itemPassword(fixture.t, client.getItem(fixture.ctx, newItem)) != newItemPassword {
 		fixture.t.Fatal("accepted B was not writable")
 	}
+}
 
-	base := []string{"--profile", "upgrade", "run", "--rm", "--no-deps", "rollback-a", "rollback", "apply"}
-	output, err := fixture.harness.tryUpgradeCompose(fixture.ctx, false, base...)
-	if err == nil || exactCommandErrorCode(fixture.t, output) != "conflict" {
-		fixture.t.Fatalf("ordinary rollback was not rejected after accept: %v: %s", err, harnessDiagnostics(output))
+func (fixture *upgradeFixture) rollbackAfterExchangeInterruption() {
+	fixture.t.Helper()
+	fixture.assertFrozenFailureState()
+	rolledBack := runUpgradeResult(
+		fixture.t,
+		fixture.harness.upgradeCommand("rollback-a", "rollback", "apply"),
+		productupgrade.PhaseRolledBack,
+		fixture.from,
+		fixture.to,
+	)
+	if len(rolledBack.Targets) != 0 {
+		fixture.t.Fatalf("rollback unexpectedly returned targets: %#v", rolledBack.Targets)
 	}
-	fixture.harness.waitComposeServiceHealthy("proxy", time.Minute)
-	if itemPassword(fixture.t, client.getItem(fixture.ctx, newItem)) != newItemPassword {
-		fixture.t.Fatal("rejected rollback changed accepted B data")
+	fixture.assertTerminalDecision(productupgrade.DecisionRollback)
+	activeMarker := filepath.Join(fixture.harness.localRoot, "data", fixture.markerName)
+	if _, err := os.Lstat(activeMarker); !os.IsNotExist(err) {
+		fixture.t.Fatalf("candidate-only marker remained active after exchange: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(fixture.harness.localRoot, "state", "upgrade", "history", fixture.upgradeID)); err != nil {
-		fixture.t.Fatalf("accepted history is unavailable: %v", err)
+	rollbackMarker := filepath.Join(
+		fixture.harness.localRoot,
+		"state",
+		"upgrade",
+		"current",
+		"rollback-data",
+		fixture.markerName,
+	)
+	if value, err := os.ReadFile(rollbackMarker); err != nil || string(value) != "candidate-only\n" {
+		fixture.t.Fatalf("exchange did not move B data to rollback position: %q/%v", value, err)
 	}
-	if _, err := os.Lstat(filepath.Join(fixture.harness.localRoot, "state", "upgrade", "quarantine", fixture.upgradeID)); !os.IsNotExist(err) {
-		fixture.t.Fatalf("successful accept created rollback quarantine: %v", err)
+	rsa, err := os.ReadFile(filepath.Join(fixture.harness.localRoot, "data", "rsa_key.pem"))
+	if err != nil || sha256.Sum256(rsa) != fixture.originalRSA {
+		fixture.t.Fatalf("exchange did not restore A RSA identity: %v", err)
+	}
+	if !contentIDPattern.MatchString(fixture.rollbackTreeID) {
+		fixture.t.Fatal("frozen A rollback tree identity is invalid")
+	}
+
+	fixture.runDeploymentOrchestrator(productupgrade.DecisionRollback, "completed")
+	fixture.runDeploymentOrchestrator(productupgrade.DecisionRollback, "already_complete")
+	fixture.assertTerminalServices(fixture.from, false)
+	archive := fixture.assertArchived(productupgrade.DecisionRollback)
+	if value, err := os.ReadFile(filepath.Join(archive, "rollback-data", fixture.markerName)); err != nil || string(value) != "candidate-only\n" {
+		fixture.t.Fatalf("B data was not quarantined after rollback: %q/%v", value, err)
+	}
+	if _, err := os.Stat(filepath.Join(archive, "candidate.json")); err != nil {
+		fixture.t.Fatalf("verified B candidate evidence was not quarantined: %v", err)
+	}
+	var ticket productupgrade.RollbackTicket
+	if err := decodeExactJSON(readPrivateText(fixture.t, filepath.Join(archive, "rollback-ticket.json")), &ticket); err != nil ||
+		ticket.RollbackTreeID != fixture.rollbackTreeID {
+		fixture.t.Fatalf("archived rollback tree identity changed: %#v/%v", ticket, err)
+	}
+	rsa, err = os.ReadFile(filepath.Join(fixture.harness.localRoot, "data", "rsa_key.pem"))
+	if err != nil || sha256.Sum256(rsa) != fixture.originalRSA {
+		fixture.t.Fatalf("terminal A RSA identity changed after rollback: %v", err)
+	}
+
+	fixture.harness.setBackend(fixture.harness.mappedComposeServiceEndpoint("proxy", 8080))
+	fixture.harness.waitHTTP(fixture.harness.publicHTTP+"/.vaultwarden-less/healthz", 204, time.Minute)
+	if itemPassword(fixture.t, fixture.client.getItem(fixture.ctx, fixture.itemID)) != initialItemPassword {
+		fixture.t.Fatal("resumed A session could not read restored data")
+	}
+	restored := newBitwardenCLI(
+		fixture.t,
+		filepath.Join(fixture.harness.localRoot, "bw-upgrade-rolled-back"),
+		fixture.harness.publicTLS,
+		fixture.harness.tlsCAFile,
+		fixture.email,
+	)
+	restored.login(fixture.ctx)
+	if itemPassword(fixture.t, restored.getItem(fixture.ctx, fixture.itemID)) != initialItemPassword {
+		fixture.t.Fatal("fresh client could not read A data after deepest rollback")
 	}
 }
 

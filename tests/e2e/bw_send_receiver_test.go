@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 )
 
 type bitwardenSendReceiver struct {
@@ -43,32 +42,6 @@ func (client *bitwardenCLI) createFileSendWithLimit(ctx context.Context, path, n
 	return id
 }
 
-func (client *bitwardenCLI) waitFileSendAccessCount(
-	ctx context.Context, id string, want int, timeout time.Duration,
-) {
-	client.t.Helper()
-	deadline := time.Now().Add(timeout)
-	var observed int
-	for time.Now().Before(deadline) {
-		client.sync(ctx)
-		object := decodeJSONObject(
-			client.t,
-			client.run(ctx, nil, "--raw", "send", "get", id),
-			"file Send access count",
-		)
-		observed = integerValue(object["accessCount"])
-		if observed == want {
-			return
-		}
-		select {
-		case <-ctx.Done():
-			client.t.Fatal(ctx.Err())
-		case <-time.After(500 * time.Millisecond):
-		}
-	}
-	client.t.Fatalf("file Send accessCount = %d, want %d", observed, want)
-}
-
 func (client *bitwardenCLI) getFileSend(ctx context.Context, id, output string) {
 	sendURL := client.fileSendURL(ctx, id)
 	receiver := newBitwardenSendReceiver(client.t, ctx, client.server, client.caFile)
@@ -77,35 +50,6 @@ func (client *bitwardenCLI) getFileSend(ctx context.Context, id, output string) 
 		diagnostics = string(stdout) + "\n" + diagnostics
 		diagnostics = strings.ReplaceAll(diagnostics, sendURL, "<redacted-send-url>")
 		client.t.Fatalf("Bitwarden CLI file Send receive failed: %v: %s", err, client.redact(diagnostics))
-	}
-}
-
-func (client *bitwardenCLI) expectFileSendAccessFailure(ctx context.Context, id string) {
-	client.t.Helper()
-	sendURL := client.fileSendURL(ctx, id)
-	receiver := newBitwardenSendReceiver(client.t, ctx, client.server, client.caFile)
-	output := filepath.Join(receiver.temp, "unexpected-send-output")
-	stdout, diagnostics, err := receiver.tryReceive(ctx, sendURL, output, true)
-	if err == nil {
-		client.t.Fatal("a fresh recipient downloaded the access-limited Send after its limit")
-	}
-	if _, statError := os.Lstat(output); !os.IsNotExist(statError) {
-		client.t.Fatalf("failed access published an output file: %v", statError)
-	}
-	allDiagnostics := string(stdout) + "\n" + diagnostics
-	if containsSecret(allDiagnostics, client.password, client.session) {
-		client.t.Fatal("Send failure diagnostics exposed a password")
-	}
-	var response struct {
-		Success bool   `json:"success"`
-		Message string `json:"message"`
-	}
-	if json.Unmarshal(bytes.TrimSpace(stdout), &response) != nil ||
-		response.Success || response.Message != "Not found." {
-		allDiagnostics = strings.ReplaceAll(
-			client.redact(allDiagnostics), sendURL, "<redacted-send-url>",
-		)
-		client.t.Fatalf("fresh recipient failed for an unexpected reason: %s", allDiagnostics)
 	}
 }
 

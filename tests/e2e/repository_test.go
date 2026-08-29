@@ -72,19 +72,6 @@ type snapshotList struct {
 	} `json:"snapshots"`
 }
 
-type pruneOutput struct {
-	SchemaVersion int    `json:"schema_version"`
-	Operation     string `json:"operation"`
-	Target        string `json:"target"`
-	Applied       bool   `json:"applied"`
-	Groups        []struct {
-		Host              string   `json:"host"`
-		Paths             []string `json:"paths"`
-		KeepSnapshotIDs   []string `json:"keep_snapshot_ids"`
-		RemoveSnapshotIDs []string `json:"remove_snapshot_ids"`
-	} `json:"groups"`
-}
-
 func (h *e2eHarness) repositoryCheck() {
 	h.repositoryCheckTarget("primary")
 }
@@ -106,24 +93,6 @@ func (h *e2eHarness) repositoryCheckTarget(target string) {
 		result.Target != target || !result.Success {
 		h.t.Fatalf("invalid repository check result: %s", harnessDiagnostics(output))
 	}
-}
-
-func (h *e2eHarness) prune(apply bool) pruneOutput {
-	arguments := []string{
-		"--profile", "maintenance", "run", "--rm", "--no-deps", "maintenance",
-		"repo", "prune", "--target", "primary", "--config", "/config/backup.yaml",
-	}
-	if apply {
-		arguments = append(arguments, "--apply")
-	}
-	output := h.compose(arguments...)
-	var result pruneOutput
-	if decodeExactJSON(output, &result) != nil ||
-		result.SchemaVersion != productcli.ResultSchemaVersion || result.Operation != "prune" ||
-		result.Target != "primary" || result.Applied != apply || result.Groups == nil {
-		h.t.Fatalf("invalid repository prune result: %s", harnessDiagnostics(output))
-	}
-	return result
 }
 
 func (h *e2eHarness) snapshots() (snapshotList, error) {
@@ -197,24 +166,6 @@ func (h *e2eHarness) requestBackup() {
 	}
 }
 
-func (h *e2eHarness) waitCheckAfter(previousFinished, result string, timeout time.Duration) productworker.Status {
-	h.t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		status := h.status()
-		if status.LastCheck != nil && status.LastCheck.FinishedAt != previousFinished && status.LastCheck.Result == result {
-			return status
-		}
-		select {
-		case <-h.ctx.Done():
-			h.t.Fatal(h.ctx.Err())
-		case <-time.After(2 * time.Second):
-		}
-	}
-	h.t.Fatalf("worker did not complete a new %s check", result)
-	return productworker.Status{}
-}
-
 func (h *e2eHarness) waitSnapshotCount(count int, timeout time.Duration) snapshotList {
 	h.t.Helper()
 	deadline := time.Now().Add(timeout)
@@ -234,93 +185,6 @@ func (h *e2eHarness) waitSnapshotCount(count int, timeout time.Duration) snapsho
 	}
 	h.t.Fatalf("snapshot count did not become %d", count)
 	return snapshotList{}
-}
-
-func (h *e2eHarness) assertSnapshotCountFor(count int, duration time.Duration) {
-	h.t.Helper()
-	deadline := time.Now().Add(duration)
-	observed := false
-	for time.Now().Before(deadline) {
-		result, err := h.snapshots()
-		if err == nil {
-			observed = true
-			if len(result.Snapshots) != count {
-				h.t.Fatalf("snapshot count became %d during an inconsistent source window, want %d", len(result.Snapshots), count)
-			}
-		}
-		select {
-		case <-h.ctx.Done():
-			h.t.Fatal(h.ctx.Err())
-		case <-time.After(2 * time.Second):
-		}
-	}
-	if !observed {
-		h.t.Fatal("could not observe repository snapshots during inconsistent source window")
-	}
-}
-
-func (h *e2eHarness) waitWorkerState(want string, timeout time.Duration) {
-	h.t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		output, err := h.tryCompose(
-			h.ctx,
-			"exec",
-			"--no-TTY",
-			"backup",
-			"/bin/vaultwarden-less-backup",
-			"status",
-		)
-		if err == nil {
-			var status struct {
-				State string `json:"state"`
-			}
-			if json.Unmarshal([]byte(output), &status) == nil && status.State == want {
-				return
-			}
-		}
-		select {
-		case <-h.ctx.Done():
-			h.t.Fatal(h.ctx.Err())
-		case <-time.After(time.Second):
-		}
-	}
-	h.t.Fatalf("worker state did not become %s", want)
-}
-
-func (h *e2eHarness) waitUnchangedCheck(previousFinished string, timeout time.Duration) {
-	h.t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		output, err := h.tryCompose(
-			h.ctx,
-			"exec",
-			"--no-TTY",
-			"backup",
-			"/bin/vaultwarden-less-backup",
-			"status",
-		)
-		if err == nil {
-			var status struct {
-				LastCheck *struct {
-					FinishedAt string `json:"finished_at"`
-					Result     string `json:"result"`
-				} `json:"last_check"`
-			}
-			if json.Unmarshal([]byte(output), &status) == nil &&
-				status.LastCheck != nil &&
-				status.LastCheck.FinishedAt != previousFinished &&
-				status.LastCheck.Result == "unchanged" {
-				return
-			}
-		}
-		select {
-		case <-h.ctx.Done():
-			h.t.Fatal(h.ctx.Err())
-		case <-time.After(2 * time.Second):
-		}
-	}
-	h.t.Fatal("worker did not complete an unchanged startup check")
 }
 
 type restoreOutput struct {
