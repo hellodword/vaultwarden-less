@@ -57,7 +57,7 @@ func (repository *fakeRepository) Init(context.Context, config.Target) error {
 func (repository *fakeRepository) Unlock(context.Context, config.Target) error {
 	return repository.record("unlock")
 }
-func (repository *fakeRepository) Check(context.Context, config.Target, string) error {
+func (repository *fakeRepository) Check(context.Context, config.Target) error {
 	return repository.record("check")
 }
 func (repository *fakeRepository) Prune(context.Context, config.Target, bool) (restic.PruneResult, error) {
@@ -117,7 +117,6 @@ func TestCLIUsageRuntimeAndDirtyFailuresHaveOneErrorDocument(t *testing.T) {
 		{"config", "validate"},
 		{"repo"},
 		{"repo", "snapshots"},
-		{"repo", "check", "--target", "primary", "--read-data-subset", "1/12"},
 		{"restore"},
 		{"restore", "--target", "primary", "--output", "/restore/drill"},
 	} {

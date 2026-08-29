@@ -35,8 +35,6 @@ def parse_arguments() -> argparse.Namespace:
         arguments.command = arguments.command[1:]
     if not arguments.command:
         parser.error("a Go test command is required after --")
-    if "-json" not in arguments.command:
-        parser.error("the Go test command must contain -json")
     if len(set(arguments.require)) != len(arguments.require):
         parser.error("required identities must be unique")
     return arguments

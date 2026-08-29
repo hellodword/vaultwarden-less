@@ -150,7 +150,7 @@ func TestMotoResticIntegration(t *testing.T) {
 		if err != nil || truncated || len(listed) != 2 {
 			t.Fatalf("snapshots = %#v/%v", listed, err)
 		}
-		if err := runner.Check(ctx, target, ""); err != nil {
+		if err := runner.Check(ctx, target); err != nil {
 			t.Fatal(err)
 		}
 		if err := runner.Unlock(ctx, target); err != nil {
@@ -265,7 +265,7 @@ func TestMotoResticIntegration(t *testing.T) {
 		if !remaining[outOfScopeID] {
 			t.Fatalf("prune removed out-of-scope snapshot %s", outOfScopeID)
 		}
-		if err := runner.Check(ctx, target, ""); err != nil {
+		if err := runner.Check(ctx, target); err != nil {
 			t.Fatal(err)
 		}
 	})

@@ -24,6 +24,7 @@ import (
 	"github.com/hellodword/vaultwarden-less/internal/config"
 	"github.com/hellodword/vaultwarden-less/internal/privatefs"
 	"github.com/hellodword/vaultwarden-less/internal/snapshot"
+	"github.com/hellodword/vaultwarden-less/internal/strictjson"
 )
 
 const (
@@ -275,20 +276,8 @@ func (r Runner) Unlock(ctx context.Context, target config.Target) error {
 	return nil
 }
 
-func (r Runner) Check(ctx context.Context, target config.Target, readDataSubset string) error {
-	arguments := []string{"check", "--json"}
-	if readDataSubset != "" {
-		parts := strings.Split(readDataSubset, "/")
-		if len(parts) != 2 || parts[1] != "12" {
-			return &OperationError{Code: "read_subset_invalid", ExitCode: -1}
-		}
-		part, err := strconv.Atoi(parts[0])
-		if err != nil || part < 1 || part > 12 {
-			return &OperationError{Code: "read_subset_invalid", ExitCode: -1}
-		}
-		arguments = append(arguments, "--read-data-subset", readDataSubset)
-	}
-	output, err := r.maintenance(ctx, target, arguments)
+func (r Runner) Check(ctx context.Context, target config.Target) error {
+	output, err := r.maintenance(ctx, target, []string{"check", "--json"})
 	if err != nil {
 		return err
 	}
@@ -836,72 +825,10 @@ func decodeJSONFrames(data []byte) ([]json.RawMessage, error) {
 }
 
 func strictUnmarshal(data []byte, destination any) error {
-	if err := rejectDuplicateKeys(data); err != nil {
+	if err := strictjson.RejectDuplicateKeys(data); err != nil {
 		return err
 	}
 	return json.Unmarshal(data, destination)
-}
-
-func rejectDuplicateKeys(data []byte) error {
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.UseNumber()
-	var consume func() error
-	consume = func() error {
-		token, err := decoder.Token()
-		if err != nil {
-			return err
-		}
-		delimiter, ok := token.(json.Delim)
-		if !ok {
-			return nil
-		}
-		switch delimiter {
-		case '{':
-			seen := map[string]struct{}{}
-			for decoder.More() {
-				keyToken, err := decoder.Token()
-				if err != nil {
-					return err
-				}
-				key, ok := keyToken.(string)
-				if !ok {
-					return fmt.Errorf("JSON object key is not a string")
-				}
-				if _, duplicate := seen[key]; duplicate {
-					return fmt.Errorf("duplicate JSON key")
-				}
-				seen[key] = struct{}{}
-				if err := consume(); err != nil {
-					return err
-				}
-			}
-			closing, err := decoder.Token()
-			if err != nil || closing != json.Delim('}') {
-				return fmt.Errorf("invalid JSON object")
-			}
-		case '[':
-			for decoder.More() {
-				if err := consume(); err != nil {
-					return err
-				}
-			}
-			closing, err := decoder.Token()
-			if err != nil || closing != json.Delim(']') {
-				return fmt.Errorf("invalid JSON array")
-			}
-		default:
-			return fmt.Errorf("unexpected JSON delimiter")
-		}
-		return nil
-	}
-	if err := consume(); err != nil {
-		return err
-	}
-	var extra any
-	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
-		return fmt.Errorf("trailing JSON")
-	}
-	return nil
 }
 
 func formatTime(value time.Time) string {

@@ -13,6 +13,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/hellodword/vaultwarden-less/internal/privatefs"
+	"github.com/hellodword/vaultwarden-less/internal/strictjson"
 )
 
 const (
@@ -121,7 +122,7 @@ func readStrictJSON(path string, destination any) error {
 	if len(data) == 0 || !utf8.Valid(data) {
 		return fmt.Errorf("state JSON is empty or invalid UTF-8")
 	}
-	if err := rejectDuplicateJSONKeys(data); err != nil {
+	if err := strictjson.RejectDuplicateKeys(data); err != nil {
 		return err
 	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
@@ -166,67 +167,6 @@ func readStateBytes(path string) ([]byte, error) {
 		return nil, fmt.Errorf("state path changed while reading")
 	}
 	return data, nil
-}
-
-func rejectDuplicateJSONKeys(data []byte) error {
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.UseNumber()
-	if err := walkJSONValue(decoder); err != nil {
-		return fmt.Errorf("state JSON is invalid: %w", err)
-	}
-	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
-		if err == nil {
-			return fmt.Errorf("state JSON contains trailing data")
-		}
-		return err
-	}
-	return nil
-}
-
-func walkJSONValue(decoder *json.Decoder) error {
-	token, err := decoder.Token()
-	if err != nil {
-		return err
-	}
-	delimiter, composite := token.(json.Delim)
-	if !composite {
-		return nil
-	}
-	switch delimiter {
-	case '{':
-		seen := make(map[string]struct{})
-		for decoder.More() {
-			nameToken, err := decoder.Token()
-			if err != nil {
-				return err
-			}
-			name, ok := nameToken.(string)
-			if !ok {
-				return fmt.Errorf("JSON object key is not a string")
-			}
-			if _, duplicate := seen[name]; duplicate {
-				return fmt.Errorf("duplicate JSON key")
-			}
-			seen[name] = struct{}{}
-			if err := walkJSONValue(decoder); err != nil {
-				return err
-			}
-		}
-	case '[':
-		for decoder.More() {
-			if err := walkJSONValue(decoder); err != nil {
-				return err
-			}
-		}
-	default:
-		return fmt.Errorf("unexpected JSON delimiter")
-	}
-	closing, err := decoder.Token()
-	want := map[json.Delim]json.Delim{'{': '}', '[': ']'}[delimiter]
-	if err != nil || closing != want {
-		return fmt.Errorf("invalid JSON composite")
-	}
-	return nil
 }
 
 func writeNewJSON(path string, value any) error {

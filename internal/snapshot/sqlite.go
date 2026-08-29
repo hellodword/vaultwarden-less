@@ -19,6 +19,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/hellodword/vaultwarden-less/internal/privatefs"
+	"github.com/hellodword/vaultwarden-less/internal/strictjson"
 	"github.com/hellodword/vaultwarden-less/internal/upstream"
 	"github.com/mattn/go-sqlite3"
 )
@@ -579,7 +580,7 @@ func referencedFiles(ctx context.Context, path string) ([]referencedFile, error)
 }
 
 func decodeSendFileData(data string) (string, int64, error) {
-	if !utf8.ValidString(data) || rejectDuplicateJSONKeys([]byte(data)) != nil {
+	if !utf8.ValidString(data) || strictjson.RejectDuplicateKeys([]byte(data)) != nil {
 		return "", 0, fmt.Errorf("invalid file Send data")
 	}
 	type sendFileData struct {

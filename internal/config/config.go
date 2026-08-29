@@ -308,8 +308,6 @@ func (c Backup) Target(name string) (Target, bool) {
 	return Target{}, false
 }
 
-func (t Target) Warnings() []string { return []string{} }
-
 func (t Target) Validate() error {
 	if !namePattern.MatchString(t.Name) {
 		return fmt.Errorf("invalid name %q", t.Name)

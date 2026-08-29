@@ -70,11 +70,6 @@ func serveCommand(configPath *string, environment commandEnvironment) *cobra.Com
 				return commandFailure(codeRepositoryFailure, "Restic version verification failed", err)
 			}
 
-			for _, target := range cfg.Targets {
-				for _, warning := range target.Warnings() {
-					logger.Warn("configuration warning", "target", target.Name, "warning", warning)
-				}
-			}
 			ctx, cancel := context.WithCancel(cmd.Context())
 			defer cancel()
 			builder := snapshot.Builder{

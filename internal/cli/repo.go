@@ -111,7 +111,7 @@ func repoCommand(configPath *string, environment commandEnvironment) *cobra.Comm
 		return nil
 	}
 	checkCommand := operation("check", "Check repository metadata", func(ctx context.Context, repository repository, target config.Target) (any, error) {
-		if err := repository.Check(ctx, target, ""); err != nil {
+		if err := repository.Check(ctx, target); err != nil {
 			return nil, err
 		}
 		return successfulOperation("check", target.Name), nil

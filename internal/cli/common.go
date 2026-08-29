@@ -31,7 +31,7 @@ type repository interface {
 	Snapshots(context.Context, config.Target, int) ([]restic.Snapshot, bool, error)
 	Init(context.Context, config.Target) error
 	Unlock(context.Context, config.Target) error
-	Check(context.Context, config.Target, string) error
+	Check(context.Context, config.Target) error
 	Prune(context.Context, config.Target, bool) (restic.PruneResult, error)
 	ResolveSnapshot(context.Context, config.Target, string) (restic.Snapshot, error)
 	Restore(context.Context, config.Target, string, string) error

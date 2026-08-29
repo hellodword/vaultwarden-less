@@ -28,7 +28,6 @@ let
       ldflags = [
         "-s"
         "-w"
-        "-X=github.com/hellodword/vaultwarden-less/internal/buildinfo.Version=${identity.release}"
         "-X=github.com/hellodword/vaultwarden-less/internal/buildinfo.ProjectCommit=${identity.projectCommit}"
         "-X=github.com/hellodword/vaultwarden-less/internal/buildinfo.Release=${identity.release}"
         "-X=github.com/hellodword/vaultwarden-less/internal/buildinfo.Clean=${cleanString}"

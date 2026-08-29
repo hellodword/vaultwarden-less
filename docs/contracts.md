@@ -1172,12 +1172,19 @@ deployment.py [--deployment-root <directory>] [--project-name <name>] <deploymen
 release.py create --output-root <ignored-directory>
 release.py load <release-directory>
 upstream_diff.py <vaultwarden|bitwarden-cli|restic|moto|go> <candidate-tag> [--upstreams UPSTREAMS.toml]
-verify_go_test.py --require <package>:<test> [--require ...] -- <go test -json command>
+verify_go_test.py --require <package>:<test> [--require ...] -- <JSON-event-producing test command>
 ```
 
 `check_release.py` requires the exact clean pair and gate order defined by the
 public Just contract, stops on the first failure, and rechecks the pair before
 one schema-1 success line. It never includes soak, cold, or release creation.
+
+`verify_go_test.py` validates the child stream rather than requiring a literal
+`-json` token in child argv. Every line must still be a valid Go test JSON
+event, and each required test must have ordered run, test PASS, later package
+PASS, no skip/fail event, and a zero child exit. Project recipes use
+`go test -json`; repository-external runners may equivalently feed the locked
+`go tool test2json` stream.
 
 `deployment.py` accepts only a real deployment root, a bounded Compose project
 name, and either the named terminal workflow or a nonempty product deployment

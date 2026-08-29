@@ -10,10 +10,6 @@ import (
 var releasePattern = regexp.MustCompile(`^RELEASE\.[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}-[0-9]{2}-[0-9]{2}Z-g([0-9a-f]{12})$`)
 
 var (
-	// Version remains the text-version compatibility value until the schema 1
-	// CLI lands. Release builds stamp it with Release.
-	Version = "development"
-
 	// ProjectCommit is a full clean Git commit or the empty string for a dirty
 	// development build.
 	ProjectCommit = ""

@@ -32,7 +32,7 @@ class VerifyGoTestScriptTest(unittest.TestCase):
         output = io.StringIO()
         diagnostics = io.StringIO()
         result = verify_go_test.verify(
-            [sys.executable, "-c", program, "-json"],
+            [sys.executable, "-c", program],
             REQUIRED,
             output,
             diagnostics,
@@ -117,7 +117,7 @@ class VerifyGoTestScriptTest(unittest.TestCase):
         output = io.StringIO()
         diagnostics = io.StringIO()
         result = verify_go_test.verify(
-            [sys.executable, "-c", "print('not json')", "-json"],
+            [sys.executable, "-c", "print('not json')"],
             REQUIRED,
             output,
             diagnostics,

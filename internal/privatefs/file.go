@@ -5,11 +5,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 	"syscall"
 )
-
-const maxSecretBytes = 64 << 10
 
 // ReadBytes reads a bounded, regular, non-symlink 0600 file owned by the
 // effective user.
@@ -64,23 +61,6 @@ func ReadBytes(path string, limit int64) ([]byte, error) {
 		return nil, fmt.Errorf("private file changed while reading")
 	}
 	return data[:n], nil
-}
-
-// Read returns a small non-empty private text file. A single trailing line
-// ending is removed; other whitespace is data.
-func Read(path string) (string, error) {
-	data, err := ReadBytes(path, maxSecretBytes)
-	if err != nil {
-		return "", err
-	}
-	value := strings.TrimSuffix(strings.TrimSuffix(string(data), "\n"), "\r")
-	if value == "" {
-		return "", fmt.Errorf("private file is empty")
-	}
-	if strings.IndexByte(value, 0) >= 0 {
-		return "", fmt.Errorf("private file contains a NUL byte")
-	}
-	return value, nil
 }
 
 func privateReadableMode(info os.FileInfo) bool {

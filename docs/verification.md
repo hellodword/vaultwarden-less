@@ -78,6 +78,10 @@ Every real Go scenario is run with `go test -json` through
 A shell exit code, similarly named test in another package, subtest-only pass,
 malformed output, or missing final package pass is rejected. Successful output
 includes one explicit `go test verification passed: ...` line.
+The verifier checks the event stream, not whether child argv contains the
+literal token `-json`: project recipes use `go test -json`, while the
+repository-external runner may supply the equivalent locked
+`go tool test2json` stream.
 
 ## Moto/Restic integration
 
