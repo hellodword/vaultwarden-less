@@ -27,7 +27,7 @@ type composeGateService struct {
 func TestComposeStartupGateModel(t *testing.T) {
 	repository := repositoryRoot(t)
 	root := t.TempDir()
-	for _, relative := range []string{"config", "data", "import", "import/source", "import/candidate", "restore", "restore/drill", "state"} {
+	for _, relative := range []string{"config", "data", "import", "import/source", "import/candidate", "restore", "restore/drill", "restore/multi-primary", "state"} {
 		if err := os.MkdirAll(filepath.Join(root, relative), 0o700); err != nil {
 			t.Fatal(err)
 		}
@@ -67,6 +67,26 @@ func TestComposeStartupGateModel(t *testing.T) {
 	assertGateMount(t, admin, filepath.Join(root, "data"), "/data", true)
 	assertGateMount(t, admin, filepath.Join(root, "state"), "/state", false)
 	assertGateMount(t, admin, root, "/deployment-root", false)
+
+	notifierCA := filepath.Join(root, "config", "notifier-ca.pem")
+	writePrivateFile(t, notifierCA, "test-only CA\n")
+	t.Setenv("E2E_SOURCE_PORT", "")
+	t.Setenv("E2E_PROXY_PORT", "")
+	t.Setenv("E2E_DRILL_PORT", "")
+	t.Setenv("E2E_DOMAIN", "https://vaultwarden.example.test")
+	t.Setenv("E2E_NOTIFIER_CA", notifierCA)
+	drillSource := filepath.Join(root, "restore", "multi-primary")
+	t.Setenv("E2E_DRILL_SOURCE", drillSource)
+	testModel := renderComposeModel(
+		t,
+		root,
+		filepath.Join(root, ".env"),
+		filepath.Join(repository, "compose.yml"),
+		"--file", filepath.Join(repository, "tests", "e2e", "compose.override.yml"),
+		"--profile", "drill",
+	)
+	assertGateMount(t, testModel["drill-copy"], drillSource, "/source", true)
+	assertGateMount(t, testModel["drill-vaultwarden"], drillSource, "/recovery", true)
 
 	upgradeEnvironment := filepath.Join(root, "compose.env")
 	writePrivateFile(t, upgradeEnvironment, deploymentEnvironment+

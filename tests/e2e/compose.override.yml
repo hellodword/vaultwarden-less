@@ -63,6 +63,13 @@ services:
       DOMAIN: ${E2E_DOMAIN:?E2E_DOMAIN is required}
     ports: !override
       - "127.0.0.1:${E2E_DRILL_PORT-}:80"
+    volumes:
+      - type: bind
+        source: ${E2E_DRILL_SOURCE:?E2E_DRILL_SOURCE is required}
+        target: /recovery
+        read_only: true
+        bind:
+          create_host_path: false
 
   import-vaultwarden:
     environment:

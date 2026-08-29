@@ -75,6 +75,7 @@ func TestMultiTargetSoak(t *testing.T) {
 	}
 	fixture.assertOneDegradedNotification()
 	fixture.recoverSecondary()
+	fixture.harness.waitNotificationContains(30*time.Second, "target secondary has recovered")
 }
 
 func newMultiTargetFixture(t *testing.T, timeout time.Duration) *multiTargetFixture {
@@ -146,7 +147,6 @@ func (fixture *multiTargetFixture) recoverSecondary() (snapshotList, snapshotLis
 	if recoveredPrimary.SnapshotID == nil || *recoveredPrimary.SnapshotID != fixture.primarySnapshotID {
 		fixture.t.Fatalf("catch-up replaced the primary recovery point: %#v", recoveredPrimary)
 	}
-	fixture.harness.waitNotificationContains(30*time.Second, "target secondary has recovered")
 	fixture.harness.waitNotificationContains(30*time.Second, "synced=[primary]", "created=[secondary]", "failed=[]")
 
 	primarySnapshots := fixture.harness.waitSnapshotCount(1, 2*time.Minute)
