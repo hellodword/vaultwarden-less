@@ -183,6 +183,15 @@ func rollbackCommand(environment commandEnvironment) *cobra.Command {
 }
 
 func rollbackManager(environment commandEnvironment) (upgrade.Manager, error) {
+	root := filepath.Clean(environment.deploymentRoot)
+	if environment.deploymentRoot == "" || !filepath.IsAbs(environment.deploymentRoot) ||
+		root != environment.deploymentRoot || root == string(filepath.Separator) {
+		return upgrade.Manager{}, commandFailure(codeInternal, "The rollback filesystem boundary is invalid", nil)
+	}
+	environment.deploymentPath = filepath.Join(root, ".env")
+	environment.dataDir = filepath.Join(root, "data")
+	environment.restoreRoot = filepath.Join(root, "restore")
+	environment.stateDir = filepath.Join(root, "state")
 	return upgradeManager(environment)
 }
 

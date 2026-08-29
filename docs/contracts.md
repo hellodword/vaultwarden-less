@@ -179,8 +179,12 @@ executing `/bin/vaultwarden`:
 
 An unavailable or incomplete mode fails closed. Normal backup and proxy serve
 paths independently require the exact active commit and release before they
-open data or accept traffic. `version`, `healthcheck`, `config validate`, and
-the explicit initialization workflow retain their narrower pre-active modes.
+open data or accept traffic. The data-opening Vaultwarden and backup roles also
+validate the live data filesystem against accepted upgrade evidence. Proxy has
+no data mount: its state-only gate still validates the complete upgrade
+decision/activation, verified candidate, and decision-appropriate rollback
+device/tree evidence. `version`, `healthcheck`, `config validate`, and the
+explicit initialization workflow retain their narrower pre-active modes.
 
 ## YAML configuration and credentials
 
@@ -914,6 +918,14 @@ ordinary A services open the now-mutable tree without repeatedly hashing it;
 an interruption before the refresh leaves every service gate closed. A rerun
 preserves the refreshed instant. The command does not rewrite A data or remove
 RSA state.
+
+`rollback-a` is the immutable-A, networkless, non-root administrative role. It
+has one writable deployment-root bind at `/deployment-root` because Linux
+returns `EXDEV` when `data` and `rollback-data` are exposed as separate mount
+points. The command derives only `.env`, `data`, `restore`, and `state` paths
+under that fixed root; its container root filesystem is read-only, all
+capabilities are dropped, `no-new-privileges` is set, and no engine socket is
+mounted.
 
 `scripts/deployment.py upgrade rollback` stops B and drill services, invokes
 that resumable A command, verifies and retags only A's three immutable images

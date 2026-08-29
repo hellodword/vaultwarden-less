@@ -174,24 +174,8 @@ services:
     command: [--help]
     volumes:
       - type: bind
-        source: ./.env
-        target: /deployment/.env
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ./data
-        target: /data
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ./restore
-        target: /restore
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ./state
-        target: /state
+        source: .
+        target: /deployment-root
         bind:
           create_host_path: false
 

@@ -286,18 +286,28 @@ func TestUpgradeSyncRequiresBothExactRecoveryIdentities(t *testing.T) {
 	}
 }
 
-func TestRollbackManagerUsesExactConfiguredMounts(t *testing.T) {
+func TestRollbackManagerUsesOneCommonDeploymentRoot(t *testing.T) {
 	environment := testEnvironment(nil, nil)
 	root := t.TempDir()
-	environment.deploymentPath = filepath.Join(root, ".env")
+	environment.deploymentRoot = root
+	loadedPath := ""
+	loadDeployment := environment.loadDeployment
+	environment.loadDeployment = func(path string) (config.Deployment, error) {
+		loadedPath = path
+		return loadDeployment(path)
+	}
 	environment.dataDir = "/separate-data-mount"
 	environment.stateDir = "/separate-state-mount"
 	manager, err := rollbackManager(environment)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if manager.DataDir != environment.dataDir || manager.StateDir != environment.stateDir || manager.RestoreRoot != environment.restoreRoot {
+	if manager.DataDir != filepath.Join(root, "data") || manager.StateDir != filepath.Join(root, "state") ||
+		manager.RestoreRoot != filepath.Join(root, "restore") {
 		t.Fatalf("rollback paths = %q/%q", manager.DataDir, manager.StateDir)
+	}
+	if loadedPath != filepath.Join(root, ".env") {
+		t.Fatalf("rollback deployment path = %q", loadedPath)
 	}
 	regular, err := upgradeManager(environment)
 	if err != nil {
@@ -305,6 +315,16 @@ func TestRollbackManagerUsesExactConfiguredMounts(t *testing.T) {
 	}
 	if regular.DataDir != environment.dataDir || regular.StateDir != environment.stateDir {
 		t.Fatalf("regular upgrade paths changed = %q/%q", regular.DataDir, regular.StateDir)
+	}
+}
+
+func TestRollbackManagerRejectsInvalidCommonRoot(t *testing.T) {
+	environment := testEnvironment(nil, nil)
+	environment.deploymentRoot = "relative"
+	_, err := rollbackManager(environment)
+	var commandError *CommandError
+	if !errors.As(err, &commandError) || commandError.Code != codeInternal {
+		t.Fatalf("invalid rollback root = %#v", err)
 	}
 }
 
@@ -419,7 +439,8 @@ func testEnvironment(repositoryClient repository, server *httptest.Server, resto
 		allowServe:    func(context.Context, string, string, deployment.Identity, config.Deployment) error { return nil },
 		drillCheck:    func(context.Context) error { return nil },
 		httpClient:    &http.Client{Timeout: time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }},
-		workerURL:     "http://127.0.0.1:1", deploymentPath: "/deployment/.env", vaultwardenPath: "/deployment/vaultwarden.env",
+		workerURL:     "http://127.0.0.1:1", deploymentRoot: "/deployment-root",
+		deploymentPath: "/deployment/.env", vaultwardenPath: "/deployment/vaultwarden.env",
 		credentialsPath: "/credentials/role.yaml",
 		notifierPath:    "/credentials/notifiers.yaml", passwordRoot: "/credentials/restic", resticBinary: "restic",
 		dataDir: "/data", stagingDir: "/staging", cacheDir: "/cache", restoreRoot: "/restore", stateDir: "/state",

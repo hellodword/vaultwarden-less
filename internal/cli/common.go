@@ -53,6 +53,7 @@ type commandEnvironment struct {
 	drillCheck        func(context.Context) error
 	httpClient        *http.Client
 	workerURL         string
+	deploymentRoot    string
 	deploymentPath    string
 	vaultwardenPath   string
 	credentialsPath   string
@@ -102,6 +103,7 @@ func defaultEnvironment(stderr io.Writer) commandEnvironment {
 			},
 		},
 		workerURL:       config.WorkerURL,
+		deploymentRoot:  config.DeploymentRoot,
 		deploymentPath:  config.DeploymentEnvPath,
 		vaultwardenPath: config.VaultwardenEnvPath,
 		credentialsPath: config.RoleCredentialsPath,

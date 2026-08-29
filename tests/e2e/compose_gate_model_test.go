@@ -15,7 +15,11 @@ import (
 
 type composeGateService struct {
 	Command     []string `json:"command"`
+	User        string   `json:"user"`
 	NetworkMode string   `json:"network_mode"`
+	ReadOnly    bool     `json:"read_only"`
+	CapDrop     []string `json:"cap_drop"`
+	SecurityOpt []string `json:"security_opt"`
 	Volumes     []struct {
 		Type     string `json:"type"`
 		Source   string `json:"source"`
@@ -48,6 +52,12 @@ func TestComposeStartupGateModel(t *testing.T) {
 	assertGateMount(t, base["vaultwarden"], filepath.Join(root, ".env"), "/deployment/.env", true)
 	assertGateMount(t, base["vaultwarden"], filepath.Join(root, "state"), "/state", true)
 	assertGateMount(t, base["vaultwarden"], filepath.Join(root, "data"), "/data", false)
+	proxy := base["proxy"]
+	if len(proxy.Volumes) != 2 {
+		t.Fatalf("proxy gained a data or workflow mount: %#v", proxy.Volumes)
+	}
+	assertGateMount(t, proxy, filepath.Join(root, ".env"), "/deployment/.env", true)
+	assertGateMount(t, proxy, filepath.Join(root, "state"), "/state", true)
 
 	assertGateCommand(t, base["drill-vaultwarden"], "drill")
 	assertGateMount(t, base["drill-vaultwarden"], filepath.Join(root, ".env"), "/deployment/.env", true)
@@ -82,6 +92,7 @@ func TestComposeStartupGateModel(t *testing.T) {
 	assertGateCommand(t, upgradeModel["rollback-vaultwarden-a"], "rollback")
 	assertGateMount(t, upgradeModel["rollback-vaultwarden-a"], filepath.Join(root, ".env"), "/deployment/.env", true)
 	assertGateMount(t, upgradeModel["rollback-vaultwarden-a"], filepath.Join(root, "state"), "/state", true)
+	assertRollbackAdminIsolation(t, upgradeModel["rollback-a"], root)
 }
 
 func renderComposeModel(t *testing.T, root, environment, compose string, extra ...string) map[string]composeGateService {
@@ -126,4 +137,15 @@ func assertGateMount(t *testing.T, service composeGateService, source, target st
 		}
 	}
 	t.Fatalf("missing gate mount source=%q target=%q read_only=%t in %#v", source, target, readOnly, service.Volumes)
+}
+
+func assertRollbackAdminIsolation(t *testing.T, service composeGateService, root string) {
+	t.Helper()
+	expectedUser := fmt.Sprintf("%d:%d", os.Geteuid(), os.Getegid())
+	if service.User != expectedUser || service.NetworkMode != "none" || !service.ReadOnly ||
+		!slices.Equal(service.CapDrop, []string{"ALL"}) ||
+		!slices.Equal(service.SecurityOpt, []string{"no-new-privileges:true"}) || len(service.Volumes) != 1 {
+		t.Fatalf("rollback service isolation is invalid: %#v", service)
+	}
+	assertGateMount(t, service, root, "/deployment-root", false)
 }

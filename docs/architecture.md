@@ -94,7 +94,10 @@ private `state/deployment/active.json` is the only serving authority: normal
 Vaultwarden, backup, and proxy independently reject a missing, damaged, or
 mismatched identity. The Vaultwarden gate runs before `/bin/vaultwarden`, so a
 rejected image cannot open or migrate `/data/db.sqlite3` or create SQLite/WAL
-or RSA state. Upgrade, rollback, drill, and import use explicit Compose argv
+or RSA state. Proxy remains data-blind and validates terminal upgrade state
+plus frozen rollback evidence without gaining a `/data` mount; roles that open
+data additionally validate the live data filesystem device. Upgrade, rollback,
+drill, and import use explicit Compose argv
 and their narrower durable workflow evidence; no mode is inferred from tags or
 the presence of a database. The host-side Python orchestrator owns only
 structured Docker argv, exact image/runtime verification, drill cleanup, and
@@ -190,6 +193,13 @@ current record to history only after healthy B services and drill cleanup.
 Rollback uses the frozen tree ID to resume a single same-filesystem exchange,
 starts ordinary A services, and then archives the complete current record with
 exchanged B data to quarantine. See [Upgrades](upgrades.md).
+
+The networkless non-root `rollback-a` role receives one writable deployment-root
+bind because Linux cannot exchange `data` and
+`state/upgrade/current/rollback-data` through separate mount points. It derives
+its `.env`, data, restore, and state paths under that exact root, uses immutable
+A, has a read-only container root filesystem, no capabilities, and no container
+engine socket or network.
 
 ## Failure semantics
 

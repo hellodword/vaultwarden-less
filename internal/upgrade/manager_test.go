@@ -496,6 +496,19 @@ func TestExplicitRollbackExchangesAAndQuarantinesOpaqueB(t *testing.T) {
 	); err != nil {
 		t.Fatalf("rollback A gate: %v", err)
 	}
+	unmounted := fixture.data + "-unmounted-after-rollback"
+	if err := os.Rename(fixture.data, unmounted); err != nil {
+		t.Fatal(err)
+	}
+	if err := StateOnlyServingAllowed(
+		context.Background(), fixture.state,
+		deployment.Identity{ProjectCommit: testACommit, Release: testARelease}, fixture.deployment,
+	); err != nil {
+		t.Fatalf("rollback state-only gate required data: %v", err)
+	}
+	if err := os.Rename(unmounted, fixture.data); err != nil {
+		t.Fatal(err)
+	}
 	writePrivateFile(t, filepath.Join(fixture.data, "post-start"), []byte("ordinary A runtime mutation"))
 	if err := fixture.serving(testACommit, testARelease); err != nil {
 		t.Fatalf("restarted A service after runtime mutation: %v", err)
@@ -926,6 +939,56 @@ func TestServingGateAllowsAOnlyBeforeFreezeAndFailsClosed(t *testing.T) {
 	writePrivateFile(t, state.ticket, []byte(`{"schema_version":1}`+"\n"))
 	if err := fixture.serving(testACommit, testARelease); !IsKind(err, ErrorInvalidState) {
 		t.Fatalf("corrupt frozen serve = %v", err)
+	}
+}
+
+func TestStateOnlyServingGateKeepsDataUnmountedAndFailClosed(t *testing.T) {
+	fixture := newManagerFixture(t)
+	prepareAndMigrate(t, fixture)
+	b := fixture.manager(testBCommit, testBRelease)
+	if _, err := b.Verify(
+		context.Background(), []string{"primary"}, fixedCollector(evidence([]string{"primary"}, "9")),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Accept(context.Background(), func(context.Context) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	identity := deployment.Identity{ProjectCommit: testBCommit, Release: testBRelease}
+	if err := StateOnlyServingAllowed(context.Background(), fixture.state, identity, fixture.deployment); err != nil {
+		t.Fatalf("accepted state-only serve = %v", err)
+	}
+
+	unmounted := fixture.data + "-unmounted"
+	if err := os.Rename(fixture.data, unmounted); err != nil {
+		t.Fatal(err)
+	}
+	if err := StateOnlyServingAllowed(context.Background(), fixture.state, identity, fixture.deployment); err != nil {
+		t.Fatalf("state-only serve required a data mount: %v", err)
+	}
+	if err := fixture.serving(testBCommit, testBRelease); !IsKind(err, ErrorConflict) {
+		t.Fatalf("data-opening serve without data = %v", err)
+	}
+	if err := os.Rename(unmounted, fixture.data); err != nil {
+		t.Fatal(err)
+	}
+
+	tamper := filepath.Join(paths(fixture.state).rollback, "tamper")
+	writePrivateFile(t, tamper, []byte("tamper"))
+	if err := StateOnlyServingAllowed(context.Background(), fixture.state, identity, fixture.deployment); !IsKind(err, ErrorVerification) {
+		t.Fatalf("state-only serve with changed rollback tree = %v", err)
+	}
+	if err := os.Remove(tamper); err != nil {
+		t.Fatal(err)
+	}
+	if err := StateOnlyServingAllowed(context.Background(), fixture.state, identity, fixture.deployment); err != nil {
+		t.Fatalf("restored state-only serve = %v", err)
+	}
+	if err := StateOnlyServingAllowed(
+		context.Background(), fixture.state,
+		deployment.Identity{ProjectCommit: testACommit, Release: testARelease}, fixture.deployment,
+	); !IsKind(err, ErrorConflict) {
+		t.Fatalf("state-only serve with wrong active identity = %v", err)
 	}
 }
 

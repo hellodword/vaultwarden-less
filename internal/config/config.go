@@ -32,6 +32,7 @@ const (
 	MaxPasswordBytes = 64 << 10
 
 	DefaultBackupConfigPath = "/config/backup.yaml"
+	DeploymentRoot          = "/deployment-root"
 	DeploymentEnvPath       = "/deployment/.env"
 	VaultwardenEnvPath      = "/deployment/vaultwarden.env"
 	RoleCredentialsPath     = "/run/credentials/role.yaml"

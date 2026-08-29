@@ -59,7 +59,7 @@ func execute(ctx context.Context, arguments []string, stdout, stderr io.Writer) 
 			}); err != nil {
 				return err
 			}
-			return upgrade.ServingAllowed(ctx, config.StateDir, config.DataDir, deploymentstate.Identity{
+			return upgrade.StateOnlyServingAllowed(ctx, config.StateDir, deploymentstate.Identity{
 				ProjectCommit: buildinfo.ProjectCommit,
 				Release:       buildinfo.Release,
 			}, deployment)

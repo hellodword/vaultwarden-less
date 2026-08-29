@@ -713,6 +713,27 @@ func ServingAllowed(
 	identity deployment.Identity,
 	configured config.Deployment,
 ) error {
+	return servingAllowed(ctx, stateDir, dataDir, identity, configured, true)
+}
+
+// StateOnlyServingAllowed validates a non-data-opening role without granting
+// it a data mount. Roles that can open data must use ServingAllowed.
+func StateOnlyServingAllowed(
+	ctx context.Context,
+	stateDir string,
+	identity deployment.Identity,
+	configured config.Deployment,
+) error {
+	return servingAllowed(ctx, stateDir, config.DataDir, identity, configured, false)
+}
+
+func servingAllowed(
+	ctx context.Context,
+	stateDir, dataDir string,
+	identity deployment.Identity,
+	configured config.Deployment,
+	validateActiveData bool,
+) error {
 	if err := identity.Validate(); err != nil {
 		return stateError(ErrorInvalidState, fmt.Errorf("serving identity is invalid"))
 	}
@@ -757,7 +778,7 @@ func ServingAllowed(
 		}
 		return nil
 	}
-	return terminalServingAllowed(ctx, stateDir, dataDir, identity, configured, "")
+	return terminalServingAllowed(ctx, stateDir, dataDir, identity, configured, "", validateActiveData)
 }
 
 func RollbackServingAllowed(
@@ -766,7 +787,7 @@ func RollbackServingAllowed(
 	identity deployment.Identity,
 	configured config.Deployment,
 ) error {
-	return terminalServingAllowed(ctx, stateDir, dataDir, identity, configured, DecisionRollback)
+	return terminalServingAllowed(ctx, stateDir, dataDir, identity, configured, DecisionRollback, true)
 }
 
 func terminalServingAllowed(
@@ -775,6 +796,7 @@ func terminalServingAllowed(
 	identity deployment.Identity,
 	configured config.Deployment,
 	requiredDecision string,
+	validateActiveData bool,
 ) error {
 	if err := identity.Validate(); err != nil {
 		return stateError(ErrorInvalidState, fmt.Errorf("serving identity is invalid"))
@@ -832,8 +854,14 @@ func terminalServingAllowed(
 		if candidate.Phase != PhaseVerified {
 			return stateError(ErrorConflict, fmt.Errorf("accepted candidate is not verified"))
 		}
-		if err := manager.validateFrozenTree(ctx, state.rollback, ticket); err != nil {
-			return err
+		var validationErr error
+		if validateActiveData {
+			validationErr = manager.validateFrozenTree(ctx, state.rollback, ticket)
+		} else {
+			validationErr = manager.validateFrozenRollback(ctx, state.rollback, ticket)
+		}
+		if validationErr != nil {
+			return validationErr
 		}
 		return nil
 	}
@@ -1017,8 +1045,12 @@ func (manager Manager) validateFrozenTree(ctx context.Context, rollback string, 
 	if err != nil || activeDevice != ticket.ActiveDevice {
 		return stateError(ErrorConflict, fmt.Errorf("active filesystem device changed"))
 	}
+	return manager.validateFrozenRollback(ctx, rollback, ticket)
+}
+
+func (manager Manager) validateFrozenRollback(ctx context.Context, rollback string, ticket RollbackTicket) error {
 	rollbackDevice, err := manager.device()(rollback)
-	if err != nil || rollbackDevice != ticket.RollbackDevice || rollbackDevice != activeDevice {
+	if err != nil || rollbackDevice != ticket.RollbackDevice {
 		return stateError(ErrorConflict, fmt.Errorf("rollback filesystem device changed"))
 	}
 	identity, err := rollbackTreeID(ctx, rollback)
