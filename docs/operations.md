@@ -10,6 +10,46 @@ Never run `git clean -x` or `git clean -X` in a deployment clone. Do not delete
 or overwrite `data`, `restore`, `state`, credentials, or a repository merely to
 make a command pass.
 
+## Operator command surface
+
+On a source host with the pinned Nix environment, the public Operations group
+is exactly:
+
+```text
+up
+status
+backup
+deployment *args
+maintenance *args
+restore <target> <output> [snapshot]
+drill-up
+drill-down
+```
+
+Invoke these as `nix develop --command just <recipe> ...`. `deployment` routes
+ordinary state operations to the networkless deployment-admin service and
+resumes terminal upgrade/import workflows in the host orchestrator.
+`maintenance` passes structured arguments to the repository-networked service;
+`backup` asks the resident worker for one debounced check. These are
+conveniences over the exact Docker Compose commands documented below, which
+remain the interface for an ordinary deployment host without Nix.
+
+There are deliberately no `down`, `ps`, `logs`, `drill-status`, or detailed
+`repo-*` recipes. Use the documented raw commands, for example:
+
+```sh
+docker compose --env-file .env --file compose.yml down
+docker compose --env-file .env --file compose.yml ps
+docker compose --env-file .env --file compose.yml logs --tail 200 vaultwarden backup proxy
+docker compose --project-name vaultwarden-less-drill --env-file .env --file compose.yml --profile drill ps
+docker compose --env-file .env --file compose.yml --profile maintenance run --rm --no-deps maintenance repo check --target primary
+```
+
+No removed recipe has an alias or fallback. Repository format migration is not
+an operator command: initialization always creates Restic format 2, and a
+future explicit `restic migrate` would be a separately authorized maintenance
+event outside this interface.
+
 ## Release transfer and startup
 
 A release directory must contain exactly `images.tar.gz` and `SHA256SUMS` from

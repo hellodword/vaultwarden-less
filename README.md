@@ -16,8 +16,8 @@ orchestrator without leaving a cross-version support gap. See the normative
 
 The deployment host needs only Git, Python 3, Docker Engine, the Docker Compose
 plugin, and a release directory containing `images.tar.gz` and `SHA256SUMS`.
-Python runs the standard-library-only terminal upgrade orchestrator; the host
-does not need Nix, Go, Restic, or a registry.
+Python runs the standard-library-only terminal upgrade/import orchestrator;
+the host does not need Nix, Go, Restic, or a registry.
 
 ## Ten-minute local start
 
@@ -39,7 +39,7 @@ validation.
 
 ```sh
 install -d -m 0700 config credentials credentials/restic
-install -d -m 0700 data staging cache restore state dist tmp
+install -d -m 0700 data import staging cache restore state dist tmp
 install -m 0600 .env.example .env
 install -m 0600 config/backup.example.yaml config/backup.yaml
 install -m 0600 config/vaultwarden.example.env config/vaultwarden.env
@@ -105,14 +105,19 @@ environment. Do not install project tools globally.
 ```sh
 nix develop --command just --list
 nix develop --command just check
-nix develop --command just check-full
+nix develop --command just check-release <A-full-commit>
+nix develop --command just soak
 nix develop --command just release <ignored-output-root>
 ```
 
-`check-full` includes the fast gate, vulnerability scan, all products, real
-Moto/Restic integration, the ordinary Vaultwarden backup/restore/drill
-lifecycle, and the real two-repository degradation/catch-up lifecycle. Upgrade
-acceptance is a separate command because it needs two explicit clean commits.
+`check` is the daily format, ordinary-test, vet, lint, and flake gate; it does
+not run full-tree race or real container scenarios. `check-release` requires a
+distinct clean A commit and clean HEAD B, then runs the full-tree race,
+vulnerability/product/integration checks, lean backup, fast multi-target,
+initial-import, and both A/B upgrade lifecycles. `soak` is the separate real
+30-minute multi-target degradation gate. Cold-host and same-commit release
+reproducibility remain conditional acceptance procedures rather than daily
+commands.
 
 ## Documentation map
 

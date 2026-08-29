@@ -47,7 +47,10 @@ assert lib.any (lib.hasInfix "${upstreams.go.source_tag}.src.tar.gz") goSourceUR
   script-tests =
     pkgs.runCommand "vaultwarden-less-script-tests"
       {
-        nativeBuildInputs = [ pkgs.python3 ];
+        nativeBuildInputs = [
+          pkgs.just
+          pkgs.python3
+        ];
       }
       ''
         cd ${source}

@@ -107,8 +107,8 @@ ports differ. A leading plus, sign, leading zero, exponent, or surrounding
 whitespace is invalid.
 
 `config`, `credentials`, `credentials/restic`, `data`, `import`, `staging`,
-`cache`, `restore`, and `state`, including every required runtime subdirectory, are real
-non-symlink directories owned by the runtime UID/GID with mode `0700`. Every
+`cache`, `restore`, and `state`, including every required runtime subdirectory,
+are real non-symlink directories owned by the runtime UID/GID with mode `0700`. Every
 private configuration, credential, password, manifest, and upgrade-state file
 is a real non-symlink regular file owned by that identity with mode `0600`.
 Every ancestor is inspected without following a symlink. Examples are public
@@ -116,12 +116,13 @@ templates and are not subject to private-file ownership checks until copied to
 their private names.
 
 `compose.yml` is the production topology and defines the `deployment`,
-`maintenance`, `restore`, `drill`, and `import` profiles. `compose.upgrade.yml` is used only as an
-overlay during an upgrade or rollback. Both files are normative. They use only
+`maintenance`, `restore`, `drill`, and `import` profiles.
+`compose.upgrade.yml` is used only as an overlay during an upgrade or rollback.
+Both files are normative. They use only
 the three `vaultwarden-less-*:local` production aliases in normal operation,
-contain no `build:` key, set `pull_policy: never`, publish only the proxy and
-the isolated drill on loopback, never mount a container engine socket, and do
-not pull from a registry. Every resident service uses the configured non-root
+contain no `build:` key, set `pull_policy: never`, publish only the proxy,
+isolated drill, and initial-import candidate on loopback, never mount a
+container engine socket, and do not pull from a registry. Every resident service uses the configured non-root
 identity, a read-only root filesystem, `no-new-privileges`, and an empty
 capability set. A bounded one-shot copy helper may run as root with only the
 capabilities declared in `compose.yml`.
@@ -267,6 +268,12 @@ plus immutable product-controlled home, temporary-directory, and trust-store
 values required by the image. User configuration cannot override those fixed
 values. Repository locators, password material, target environment values,
 notifier values, and raw subprocess stderr are never logged or returned.
+
+`repo init` always invokes Restic with `init --repository-version 2`. The real
+integration must read repository config and observe integer version 2. No
+product command exposes or invokes `restic migrate`; changing repository
+format is an explicit, separately authorized maintenance event, never a
+software-upgrade side effect.
 
 Every Restic invocation owns a fresh parser and process context. JSON output is
 read as command-specific frames with an 8 MiB maximum frame, 64 MiB maximum
@@ -737,6 +744,43 @@ third-party license copy. The project remains MIT under `LICENSE`; `NOTICE.md`
 accurately notes Vaultwarden's AGPL obligations. The project does not claim a
 complete SBOM or license/source archive.
 
+### Public Just interface
+
+The single root `Justfile` has no modules or aliases. `just --list` exposes
+exactly these 18 recipes in three native groups:
+
+| Group | Public recipes |
+| --- | --- |
+| Development | `check`, `check-release <A-commit>`, `release <output-root>`, `soak` |
+| Operations | `up`, `status`, `backup`, `deployment *args`, `maintenance *args`, `restore <target> <output> [snapshot]`, `drill-up`, `drill-down` |
+| Upgrade | `upgrade-prepare <B-commit> <B-release>`, `upgrade-freeze`, `upgrade-start`, `upgrade-verify`, `upgrade-accept`, `upgrade-rollback` |
+
+`check` runs formatting verification, ordinary Go/Python tests, vet, lint, and
+`nix flake check`; it does not run full-tree race or a real E2E. A
+`check-release` requires a distinct full clean A commit and clean HEAD B. It
+runs `check`, full-tree race, `govulncheck`, all products, Moto/Restic
+integration, lean backup, fast multi-target, initial import, and both A/B
+upgrade cases in that order, then revalidates the unchanged clean pair. It
+does not run `soak`, cold-host acceptance, or release reproducibility. `soak`
+runs only the real 30-minute multi-target degradation scenario.
+
+`backup` requests one debounced recovery check from the resident worker.
+`deployment` routes state operations through networkless `deployment-admin`
+and owns the resumable terminal upgrade/import host workflows. `maintenance`
+passes its arguments as structured Compose argv to the networked one-shot
+maintenance service. `upgrade-start` performs both B role checks, starts only
+`upgrade-vaultwarden-b`, waits for health, and records migration evidence; it
+does not start B proxy or backup.
+
+Formatting, ordinary tests, release race, vet, lint, product builds, security,
+integration, individual E2Es, configuration validation, image loading, schema
+capture, and upstream diff are private implementation recipes. The retired
+public names `down`, `ps`, `logs`, `drill-status`, `request-backup`,
+`repo-init`, `repo-check`, `repo-snapshots`, `upgrade-start-b`,
+`upgrade-migrate-check`, `fmt`, `test`, `vet`, and `lint` do not exist. Raw
+Compose commands documented in Operations replace the removed operator
+aliases; there is no compatibility fallback.
+
 ## Upgrade and explicit rollback
 
 Upgrade applies only between two different clean commits that both implement
@@ -1108,34 +1152,46 @@ state conflicts use `conflict`.
 ## Development scripts
 
 The only durable Python scripts are `capture_vaultwarden_schema.py`,
-`deployment.py`, `release.py`, `upstream_diff.py`, and `verify_go_test.py`;
-each uses only the standard library and has a same-named contract test.
-`deployment.py` is the host terminal-workflow orchestrator; the others are
-development/verification tools. Schema capture, release, and upstream diff may
-print one result path followed by LF. The Go verifier relays `go test -json`
-evidence and prints its single verification result.
+`check_release.py`, `deployment.py`, `release.py`, `upstream_diff.py`, and
+`verify_go_test.py`; each uses only the standard library and has a same-named
+contract test. `test_justfile.py` separately owns the exact public/private Just
+allowlist and every recipe's dry-run argv. `deployment.py` is the host
+terminal-workflow orchestrator; the others are development/verification tools.
+Schema capture, release, and upstream diff may print one result path followed
+by LF. The release checker and Go verifier print their single verification
+result.
 
 Their exact command surfaces are:
 
 ```text
 capture_vaultwarden_schema.py --database <sqlite-file> [--upstreams UPSTREAMS.toml] [--output internal/upstream/vaultwarden-schema.json]
+check_release.py <A-full-commit>
 deployment.py [--deployment-root <directory>] [--project-name <name>] upgrade <accept|rollback>
 deployment.py [--deployment-root <directory>] [--project-name <name>] import accept
+deployment.py [--deployment-root <directory>] [--project-name <name>] <deployment state operation...>
 release.py create --output-root <ignored-directory>
 release.py load <release-directory>
 upstream_diff.py <vaultwarden|bitwarden-cli|restic|moto|go> <candidate-tag> [--upstreams UPSTREAMS.toml]
 verify_go_test.py --require <package>:<test> [--require ...] -- <go test -json command>
 ```
 
+`check_release.py` requires the exact clean pair and gate order defined by the
+public Just contract, stops on the first failure, and rechecks the pair before
+one schema-1 success line. It never includes soak, cold, or release creation.
+
 `deployment.py` accepts only a real deployment root, a bounded Compose project
-name, and the named terminal workflow. It strictly reads canonical private
-active/prepare/decision/Compose state, never reads the database, and passes
-only structured argv to Docker. It never uses a shell, `sed`, an exported
-release variable, a socket mount, or a prune command. Success is one canonical
-schema-1 JSON line with `status` equal to `completed` or `already_complete`,
-the workflow/decision, upgrade ID or initial import ID, and exact active identity. Usage and runtime
-failures use bounded `usage_error` or `deployment_orchestration_failed` JSON
-errors and exit 2 or 1 respectively.
+name, and either the named terminal workflow or a nonempty product deployment
+operation. It strictly reads canonical private active/prepare/decision/Compose
+state, never reads the database, and passes only structured argv to Docker. A
+nonterminal operation runs only through `deployment-admin`; the host never
+invokes the product state command directly. The script never uses a shell,
+`sed`, an exported release variable, a socket mount, or a prune command.
+Terminal success is one canonical schema-1 JSON line with `status` equal to
+`completed` or `already_complete`, the workflow/decision, upgrade ID or
+initial import ID, and exact active identity. A forwarded state operation
+returns the product's strict JSON object. Usage and runtime failures use
+bounded `usage_error` or `deployment_orchestration_failed` JSON errors and exit
+2 or 1 respectively.
 
 Schema capture refuses a symlink database or output/parent, opens SQLite
 read-only with WAL-aware semantics, checks `quick_check`, exact audited latest

@@ -1,4 +1,4 @@
-"""Resume terminal deployment workflows through structured Docker CLI argv."""
+"""Route deployment state and resumable terminal workflows through Docker argv."""
 
 from __future__ import annotations
 
@@ -517,6 +517,26 @@ class Orchestrator:
         self.project_name = project_name
         self.run_command = run_command
 
+    def state_operation(self, arguments: Sequence[str]) -> dict[str, Any]:
+        if not arguments:
+            raise UsageError("a deployment state operation is required")
+        compose = self._compose(self.root / ".env", overlay=False)
+        result = self._run(
+            [
+                *compose,
+                "--profile",
+                "deployment",
+                "run",
+                "--rm",
+                "--no-deps",
+                "deployment-admin",
+                "deployment",
+                *arguments,
+            ],
+            capture=True,
+        )
+        return self._json_object(result.stdout)
+
     def terminal_upgrade(self, requested: str) -> dict[str, Any]:
         current = self.root / "state" / "upgrade" / "current"
         try:
@@ -972,11 +992,7 @@ def parser() -> Parser:
     root = Parser(description=__doc__)
     root.add_argument("--deployment-root", type=Path, default=Path.cwd())
     root.add_argument("--project-name", default="vaultwarden-less")
-    workflows = root.add_subparsers(dest="workflow", required=True, parser_class=Parser)
-    upgrade = workflows.add_parser("upgrade")
-    upgrade.add_argument("decision", choices=("accept", "rollback"))
-    initial_import = workflows.add_parser("import")
-    initial_import.add_argument("decision", choices=("accept",))
+    root.add_argument("operation", nargs=argparse.REMAINDER)
     return root
 
 
@@ -993,12 +1009,12 @@ def main(arguments: Sequence[str] | None = None) -> int:
     try:
         parsed = parser().parse_args(arguments)
         orchestrator = Orchestrator(parsed.deployment_root, parsed.project_name)
-        if parsed.workflow == "upgrade":
-            result = orchestrator.terminal_upgrade(parsed.decision)
-        elif parsed.workflow == "import" and parsed.decision == "accept":
+        if parsed.operation in (["upgrade", "accept"], ["upgrade", "rollback"]):
+            result = orchestrator.terminal_upgrade(parsed.operation[1])
+        elif parsed.operation == ["import", "accept"]:
             result = orchestrator.terminal_import()
         else:
-            raise UsageError("unsupported workflow")
+            result = orchestrator.state_operation(parsed.operation)
     except UsageError:
         _write_error("usage_error", "Invalid deployment arguments")
         return 2

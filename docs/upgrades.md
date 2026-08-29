@@ -54,8 +54,7 @@ On a source/deployment host with the pinned Nix environment, use the recipes in
 ```sh
 nix develop --command just upgrade-prepare <B-full-commit> <B-immutable-release>
 nix develop --command just upgrade-freeze
-nix develop --command just upgrade-start-b
-nix develop --command just upgrade-migrate-check
+nix develop --command just upgrade-start
 nix develop --command just upgrade-verify
 nix develop --command just upgrade-accept
 ```
@@ -67,11 +66,15 @@ idempotent phase, invoke only:
 nix develop --command just upgrade-rollback
 ```
 
-The phase recipes are thin Compose invocations. Terminal accept and rollback
-call the standard-library `scripts/deployment.py` orchestrator, which reads
-strict state and uses only structured Docker argv. The following sections give
-the equivalent commands for an ordinary deployment host without Nix; that host
-needs Python 3 only for the terminal orchestrator.
+`upgrade-start` is the indivisible public operation that validates both B
+roles, starts only `upgrade-vaultwarden-b`, waits for health, and records the
+migration check. It never starts B proxy or backup. The phase recipes are thin
+Compose invocations. Terminal accept and rollback call the standard-library
+`scripts/deployment.py` orchestrator, which reads strict state and uses only
+structured Docker argv. The following sections give the equivalent commands
+for an ordinary deployment host without Nix; that host needs Python 3 only for
+the terminal orchestrator. The retired `upgrade-start-b` and
+`upgrade-migrate-check` names have no aliases.
 
 ## 1. Prepare while A is serving
 
@@ -230,15 +233,26 @@ For every product upgrade, record:
 5. repository snapshot, content, and archive identities for every verification
    target;
 6. latest and explicit restore plus isolated drill results;
-7. three forced pre-accept failures: migration permission, invalid target, and
-   corrupted drill, each followed by explicit rollback;
-8. restart/idempotency behavior at every phase;
-9. post-terminal service, repository, history/quarantine, and resource state.
+7. the complete accept case interrupted immediately after its immutable
+   decision, followed by host-orchestrated resume, healthy B services,
+   history, retained immutable A images, and `already_complete` replay;
+8. the deepest rollback case: B migration/evidence completes, the final
+   drill/accept boundary is corrupted, exchange is interrupted before active A
+   publication, then host orchestration restores A data/RSA/service identity,
+   quarantines B, and proves `already_complete` replay;
+9. unit fault-matrix evidence for decision-before/after, active publication,
+   exchange, service start, drill cleanup, finalize, conflict, tamper, and
+   restart boundaries;
+10. post-terminal repository, client data, history/quarantine, task-resource,
+    and credential cleanup state.
 
-Only claim exact-pair Vaultwarden cross-version compatibility when items 1–9
-ran with two genuinely different versions managed by the corresponding project
-releases. Two commits that package the same Vaultwarden version completely
-prove the orchestration framework for their exact pair without creating a
-pending cross-version promise. Neither outcome supports arbitrary Vaultwarden,
-Restic, Bitwarden CLI, or other component builds outside the project-managed
-set.
+Only claim exact-pair Vaultwarden cross-version compatibility when items 1–10
+ran with two genuinely different versions reported by the corresponding
+project images. If the versions are equal, record the distinct-version gate as
+not applicable; the two cases still prove orchestration for that exact pair.
+The same actual-version rule applies independently to Restic. A distinct
+Restic pair additionally runs A format-2 init/write, B list/check/restore/write,
+then A list/check/restore of B's point; an equal pair records that matrix as not
+applicable. Neither outcome supports arbitrary Vaultwarden, Restic, Bitwarden
+CLI, or other component builds outside the project-managed set, and no upgrade
+path invokes repository-format migration.

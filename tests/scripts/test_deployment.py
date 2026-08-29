@@ -447,6 +447,51 @@ class DeploymentOrchestratorTest(unittest.TestCase):
     def orchestrator(self, fake: FakeDocker) -> deployment.Orchestrator:
         return deployment.Orchestrator(self.root, PROJECT, fake)
 
+    def test_state_operations_use_networkless_admin_with_exact_argv(self) -> None:
+        calls: list[list[str]] = []
+
+        def run(
+            arguments: list[str],
+            *,
+            cwd: Path,
+            check: bool,
+            text: bool,
+            capture_output: bool,
+        ) -> subprocess.CompletedProcess[str]:
+            calls.append(arguments)
+            self.assertEqual(cwd, self.root)
+            self.assertFalse(check)
+            self.assertTrue(text)
+            self.assertTrue(capture_output)
+            return completed(
+                arguments,
+                '{"schema_version":1,"status":"verified"}\n',
+            )
+
+        orchestrator = deployment.Orchestrator(self.root, PROJECT, run)
+        result = orchestrator.state_operation(
+            ["import", "verify", "--confirm-client-login"]
+        )
+        self.assertEqual(result, {"schema_version": 1, "status": "verified"})
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(
+            calls[0][-10:],
+            [
+                "--profile",
+                "deployment",
+                "run",
+                "--rm",
+                "--no-deps",
+                "deployment-admin",
+                "deployment",
+                "import",
+                "verify",
+                "--confirm-client-login",
+            ],
+        )
+        with self.assertRaises(deployment.UsageError):
+            orchestrator.state_operation([])
+
     def test_accept_uses_exact_argv_and_is_already_complete_after_finalize(
         self,
     ) -> None:

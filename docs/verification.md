@@ -20,11 +20,14 @@ nix develop --command just check
 `check` runs:
 
 - repository formatting verification;
-- every ordinary Go test and all five Python script contract-test files;
-- all Go packages under the race detector;
+- every ordinary Go test and all seven Python/Just contract-test files;
 - `go vet`, GolangCI-Lint, Ruff lint, and Ruff formatting checks;
 - all declared flake checks, including package/toolchain, Compose contract,
   recovery projection, script set, and formatting boundaries.
+
+It deliberately does not run full-tree race, `govulncheck`, product image
+builds outside declared flake checks, or any real Docker E2E. Those belong to
+the release-candidate layer.
 
 External Go tests compile during ordinary `go test`, but their first action
 checks an explicit runtime flag and skips before Docker lookup, image work,
@@ -40,20 +43,25 @@ state, import source/WAL/exchange/resumption, upgrade state/tamper/idempotency,
 deterministic crypto vectors, and pure
 port boundaries.
 
-## Security and products
+## Release-candidate race, security, and products
 
 ```sh
-nix develop --command just security
-nix develop --command just build
+nix develop --command go test -race ./... -count=1
+nix develop --command govulncheck ./...
+nix build --no-link .#backup .#proxy .#backup-image .#proxy-image .#vaultwarden-image .#moto-image
 ```
 
-`security` is the declared `govulncheck ./...` reachability scan using the
-locked Go toolchain. It does not claim a complete container, operating-system,
-JavaScript, provider, or supply-chain vulnerability inventory.
+The public `check-release <A-full-commit>` gate runs these after `check`.
+Full-tree race is release evidence, not a daily cost. `govulncheck ./...` is a
+reachability scan using the locked Go toolchain; it does not claim a complete
+container, operating-system, JavaScript, provider, or supply-chain
+vulnerability inventory.
 
-`build` builds both binaries plus backup, proxy, Vaultwarden, and test-only
-Moto images. It proves Nix can realize the declared products from locked
-inputs. It does not start those images or prove their deployment configuration.
+The product command builds both public binaries plus backup, proxy,
+Vaultwarden, and test-only Moto images. The Vaultwarden gate remains
+image-internal rather than a public flake package. A build proves Nix can
+realize the declared products from locked inputs; it does not start them or
+prove their deployment configuration.
 
 ## Required-test verifier
 
@@ -74,7 +82,10 @@ includes one explicit `go test verification passed: ...` line.
 ## Moto/Restic integration
 
 ```sh
-nix develop --command just integration
+nix develop --command python3 scripts/verify_go_test.py \
+  --require github.com/hellodword/vaultwarden-less/internal/restore:TestMotoResticIntegration \
+  -- go test -json ./internal/restore -run '^TestMotoResticIntegration$' \
+  -count=1 -timeout=20m -args -run-moto-integration
 ```
 
 Required identity:
@@ -84,11 +95,12 @@ github.com/hellodword/vaultwarden-less/internal/restore:TestMotoResticIntegratio
 ```
 
 This uses the Nix-built Restic executable and locally built pinned Moto image.
-It proves real S3 HTTP, bucket/repository initialization, changed backups,
-content deduplication, bounded listing, repository check/unlock, latest and
-explicit restore, complete recovery-tree verification, no-overwrite behavior,
-corrupt-latest refusal without fallback, controlled fixed-retention preview and
-apply sets, out-of-scope preservation, and final repository check.
+It proves real S3 HTTP, bucket/repository initialization with exact Restic
+format 2, changed backups, content deduplication, bounded listing, repository
+check/unlock, latest and explicit restore, complete recovery-tree verification,
+no-overwrite behavior, corrupt-latest refusal without fallback, controlled
+fixed-retention preview/apply sets, out-of-scope preservation, and final
+repository check. No product path invokes `restic migrate`.
 
 Moto proves the product/Restic/S3 protocol boundary. It does not prove AWS,
 R2, COS, OSS, Scaleway, or B2 production behavior, IAM, throttling, object lock,
@@ -97,7 +109,10 @@ lifecycle, durability, billing, or regional outage behavior.
 ## Ordinary backup, restore, and drill lifecycle
 
 ```sh
-nix develop --command just e2e-backup
+nix develop --command python3 scripts/verify_go_test.py \
+  --require github.com/hellodword/vaultwarden-less/tests/e2e:TestBackupRestoreLifecycle \
+  -- go test -json ./tests/e2e -run '^TestBackupRestoreLifecycle$' \
+  -count=1 -timeout=30m -args -run-backup-e2e
 ```
 
 Required identity:
@@ -107,26 +122,23 @@ github.com/hellodword/vaultwarden-less/tests/e2e:TestBackupRestoreLifecycle
 ```
 
 The scenario uses the exact audited Vaultwarden image, project proxy/worker,
-Moto, pinned Restic, and exact Nix Bitwarden CLI. Two narrow protocol fixtures
-perform only account registration and initial organization creation, which the
-CLI does not expose; all subsequent vault operations use the real CLI.
+Moto, pinned Restic, and exact Nix Bitwarden CLI. A narrow protocol fixture
+performs only account registration, which the CLI does not expose; all later
+vault operations use the real CLI.
 
 It proves:
 
-1. two users, organization/collections, organization and personal items,
-   folder, attachment, ordinary Send, and one access-limited Send;
-2. a missing referenced payload prevents snapshot publication while preserving
-   the prior point;
-3. the same inconsistent window contains several source changes but creates no
-   intermediate point;
-4. exactly two recovery points, changed logical identity, real repository
-   check, fixed prune preview/apply, and worker restart continuity;
-5. latest restore and isolated drill, pre-recovery session failure, fresh
-   sessions, exact item/organization/attachment/Send verification, and
-   exhausted access-limit behavior;
-6. explicit earlier full-ID restore and earlier data through a second drill;
-7. task-scoped containers, networks, volumes, credentials, appdata, and temp
-   outputs are removed.
+1. one synthetic user, one login, one attachment no larger than 4 KiB, and one
+   file Send no larger than 32 KiB;
+2. a first verified recovery point, then one login update and a second logical
+   generation with a different content identity;
+3. a real repository check and latest restore whose snapshot/content/archive
+   identities match the newest point;
+4. an isolated drill in which the pre-recovery session fails, a fresh official
+   CLI login succeeds, the updated login is present, and attachment/Send bytes
+   match exactly;
+5. task-scoped containers, networks, volumes, credentials, appdata, and
+   temporary outputs are removed.
 
 This proves the exercised API/CLI paths for the exact project-managed and
 audited component set. It is not a full Vaultwarden feature test, browser UI
@@ -180,72 +192,100 @@ Vaultwarden migration boundary. It does not authorize importing a live source,
 merging into active data, substituting another upstream version, or deleting
 the external original.
 
-## Two-repository degradation and catch-up
+## Two-repository fast catch-up and soak
+
+The release-candidate fast case runs equivalently to:
 
 ```sh
-nix develop --command just e2e-multitarget
+nix develop --command python3 scripts/verify_go_test.py \
+  --require github.com/hellodword/vaultwarden-less/tests/e2e:TestMultiTargetFastCatchUp \
+  -- go test -json ./tests/e2e -run '^TestMultiTargetFastCatchUp$' \
+  -count=1 -timeout=25m -args -run-multitarget-fast-e2e
+```
+
+It uses two independently initialized real Moto/Restic repositories and a
+test-only deterministic 403 endpoint. Primary creates the point while
+secondary reports partial/retrying; removal of the exact adapter and restoration
+of the real secondary catches up the same content ID without another source
+mutation. Both repositories must pass check and exact restore, and both restore
+trees must pass an isolated official-client drill. There is no degradation
+wait in this fast case.
+
+The separate conditional wall-clock gate is:
+
+```sh
+nix develop --command just soak
 ```
 
 Required identity:
 
 ```text
-github.com/hellodword/vaultwarden-less/tests/e2e:TestMultiTargetDegradationAndCatchUp
+github.com/hellodword/vaultwarden-less/tests/e2e:TestMultiTargetSoak
 ```
 
-The scenario uses two independently initialized real Moto/Restic repositories.
-It proves initial equality, controlled failure of one target, success retained
-on the other, the real 30-minute transition to partial/degraded, recovery and
-catch-up without another source mutation, equal newest content identity, and
-repository check/restore/drill against both targets. Snapshot count or time
-alone is never used as equality evidence.
+The soak holds the secondary failure for at least 30 real minutes, requires the
+retrying-to-degraded transition, exactly one degraded notification, a healthy
+primary with no duplicate logical snapshot through another full retry
+interval, then restores and catches up secondary. It has no product clock hook
+and is never part of `check` or `check-release`.
 
-It does not prove cross-provider consistency or a cloud vendor's outage
+Neither case proves cross-provider consistency or a cloud vendor's outage
 behavior. Repeat the controlled procedure on production-like targets before
 acceptance.
 
 ## Upgrade and rollback lifecycle
 
 ```sh
-nix develop --command just e2e-upgrade <A-full-commit> <B-full-commit>
+nix develop --command just check-release <A-full-commit>
 ```
 
-Required identity:
+The clean current HEAD is B. The final release-candidate phase requires both:
 
 ```text
+github.com/hellodword/vaultwarden-less/tests/e2e:TestUpgradeAcceptLifecycle
 github.com/hellodword/vaultwarden-less/tests/e2e:TestUpgradeRollbackLifecycle
 ```
 
 Both commits must be clean schema-1 products with deterministic immutable
-releases. The suite proves:
+releases. The accept case runs A-owned prepare/freeze, B migration/evidence and
+healthy drill, writes the accept decision, simulates an interruption before
+host service orchestration, then resumes to exact healthy B services, history,
+retained immutable A images, client data, and an `already_complete` replay.
+The rollback case reaches verified B, corrupts the final drill/accept boundary,
+writes rollback and exchanges the frozen tree, simulates an interruption before
+active A publication, then resumes to exact A RSA/data/service identity,
+quarantined B, fresh client verification, and an `already_complete` replay.
+The focused Go/Python fault matrix owns the remaining decision, active write,
+service start, cleanup, finalize, conflict, tamper, permission, and restart
+boundaries without repeating costly full lifecycles.
 
-- A-owned prepare/freeze and same-filesystem rollback evidence;
-- B-only migration/schema audit, isolated repository evidence, restore/drill,
-  and explicit accept;
-- fail-closed B proxy/worker before accept;
-- forced migration-permission, invalid-target, and corrupt-drill failures,
-  each followed by explicit immutable-A rollback;
-- an isolated evidence/accept success path;
-- tamper, wrong-owner, terminal conflict, restart, and cleanup boundaries.
+The tests inspect actual Vaultwarden and Restic versions inside both immutable
+image sets. Equal Vaultwarden versions record the cross-version claim as not
+applicable while preserving complete exact-pair orchestration evidence.
+Different Vaultwarden versions permit an exact-pair claim only after both
+cases pass. Equal Restic versions similarly make its matrix not applicable;
+different versions additionally require A format-2 init/write, B
+list/check/restore/write, and A list/check/restore of B's point. No result
+extends to a component version or image outside the project-managed pair.
 
-Different clean commits and immutable tags prove the framework for that exact
-managed release pair. If both images report the same actual Vaultwarden
-version, the framework result is complete and creates no pending cross-version
-support obligation. Exact-pair cross-version compatibility may additionally be
-claimed only when two project-managed releases report different actual
-Vaultwarden versions and the entire suite ran with that pair. No result extends
-to a Vaultwarden, Restic, Bitwarden CLI, or other component version that the
-project does not manage.
-
-## Aggregated non-upgrade gate
+## Release-candidate gate
 
 ```sh
-nix develop --command just check-full
+nix develop --command just check-release <A-full-commit>
 ```
 
-`check-full` is exactly `check`, `security`, `build`, `integration`,
-`e2e-backup`, and `e2e-multitarget`. It intentionally does not guess A/B
-commits and therefore does not include `e2e-upgrade`. A final acceptance that
-changes upgrade behavior or an audited upstream must run both.
+The argument must be one full lowercase A commit. HEAD is B; A and B must be
+different complete commits, and the worktree including untracked files must be
+clean before and after. The gate is exactly: daily `check`, full-tree race,
+`govulncheck`, all production images/binaries plus Moto, Moto/Restic
+integration, lean backup, fast multi-target, initial import, and finally both
+A/B upgrade cases. It stops on the first failure and emits one schema-1 success
+document only after revalidating the unchanged pair.
+
+The gate intentionally excludes the 30-minute soak, archive-only cold-host
+acceptance, and same-commit double release. Run those separately when their
+documented conditions trigger; never describe a non-triggered condition as a
+pass.
 
 Optional nonzero real-test ports are loopback-only, canonical decimal
 `1024..65535`, and must differ inside one scenario. Omit them to use ephemeral
@@ -302,8 +342,12 @@ Before final acceptance:
   service, profile, command, flag, and output against the current tree;
 - render all Compose profiles and the upgrade overlay with ignored private
   fixtures;
-- prove `scripts/` and `tests/scripts/` contain exactly the five documented
-  same-named files and each has a live command/test reference;
+- prove `scripts/` contains exactly the six documented durable Python scripts,
+  `tests/scripts/` contains their six same-named contract tests plus the Just
+  contract test, and each has a live command/test reference;
+- prove `just --list` exposes exactly the documented 18 names and three groups,
+  every other recipe is private, and every public/private dry-run argv matches
+  its contract;
 - search for obsolete schema, bundle, generated deployment, patch, command,
   test, and compatibility terminology;
 - scan tracked content and the full diff for credentials, private addresses,

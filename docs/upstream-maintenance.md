@@ -29,14 +29,15 @@ Start from a clean branch at a passing commit:
 ```sh
 git status --short --branch
 nix develop --command just check
-nix develop --command just security
-nix develop --command just build
+nix develop --command go test -race ./... -count=1
+nix develop --command govulncheck ./...
+nix build --no-link .#backup .#proxy .#backup-image .#proxy-image .#vaultwarden-image .#moto-image
 ```
 
 Create one ignored candidate report:
 
 ```sh
-nix develop --command just upstream-diff <component> <candidate-tag>
+nix develop --command python3 scripts/upstream_diff.py <component> <candidate-tag>
 ```
 
 Components are `vaultwarden`, `bitwarden-cli`, `restic`, `moto`, and `go`.
@@ -72,7 +73,9 @@ against a new ignored private directory and let it create a fresh SQLite
 database. Capture the complete schema with the project script:
 
 ```sh
-nix develop --command just schema-capture /absolute/path/to/fresh/db.sqlite3 internal/upstream/vaultwarden-schema.json
+nix develop --command python3 scripts/capture_vaultwarden_schema.py \
+  --database /absolute/path/to/fresh/db.sqlite3 \
+  --output internal/upstream/vaultwarden-schema.json
 ```
 
 The capture opens SQLite read-only with WAL awareness, checks integrity and the
@@ -139,9 +142,13 @@ retain the current package. The toolchain check must match the recorded Restic
 tag and readable source revision.
 
 Run unit and race tests for the Restic adapter, the real Moto/Restic integration
-including init/check/prune/restore failures, both real Vaultwarden lifecycles,
-upgrade E2E, vulnerability checks, and deterministic release creation. Moto is
-not a substitute for a real configured storage provider.
+including format-2 init/check/prune/restore failures, lean backup, fast
+multi-target, initial-import, both upgrade E2Es, vulnerability checks, and
+deterministic release creation. Compare actual A/B Restic versions: only a
+distinct pair runs and may claim the format-2 cross-version round trip. An
+equal pair records that matrix as not applicable. Never add an implicit
+`restic migrate` call. Moto is not a substitute for a real configured storage
+provider.
 
 ## Go checklist
 
@@ -178,10 +185,10 @@ creation, list/read/write/delete, multipart, object metadata, failures, and
 cleanup. Confirm the actual Nix package version and readable source revision
 against `UPSTREAMS.toml`.
 
-Run the real integration test and both Vaultwarden lifecycle suites. Inspect
-that each required Go test genuinely ran and passed and that all task-owned
-containers, networks, and volumes are gone. A Moto update does not authorize a
-production provider claim.
+Run the real integration, lean backup, fast multi-target, initial-import, and
+both upgrade scenarios. Inspect that every required Go test genuinely ran and
+passed and that all task-owned containers, networks, and volumes are gone. A
+Moto update does not authorize a production provider claim.
 
 ## Shared Nix-input changes
 
@@ -204,19 +211,28 @@ the selected product set is unchanged.
 
 ## Required acceptance
 
-Run focused tests first, then the complete gates:
+Run focused tests first, then the complete fast release-candidate gate from a
+distinct clean prior A commit to clean HEAD B:
 
 ```sh
-nix develop --command just check
-nix develop --command just security
-nix develop --command just build
-nix develop --command just integration
-nix develop --command just e2e-backup
-nix develop --command just e2e-multitarget
-nix develop --command just e2e-upgrade <A-full-commit> <B-full-commit>
+nix develop --command just check-release <A-full-commit>
 ```
 
-Generate the release twice from the same exact clean commit into two previously
+This runs daily checks, full-tree race, `govulncheck`, all products,
+Moto/Restic integration, lean backup, fast multi-target, initial import, and
+both A/B upgrade cases. Required-test JSON must prove run/PASS and package PASS
+with no skip/fail for every real scenario. It intentionally excludes soak,
+cold-host acceptance, and same-commit reproducibility.
+
+Run the real 30-minute gate when worker timing, retries, notifications,
+multi-target behavior, or a dependency on those boundaries changes:
+
+```sh
+nix develop --command just soak
+```
+
+When Nix image composition, entrypoints, labels, or release logic changes,
+generate the release twice from the same exact clean commit into two previously
 absent ignored roots:
 
 ```sh
@@ -227,15 +243,20 @@ nix develop --command just release <second-ignored-output-root>
 Require byte-identical `images.tar.gz` and `SHA256SUMS`, successful checksum and
 standard `docker image load`, exactly six references for three image IDs,
 matching OCI labels, no Moto image, and the actual expected upstream versions.
-Then repeat the archive-only cold deployment acceptance in
-[Operations](operations.md) on an ordinary isolated Linux/amd64 host.
+Repeat the archive-only cold deployment acceptance in
+[Operations](operations.md) when Compose, image entrypoints, permissions, bind
+paths, directory exchange, or deployment orchestration changes. Record a
+non-triggered condition and its evidence as not applicable, never as passed.
 
-For an actual Vaultwarden change, the upgrade suite must cover migration
-permission failure, invalid verification target, corrupt drill, isolated
-evidence/accept, explicit rollback for each pre-accept failure, and success with
-two genuinely different project-managed Vaultwarden versions. The resulting
-compatibility claim applies only to that exact release pair, not to other
-upstream versions or independently built images.
+For an actual Vaultwarden change, the upgrade suite must run exactly the full
+accept case interrupted after decision and the deepest rollback case interrupted
+after exchange. The focused unit fault matrix covers the other decision,
+active-write, service-start, cleanup, finalize, conflict, permission, tamper,
+and restart boundaries. A cross-version claim additionally requires the two
+images to report genuinely different Vaultwarden versions; equal versions make
+that conditional claim not applicable while still proving the exact-pair
+orchestrator. The resulting claim applies only to that release pair, not to
+other upstream versions or independently built images.
 
 ## Final review
 
