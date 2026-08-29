@@ -390,6 +390,25 @@ func (h *e2eHarness) prepareDeployment() {
 	)
 }
 
+func (h *e2eHarness) initializeDeployment() {
+	h.t.Helper()
+	output := h.compose(
+		"--profile", "deployment", "run", "--rm", "--no-deps", "deployment-admin",
+		"deployment", "init",
+	)
+	var result struct {
+		SchemaVersion int    `json:"schema_version"`
+		Status        string `json:"status"`
+		ProjectCommit string `json:"project_commit"`
+		Release       string `json:"release"`
+	}
+	if decodeExactJSON(output, &result) != nil || result.SchemaVersion != 1 || result.Status != "initialized" ||
+		!lowerHex40Pattern.MatchString(result.ProjectCommit) ||
+		!strings.HasSuffix(result.Release, "-g"+result.ProjectCommit[:12]) {
+		h.t.Fatalf("invalid deployment initialization result: %s", harnessDiagnostics(output))
+	}
+}
+
 func (h *e2eHarness) validateComposeModel() {
 	h.t.Helper()
 	output := h.compose("--profile", "drill", "config", "--format", "json")

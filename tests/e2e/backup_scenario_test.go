@@ -18,6 +18,7 @@ func TestBackupRestoreLifecycle(t *testing.T) {
 	defer cancel()
 	harness := newE2EHarness(t, ctx)
 	harness.startMotoAndRepository()
+	harness.initializeDeployment()
 	harness.startVaultwarden()
 
 	unique := time.Now().UnixNano()

@@ -41,7 +41,7 @@ func TestInitialImportLifecycle(t *testing.T) {
 	defer cancel()
 	harness := newE2EHarness(t, ctx)
 	harness.startMotoAndRepository()
-	runImportAdmin(t, harness, "deployment", "init")
+	harness.initializeDeployment()
 	harness.startVaultwarden()
 
 	unique := time.Now().UnixNano()

@@ -558,6 +558,7 @@ func newUpgradeFixture(
 	harness.validateUpgradeRollbackComposeModel()
 	harness.selectProductionRelease(from)
 	harness.startMotoAndRepository()
+	harness.initializeDeployment()
 	harness.startVaultwarden()
 
 	unique := time.Now().UnixNano()

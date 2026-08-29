@@ -83,6 +83,7 @@ func newMultiTargetFixture(t *testing.T, timeout time.Duration) *multiTargetFixt
 	t.Cleanup(cancel)
 	harness := newE2EHarness(t, ctx, "primary", "secondary")
 	harness.startMotoAndRepository()
+	harness.initializeDeployment()
 	harness.startVaultwarden()
 
 	unique := time.Now().UnixNano()
