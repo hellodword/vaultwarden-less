@@ -48,29 +48,31 @@ var (
 )
 
 type e2eHarness struct {
-	t                  *testing.T
-	ctx                context.Context
-	repository         string
-	localRoot          string
-	project            string
-	publishedHost      string
-	proxyHostPort      int
-	drillHostPort      int
-	dockerConfig       string
-	dockerPath         string
-	dockerEnv          []string
-	productionCompose  string
-	upgradeCompose     string
-	testCompose        string
-	upgradeTestCompose string
-	targets            []string
-	publicHTTP         string
-	publicTLS          string
-	tlsCAFile          string
-	tlsServer          *httptest.Server
-	notifierCAFile     string
-	notifierWebhook    string
-	notifierServer     *httptest.Server
+	t                   *testing.T
+	ctx                 context.Context
+	repository          string
+	localRoot           string
+	project             string
+	publishedHost       string
+	proxyHostPort       int
+	drillHostPort       int
+	deploymentPort      int
+	deploymentDrillPort int
+	dockerConfig        string
+	dockerPath          string
+	dockerEnv           []string
+	productionCompose   string
+	upgradeCompose      string
+	testCompose         string
+	upgradeTestCompose  string
+	targets             []string
+	publicHTTP          string
+	publicTLS           string
+	tlsCAFile           string
+	tlsServer           *httptest.Server
+	notifierCAFile      string
+	notifierWebhook     string
+	notifierServer      *httptest.Server
 
 	backendMu sync.RWMutex
 	backend   *url.URL
@@ -345,6 +347,8 @@ func (h *e2eHarness) prepareDeployment() {
 	for drillDeploymentPort == listenPort {
 		drillDeploymentPort = unusedLoopbackPort(h.t)
 	}
+	h.deploymentPort = listenPort
+	h.deploymentDrillPort = drillDeploymentPort
 	deployment = strings.Replace(deployment, "DEPLOYMENT_ROOT=/srv/vaultwarden-less", "DEPLOYMENT_ROOT="+h.localRoot, 1)
 	deployment = strings.Replace(deployment, "RUNTIME_UID=1000", "RUNTIME_UID="+strconv.Itoa(os.Geteuid()), 1)
 	deployment = strings.Replace(deployment, "RUNTIME_GID=1000", "RUNTIME_GID="+strconv.Itoa(os.Getegid()), 1)
@@ -463,8 +467,11 @@ func (h *e2eHarness) validateComposeModel() {
 	if drillCopy.User != "0:0" ||
 		!slices.Equal(drillCopy.CapAdd, []string{"CHOWN", "DAC_OVERRIDE", "FOWNER"}) ||
 		!maps.Equal(drillCopy.Environment, map[string]string{
-			"RUNTIME_UID": strconv.Itoa(os.Geteuid()),
-			"RUNTIME_GID": strconv.Itoa(os.Getegid()),
+			"DEPLOYMENT_ROOT": h.localRoot,
+			"RUNTIME_UID":     strconv.Itoa(os.Geteuid()),
+			"RUNTIME_GID":     strconv.Itoa(os.Getegid()),
+			"LISTEN_PORT":     strconv.Itoa(h.deploymentPort),
+			"DRILL_PORT":      strconv.Itoa(h.deploymentDrillPort),
 		}) {
 		h.t.Fatalf("Compose model has invalid root-only drill copy identity: user=%q caps=%v environment=%v", drillCopy.User, drillCopy.CapAdd, drillCopy.Environment)
 	}
