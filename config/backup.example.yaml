@@ -1,4 +1,3 @@
-schema_version: 1
 upgrade_verification_targets:
   - primary
 targets:

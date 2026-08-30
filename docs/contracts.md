@@ -1,20 +1,25 @@
-# Schema 1 contracts
+# Product contracts
 
-This document is the normative machine contract for the implemented schema 1
-product. Tracked examples, Compose files, binaries, tests, and operator prose
-must agree with it; none can silently redefine it.
+This document is the normative machine contract for the versionless product.
+Tracked examples, Compose files, binaries, tests, and operator prose must agree
+with it; none can silently redefine it. The breaking change from the retired
+schema-marked contract is explicitly authorized for the interfaces named here.
+It does not authorize deployment, publication, deletion, or mutation of real
+data.
 
-Schema 1 deliberately has no migration from older product schemas or runtime
-data. To read old configuration, snapshots, or state, check out the exact clean
-commit that created it and use that commit's complete toolchain. No product
-command authorizes destroying or overwriting real data, publishing, deploying,
-or changing another durable contract.
+There is no reader, migration, fallback, or converter for old project
+configuration, state, manifests, hash streams, or Restic snapshots. A first
+versionless deployment uses a fresh deployment root and fresh repository
+prefix, and retains the complete legacy root, repositories, images, and commit
+as the rollback path. Project code must reject old fields and bytes using the
+stable classifications defined below rather than infer compatibility.
 
-All `schema_version` values in this document are the JSON or YAML integer `1`,
-never a string or boolean. All instants are UTC RFC 3339 with exactly three
-fractional digits, for example `2026-08-27T12:34:56.789Z`. A full commit is 40
-lowercase hexadecimal characters. A digest is `sha256:` followed by 64
-lowercase hexadecimal characters.
+All instants are UTC RFC 3339 with exactly three fractional digits, for example
+`2026-08-27T12:34:56.789Z`. A full commit is 40 lowercase hexadecimal
+characters. A digest is `sha256:` followed by 64 lowercase hexadecimal
+characters. The only allowed version markers are externally owned: Restic
+repository format 2, OCI and Docker media types, Docker authentication URL
+`/v1/`, Git porcelain v1, upstream versions, and Vaultwarden migrations.
 
 ## Supported component set
 
@@ -41,99 +46,80 @@ releases intentionally contain different actual Vaultwarden versions,
 cross-version compatibility may be claimed only for that exact pair after the
 complete upgrade scenario passes.
 
-## Deployment clone
+## Source checkout and deployment root
 
-The deployment directory is an ordinary Git clone. There is no generated
-deployment tree:
+The source checkout contains tracked Compose files, public templates, and
+documentation. Its ignored `.env` selects a separate private deployment root;
+the checkout is not the owner or default location of credentials, state, or
+application data. Existing checkout-relative ignored paths remain protected by
+`.gitignore` only to prevent legacy private material from entering Git. Product
+code and tests never read them as fixtures.
 
-```text
-compose.yml
-compose.upgrade.yml
-.env.example
-.env
-config/
-  backup.example.yaml
-  backup.yaml
-  vaultwarden.example.env
-  vaultwarden.env
-credentials/
-  backup.example.yaml
-  backup.yaml
-  maintenance.example.yaml
-  maintenance.yaml
-  notifiers.example.yaml
-  notifiers.yaml
-  restic/
-    primary.example
-    primary
-data/
-import/
-  source/
-  candidate/
-staging/
-cache/
-restore/
-state/
-dist/
-tmp/
-```
-
-The non-example private files and all runtime directories are ignored. The
-examples remain tracked. Never run `git clean -x` or `git clean -X` in a
-deployment clone: either command can remove credentials and application data.
-Normal operation consists of `git pull --ff-only`, checking and loading an
-image archive, validating configuration, and `docker compose up -d`. Artifact
-transport is outside the project contract and is not documented by this
-repository.
-
-`.env` is a non-symlink regular file owned by the runtime UID/GID with mode
-`0600`. It contains each of these five assignments exactly once and contains no
-other line:
+The deployment `.env` is parsed by the locked Docker Compose implementation.
+The project does not implement a second dotenv grammar. After Compose
+interpolation these five values are required:
 
 ```dotenv
-DEPLOYMENT_SCHEMA_VERSION=1
+DEPLOYMENT_ROOT=/srv/vaultwarden-less
 RUNTIME_UID=1000
 RUNTIME_GID=1000
 LISTEN_PORT=8080
 DRILL_PORT=8081
 ```
 
-Assignments are ASCII `NAME=value` with no leading or trailing whitespace,
-quotes, comments, `export`, interpolation, continuation, blank lines, or CR.
-The last line may end at EOF or with one LF. Assignment order is not semantic.
-`DEPLOYMENT_SCHEMA_VERSION` is exactly `1`; each runtime ID is canonical
-decimal `1..4294967294`; each port is canonical decimal `1024..65535`; the two
-ports differ. A leading plus, sign, leading zero, exponent, or surrounding
-whitespace is invalid.
+`DEPLOYMENT_ROOT` resolves to an existing absolute directory and is not `/`.
+Runtime IDs are canonical decimal `1..4294967294`; ports are canonical decimal
+`1024..65535` and differ. The Compose-resolved values, not a product-owned
+reparse of `.env`, are the inputs to configuration checks. The example uses
+plain canonical assignments; quoting, escaping, comments, interpolation, and
+precedence follow Docker Compose's official `.env` rules.
 
-`config`, `credentials`, `credentials/restic`, `data`, `import`, `staging`,
-`cache`, `restore`, and `state`, including every required runtime subdirectory,
-are real non-symlink directories owned by the runtime UID/GID with mode `0700`. Every
-private configuration, credential, password, manifest, and upgrade-state file
-is a real non-symlink regular file owned by that identity with mode `0600`.
-Every ancestor is inspected without following a symlink. Examples are public
-templates and are not subject to private-file ownership checks until copied to
-their private names.
+The private layout is exactly rooted below `DEPLOYMENT_ROOT`:
 
-`compose.yml` is the production topology and defines the `deployment`,
-`maintenance`, `restore`, `drill`, and `import` profiles.
-`compose.upgrade.yml` is used only as an overlay during an upgrade or rollback.
-Both files are normative. They use only
-the three `vaultwarden-less-*:local` production aliases in normal operation,
-contain no `build:` key, set `pull_policy: never`, publish only the proxy,
-isolated drill, and initial-import candidate on loopback, never mount a
-container engine socket, and do not pull from a registry. Every resident service uses the configured non-root
-identity, a read-only root filesystem, `no-new-privileges`, and an empty
-capability set. A bounded one-shot copy helper may run as root with only the
-capabilities declared in `compose.yml`.
+```text
+<DEPLOYMENT_ROOT>/
+  config/
+    backup.yaml
+    vaultwarden.env
+  credentials/
+    backup.yaml
+    maintenance.yaml
+    notifiers.yaml
+    restic/<target>
+  data/
+  import/
+  staging/
+  cache/
+  restore/
+  state/
+```
 
-Before production `up`, both `config-check-backup` and
-`config-check-maintenance` must succeed. Together they validate `.env`, all
-private paths and modes, target/password key sets, role isolation, notifier
-credentials, and both role configurations without contacting a repository.
-On the first empty deployment, `deployment-admin deployment init` must then
-publish the exact active release identity. An operator must not use
-`docker compose build` for this project.
+The root and every private directory are existing, real, non-symlink
+directories owned by the runtime UID/GID with mode `0700`. Every private file
+is a real, single-link, non-symlink regular file owned by that identity with
+mode `0600`; every ancestor is inspected without following symlinks. Checks
+report a stable error and never repair ownership or mode with `chmod` or
+`chown`. The recommended root is outside the checkout. A root inside it is
+permitted only when the operator has independently confirmed the whole root is
+ignored.
+
+`compose.yml` defines production, maintenance, restore, drill, and import
+profiles. `compose.upgrade.yml` is only an upgrade/rollback overlay. Every
+private bind uses `${DEPLOYMENT_ROOT}/...` long syntax with
+`bind.create_host_path: false`; rendered Compose contains no
+checkout-relative private bind. Both files use only local production aliases,
+contain no `build:` key, set `pull_policy: never`, publish only intended
+loopback/public endpoints, mount no container-engine socket, and pull no
+registry image. Resident services use the configured non-root identity,
+read-only roots, `no-new-privileges`, and no capabilities.
+
+Before production start, both role configuration checks validate the resolved
+deployment values, actual binds, private paths, target/password key sets,
+role separation, notifier credentials, UID/GID, and ports without contacting a
+repository. An empty deployment is initialized only after those checks.
+Production operator procedures use Git, Docker Engine, Docker Compose, gzip,
+and checksum tools; they do not require Python, Go, Nix, or Just. No product
+command may overwrite live `data`.
 
 ## Active release identity and startup gates
 
@@ -142,11 +128,11 @@ Its sole durable document is a non-symlink, single-link `0600` regular file no
 larger than 1 MiB, owned by that same identity:
 
 ```json
-{"schema_version":1,"project_commit":"0123456789abcdef0123456789abcdef01234567","release":"RELEASE.2026-08-28T12-34-56Z-g0123456789ab","activated_at":"2026-08-28T12:34:56.789Z"}
+{"project_commit":"0123456789abcdef0123456789abcdef01234567","release":"RELEASE.2026-08-28T12-34-56Z-g0123456789ab","activated_at":"2026-08-28T12:34:56.789Z"}
 ```
 
 The file is canonical one-line JSON followed by LF. Unknown or duplicate
-fields, trailing values, wrong JSON types, another schema version, a
+fields, trailing values, wrong JSON types, a retired version field, a
 non-lowercase/full commit, a release that does not contain the matching first
 12 commit characters, and a non-UTC millisecond timestamp are invalid.
 For a terminal workflow, immutable `decided_at` is chosen strictly after the
@@ -190,9 +176,35 @@ upgrade decision/activation, verified candidate, and frozen rollback device and
 tree identity. `version`, `healthcheck`, `config validate`, and the explicit
 initialization workflow retain their narrower pre-active modes.
 
+### Stable state-file ownership
+
+`internal/statefile` is the only package that owns durable private JSON file
+I/O. Its interface is:
+
+```go
+ReadJSON(path string, limit int64, destination any) error
+WriteNewJSON(path string, limit int64, value any) error
+ReplaceJSON(path string, limit int64, value any) error
+IsOwnedTemporary(targetName string, candidateName string) bool
+```
+
+It enforces the private single-link `0600` file and UID/GID contract, rejects
+symlinks and file substitution by comparing the opened object before and after
+I/O, applies the explicit size limit, writes canonical JSON plus one LF, uses a
+same-directory owned temporary file, fsyncs the file and parent, and implements
+no-replace or replace exactly as selected. Cleanup recognizes only temporary
+names owned by the target. Deployment, import, and upgrade retain ownership of
+their fields, phases, identities, validation, and stable domain error codes.
+Injected failure at any write boundary leaves either the complete prior file or
+the complete new file, never a partial durable document.
+
+Retired version fields are unknown fields. Old deployment, import, and upgrade
+JSON map respectively to `deployment_state_invalid`, `import_state_invalid`,
+and `upgrade_state_invalid`; no package removes the field and retries.
+
 ## YAML configuration and credentials
 
-Each schema 1 YAML file is at most 1 MiB, contains exactly one document, and is
+Each YAML file is at most 1 MiB, contains exactly one document, and is
 decoded without implicit type conversion. Unknown fields, duplicate mapping
 keys at any depth, merge keys, anchors, aliases, tags, and trailing documents
 are rejected. Mapping order is not semantic. Target and notifier list order is
@@ -203,7 +215,6 @@ semantic and is preserved in output and execution.
 `config/backup.yaml` has exactly this shape:
 
 ```yaml
-schema_version: 1
 upgrade_verification_targets:
   - primary
 targets:
@@ -231,7 +242,10 @@ support to another Restic build or version.
 
 `upgrade_verification_targets` contains 1 to 32 unique target names, preserves
 order, and is a subset (including the possible full set) of `targets`.
-Targets execute serially in configuration order. There are 0 to 16 notifiers;
+Resident target synchronization uses at most two operations concurrently.
+Targets are dispatched and all results and notifications are published in
+configuration order; one failure does not cancel another target. Upgrade
+verification targets remain serial. There are 0 to 16 notifiers;
 notifier names use the target-name pattern and are unique. The only notifier
 types are `wechat` and `bark`. This file never contains a secret.
 
@@ -241,7 +255,6 @@ types are `wechat` and `bark`. This file never contains a secret.
 strict shape but are separate files and security roles:
 
 ```yaml
-schema_version: 1
 targets:
   primary:
     environment:
@@ -297,7 +310,6 @@ including raw diagnostics.
 `credentials/notifiers.yaml` has exactly:
 
 ```yaml
-schema_version: 1
 notifiers:
   operations:
     webhook_url: https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=replace-me
@@ -393,19 +405,32 @@ exits 1. A usage failure has the same stream rule and exits 2. `serve` writes
 no stdout and writes bounded structured JSON Lines logs to stderr. Logs never
 contain secrets or record data.
 
-Every error is strict schema 1:
+Every error uses this strict envelope:
 
 ```json
-{"schema_version":1,"error":{"code":"invalid_config","message":"Safe message"}}
+{"error":{"code":"invalid_config","message":"Safe message"}}
 ```
 
 The exhaustive stable codes are `usage_error`, `invalid_config`,
 `invalid_credentials`, `unsafe_path`, `not_ready`, `conflict`,
-`source_inconsistent`, `unsupported_schema`, `repository_failure`,
+`source_inconsistent`, `repository_failure`,
 `verification_failure`, `timeout`, `upgrade_state_invalid`,
 `import_state_invalid`, `deployment_state_invalid`, and
 `internal_error`. The message is safe human context and is not a stable parsing
 surface. No error has extra fields.
+
+Retired inputs fail without compatibility handling:
+
+| Input boundary | Stable result |
+| --- | --- |
+| Backup YAML with a retired field | `invalid_config` |
+| Credential YAML with a retired field | `invalid_credentials` |
+| Versioned HTTP path or nonempty request object | HTTP 400 `usage_error` |
+| Deployment, import, or upgrade state with a retired field | the matching `*_state_invalid` code |
+| Manifest, hash stream, or snapshot carrying retired bytes/tags | `verification_failure` |
+
+These classifications apply before any side effect. There is no automatic
+rewrite, fallback reader, or converter.
 
 A dirty or non-Git build reports development identity. Only `version`,
 `healthcheck`, `config validate`, and help may run in that state. Both `serve`
@@ -415,27 +440,25 @@ or upgrade state fail `not_ready` before side effects.
 The complete success documents are:
 
 ```json
-{"schema_version":1,"project_commit":"0123456789abcdef0123456789abcdef01234567","release":"RELEASE.2026-08-27T12-34-56Z-g0123456789ab","clean":true}
-{"schema_version":1,"project_commit":null,"release":"development","clean":false}
-{"schema_version":1,"healthy":true}
-{"schema_version":1,"accepted":true}
-{"schema_version":1,"valid":true,"role":"backup","targets":["primary"],"warnings":[]}
-{"schema_version":1,"status":"initialized","project_commit":"0123456789abcdef0123456789abcdef01234567","release":"RELEASE.2026-08-27T12-34-56Z-g0123456789ab"}
-{"schema_version":1,"status":"already_initialized","project_commit":"0123456789abcdef0123456789abcdef01234567","release":"RELEASE.2026-08-27T12-34-56Z-g0123456789ab"}
-{"schema_version":1,"operation":"init","target":"primary","success":true}
+{"project_commit":"0123456789abcdef0123456789abcdef01234567","release":"RELEASE.2026-08-27T12-34-56Z-g0123456789ab","clean":true}
+{"project_commit":null,"release":"development","clean":false}
+{"healthy":true}
+{"accepted":true}
+{"valid":true,"role":"backup","targets":["primary"]}
+{"status":"initialized","project_commit":"0123456789abcdef0123456789abcdef01234567","release":"RELEASE.2026-08-27T12-34-56Z-g0123456789ab"}
+{"status":"already_initialized","project_commit":"0123456789abcdef0123456789abcdef01234567","release":"RELEASE.2026-08-27T12-34-56Z-g0123456789ab"}
+{"operation":"init","target":"primary","success":true}
 ```
 
 `repo init`, `repo check`, and `repo unlock` use the last shape with their own
-operation string. Config target order is configuration order. Schema 1 defines
-no configuration warnings, so `warnings` is an empty array; retaining the field
-prevents a later warning from changing the envelope.
+operation string. Config target order is configuration order. Configuration
+validation has no `warnings` field.
 
 Snapshots are newest first, and matching snapshots with equal timestamps are
 ordered by ID descending:
 
 ```json
 {
-  "schema_version": 1,
   "target": "primary",
   "limit": 100,
   "truncated": false,
@@ -454,7 +477,6 @@ stable JSON order after validation:
 
 ```json
 {
-  "schema_version": 1,
   "operation": "prune",
   "target": "primary",
   "applied": false,
@@ -470,7 +492,7 @@ stable JSON order after validation:
 Restore returns:
 
 ```json
-{"schema_version":1,"target":"primary","snapshot_id":"<64-lowercase-hex>","project_commit":"<full-commit>","content_id":"sha256:<64-lowercase-hex>","archive_id":"sha256:<64-lowercase-hex>","output":"/restore/drill"}
+{"target":"primary","snapshot_id":"<64-lowercase-hex>","project_commit":"<full-commit>","content_id":"sha256:<64-lowercase-hex>","archive_id":"sha256:<64-lowercase-hex>","output":"/restore/drill"}
 ```
 
 Upgrade and rollback commands use one common result. `targets` is present only
@@ -478,7 +500,6 @@ for `frozen` and `verified` and otherwise is an empty array:
 
 ```json
 {
-  "schema_version": 1,
   "upgrade_id": "<A-full-commit>..<B-full-commit>",
   "phase": "verified",
   "from_commit": "<A-full-commit>",
@@ -500,7 +521,6 @@ null:
 
 ```json
 {
-  "schema_version": 1,
   "state": "idle",
   "started_at": "2026-08-27T12:00:00.000Z",
   "next_check_at": null,
@@ -533,22 +553,23 @@ causes no upload.
 
 ## Internal HTTP and proxy events
 
-The private backup HTTP interface is schema 1:
+The private backup HTTP interface is:
 
 - `GET /healthz` accepts no query or body and returns 204 with an empty body.
-- `GET /v1/status` accepts no query or body and returns the CLI status JSON.
-- `POST /v1/events` accepts the strict schema request and returns 204.
-- `POST /v1/checks` accepts the same request and returns 202 plus the
+- `GET /status` accepts no query or body and returns the CLI status JSON.
+- `POST /events` accepts the strict empty request and returns 204.
+- `POST /checks` accepts the same request and returns 202 plus the
   `request-backup` JSON.
 
-The only request object is `{"schema_version":1}`. JSON whitespace is allowed,
-but the object must have exactly one occurrence of that key, its value must be
-integer 1, and no second JSON value may follow. Body size is at most 1024 bytes.
+The only request object is `{}`. JSON whitespace is allowed, but the object
+must be empty and no second JSON value may follow. Body size is at most 1024 bytes.
 Content-Type is exactly `application/json` with no parameters. A query string,
 wrong method, duplicate or unknown key, redirect, or extra document is
 rejected. JSON HTTP errors use the CLI error envelope. Invalid input is 400,
 wrong method is 405, conflict is 409, unsafe path is 422, not-ready is 503,
 timeout is 504, repository failure is 502, and other runtime failures are 500.
+Retired versioned paths and request fields are invalid input and return 400
+`usage_error`; they are not aliases.
 
 The proxy publishes `/.vaultwarden-less/healthz`; every other request and
 response is transparently forwarded. A completed upstream response with a
@@ -564,11 +585,10 @@ The recovery identity is the full clean project commit that created the
 snapshot. That commit uniquely selects `flake.lock`; the manifest does not
 repeat software versions, image digests, source hashes, or the lock hash.
 
-`manifest.json` is strict schema 1:
+`manifest.json` is strict versionless JSON:
 
 ```json
 {
-  "schema_version": 1,
   "project_commit": "<40-lowercase-hex>",
   "content_id": "sha256:<64-lowercase-hex>",
   "archive_id": "sha256:<64-lowercase-hex>",
@@ -628,7 +648,7 @@ consumer test, a second generation with no diff, and the real lifecycle gates.
 
 `content_id` is SHA-256 over this exact byte stream:
 
-1. Raw magic `vaultwarden-less-logical-v1\0`.
+1. Raw magic `vaultwarden-less-logical\0`.
 2. One length frame containing the 40-byte ASCII project commit.
 3. A big-endian uint64 count of included tables.
 4. For each included table by raw UTF-8 table-name bytes: a name frame, a
@@ -649,7 +669,7 @@ value outside the fixed representation fail. No Unicode, case, whitespace,
 timestamp, filename, or path normalization occurs.
 
 `archive_id` is SHA-256 over raw magic
-`vaultwarden-less-archive-v1\0`, a big-endian uint64 manifest-file count, and,
+`vaultwarden-less-archive\0`, a big-endian uint64 manifest-file count, and,
 for every manifest file in raw UTF-8 path order, a path frame followed by a
 length frame containing the exact staged file bytes. It therefore changes when
 the online-backup bytes change even if the logical projection does not.
@@ -659,15 +679,15 @@ the online-backup bytes change even if the logical projection does not.
 Every recovery snapshot repeats these tags:
 
 ```text
-schema=1
 project_commit=<full-commit>
 content_id=sha256:<64-lowercase-hex>
 archive_id=sha256:<64-lowercase-hex>
 ```
 
 The fixed Restic host is `vaultwarden-less` and fixed path is
-`/staging/point`. Selection and prune require the host, path, schema tag, and
-all three identity tags. Explicit snapshot IDs are full 64-character IDs.
+`/staging/point`. Selection and prune require the host, path, and all three
+identity tags. A retired schema tag makes the snapshot invalid rather than
+compatible. Explicit snapshot IDs are full 64-character IDs.
 
 For each target, the newest matching snapshot's `content_id` decides upload.
 Equal content skips that target even when the observed `archive_id` differs.
@@ -684,6 +704,28 @@ previously absent `/restore/<name>`. Failure removes only the task-owned
 temporary tree and never exposes a partial output. RSA material is not in the
 manifest, so first startup generates a new key and invalidates all prior
 access, refresh, invitation, and session state.
+
+### Production restore boundary
+
+Production restore is an operator runbook, not an automatic promotion command.
+The selected restore must pass full verification and a drill, and its
+`project_commit` must equal the current active identity. After exact
+incident-specific authorization, the operator stops proxy, backup, and
+Vaultwarden in that order and confirms no process holds the database.
+
+On the same deployment-root filesystem the operator creates a unique
+`state/incidents/<incident-id>/`, saves the selected manifest, renames existing
+`data` without replacement to `pre-restore-data`, removes the manifest from the
+verified restore tree, and renames that tree without replacement to `data`.
+Every failure preserves both available trees. Rollback while stopped moves a
+failed restore without replacement to `failed-restored-data` and restores the
+original tree without replacement. Active identity is unchanged. A snapshot
+from another commit or from a legacy/versioned contract is rejected.
+
+Because the recovery tree excludes RSA material, old sessions must fail and a
+fresh login, backup, restore, and drill must all succeed. Incident material is
+not deleted without separate authorization. Product commands never perform
+these promotion renames or infer permission from a successful backup.
 
 ## Release, images, and Nix
 
@@ -729,12 +771,15 @@ never overwrites an existing path. Two builds from the same clean commit and
 inputs must make both files byte-identical.
 
 The flake has one locked `nixos-unstable` input; treefmt follows it. Public
-outputs include backup and proxy binaries, backup/proxy/Vaultwarden production
-images, the Moto test image, formatter, checks, the default development shell,
-and apps `.#just`, `.#image-load`, and `.#release`. Vaultwarden is
-`pkgs.vaultwarden`; Restic is unmodified `pkgs.restic`; Go, Bitwarden CLI, and
-Moto come from the same locked package set. Nixpkgs `knownVulnerabilities`
-remains effective. Project vulnerability checking is only `govulncheck ./...`.
+outputs are the existing packages, formatter, one
+`devShells.<system>.default`, and checks. It exposes no `apps`. `checks.unit`
+executes `go test ./... -count=1` as a validation derivation distinct from a
+product package. Ordinary Go and Python tests, vet, GolangCI-Lint, Ruff,
+formatting, contracts, and toolchain checks all participate in
+`nix flake check`. Vaultwarden is `pkgs.vaultwarden`; Restic is unmodified
+`pkgs.restic`; Go, Bitwarden CLI, and Moto come from the same locked package
+set. Nixpkgs `knownVulnerabilities` remains effective. Project vulnerability
+checking is `govulncheck ./...`.
 
 `UPSTREAMS.toml` contains only human-audited repository, tag, commit, audit
 paths, Vaultwarden migration, schema path, and projection path. It does not
@@ -750,45 +795,93 @@ complete SBOM or license/source archive.
 
 ### Public Just interface
 
-The single root `Justfile` has no modules or aliases. `just --list` exposes
-exactly these 18 recipes in three native groups:
+The single root `Justfile` has no modules, groups, aliases, private helpers, or
+recipe dependencies. `just --list` exposes exactly:
 
-| Group | Public recipes |
-| --- | --- |
-| Development | `check`, `check-release <A-commit>`, `release <output-root>`, `soak` |
-| Operations | `up`, `status`, `backup`, `deployment *args`, `maintenance *args`, `restore <target> <output> [snapshot]`, `drill-up`, `drill-down` |
-| Upgrade | `upgrade-prepare <B-commit> <B-release>`, `upgrade-freeze`, `upgrade-start`, `upgrade-verify`, `upgrade-accept`, `upgrade-rollback` |
+```text
+check
+check-release <A-full-commit>
+release <A-full-commit> <output-directory>
+```
 
-`check` runs formatting verification, ordinary Go/Python tests, vet, lint, and
-`nix flake check`; it does not run full-tree race or a real E2E. A
-`check-release` requires a distinct full clean A commit and clean HEAD B. It
-runs `check`, full-tree race, `govulncheck`, all products, Moto/Restic
-integration, lean backup, fast multi-target, initial import, and both A/B
-upgrade cases in that order, then revalidates the unchanged clean pair. It
-does not run `soak`, cold-host acceptance, or release reproducibility. `soak`
-runs only the real 30-minute multi-target degradation scenario.
+`just` is invoked directly, never through `nix develop`. `check` is one
+`nix flake check` invocation. `check-release` enters the default development
+shell once to run `scripts/check_release.py`; that script directly invokes its
+fixed tools and never invokes Just. `release` similarly runs the tested
+`scripts/release.py` build-machine workflow. Production operation and
+maintenance use documented raw Compose commands. All retired recipes,
+including `soak`, have no alias or compatibility fallback.
 
-`backup` requests one debounced recovery check from the resident worker.
-`deployment` routes state operations through networkless `deployment-admin`
-and owns the resumable terminal upgrade/import host workflows. `maintenance`
-passes its arguments as structured Compose argv to the networked one-shot
-maintenance service. `upgrade-start` performs both B role checks, starts only
-`upgrade-vaultwarden-b`, waits for health, and records migration evidence; it
-does not start B proxy or backup.
+`check-release A` requires a full clean A distinct from clean HEAD B and, in
+order, runs: `nix flake check`; full-tree race; full-tree coverage;
+`govulncheck`; every binary and production/Moto image build; Moto/Restic
+integration; expanded backup/restore/drill E2E; accelerated fake-clock
+multi-target threshold integration; short production-image dual-repository
+failure isolation/catch-up E2E; initial import E2E; A/B accept E2E; and A/B
+rollback E2E. It then revalidates A, B, and the unchanged worktree.
 
-Formatting, ordinary tests, release race, vet, lint, product builds, security,
-integration, individual E2Es, configuration validation, image loading, schema
-capture, and upstream diff are private implementation recipes. The retired
-public names `down`, `ps`, `logs`, `drill-status`, `request-backup`,
-`repo-init`, `repo-check`, `repo-snapshots`, `upgrade-start-b`,
-`upgrade-migrate-check`, `fmt`, `test`, `vet`, and `lint` do not exist. Raw
-Compose commands documented in Operations replace the removed operator
-aliases; there is no compatibility fallback.
+On success it atomically creates
+`tmp/release-evidence/<A>..<B>/candidate.json`. The directory is ignored and
+`0700`; the canonical `0600` JSON contains exact A/B, UTC millisecond start and
+finish instants, the ordered passed gate names, and `"status":"passed"`. It
+contains no version field, secret, or raw stderr. Evidence has no wall-clock
+expiry; any mismatched commit or byte content invalidates it.
+
+```json
+{"from_commit":"<A-full-commit>","to_commit":"<B-full-commit>","started_at":"2026-08-30T10:00:00.000Z","finished_at":"2026-08-30T10:30:00.000Z","gates":["nix-flake-check","go-race","go-coverage","govulncheck","products","moto-restic","backup-restore-drill","multitarget-threshold","dual-repository","initial-import","upgrade-accept","upgrade-rollback"],"status":"passed"}
+```
+
+`release A output-directory` requires an absent output, an existing real
+parent, a clean B, and byte-valid candidate evidence for that exact A/B. If the
+output is inside the Git tree it must be ignored. Two independent temporary
+builds must produce byte-identical `images.tar.gz` and `SHA256SUMS`. Standard
+image loading must prove exactly six references, three distinct image IDs,
+matching local/immutable pairs, OCI identity, entrypoints, expected upstream
+version, and absence of Moto. Before the final no-replace rename, canonical
+`artifact.json` is atomically written beside candidate evidence with its hash,
+A/B, immutable release, both output hashes, UTC millisecond completion, and
+`"status":"verified"`. It attests verification, not external publication.
+Failure removes only task-owned temporary paths and never replaces output.
+
+```json
+{"candidate_sha256":"sha256:<64-lowercase-hex>","from_commit":"<A-full-commit>","to_commit":"<B-full-commit>","release":"<B-immutable-release>","files":{"SHA256SUMS":"sha256:<64-lowercase-hex>","images.tar.gz":"sha256:<64-lowercase-hex>"},"verified_at":"2026-08-30T10:40:00.000Z","status":"verified"}
+```
+
+### First versionless release identities
+
+`L` is the last complete legacy/schema-marked commit and release actually kept
+for rollback. `C` is the first complete, fully green, unpublishing versionless
+implementation commit. `B` is a later, distinct, fully green release-candidate
+commit that preserves the same versionless runtime contract.
+
+The first release requires two independent evidence paths. Normal
+`check-release C` and `release C <output>` establish C→B A/B state-machine and
+artifact evidence. Separately, an isolated L→B rehearsal starts with a fresh
+deployment root, fresh Restic repository prefix, and B-owned configuration and
+state. It never parses L project state or snapshots: a completely stopped copy
+of L's raw Vaultwarden data is placed at B's `import/source` and processed by
+B's ordinary external-import flow, including upstream migration, RSA rotation,
+two-client data verification, new-repository backup, restore, and drill.
+
+The complete L commit, images, root, and repository remain intact. Before edge
+traffic switches, failure recovery is to stop B and restart complete L. After
+an authorized switch, L remains until B backup, restore, drill, and a separately
+defined observation period pass. This contract neither authorizes a production
+switch nor deletion of L.
+
+The ignored canonical `tmp/release-evidence/<L>..<B>/cutover.json` shape is:
+
+```json
+{"legacy_commit":"<L-full-commit>","to_commit":"<B-full-commit>","legacy_source_tree_id":"sha256:<64-lowercase-hex>","import":{"project_commit":"<B-full-commit>","active_release":"<B-immutable-release>","source_tree_id":"sha256:<64-lowercase-hex>","candidate_tree_id":"sha256:<64-lowercase-hex>"},"repository":{"prefix":"synthetic-fresh-prefix","snapshot_id":"<64-lowercase-hex>","content_id":"sha256:<64-lowercase-hex>","archive_id":"sha256:<64-lowercase-hex>"},"verification":{"two_users":true,"user_data":true,"old_sessions_rejected":true,"restore":true,"drill":true,"rollback":true},"status":"passed"}
+```
+
+Only synthetic identifiers may enter this evidence. A real endpoint, account,
+credential, personal value, database row, or raw command output is forbidden.
 
 ## Upgrade and explicit rollback
 
 Upgrade applies only between two different clean commits that both implement
-this schema 1 contract. The upgrade ID is `<A-full-commit>..<B-full-commit>`.
+this versionless contract. The upgrade ID is `<A-full-commit>..<B-full-commit>`.
 A owns `upgrade prepare`, `upgrade freeze`, and `rollback apply`. B owns
 `upgrade migrate-check`, `upgrade verify`, and `upgrade accept`. A never opens,
 decodes, hashes, or makes a decision from `candidate.json`; moving that fixed
@@ -818,7 +911,6 @@ data follows the normal private tree rules.
 
 ```json
 {
-  "schema_version": 1,
   "upgrade_id": "<A>..<B>",
   "phase": "prepared",
   "from_commit": "<A>",
@@ -833,7 +925,7 @@ data follows the normal private tree rules.
 this order and no other content:
 
 ```dotenv
-DEPLOYMENT_SCHEMA_VERSION=1
+DEPLOYMENT_ROOT=<absolute-directory>
 RUNTIME_UID=<decimal>
 RUNTIME_GID=<decimal>
 LISTEN_PORT=<decimal>
@@ -849,7 +941,6 @@ are validated immutable tags and exactly match `prepare.json`.
 
 ```json
 {
-  "schema_version": 1,
   "upgrade_id": "<A>..<B>",
   "phase": "frozen",
   "from_commit": "<A>",
@@ -874,7 +965,7 @@ are validated immutable tags and exactly match `prepare.json`.
 Device values are unsigned filesystem device IDs read after both paths exist;
 they must be equal at freeze and again at rollback. Paths are the exact
 relative literals shown. `rollback_tree_id` hashes raw magic
-`vaultwarden-less-rollback-v1\0`, an entry count, and every non-symlink regular
+`vaultwarden-less-rollback\0`, an entry count, and every non-symlink regular
 file by UTF-8 relative path: a path frame, big-endian uint64 mode, and a content
 frame. Directories must be owned `0700`; files must be owned `0600`; special
 files, hard-link aliases, and unexpected symlinks fail. The frozen database is
@@ -884,7 +975,6 @@ closed and has no live sidecar before this copy is accepted.
 
 ```json
 {
-  "schema_version": 1,
   "upgrade_id": "<A>..<B>",
   "phase": "verified",
   "from_commit": "<A>",
@@ -904,13 +994,12 @@ closed and has no live sidecar before this copy is accepted.
 Phase is only `migrated` or `verified`. `targets` is empty while migrated and
 equals the configured verification-target order after verify. Acceptance never
 rewrites this evidence document and the old `accepted`/`accepted_at` shape is
-invalid schema 1 state.
+invalid state.
 
 `decision.json` is created once and is immutable. It has exactly:
 
 ```json
 {
-  "schema_version": 1,
   "upgrade_id": "<A>..<B>",
   "decision": "accept",
   "active_project_commit": "<B>",
@@ -942,13 +1031,14 @@ The required production sequence is:
    creates the accept decision, and then idempotently changes active identity
    from A to B. An interruption after the decision can only resume accept and
    does not repeat the pre-decision drill authorization.
-8. `scripts/deployment.py upgrade accept` starts B's three normal services,
+8. The documented raw Compose sequence starts B's three normal services,
    waits for health, proves every container image ID matches its immutable B
-   tag and OCI identity, removes only the verified drill containers, volume,
-   and restore, then invokes `upgrade finalize`. Finalize moves the complete
-   current directory to `history/<upgrade-id>` only after active B and drill
-   cleanup are consistent. The rollback copy remains in history, while
-   ordinary rollback is permanently rejected once accept is decided.
+   tag and OCI identity, removes only the verified drill resources, and then
+   invokes `upgrade finalize`. Finalize validates the immutable decision,
+   active identity, data evidence, and recorded cleanup before moving current
+   to `history/<upgrade-id>`; it does not infer container health. The rollback
+   copy remains in history, while ordinary rollback is permanently rejected
+   once accept is decided.
 
 Evidence can be reused only when A snapshot ID, content ID, archive ID, project
 commit, B commit, configured target order, and state-file bytes all match.
@@ -980,14 +1070,14 @@ under that fixed root; its container root filesystem is read-only, all
 capabilities are dropped, `no-new-privileges` is set, and no engine socket is
 mounted.
 
-`scripts/deployment.py upgrade rollback` stops B and drill services, invokes
-that resumable A command, verifies and retags only A's three immutable images
-as local, starts and verifies the three ordinary A services, removes only the
-verified drill resources, and invokes A `upgrade finalize`. Until then current
-retains the decision, candidate, and exchanged B tree. Finalize moves that
-complete directory to `quarantine/<upgrade-id>`. Any interruption can repeat
-the same terminal command; neither data tree is deleted and the opposite
-decision remains impossible.
+The documented raw Compose rollback sequence stops B and drill services,
+invokes that resumable A command, verifies and retags only A's three immutable
+images as local, starts and verifies the three ordinary A services, removes
+only the verified drill resources, and invokes A `upgrade finalize`. Until
+then current retains the decision, candidate, and exchanged B tree. Finalize
+moves that complete directory to `quarantine/<upgrade-id>`. Any interruption
+can repeat only the same recorded decision; neither data tree is deleted and
+the opposite decision remains impossible.
 
 Migration, repository verification, and drill failures are induced in tests by
 real read-only permissions, an invalid disposable target, and corrupted
@@ -1000,7 +1090,7 @@ tags and covers that exact managed release pair. When both releases contain the
 same actual Vaultwarden version, this is complete framework evidence and not an
 unverified compatibility obligation. Exact-pair cross-version verification is
 an additional claim available only after the same scenario runs with two
-managed schema 1 releases whose actual Vaultwarden versions differ. Neither
+managed versionless releases whose actual Vaultwarden versions differ. Neither
 result promises compatibility for an upstream version or build that the
 project does not manage.
 
@@ -1051,7 +1141,7 @@ sibling directories with Linux `renameat2(RENAME_EXCHANGE)` and rejects a
 filesystem that cannot perform the required atomic promotion.
 
 `source_tree_id` and `candidate_tree_id` use
-`vaultwarden-less-import-tree-v1\0`, a big-endian entry count, then sorted
+`vaultwarden-less-import-tree\0`, a big-endian entry count, then sorted
 UTF-8 slash-relative entries. Each entry contributes a length-framed path, a
 `d` or `f` byte, and a big-endian uint64 permission mode; each file then
 contributes its big-endian uint64 size and exact bytes. `source_rsa_key_id`
@@ -1062,7 +1152,6 @@ Immutable `prepare.json` has exactly:
 
 ```json
 {
-  "schema_version": 1,
   "import_id": "initial",
   "phase": "prepared",
   "project_commit": "<B-full-commit>",
@@ -1103,7 +1192,6 @@ Immutable `verification.json` has exactly:
 
 ```json
 {
-  "schema_version": 1,
   "import_id": "initial",
   "phase": "verified",
   "project_commit": "<B-full-commit>",
@@ -1124,7 +1212,6 @@ device, verification, and absent active identity, then atomically creates:
 
 ```json
 {
-  "schema_version": 1,
   "import_id": "initial",
   "decision": "accept",
   "active_project_commit": "<B-full-commit>",
@@ -1141,20 +1228,22 @@ the exchanged candidate is exactly empty, and publishes the first active B
 identity no earlier than `decided_at`. An interruption after decision can only
 repeat accept.
 
-`scripts/deployment.py import accept` stops and removes the candidate service,
-resumes the Go accept operation, starts and waits for the three normal B
-services, proves each running image ID and OCI identity, and invokes
-`deployment import finalize`. Finalize accepts only the exact active/decision
-ordering and an empty exchanged candidate, removes that empty directory, and
-atomically archives current as `state/import/history/initial`. Repeating the
-host command revalidates the active healthy runtime and returns
-`already_complete`. `deployment import cancel` is available only before a
-decision and removes only the exact disposable candidate, matching candidate
-temporaries, and current state; it never removes source or data.
+The documented raw Compose accept sequence stops and removes the candidate
+service, resumes the Go accept operation, starts and verifies the three normal
+B services, and invokes `deployment import finalize`. Finalize accepts only
+the exact active/decision ordering, verified data identity, and an empty
+exchanged candidate, removes that exact empty directory, and atomically
+archives current as `state/import/history/initial`. It records durable-state
+consistency only; adjacent Compose `ps`, container `version`/health checks, and
+image inspection own runtime proof. Repeating the terminal sequence can only
+continue the same recorded decision. `deployment import cancel` is available
+only before a decision and removes only the exact disposable candidate,
+matching candidate temporaries, and current state; it never removes source or
+data.
 
 Every import command returns the ordinary one-line success/error contract.
-The import success document has `schema_version`, `import_id`, `phase`, exact
-project identity, source/candidate tree IDs, and
+The import success document has `import_id`, `phase`, exact project identity,
+source/candidate tree IDs, and
 `client_login_confirmed`. Phases exposed by those commands are `prepared`,
 `verified`, `accepted`, `cancelled`, and `finalized`. Unsafe or malformed state
 uses `import_state_invalid`; changed/unsafe source uses `source_inconsistent`;
@@ -1164,32 +1253,28 @@ state conflicts use `conflict`.
 ## Development scripts
 
 The only durable Python scripts are `capture_vaultwarden_schema.py`,
-`check_release.py`, `deployment.py`, `release.py`, `upstream_diff.py`, and
-`verify_go_test.py`; each uses only the standard library and has a same-named
-contract test. `test_justfile.py` separately owns the exact public/private Just
-allowlist and every recipe's dry-run argv. `deployment.py` is the host
-terminal-workflow orchestrator; the others are development/verification tools.
-Schema capture, release, and upstream diff may print one result path followed
-by LF. The release checker and Go verifier print their single verification
-result.
+`check_release.py`, `release.py`, `upstream_diff.py`, and
+`verify_go_test.py`; each uses only the standard library and has a focused
+contract test. `test_justfile.py` owns the three-recipe allowlist and their
+final dry-run argv. Production terminal workflows are documented Compose and
+product-CLI steps, not a host Python interface. Schema capture, release, and
+upstream diff may print one result path followed by LF. The release checker and
+Go verifier print one strict result.
 
 Their exact command surfaces are:
 
 ```text
 capture_vaultwarden_schema.py --database <sqlite-file> [--upstreams UPSTREAMS.toml] [--output internal/upstream/vaultwarden-schema.json]
 check_release.py <A-full-commit>
-deployment.py [--deployment-root <directory>] [--project-name <name>] upgrade <accept|rollback>
-deployment.py [--deployment-root <directory>] [--project-name <name>] import accept
-deployment.py [--deployment-root <directory>] [--project-name <name>] <deployment state operation...>
-release.py create --output-root <ignored-directory>
-release.py load <release-directory>
+release.py <A-full-commit> <output-directory>
 upstream_diff.py <vaultwarden|bitwarden-cli|restic|moto|go> <candidate-tag> [--upstreams UPSTREAMS.toml]
 verify_go_test.py --require <package>:<test> [--require ...] -- <JSON-event-producing test command>
 ```
 
 `check_release.py` requires the exact clean pair and gate order defined by the
 public Just contract, stops on the first failure, and rechecks the pair before
-one schema-1 success line. It never includes soak, cold, or release creation.
+atomically writing candidate evidence. It never emits raw child stderr into
+evidence and does not invoke Just.
 
 `verify_go_test.py` validates the child stream rather than requiring a literal
 `-json` token in child argv. Every line must still be a valid Go test JSON
@@ -1197,20 +1282,6 @@ event, and each required test must have ordered run, test PASS, later package
 PASS, no skip/fail event, and a zero child exit. Project recipes use
 `go test -json`; repository-external runners may equivalently feed the locked
 `go tool test2json` stream.
-
-`deployment.py` accepts only a real deployment root, a bounded Compose project
-name, and either the named terminal workflow or a nonempty product deployment
-operation. It strictly reads canonical private active/prepare/decision/Compose
-state, never reads the database, and passes only structured argv to Docker. A
-nonterminal operation runs only through `deployment-admin`; the host never
-invokes the product state command directly. The script never uses a shell,
-`sed`, an exported release variable, a socket mount, or a prune command.
-Terminal success is one canonical schema-1 JSON line with `status` equal to
-`completed` or `already_complete`, the workflow/decision, upgrade ID or
-initial import ID, and exact active identity. A forwarded state operation
-returns the product's strict JSON object. Usage and runtime failures use
-bounded `usage_error` or `deployment_orchestration_failed` JSON errors and exit
-2 or 1 respectively.
 
 Schema capture refuses a symlink database or output/parent, opens SQLite
 read-only with WAL-aware semantics, checks `quick_check`, exact audited latest
@@ -1222,14 +1293,13 @@ uses UTF-8, two-space indent, LF, and a deterministic framed fingerprint. An
 unchanged database produces identical bytes even through a path containing
 spaces, tabs, newlines, backslashes, or non-ASCII characters.
 
-Release `create` enforces the clean identity and release/image contract above,
-loads the three production Nix image outputs, assigns exactly six production references,
-validates labels and image-ID pairs, runs one structured image save, writes
-deterministic gzip and checksum output in a same-parent temporary directory,
-and refuses an existing final directory. `load` verifies the two-file directory
-and checksum before standard image load, then proves the six references point
-to three exact image IDs and have the expected labels. A subprocess or inspect
-failure cleans only task-owned temporary output.
+Release validates exact candidate evidence, independently builds twice, loads
+and verifies each production image set, assigns exactly six production
+references, validates labels and image-ID pairs, and writes deterministic gzip
+and checksum output in task-owned same-parent temporary directories. It
+refuses an existing final directory. Standard checksum and image-load tools,
+not a script subcommand, perform external re-verification. A subprocess or
+inspection failure cleans only task-owned temporary output.
 
 Upstream diff resolves both tags to full commits in an ignored cache with an
 exact expected origin. Changed paths come only from `git diff --name-status -z
