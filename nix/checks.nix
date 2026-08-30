@@ -17,6 +17,33 @@ let
     in
     revision == tag || revision == "refs/tags/${tag}";
   goSourceURLs = pkgs.go.src.urls or [ (pkgs.go.src.url or "") ];
+  goCheck =
+    {
+      name,
+      command,
+      extraInputs ? [ ],
+    }:
+    pkgs.runCommand name
+      {
+        nativeBuildInputs = [
+          pkgs.go
+          pkgs.gcc
+        ]
+        ++ extraInputs;
+        GOTOOLCHAIN = "local";
+        CGO_ENABLED = "1";
+      }
+      ''
+        export GOCACHE="$TMPDIR/go-cache"
+        export GOMODCACHE="$TMPDIR/go-modules"
+        export XDG_CACHE_HOME="$TMPDIR/xdg-cache"
+        mkdir -m 0700 "$GOCACHE" "$GOMODCACHE" "$XDG_CACHE_HOME"
+        cp -R --no-preserve=mode ${packages.backup.goModules}/. "$GOMODCACHE"
+        chmod -R u+w "$GOMODCACHE"
+        cd ${source}
+        ${command}
+        touch "$out"
+      '';
 in
 assert pkgs.vaultwarden.version == upstreams.vaultwarden.source_tag;
 assert sourceRevMatches pkgs.vaultwarden upstreams.vaultwarden.source_tag;
@@ -31,7 +58,25 @@ assert lib.any (lib.hasInfix "${upstreams.go.source_tag}.src.tar.gz") goSourceUR
 {
   format = formatter.config.build.check inputs.self;
 
-  unit = packages.backup;
+  unit = goCheck {
+    name = "vaultwarden-less-unit";
+    command = "go test ./... -count=1";
+    extraInputs = [
+      pkgs.docker
+      pkgs.docker-compose
+    ];
+  };
+
+  vet = goCheck {
+    name = "vaultwarden-less-vet";
+    command = "go vet ./...";
+  };
+
+  go-lint = goCheck {
+    name = "vaultwarden-less-go-lint";
+    command = "golangci-lint run";
+    extraInputs = [ pkgs.golangci-lint ];
+  };
 
   python =
     pkgs.runCommand "vaultwarden-less-python-check"
@@ -87,7 +132,9 @@ assert lib.any (lib.hasInfix "${upstreams.go.source_tag}.src.tar.gz") goSourceUR
             schema = json.load(source)
         with open(upstreams["vaultwarden"]["recovery_projection"], encoding="utf-8") as source:
             projection = json.load(source)
-        assert schema["contract_version"] == 1
+        assert set(schema) == {
+            "vaultwarden_version", "database_migration", "fingerprint", "objects"
+        }
         assert schema["vaultwarden_version"] == upstreams["vaultwarden"]["source_tag"]
         assert schema["database_migration"] == upstreams["vaultwarden"]["database_migration"]
         digest = hashlib.sha256()
@@ -112,7 +159,7 @@ assert lib.any (lib.hasInfix "${upstreams.go.source_tag}.src.tar.gz") goSourceUR
         }
         declared = {table["name"]: table["columns"] for table in projection["tables"]}
         assert actual == declared
-        assert projection["schema_version"] == 1
+        assert set(projection) == {"schema_contract", "tables"}
         assert projection["schema_contract"] == upstreams["vaultwarden"]["schema_contract"]
         PY
         touch "$out"
@@ -137,9 +184,9 @@ assert lib.any (lib.hasInfix "${upstreams.go.source_tag}.src.tar.gz") goSourceUR
         CGO_ENABLED = "1";
       }
       ''
-        export HOME="$TMPDIR/home"
         export BITWARDENCLI_APPDATA_DIR="$TMPDIR/bitwarden-cli"
-        mkdir -m 0700 "$HOME" "$BITWARDENCLI_APPDATA_DIR"
+        export XDG_CACHE_HOME="$TMPDIR/xdg-cache"
+        mkdir -m 0700 "$BITWARDENCLI_APPDATA_DIR" "$XDG_CACHE_HOME"
         test "$(go version)" = "go version go${pkgs.go.version} linux/amd64"
         test "$(go env GOTOOLCHAIN)" = "local"
         test "$(restic version | cut -d' ' -f2)" = "${pkgs.restic.version}"

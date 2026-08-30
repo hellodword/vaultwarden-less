@@ -67,11 +67,6 @@
         default = packages.backup;
       };
 
-      apps.${system} = import ./nix/apps.nix {
-        inherit pkgs;
-        source = ./.;
-      };
-
       devShells.${system}.default = import ./nix/dev-shells.nix {
         inherit formatter pkgs;
       };
