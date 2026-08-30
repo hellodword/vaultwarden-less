@@ -6,22 +6,22 @@ owns preparation, freeze evidence, and rollback. Immutable B owns migration
 checking, repository evidence, drill verification, and acceptance. Until
 acceptance, B's proxy and resident backup are fail-closed.
 
-The exact persisted state and JSON schemas are normative in
-[the schema 1 contracts](contracts.md). Do not edit `state/upgrade`, A/B image
+The exact persisted state and JSON shapes are normative in
+[the product contracts](contracts.md). Do not edit `state/upgrade`, A/B image
 labels, or `compose.env` by hand.
 
 ## Preconditions
 
 Before `prepare`:
 
-- A is an exact clean schema-1 release and its three production services are
+- A is an exact clean versionless release and its three production services are
   healthy; `state/deployment/active.json` exactly names A.
 - No initial import is current; a prepared, verified, decided, or incomplete
   `state/import/current` must be cancelled before decision or completed before
   any upgrade preparation.
 - A has recent verified snapshots on every configured upgrade-verification
   target, and a latest restore plus drill has passed.
-- B is an exact clean schema-1 commit with a separately generated and checked
+- B is an exact clean versionless commit with a separately generated and checked
   two-file release.
 - A and B immutable image references are available locally or their release
   archives are available for standard loading.
@@ -46,35 +46,22 @@ a separate claim available only when the actual Vaultwarden versions differ
 and the complete scenario runs with both. Neither claim covers substituted or
 independently upgraded components outside the project-managed set.
 
-## Supported orchestrator
+## Production command surface
 
-On a source/deployment host with the pinned Nix environment, use the recipes in
-`Justfile`:
-
-```sh
-nix develop --command just upgrade-prepare <B-full-commit> <B-immutable-release>
-nix develop --command just upgrade-freeze
-nix develop --command just upgrade-start
-nix develop --command just upgrade-verify
-nix develop --command just upgrade-accept
-```
-
-If any pre-accept phase fails and the failure cannot be corrected by the same
-idempotent phase, invoke only:
+The production interface is the raw Docker Compose and product-CLI sequence
+below. The host needs no Python, Nix, Just, or Go. Run every command from the
+exact clean B checkout, and set this shell value from the reviewed absolute
+deployment root without sourcing `.env`:
 
 ```sh
-nix develop --command just upgrade-rollback
+vwless_upgrade_env='<exact DEPLOYMENT_ROOT>/state/upgrade/current/compose.env'
+test -f "$vwless_upgrade_env"
 ```
 
-`upgrade-start` is the indivisible public operation that validates both B
-roles, starts only `upgrade-vaultwarden-b`, waits for health, and records the
-migration check. It never starts B proxy or backup. The phase recipes are thin
-Compose invocations. Terminal accept and rollback call the standard-library
-`scripts/deployment.py` orchestrator, which reads strict state and uses only
-structured Docker argv. The following sections give the equivalent commands
-for an ordinary deployment host without Nix; that host needs Python 3 only for
-the terminal orchestrator. The retired `upgrade-start-b` and
-`upgrade-migrate-check` names have no aliases.
+Every pre-terminal phase is retried only by repeating that same product
+command. Once `decision.json` exists, only the matching accept or rollback
+sequence may continue. A host restart never authorizes or infers another
+phase.
 
 ## 1. Prepare while A is serving
 
@@ -116,7 +103,7 @@ runs the freeze command from A's immutable backup image:
 ```sh
 docker compose --env-file .env --file compose.yml stop proxy
 docker compose --env-file .env --file compose.yml stop backup vaultwarden
-docker compose --env-file state/upgrade/current/compose.env --file compose.yml --file compose.upgrade.yml --profile upgrade run --rm --no-deps upgrade-a upgrade freeze
+docker compose --env-file "$vwless_upgrade_env" --file compose.yml --file compose.upgrade.yml --profile upgrade run --rm --no-deps upgrade-a upgrade freeze
 ```
 
 Freeze verifies that writes are stopped, creates A-owned repository evidence,
@@ -131,10 +118,10 @@ Validate B with both roles before starting it. Then start only B's Vaultwarden
 and wait for health:
 
 ```sh
-docker compose --env-file state/upgrade/current/compose.env --file compose.yml --file compose.upgrade.yml --profile maintenance run --rm --no-deps config-check-backup
-docker compose --env-file state/upgrade/current/compose.env --file compose.yml --file compose.upgrade.yml --profile maintenance run --rm --no-deps config-check-maintenance
-docker compose --env-file state/upgrade/current/compose.env --file compose.yml --file compose.upgrade.yml --profile upgrade up --detach --no-deps --wait --wait-timeout 180 upgrade-vaultwarden-b
-docker compose --env-file state/upgrade/current/compose.env --file compose.yml --file compose.upgrade.yml --profile upgrade run --rm --no-deps upgrade-b upgrade migrate-check
+docker compose --env-file "$vwless_upgrade_env" --file compose.yml --file compose.upgrade.yml --profile maintenance run --rm --no-deps config-check-backup
+docker compose --env-file "$vwless_upgrade_env" --file compose.yml --file compose.upgrade.yml --profile maintenance run --rm --no-deps config-check-maintenance
+docker compose --env-file "$vwless_upgrade_env" --file compose.yml --file compose.upgrade.yml --profile upgrade up --detach --no-deps --wait --wait-timeout 180 upgrade-vaultwarden-b
+docker compose --env-file "$vwless_upgrade_env" --file compose.yml --file compose.upgrade.yml --profile upgrade run --rm --no-deps upgrade-b upgrade migrate-check
 ```
 
 B migrates the stopped tree. `migrate-check` captures and compares the exact
@@ -147,13 +134,13 @@ Stop active B, ask immutable B to create/restore its evidence, and start only
 the isolated B drill:
 
 ```sh
-docker compose --env-file state/upgrade/current/compose.env --file compose.yml --file compose.upgrade.yml --profile upgrade stop proxy backup vaultwarden upgrade-vaultwarden-b
-docker compose --env-file state/upgrade/current/compose.env --file compose.yml --file compose.upgrade.yml --profile upgrade run --rm --no-deps upgrade-b upgrade verify
-docker compose --env-file state/upgrade/current/compose.env --file compose.yml --file compose.upgrade.yml --profile drill up --detach --wait --wait-timeout 180 drill-vaultwarden
+docker compose --env-file "$vwless_upgrade_env" --file compose.yml --file compose.upgrade.yml --profile upgrade stop proxy backup vaultwarden upgrade-vaultwarden-b
+docker compose --env-file "$vwless_upgrade_env" --file compose.yml --file compose.upgrade.yml --profile upgrade run --rm --no-deps upgrade-b upgrade verify
+docker compose --env-file "$vwless_upgrade_env" --file compose.yml --file compose.upgrade.yml --profile drill up --detach --wait --wait-timeout 180 drill-vaultwarden
 ```
 
 Verification must succeed on every configured upgrade target. B creates a
-schema-1 recovery point, checks its immutable identities, performs real Restic
+versionless recovery point, checks its immutable identities, performs real Restic
 restores, validates the rollback evidence, and constructs the drill from B
 data. With a normal Bitwarden client and fresh sessions, verify representative
 items, organization/collection data, attachments, Sends, and expected session
@@ -166,21 +153,49 @@ the explicit rollback path below.
 ## 5A. Accept B
 
 Acceptance is an explicit terminal decision. It requires healthy B drill
-evidence and changes serving ownership to B. On an ordinary deployment host,
-run the durable terminal orchestrator:
+evidence and changes serving ownership to B. Set the expected identity from
+the reviewed prepare document and release archive, then run this resumable
+sequence:
 
 ```sh
-python3 scripts/deployment.py upgrade accept
+vwless_b_commit='<B-full-commit>'
+vwless_b_release='<B-immutable-release>'
+docker compose --env-file "$vwless_upgrade_env" --file compose.yml --file compose.upgrade.yml --profile upgrade --profile drill run --rm --no-deps upgrade-b upgrade accept
+docker compose --env-file "$vwless_upgrade_env" --file compose.yml --file compose.upgrade.yml up --detach --wait --wait-timeout 180 vaultwarden backup proxy
+docker compose --env-file "$vwless_upgrade_env" --file compose.yml --file compose.upgrade.yml ps vaultwarden backup proxy
+docker compose --env-file "$vwless_upgrade_env" --file compose.yml --file compose.upgrade.yml exec --no-TTY backup /bin/vaultwarden-less-backup version
+docker compose --env-file "$vwless_upgrade_env" --file compose.yml --file compose.upgrade.yml exec --no-TTY proxy /bin/vaultwarden-less-proxy version
+docker compose --env-file "$vwless_upgrade_env" --file compose.yml --file compose.upgrade.yml exec --no-TTY vaultwarden /bin/vaultwarden --version
+for vwless_product in backup proxy vaultwarden; do
+  vwless_image="vaultwarden-less-$vwless_product:$vwless_b_release"
+  test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$vwless_image")" = "$vwless_b_commit"
+  test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$vwless_image")" = "$vwless_b_release"
+done
+docker compose --env-file "$vwless_upgrade_env" --file compose.yml --file compose.upgrade.yml --profile drill stop drill-vaultwarden
+docker compose --env-file "$vwless_upgrade_env" --file compose.yml --file compose.upgrade.yml --profile drill rm --force --stop drill-vaultwarden drill-copy
+vwless_drill_volume="$(docker volume ls --quiet --filter label=com.docker.compose.project=vaultwarden-less --filter label=com.docker.compose.volume=drill-data)"
+test -z "$vwless_drill_volume" || test "$vwless_drill_volume" = vaultwarden-less_drill-data
+if test -n "$vwless_drill_volume"; then
+  test "$(docker volume inspect --format '{{index .Labels "com.docker.compose.project"}}' "$vwless_drill_volume")" = vaultwarden-less
+  test "$(docker volume inspect --format '{{index .Labels "com.docker.compose.volume"}}' "$vwless_drill_volume")" = drill-data
+  docker volume rm -- "$vwless_drill_volume"
+fi
+docker compose --env-file "$vwless_upgrade_env" --file compose.yml --file compose.upgrade.yml --profile upgrade --profile drill run --rm --no-deps upgrade-b upgrade cleanup-drill
+docker compose --env-file "$vwless_upgrade_env" --file compose.yml --file compose.upgrade.yml --profile upgrade --profile drill run --rm --no-deps upgrade-b upgrade finalize
 ```
 
-The command first asks immutable B to create or resume the accept decision and
-active B identity. It then starts B's three normal services, waits for health,
-checks every container image ID against the immutable tag and OCI labels,
-cleans only the verified drill, and finally archives current state to history.
-If interrupted, repeat the same command. Once the decision exists, rollback is
-permanently rejected even when active writing or service startup had not yet
-finished. To return to an older product after acceptance, plan a new audited
-forward upgrade; do not rewrite history or exchange data manually.
+The first command creates or resumes the immutable accept decision and active B
+identity. Before cleanup, require all three `ps` entries to be healthy, require
+the three in-container versions and immutable OCI labels to name the reviewed B
+release, and complete a normal HTTPS client check. If interrupted before
+finalize, repeat the sequence from its first line: the Go command can continue
+only accept and cannot exchange or decide twice. Finalize validates only
+durable decision, active, frozen-data, and cleanup evidence before archiving
+current state to history; it does not infer runtime health. After finalize the
+current `compose.env` is intentionally gone, so there is no host-level
+`already_complete` command. Once accept is decided, rollback is permanently
+rejected. Returning to an older product requires a new audited forward upgrade;
+never rewrite history or exchange data manually.
 
 Immediately check B status, repository snapshots, and representative client
 operations. Retain A's immutable images and accepted evidence according to
@@ -189,23 +204,50 @@ local incident policy; removing them is not part of acceptance.
 ## 5B. Explicit rollback before accept
 
 Rollback is never automatic. It is owned by immutable A and may run only before
-accept. The host orchestrator stops B/drill, asks A to create or resume the
-rollback decision and tree-ID-driven exchange, verifies and retags only A's
-three immutable images as local, starts the three ordinary A services, removes
-the verified drill, and only then archives current state to quarantine.
+accept. Set the expected A identity from the reviewed prepare document, then
+stop transient B/drill services, create or resume the rollback decision and
+tree-ID-driven exchange, verify and retag only A's three immutable images,
+start ordinary A, clean the exact drill resources, and finalize:
 The one-shot A role is networkless, non-root, capability-free, and uses one
 deployment-root bind so both exchange directories remain beneath the same
 mount; split `data`/`state` binds would make Linux reject the atomic exchange.
 
 ```sh
-python3 scripts/deployment.py upgrade rollback
+vwless_a_commit='<A-full-commit>'
+vwless_a_release='<A-immutable-release>'
+docker compose --env-file "$vwless_upgrade_env" --file compose.yml --file compose.upgrade.yml --profile upgrade --profile drill stop proxy backup vaultwarden upgrade-vaultwarden-b drill-vaultwarden
+docker compose --env-file "$vwless_upgrade_env" --file compose.yml --file compose.upgrade.yml --profile upgrade --profile drill rm --force --stop proxy backup vaultwarden upgrade-vaultwarden-b drill-vaultwarden drill-copy
+docker compose --env-file "$vwless_upgrade_env" --file compose.yml --file compose.upgrade.yml --profile upgrade --profile drill run --rm --no-deps rollback-a rollback apply
+for vwless_product in backup proxy vaultwarden; do
+  vwless_immutable="vaultwarden-less-$vwless_product:$vwless_a_release"
+  vwless_local="vaultwarden-less-$vwless_product:local"
+  test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$vwless_immutable")" = "$vwless_a_commit"
+  test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$vwless_immutable")" = "$vwless_a_release"
+  docker image tag "$vwless_immutable" "$vwless_local"
+  test "$(docker image inspect --format '{{.Id}}' "$vwless_local")" = "$(docker image inspect --format '{{.Id}}' "$vwless_immutable")"
+done
+docker compose --env-file .env --file compose.yml up --detach --wait --wait-timeout 180 vaultwarden backup proxy
+docker compose --env-file .env --file compose.yml ps vaultwarden backup proxy
+docker compose --env-file .env --file compose.yml exec --no-TTY backup /bin/vaultwarden-less-backup version
+docker compose --env-file .env --file compose.yml exec --no-TTY proxy /bin/vaultwarden-less-proxy version
+docker compose --env-file .env --file compose.yml exec --no-TTY vaultwarden /bin/vaultwarden --version
+vwless_drill_volume="$(docker volume ls --quiet --filter label=com.docker.compose.project=vaultwarden-less --filter label=com.docker.compose.volume=drill-data)"
+test -z "$vwless_drill_volume" || test "$vwless_drill_volume" = vaultwarden-less_drill-data
+if test -n "$vwless_drill_volume"; then
+  test "$(docker volume inspect --format '{{index .Labels "com.docker.compose.project"}}' "$vwless_drill_volume")" = vaultwarden-less
+  test "$(docker volume inspect --format '{{index .Labels "com.docker.compose.volume"}}' "$vwless_drill_volume")" = drill-data
+  docker volume rm -- "$vwless_drill_volume"
+fi
+docker compose --env-file "$vwless_upgrade_env" --file compose.yml --file compose.upgrade.yml --profile upgrade --profile drill run --rm --no-deps rollback-a upgrade cleanup-drill
+docker compose --env-file "$vwless_upgrade_env" --file compose.yml --file compose.upgrade.yml --profile upgrade --profile drill run --rm --no-deps rollback-a upgrade finalize
 ```
 
 After rollback, verify A through the ordinary proxy, read worker status, list
 snapshots, and complete a fresh restore/drill. Preserve quarantine for review.
-Repeating the command returns `already_complete` after rechecking active A,
-the three running image identities, and drill cleanup; never delete quarantine
-to force another exchange.
+If interrupted before finalize, repeat the same sequence; `rollback apply`
+recognizes the frozen A tree on either side of the exchange and cannot create
+an accept decision. After finalize, quarantine and the active A identity are
+the durable result. Never delete quarantine to force another exchange.
 
 ## Failure and restart semantics
 
@@ -237,12 +279,12 @@ For every product upgrade, record:
    target;
 6. latest and explicit restore plus isolated drill results;
 7. the complete accept case interrupted immediately after its immutable
-   decision, followed by host-orchestrated resume, healthy B services,
-   history, retained immutable A images, and `already_complete` replay;
+   decision, followed by the same raw-sequence resume, healthy B services,
+   history, and retained immutable A images;
 8. the deepest rollback case: B migration/evidence completes, the final
    drill/accept boundary is corrupted, exchange is interrupted before active A
-   publication, then host orchestration restores A data/RSA/service identity,
-   quarantines B, and proves `already_complete` replay;
+   publication, then the same raw rollback sequence restores A
+   data/RSA/service identity and quarantines B;
 9. unit fault-matrix evidence for decision-before/after, active publication,
    exchange, service start, drill cleanup, finalize, conflict, tamper, and
    restart boundaries;

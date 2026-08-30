@@ -15,7 +15,6 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 	"unicode/utf8"
 
@@ -30,7 +29,6 @@ const (
 	MaxPasswordBytes = 64 << 10
 
 	DefaultBackupConfigPath = "/config/backup.yaml"
-	DeploymentEnvPath       = "/deployment/.env"
 	VaultwardenEnvPath      = "/deployment/vaultwarden.env"
 	RoleCredentialsPath     = "/run/credentials/role.yaml"
 	ResticPasswordRoot      = "/run/credentials/restic"
@@ -490,23 +488,23 @@ func parseHTTPSURL(raw string) (*url.URL, error) {
 	return parsed, nil
 }
 
-func LoadDeployment(path string) (Deployment, error) {
-	info, err := os.Lstat(path)
-	if err != nil {
-		return Deployment{}, fmt.Errorf("inspect deployment environment: %w", err)
+func LoadDeployment() (Deployment, error) {
+	values := make(map[string]string, len(deploymentEnvironmentNames))
+	for _, name := range deploymentEnvironmentNames {
+		value, present := os.LookupEnv(name)
+		if !present || value == "" {
+			return Deployment{}, fmt.Errorf("%s is required", name)
+		}
+		values[name] = value
 	}
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !info.Mode().IsRegular() || !ok || info.Mode().Perm() != 0o600 || stat.Uid != uint32(os.Geteuid()) || stat.Gid != uint32(os.Getegid()) {
-		return Deployment{}, fmt.Errorf("deployment environment must be a real 0600 file owned by the runtime identity")
-	}
-	data, err := privatefs.ReadBytes(path, 4096)
-	if err != nil {
-		return Deployment{}, fmt.Errorf("read deployment environment: %w", err)
-	}
-	values, err := parseDeploymentAssignments(data)
-	if err != nil {
-		return Deployment{}, err
-	}
+	return decodeDeploymentEnvironment(values)
+}
+
+var deploymentEnvironmentNames = [...]string{
+	"DEPLOYMENT_ROOT", "RUNTIME_UID", "RUNTIME_GID", "LISTEN_PORT", "DRILL_PORT",
+}
+
+func decodeDeploymentEnvironment(values map[string]string) (Deployment, error) {
 	root := values["DEPLOYMENT_ROOT"]
 	if root == "" || root == string(filepath.Separator) || !filepath.IsAbs(root) || filepath.Clean(root) != root {
 		return Deployment{}, fmt.Errorf("DEPLOYMENT_ROOT is invalid")
@@ -536,41 +534,6 @@ func LoadDeployment(path string) (Deployment, error) {
 		return Deployment{}, fmt.Errorf("runtime identity does not match the validating process")
 	}
 	return deployment, nil
-}
-
-func parseDeploymentAssignments(data []byte) (map[string]string, error) {
-	if len(data) == 0 || !utf8.Valid(data) || strings.IndexByte(string(data), '\r') >= 0 {
-		return nil, fmt.Errorf("deployment environment is not strict ASCII assignments")
-	}
-	for _, value := range data {
-		if value > 0x7f {
-			return nil, fmt.Errorf("deployment environment is not ASCII")
-		}
-	}
-	text := string(data)
-	text = strings.TrimSuffix(text, "\n")
-	lines := strings.Split(text, "\n")
-	expected := map[string]struct{}{
-		"DEPLOYMENT_ROOT": {}, "RUNTIME_UID": {}, "RUNTIME_GID": {}, "LISTEN_PORT": {}, "DRILL_PORT": {},
-	}
-	if len(lines) != len(expected) {
-		return nil, fmt.Errorf("deployment environment must contain exactly five assignments")
-	}
-	values := make(map[string]string, len(lines))
-	for _, line := range lines {
-		if line == "" || strings.TrimSpace(line) != line || strings.Count(line, "=") != 1 {
-			return nil, fmt.Errorf("deployment environment contains an invalid assignment")
-		}
-		name, value, _ := strings.Cut(line, "=")
-		if _, allowed := expected[name]; !allowed || value == "" || strings.ContainsAny(value, " \t\"'$`\\#{}") {
-			return nil, fmt.Errorf("deployment environment contains an unknown or invalid assignment")
-		}
-		if _, duplicate := values[name]; duplicate {
-			return nil, fmt.Errorf("deployment environment contains a duplicate assignment")
-		}
-		values[name] = value
-	}
-	return values, nil
 }
 
 func parseCanonicalUint(raw string, minimum, maximum uint64) (uint64, error) {

@@ -344,6 +344,7 @@ func (h *e2eHarness) prepareDeployment() {
 	for drillDeploymentPort == listenPort {
 		drillDeploymentPort = unusedLoopbackPort(h.t)
 	}
+	deployment = strings.Replace(deployment, "DEPLOYMENT_ROOT=/srv/vaultwarden-less", "DEPLOYMENT_ROOT="+h.localRoot, 1)
 	deployment = strings.Replace(deployment, "RUNTIME_UID=1000", "RUNTIME_UID="+strconv.Itoa(os.Geteuid()), 1)
 	deployment = strings.Replace(deployment, "RUNTIME_GID=1000", "RUNTIME_GID="+strconv.Itoa(os.Getegid()), 1)
 	deployment = strings.Replace(deployment, "LISTEN_PORT=8080", "LISTEN_PORT="+strconv.Itoa(listenPort), 1)
@@ -363,13 +364,13 @@ func (h *e2eHarness) prepareDeployment() {
 		writePrivateFile(h.t, filepath.Join(h.localRoot, "credentials", role+".yaml"), renderRoleExample(h.t, example, h.targets))
 	}
 	notifierExample := readTrackedExample(h.t, filepath.Join(h.repository, "credentials", "notifiers.example.yaml"))
-	if !strings.Contains(notifierExample, "schema_version: 1") {
-		h.t.Fatal("notifier example is not schema 1")
+	if !strings.HasPrefix(notifierExample, "notifiers:\n") {
+		h.t.Fatal("notifier example has an unexpected shape")
 	}
 	writePrivateFile(
 		h.t,
 		filepath.Join(h.localRoot, "credentials", "notifiers.yaml"),
-		"schema_version: 1\nnotifiers:\n  e2e:\n    webhook_url: "+h.notifierWebhook+"\n",
+		"notifiers:\n  e2e:\n    webhook_url: "+h.notifierWebhook+"\n",
 	)
 	passwordExample := strings.TrimSuffix(readTrackedExample(h.t, filepath.Join(h.repository, "credentials", "restic", "primary.example")), "\n")
 	if passwordExample != "replace-me" {
@@ -397,12 +398,11 @@ func (h *e2eHarness) initializeDeployment() {
 		"deployment", "init",
 	)
 	var result struct {
-		SchemaVersion int    `json:"schema_version"`
 		Status        string `json:"status"`
 		ProjectCommit string `json:"project_commit"`
 		Release       string `json:"release"`
 	}
-	if decodeExactJSON(output, &result) != nil || result.SchemaVersion != 1 || result.Status != "initialized" ||
+	if decodeExactJSON(output, &result) != nil || result.Status != "initialized" ||
 		!lowerHex40Pattern.MatchString(result.ProjectCommit) ||
 		!strings.HasSuffix(result.Release, "-g"+result.ProjectCommit[:12]) {
 		h.t.Fatalf("invalid deployment initialization result: %s", harnessDiagnostics(output))
@@ -448,16 +448,15 @@ func (h *e2eHarness) validateComposeModel() {
 			h.t.Fatalf("Compose model has invalid %s test port: %#v", expected.service, ports)
 		}
 	}
-	deploymentMount := false
-	for _, volume := range model.Services["backup"].Volumes {
-		if volume.Type == "bind" && filepath.Clean(volume.Source) == filepath.Join(h.localRoot, ".env") &&
-			volume.Target == "/deployment/.env" && volume.ReadOnly {
-			deploymentMount = true
-			break
+	for serviceName, service := range model.Services {
+		for _, volume := range service.Volumes {
+			if volume.Type == "bind" && volume.Target == "/deployment/.env" {
+				h.t.Fatalf("Compose model retained a container-side dotenv mount for %s", serviceName)
+			}
 		}
 	}
-	if !deploymentMount {
-		h.t.Fatal("Compose model does not mount the deployment environment read-only for backup serve")
+	if model.Services["backup"].Environment["DEPLOYMENT_ROOT"] != h.localRoot {
+		h.t.Fatal("Compose model did not resolve the deployment root into the service environment")
 	}
 	drillCopy := model.Services["drill-copy"]
 	if drillCopy.User != "0:0" ||
@@ -503,7 +502,7 @@ func renderBackupExample(t *testing.T, example string, targets []string) string 
 
 func renderRoleExample(t *testing.T, example string, targets []string) string {
 	t.Helper()
-	if !strings.Contains(example, "schema_version: 1") || !strings.Contains(example, "primary:") {
+	if !strings.HasPrefix(example, "targets:\n") || !strings.Contains(example, "primary:") {
 		t.Fatal("role credential example changed unexpectedly")
 	}
 	result := strings.ReplaceAll(example, "replace-me", "test")

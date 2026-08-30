@@ -1,10 +1,11 @@
 # Operations and recovery
 
 These procedures run on an ordinary Linux/amd64 deployment host with Git,
-Python 3, Docker Engine, and the Docker Compose plugin. Python is needed only
-for the standard-library terminal upgrade/import orchestrator. Nix is needed only to
-build or verify source and create releases. Run commands from the exact
-deployment clone; Compose bind paths are relative to it.
+Docker Engine, the Docker Compose plugin, gzip, checksum tools, and GNU
+coreutils. Python, Go, Nix, and Just are not production dependencies. Nix is
+used only on a build or verification host. Run commands from the exact clean
+deployment checkout; its ignored `.env` selects `DEPLOYMENT_ROOT`, and every
+private bind resolves beneath that separate root.
 
 Never run `git clean -x` or `git clean -X` in a deployment clone. Do not delete
 or overwrite `data`, `restore`, `state`, credentials, or a repository merely to
@@ -12,27 +13,11 @@ make a command pass.
 
 ## Operator command surface
 
-On a source host with the pinned Nix environment, the public Operations group
-is exactly:
-
-```text
-up
-status
-backup
-deployment *args
-maintenance *args
-restore <target> <output> [snapshot]
-drill-up
-drill-down
-```
-
-Invoke these as `nix develop --command just <recipe> ...`. `deployment` routes
-ordinary state operations to the networkless deployment-admin service and
-resumes terminal upgrade/import workflows in the host orchestrator.
-`maintenance` passes structured arguments to the repository-networked service;
-`backup` asks the resident worker for one debounced check. These are
-conveniences over the exact Docker Compose commands documented below, which
-remain the interface for an ordinary deployment host without Nix.
+The exact Docker Compose commands below are the production interface. Any
+development-host Just recipes are conveniences only and do not own deployment
+state or terminal sequencing. State operations use the networkless
+`deployment-admin` service; repository operations use the separately
+credentialed maintenance service.
 
 There are deliberately no `down`, `ps`, `logs`, `drill-status`, or detailed
 `repo-*` recipes. Use the documented raw commands, for example:
@@ -45,10 +30,9 @@ docker compose --project-name vaultwarden-less-drill --env-file .env --file comp
 docker compose --env-file .env --file compose.yml --profile maintenance run --rm --no-deps maintenance repo check --target primary
 ```
 
-No removed recipe has an alias or fallback. Repository format migration is not
-an operator command: initialization always creates Restic format 2, and a
-future explicit `restic migrate` would be a separately authorized maintenance
-event outside this interface.
+Repository format migration is not an operator command: initialization always
+creates Restic format 2, and a future explicit `restic migrate` would be a
+separately authorized maintenance event outside this interface.
 
 ## Release transfer and startup
 
@@ -157,21 +141,31 @@ Verification checks the unchanged source, rotated RSA identity, exact audited
 schema/migration, SQLite integrity/foreign keys, and the complete
 database/attachment/Send snapshot closure. Without verification, accept fails.
 
-Accept and finish through the resumable host orchestrator:
+Accept and finish with the following raw, resumable sequence:
 
 ```sh
-python3 scripts/deployment.py import accept
+docker compose --env-file .env --file compose.yml --profile import stop import-vaultwarden
+docker compose --env-file .env --file compose.yml --profile import rm --force --stop import-vaultwarden
+docker compose --env-file .env --file compose.yml --profile deployment run --rm --no-deps deployment-admin deployment import accept
+docker compose --env-file .env --file compose.yml up --detach --wait --wait-timeout 180 vaultwarden backup proxy
+docker compose --env-file .env --file compose.yml ps vaultwarden backup proxy
+docker compose --env-file .env --file compose.yml exec --no-TTY backup /bin/vaultwarden-less-backup version
+docker compose --env-file .env --file compose.yml exec --no-TTY proxy /bin/vaultwarden-less-proxy version
+docker image inspect --format '{{json .Config.Labels}}' vaultwarden-less-vaultwarden:local
+docker compose --env-file .env --file compose.yml --profile deployment run --rm --no-deps deployment-admin deployment import finalize
 ```
 
-The command records the immutable accept decision before exchanging the
-verified candidate with empty `data`, publishes the active release, starts and
-verifies Vaultwarden/backup/proxy, removes only the empty exchanged candidate,
-and archives the state. If it exits after the decision, exchange, active write,
-service start, or before finalize, run the identical command again. A completed
-repeat returns `already_complete`. Confirm the normal HTTPS path with a fresh
-client login; the pre-import session must fail because RSA was rotated. Retain
-the external original and `import/source` until the deployment and backups have
-been independently accepted.
+The Go accept command records the immutable decision before exchanging the
+verified candidate with empty `data` and publishing the active release. Before
+finalize, require all three `ps` entries to be healthy, require backup/proxy
+version output and the Vaultwarden image labels to name the same exact clean
+release, and verify the normal HTTPS path. Finalize only validates durable
+state and archives it; it does not infer container health. If interrupted after
+the decision, exchange, active write, service start, or before finalize, repeat
+the sequence from its first line. Each Go boundary is idempotent for the same
+recorded decision. The pre-import session must fail because RSA was rotated.
+Retain the external original and `import/source` until the deployment and
+backups have been independently accepted.
 
 Before any accept decision, cancellation is explicit:
 
@@ -181,8 +175,8 @@ docker compose --env-file .env --file compose.yml --profile deployment run --rm 
 
 Cancel removes only disposable candidate/current state and never source or
 data. Once `decision.json` exists, cancel is permanently invalid; continue the
-same `python3 scripts/deployment.py import accept` workflow. Never edit import
-JSON, exchange directories manually, or replace a missing active document.
+same raw accept/start/verify/finalize sequence. Never edit import JSON, exchange
+directories manually, or replace a missing active document.
 
 ## Status and backup demand
 
@@ -284,6 +278,83 @@ latest point to an earlier point and never overwrites an existing output.
 On failure, preserve the error JSON, run `repo check`, and select a known full
 earlier ID explicitly if incident policy authorizes it. Use a new output name;
 do not delete a verified restore merely to reuse its name.
+
+### Authorized production restore runbook
+
+This is a manual incident procedure, not a product command. Do not run it
+without incident-specific authorization for the exact deployment and selected
+restore. The verified restore must already have passed the complete drill. Its
+manifest `project_commit` must exactly equal the current healthy backup
+container's `version` project commit; a legacy point or a point from another
+A/B identity is ineligible. Record both JSON documents and stop on any
+mismatch.
+
+Set the following values explicitly from the reviewed incident record; do not
+source or reparse `.env` in shell code:
+
+```sh
+vwless_root='<exact Compose-resolved DEPLOYMENT_ROOT>'
+vwless_restore_name='<verified-restore-output-name>'
+vwless_incident_id='<unique-lowercase-incident-id>'
+printf '%s\n' "$vwless_restore_name" | grep -Eq '^[a-z][a-z0-9-]{0,62}$'
+printf '%s\n' "$vwless_incident_id" | grep -Eq '^[a-z0-9][a-z0-9-]{0,62}$'
+vwless_restore="$vwless_root/restore/$vwless_restore_name"
+vwless_incident="$vwless_root/state/incidents/$vwless_incident_id"
+test "$vwless_root" != / && test -d "$vwless_root"
+test -d "$vwless_restore" && test -f "$vwless_restore/manifest.json"
+test "$(stat -c %d "$vwless_root/data")" = "$(stat -c %d "$vwless_restore")"
+LC_ALL=C mv --help | grep -q -- '--no-copy'
+LC_ALL=C mv --help | grep -q -- 'none-fail'
+LC_ALL=C cp --help | grep -q -- 'none-fail'
+umask 077
+test -e "$vwless_root/state/incidents" || mkdir -m 0700 -- "$vwless_root/state/incidents"
+mkdir -m 0700 -- "$vwless_incident"
+test "$(stat -c '%a:%u:%g' "$vwless_root/state/incidents")" = "700:$(id -u):$(id -g)"
+test "$(stat -c '%a:%u:%g' "$vwless_incident")" = "700:$(id -u):$(id -g)"
+docker compose --env-file .env --file compose.yml exec --no-TTY backup /bin/vaultwarden-less-backup version > "$vwless_incident/active-version.json"
+cp --update=none-fail --preserve=mode,timestamps -- "$vwless_restore/manifest.json" "$vwless_incident/reviewed-manifest.json"
+```
+
+Review those two saved JSON files and require the same exact full project
+commit before continuing. Then stop writers in order and confirm that no
+container or host process holds `db.sqlite3`:
+
+```sh
+docker compose --env-file .env --file compose.yml stop proxy
+docker compose --env-file .env --file compose.yml stop backup
+docker compose --env-file .env --file compose.yml stop vaultwarden
+test -z "$(docker compose --env-file .env --file compose.yml ps --status running --quiet vaultwarden backup proxy)"
+```
+
+While stopped, move the manifest into the incident record and perform only
+same-filesystem, no-copy, no-overwrite renames. Every destination below must be
+absent; `none-fail` turns an existing destination into a hard failure.
+
+```sh
+mv --update=none-fail --no-copy -T -- "$vwless_restore/manifest.json" "$vwless_incident/selected-manifest.json"
+mv --update=none-fail --no-copy -T -- "$vwless_root/data" "$vwless_incident/pre-restore-data"
+mv --update=none-fail --no-copy -T -- "$vwless_restore" "$vwless_root/data"
+```
+
+The durable active identity does not change. Start the same current release,
+require all three health checks, reject every old session, and establish a
+fresh login. Then create a new backup, restore it to a new output, and complete
+another drill. Keep the entire incident directory and both retained data trees
+until separate deletion authorization is recorded.
+
+If startup or validation fails after the restored tree reached `data`, keep
+services stopped and reverse only with no-overwrite renames:
+
+```sh
+mv --update=none-fail --no-copy -T -- "$vwless_root/data" "$vwless_incident/failed-restored-data"
+mv --update=none-fail --no-copy -T -- "$vwless_incident/pre-restore-data" "$vwless_root/data"
+docker compose --env-file .env --file compose.yml up --detach --wait --wait-timeout 180 vaultwarden backup proxy
+```
+
+If failure occurred before the restored tree reached `data`, leave that tree
+where it is and restore only the missing original `data` with the second rename.
+Never overwrite either tree, change `active.json`, promote a cross-commit
+snapshot, or remove incident material as part of this runbook.
 
 ## Isolated recovery drill
 

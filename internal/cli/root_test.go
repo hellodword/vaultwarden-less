@@ -333,8 +333,21 @@ func TestConfigValidateRoleGoldenAndFailureClassification(t *testing.T) {
 		}
 	}
 	environment := testEnvironment(nil, nil)
-	environment.validatePasswords = func(string, *config.Backup) error { return errors.New("sensitive password") }
+	var mounts [][2]string
+	environment.validateMount = func(expected, mounted string) error {
+		mounts = append(mounts, [2]string{expected, mounted})
+		return nil
+	}
 	stdout, stderr, code := executeCommand(environment, "config", "validate", "--role", "backup")
+	if code != 0 || stdout == "" || stderr != "" || len(mounts) != 10 ||
+		mounts[0] != [2]string{"/deployment-root/config/backup.yaml", "/config/backup.yaml"} ||
+		mounts[len(mounts)-1] != [2]string{"/deployment-root/credentials/notifiers.yaml", "/credentials/notifiers.yaml"} {
+		t.Fatalf("validated mounts = %#v, result = %d/%q/%q", mounts, code, stdout, stderr)
+	}
+
+	environment = testEnvironment(nil, nil)
+	environment.validatePasswords = func(string, *config.Backup) error { return errors.New("sensitive password") }
+	stdout, stderr, code = executeCommand(environment, "config", "validate", "--role", "backup")
 	if code != 1 || stdout != "" || strings.Contains(stderr, "sensitive") {
 		t.Fatalf("invalid credentials = %d/%q/%q", code, stdout, stderr)
 	}
@@ -347,6 +360,38 @@ func TestConfigValidateRoleGoldenAndFailureClassification(t *testing.T) {
 		t.Fatalf("unsafe Vaultwarden env = %d/%q/%q", code, stdout, stderr)
 	}
 	assertErrorJSON(t, stderr, codeUnsafePath)
+
+	environment = testEnvironment(nil, nil)
+	environment.validateMount = func(string, string) error { return errors.New("sensitive mount") }
+	stdout, stderr, code = executeCommand(environment, "config", "validate", "--role", "maintenance")
+	if code != 1 || stdout != "" || strings.Contains(stderr, "sensitive") {
+		t.Fatalf("unsafe mount = %d/%q/%q", code, stdout, stderr)
+	}
+	assertErrorJSON(t, stderr, codeUnsafePath)
+}
+
+func TestValidateMountedPathRequiresTheExactNonSymlinkObject(t *testing.T) {
+	root := t.TempDir()
+	expected := filepath.Join(root, "expected")
+	other := filepath.Join(root, "other")
+	link := filepath.Join(root, "link")
+	if err := os.WriteFile(expected, []byte("expected"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(other, []byte("other"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(expected, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateMountedPath(expected, expected); err != nil {
+		t.Fatal(err)
+	}
+	for _, mounted := range []string{other, link, "relative"} {
+		if err := validateMountedPath(expected, mounted); err == nil {
+			t.Fatalf("unsafe mounted path %q was accepted", mounted)
+		}
+	}
 }
 
 func TestUpgradePrepareGoldenAndServingGateClassification(t *testing.T) {
@@ -423,11 +468,11 @@ func TestRollbackManagerUsesOneCommonDeploymentRoot(t *testing.T) {
 	environment := testEnvironment(nil, nil)
 	root := t.TempDir()
 	environment.deploymentRoot = root
-	loadedPath := ""
+	loaded := false
 	loadDeployment := environment.loadDeployment
-	environment.loadDeployment = func(path string) (config.Deployment, error) {
-		loadedPath = path
-		return loadDeployment(path)
+	environment.loadDeployment = func() (config.Deployment, error) {
+		loaded = true
+		return loadDeployment()
 	}
 	environment.dataDir = "/separate-data-mount"
 	environment.stateDir = "/separate-state-mount"
@@ -439,8 +484,8 @@ func TestRollbackManagerUsesOneCommonDeploymentRoot(t *testing.T) {
 		manager.RestoreRoot != filepath.Join(root, "restore") {
 		t.Fatalf("rollback paths = %q/%q", manager.DataDir, manager.StateDir)
 	}
-	if loadedPath != filepath.Join(root, ".env") {
-		t.Fatalf("rollback deployment path = %q", loadedPath)
+	if !loaded {
+		t.Fatal("rollback did not validate the Compose-resolved deployment environment")
 	}
 	terminal, err := terminalUpgradeManager(environment)
 	if err != nil {
@@ -587,7 +632,7 @@ func testEnvironment(repositoryClient repository, server *httptest.Server, resto
 				Targets:                    []config.Target{{Name: "primary", Repository: "s3:https://objects.example.test/bucket", Options: []config.Option{}}}, Notifiers: []config.Notifier{},
 			}, nil
 		},
-		loadDeployment: func(string) (config.Deployment, error) {
+		loadDeployment: func() (config.Deployment, error) {
 			return config.Deployment{
 				Root: "/srv/vaultwarden-less", RuntimeUID: uint32(os.Geteuid()), RuntimeGID: uint32(os.Getegid()),
 				ListenPort: 8080, DrillPort: 8081,
@@ -600,16 +645,17 @@ func testEnvironment(repositoryClient repository, server *httptest.Server, resto
 		validatePasswords: func(string, *config.Backup) error { return nil },
 		validateDirectory: func(string) error { return nil },
 		validateFile:      func(string) error { return nil },
+		validateMount:     func(string, string) error { return nil },
 		repository:        func(*config.Backup) (repository, error) { return repositoryClient, nil },
 		restore: func(_ context.Context, _ restoretool.Repository, _ restoretool.Request) (restoretool.Result, error) {
 			return restoretool.Result{}, errors.New("restore should not be called")
 		},
-		requireActive:  func(string, string, string) error { return nil },
-		allowServe:     func(context.Context, string, string, deployment.Identity, config.Deployment) error { return nil },
-		drillCheck:     func(context.Context) error { return nil },
-		httpClient:     &http.Client{Timeout: time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }},
-		workerURL:      "http://127.0.0.1:1",
-		deploymentPath: "/deployment/.env", vaultwardenPath: "/deployment/vaultwarden.env",
+		requireActive:   func(string, string, string) error { return nil },
+		allowServe:      func(context.Context, string, string, deployment.Identity, config.Deployment) error { return nil },
+		drillCheck:      func(context.Context) error { return nil },
+		httpClient:      &http.Client{Timeout: time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }},
+		workerURL:       "http://127.0.0.1:1",
+		vaultwardenPath: "/deployment/vaultwarden.env",
 		credentialsPath: "/credentials/role.yaml",
 		notifierPath:    "/credentials/notifiers.yaml", passwordRoot: "/credentials/restic", resticBinary: "restic",
 		deploymentRoot: "/deployment-root",

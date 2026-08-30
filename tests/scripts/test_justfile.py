@@ -15,7 +15,6 @@ GROUPS = {
         "up",
         "status",
         "backup",
-        "deployment",
         "maintenance",
         "restore",
         "drill-up",
@@ -26,8 +25,6 @@ GROUPS = {
         "upgrade-freeze",
         "upgrade-start",
         "upgrade-verify",
-        "upgrade-accept",
-        "upgrade-rollback",
     },
 }
 
@@ -101,10 +98,6 @@ DRY_RUNS = {
                 "backup /bin/vaultwarden-less-backup request-backup"
             )
         ],
-    ),
-    "deployment": (
-        ["import", "verify", "--confirm-client-login"],
-        ['nix develop --command python3 scripts/deployment.py "$@"'],
     ),
     "maintenance": (
         ["repo", "check", "--target", "primary"],
@@ -249,14 +242,6 @@ DRY_RUNS = {
                 "--wait --wait-timeout 180 drill-vaultwarden"
             ),
         ],
-    ),
-    "upgrade-accept": (
-        [],
-        ["nix develop --command python3 scripts/deployment.py upgrade accept"],
-    ),
-    "upgrade-rollback": (
-        [],
-        ["nix develop --command python3 scripts/deployment.py upgrade rollback"],
     ),
 }
 
@@ -418,7 +403,7 @@ class JustfileContractTest(unittest.TestCase):
         recipes = self.document["recipes"]
         public = {name for name, recipe in recipes.items() if not recipe["private"]}
         self.assertEqual(public, set().union(*GROUPS.values()))
-        self.assertEqual(len(public), 18)
+        self.assertEqual(len(public), 15)
 
         for group, names in GROUPS.items():
             for name in names:
@@ -451,6 +436,9 @@ class JustfileContractTest(unittest.TestCase):
             "repo-snapshots",
             "upgrade-start-b",
             "upgrade-migrate-check",
+            "deployment",
+            "upgrade-accept",
+            "upgrade-rollback",
             "fmt",
             "test",
             "vet",

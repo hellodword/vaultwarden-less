@@ -2,6 +2,7 @@ package cli
 
 import (
 	"fmt"
+	"path/filepath"
 
 	"github.com/hellodword/vaultwarden-less/internal/notify"
 	"github.com/spf13/cobra"
@@ -37,7 +38,7 @@ func configCommand(configPath *string, environment commandEnvironment) *cobra.Co
 			if environment.loadDeployment == nil {
 				return commandFailure(codeInternal, "Deployment validation is unavailable", nil)
 			}
-			if _, err := environment.loadDeployment(environment.deploymentPath); err != nil {
+			if _, err := environment.loadDeployment(); err != nil {
 				return commandFailure(codeInvalidConfig, "The deployment environment is invalid", err)
 			}
 			cfg, err := environment.backup(*configPath)
@@ -65,9 +66,33 @@ func configCommand(configPath *string, environment commandEnvironment) *cobra.Co
 			if environment.validateDirectory == nil {
 				return commandFailure(codeInternal, "Private directory validation is unavailable", nil)
 			}
-			for _, path := range []string{environment.dataDir, environment.stagingDir, environment.cacheDir, environment.restoreRoot, environment.stateDir} {
+			for _, path := range []string{environment.deploymentRoot, environment.dataDir, environment.stagingDir, environment.cacheDir, environment.restoreRoot, environment.stateDir} {
 				if err := environment.validateDirectory(path); err != nil {
 					return commandFailure(codeUnsafePath, fmt.Sprintf("A required private directory is unsafe: %s", path), err)
+				}
+			}
+			if environment.validateMount == nil {
+				return commandFailure(codeInternal, "Deployment mount validation is unavailable", nil)
+			}
+			mounts := [][2]string{
+				{filepath.Join(environment.deploymentRoot, "config", "backup.yaml"), *configPath},
+				{filepath.Join(environment.deploymentRoot, "config", "vaultwarden.env"), environment.vaultwardenPath},
+				{filepath.Join(environment.deploymentRoot, "credentials", role+".yaml"), environment.credentialsPath},
+				{filepath.Join(environment.deploymentRoot, "credentials", "restic"), environment.passwordRoot},
+				{filepath.Join(environment.deploymentRoot, "cache"), environment.cacheDir},
+				{filepath.Join(environment.deploymentRoot, "data"), environment.dataDir},
+				{filepath.Join(environment.deploymentRoot, "staging"), environment.stagingDir},
+				{filepath.Join(environment.deploymentRoot, "restore"), environment.restoreRoot},
+				{filepath.Join(environment.deploymentRoot, "state"), environment.stateDir},
+			}
+			if role == "backup" {
+				mounts = append(mounts, [2]string{
+					filepath.Join(environment.deploymentRoot, "credentials", "notifiers.yaml"), environment.notifierPath,
+				})
+			}
+			for _, mount := range mounts {
+				if err := environment.validateMount(mount[0], mount[1]); err != nil {
+					return commandFailure(codeUnsafePath, "A private bind does not match the deployment root", err)
 				}
 			}
 			if role == "backup" {

@@ -17,7 +17,6 @@ import (
 	"testing"
 	"time"
 
-	productcli "github.com/hellodword/vaultwarden-less/internal/cli"
 	productdeployment "github.com/hellodword/vaultwarden-less/internal/deployment"
 	productsnapshot "github.com/hellodword/vaultwarden-less/internal/snapshot"
 	productupgrade "github.com/hellodword/vaultwarden-less/internal/upgrade"
@@ -33,20 +32,19 @@ type upgradeRelease struct {
 var resticReleaseVersionPattern = regexp.MustCompile(`^[0-9]+[.][0-9]+[.][0-9]+(?:[-+][0-9A-Za-z.-]+)?$`)
 
 type upgradeFixture struct {
-	t               *testing.T
-	ctx             context.Context
-	harness         *e2eHarness
-	from            upgradeRelease
-	to              upgradeRelease
-	upgradeID       string
-	email           string
-	itemID          string
-	client          *bitwardenCLI
-	originalRSA     [sha256.Size]byte
-	ticket          []byte
-	rollbackTreeID  string
-	markerName      string
-	orchestratorEnv []string
+	t              *testing.T
+	ctx            context.Context
+	harness        *e2eHarness
+	from           upgradeRelease
+	to             upgradeRelease
+	upgradeID      string
+	email          string
+	itemID         string
+	client         *bitwardenCLI
+	originalRSA    [sha256.Size]byte
+	ticket         []byte
+	rollbackTreeID string
+	markerName     string
 }
 
 func TestUpgradeAcceptLifecycle(t *testing.T) {
@@ -618,7 +616,7 @@ func newUpgradeFixture(
 		t: t, ctx: ctx, harness: harness, from: from, to: to,
 		upgradeID: prepare.UpgradeID, email: email, itemID: itemID, client: client,
 		originalRSA: sha256.Sum256(rsaBytes), ticket: ticket, rollbackTreeID: ticketDocument.RollbackTreeID,
-		markerName: markerName, orchestratorEnv: harness.prepareDeploymentOrchestrator(),
+		markerName: markerName,
 	}
 }
 
@@ -672,126 +670,6 @@ func readPrivateText(t *testing.T, path string) string {
 		t.Fatal(err)
 	}
 	return string(data)
-}
-
-func (h *e2eHarness) prepareDeploymentOrchestrator() []string {
-	h.t.Helper()
-	for _, source := range []string{h.productionCompose, h.upgradeCompose} {
-		content, err := os.ReadFile(source)
-		if err != nil {
-			h.t.Fatalf("read orchestrator Compose source: %v", err)
-		}
-		writePrivateFile(h.t, filepath.Join(h.localRoot, filepath.Base(source)), string(content))
-	}
-
-	pythonPath, err := exec.LookPath("python3")
-	if err != nil {
-		h.t.Fatalf("Python 3 is required for the deployment orchestrator: %v", err)
-	}
-	literal := func(value string) string {
-		h.t.Helper()
-		encoded, encodeErr := json.Marshal(value)
-		if encodeErr != nil {
-			h.t.Fatalf("encode orchestrator wrapper path: %v", encodeErr)
-		}
-		return string(encoded)
-	}
-	wrapperDirectory := filepath.Join(h.localRoot, "orchestrator-bin")
-	if err := os.Mkdir(wrapperDirectory, 0o700); err != nil {
-		h.t.Fatalf("create orchestrator wrapper directory: %v", err)
-	}
-	wrapper := filepath.Join(wrapperDirectory, "docker")
-	source := fmt.Sprintf(`#!%s
-import os
-import sys
-
-real_docker = %s
-base_override = %s
-upgrade_override = %s
-arguments = sys.argv[1:]
-if not arguments or arguments[0] != "compose":
-    os.execv(real_docker, [real_docker, *arguments])
-compose = arguments[1:]
-value_options = {"--project-name", "--project-directory", "--env-file", "--file", "--profile"}
-index = 0
-while index < len(compose) and compose[index] in value_options:
-    if index + 1 >= len(compose):
-        raise SystemExit(2)
-    index += 2
-if index >= len(compose):
-    raise SystemExit(2)
-overrides = ["--file", base_override]
-if any(os.path.basename(value) == "compose.upgrade.yml" for value in compose):
-    overrides.extend(("--file", upgrade_override))
-os.execv(real_docker, [real_docker, "compose", *compose[:index], *overrides, *compose[index:]])
-`, pythonPath, literal(h.dockerPath), literal(h.testCompose), literal(h.upgradeTestCompose))
-	writePrivateFile(h.t, wrapper, source)
-	if err := os.Chmod(wrapper, 0o700); err != nil {
-		h.t.Fatalf("make orchestrator Docker wrapper executable: %v", err)
-	}
-
-	environment := slices.Clone(h.dockerEnv)
-	set := func(name, value string) {
-		prefix := name + "="
-		for index, entry := range environment {
-			if strings.HasPrefix(entry, prefix) {
-				environment[index] = prefix + value
-				return
-			}
-		}
-		environment = append(environment, prefix+value)
-	}
-	set("PATH", wrapperDirectory+string(os.PathListSeparator)+os.Getenv("PATH"))
-	set("PYTHONDONTWRITEBYTECODE", "1")
-	return environment
-}
-
-type deploymentTerminalResult struct {
-	SchemaVersion       int    `json:"schema_version"`
-	Status              string `json:"status"`
-	Workflow            string `json:"workflow"`
-	Decision            string `json:"decision"`
-	UpgradeID           string `json:"upgrade_id"`
-	ActiveProjectCommit string `json:"active_project_commit"`
-	ActiveRelease       string `json:"active_release"`
-}
-
-func (fixture *upgradeFixture) runDeploymentOrchestrator(decision, status string) {
-	fixture.t.Helper()
-	pythonPath, err := exec.LookPath("python3")
-	if err != nil {
-		fixture.t.Fatalf("Python 3 is required for the deployment orchestrator: %v", err)
-	}
-	output, err := runCommandWithEnvironment(
-		fixture.ctx,
-		fixture.harness.localRoot,
-		nil,
-		fixture.orchestratorEnv,
-		pythonPath,
-		filepath.Join(fixture.harness.repository, "scripts", "deployment.py"),
-		"--deployment-root",
-		fixture.harness.localRoot,
-		"--project-name",
-		fixture.harness.project,
-		"upgrade",
-		decision,
-	)
-	if err != nil {
-		fixture.t.Fatalf("deployment orchestrator %s failed: %v: %s", decision, err, harnessDiagnostics(output))
-	}
-	var result deploymentTerminalResult
-	if err := decodeExactJSON(output, &result); err != nil ||
-		result.SchemaVersion != 1 || result.Status != status || result.Workflow != "upgrade" ||
-		result.Decision != decision || result.UpgradeID != fixture.upgradeID {
-		fixture.t.Fatalf("deployment orchestrator returned invalid %s result: %v: %s", decision, err, harnessDiagnostics(output))
-	}
-	expected := fixture.to
-	if decision == productupgrade.DecisionRollback {
-		expected = fixture.from
-	}
-	if result.ActiveProjectCommit != expected.commit || result.ActiveRelease != expected.release {
-		fixture.t.Fatalf("deployment orchestrator %s identity is invalid", decision)
-	}
 }
 
 func (h *e2eHarness) tryUpgradeCompose(ctx context.Context, generatedEnvironment bool, arguments ...string) (string, error) {
@@ -857,8 +735,8 @@ func runUpgradeResult(
 ) productupgrade.Result {
 	t.Helper()
 	var result productupgrade.Result
-	if err := decodeExactJSON(output, &result); err != nil || result.SchemaVersion != productupgrade.SchemaVersion ||
-		result.Phase != phase || result.FromCommit != from.commit || result.ToCommit != to.commit ||
+	if err := decodeExactJSON(output, &result); err != nil || result.Phase != phase ||
+		result.FromCommit != from.commit || result.ToCommit != to.commit ||
 		result.UpgradeID != from.commit+".."+to.commit || result.Targets == nil {
 		t.Fatalf("invalid %s upgrade result: %v: %s", phase, err, harnessDiagnostics(output))
 	}
@@ -958,8 +836,7 @@ func (fixture *upgradeFixture) expectUpgradeFailure(code, service string, argume
 func exactCommandErrorCode(t *testing.T, output string) string {
 	t.Helper()
 	type envelope struct {
-		SchemaVersion int `json:"schema_version"`
-		Error         struct {
+		Error struct {
 			Code    string `json:"code"`
 			Message string `json:"message"`
 		} `json:"error"`
@@ -971,8 +848,7 @@ func exactCommandErrorCode(t *testing.T, output string) string {
 			continue
 		}
 		var document envelope
-		if decodeExactJSON(line, &document) == nil && document.SchemaVersion == productcli.ResultSchemaVersion &&
-			document.Error.Code != "" && document.Error.Message != "" {
+		if decodeExactJSON(line, &document) == nil && document.Error.Code != "" && document.Error.Message != "" {
 			codes = append(codes, document.Error.Code)
 		}
 	}
@@ -1048,27 +924,27 @@ func (fixture *upgradeFixture) assertTerminalDecision(decision string) {
 	)
 	var document productupgrade.Decision
 	if err := decodeExactJSON(readPrivateText(fixture.t, decisionPath), &document); err != nil ||
-		document.SchemaVersion != productupgrade.SchemaVersion || document.UpgradeID != fixture.upgradeID ||
-		document.Decision != decision || document.ActiveProjectCommit != expected.commit ||
+		document.UpgradeID != fixture.upgradeID || document.Decision != decision ||
+		document.ActiveProjectCommit != expected.commit ||
 		document.ActiveRelease != expected.release || document.DecidedAt == "" {
 		fixture.t.Fatalf("terminal %s decision is invalid: %#v/%v", decision, document, err)
 	}
 }
 
-func (fixture *upgradeFixture) assertTerminalServices(release upgradeRelease, immutable bool) {
-	fixture.t.Helper()
-	validateUpgradeReleaseImages(fixture.t, fixture.harness, &release)
+func assertTerminalServices(t *testing.T, harness *e2eHarness, release upgradeRelease, immutable bool) {
+	t.Helper()
+	validateUpgradeReleaseImages(t, harness, &release)
 	for index, service := range []string{"vaultwarden", "backup", "proxy"} {
-		fixture.harness.waitComposeServiceHealthy(service, 4*time.Minute)
+		harness.waitComposeServiceHealthy(service, 4*time.Minute)
 		product := []string{"vaultwarden", "backup", "proxy"}[index]
 		tag := "local"
 		if immutable {
 			tag = release.release
 		}
 		reference := "vaultwarden-less-" + product + ":" + tag
-		imageOutput, err := fixture.harness.docker("image", "inspect", reference)
+		imageOutput, err := harness.docker("image", "inspect", reference)
 		if err != nil {
-			fixture.t.Fatalf("inspect terminal %s image: %v: %s", service, err, harnessDiagnostics(imageOutput))
+			t.Fatalf("inspect terminal %s image: %v: %s", service, err, harnessDiagnostics(imageOutput))
 		}
 		var images []struct {
 			ID     string `json:"Id"`
@@ -1079,12 +955,12 @@ func (fixture *upgradeFixture) assertTerminalServices(release upgradeRelease, im
 		if err := json.Unmarshal([]byte(imageOutput), &images); err != nil || len(images) != 1 ||
 			images[0].Config.Labels["org.opencontainers.image.revision"] != release.commit ||
 			images[0].Config.Labels["org.opencontainers.image.version"] != release.release {
-			fixture.t.Fatalf("terminal %s image identity is invalid: %v", service, err)
+			t.Fatalf("terminal %s image identity is invalid: %v", service, err)
 		}
-		container := fixture.harness.composeServiceContainer(service, true)
-		containerOutput, err := fixture.harness.docker("container", "inspect", container)
+		container := harness.composeServiceContainer(service, true)
+		containerOutput, err := harness.docker("container", "inspect", container)
 		if err != nil {
-			fixture.t.Fatalf("inspect terminal %s container: %v: %s", service, err, harnessDiagnostics(containerOutput))
+			t.Fatalf("inspect terminal %s container: %v: %s", service, err, harnessDiagnostics(containerOutput))
 		}
 		var containers []struct {
 			Image  string `json:"Image"`
@@ -1101,7 +977,7 @@ func (fixture *upgradeFixture) assertTerminalServices(release upgradeRelease, im
 		if err := json.Unmarshal([]byte(containerOutput), &containers); err != nil || len(containers) != 1 ||
 			containers[0].Image != images[0].ID || containers[0].Config.Image != reference ||
 			!containers[0].State.Running || containers[0].State.Health.Status != "healthy" {
-			fixture.t.Fatalf("terminal %s container identity or health is invalid: %v", service, err)
+			t.Fatalf("terminal %s container identity or health is invalid: %v", service, err)
 		}
 	}
 }
@@ -1162,9 +1038,43 @@ func (fixture *upgradeFixture) acceptAfterDecisionInterruption() {
 		}
 	}
 
-	fixture.runDeploymentOrchestrator(productupgrade.DecisionAccept, "completed")
-	fixture.runDeploymentOrchestrator(productupgrade.DecisionAccept, "already_complete")
-	fixture.assertTerminalServices(fixture.to, true)
+	resumed := runUpgradeResult(
+		fixture.t,
+		fixture.harness.upgradeCommand("upgrade-b", "upgrade", "accept"),
+		productupgrade.PhaseAccepted,
+		fixture.from,
+		fixture.to,
+	)
+	if resumed.UpgradeID != accepted.UpgradeID {
+		fixture.t.Fatal("replayed accept changed the immutable terminal decision")
+	}
+	fixture.harness.upgradeComposeCommand(
+		true,
+		"up",
+		"--detach",
+		"--wait",
+		"--wait-timeout",
+		"180",
+		"vaultwarden",
+		"backup",
+		"proxy",
+	)
+	assertTerminalServices(fixture.t, fixture.harness, fixture.to, true)
+	fixture.harness.resetUpgradeDrill()
+	runUpgradeResult(
+		fixture.t,
+		fixture.harness.upgradeCommand("upgrade-b", "upgrade", "cleanup-drill"),
+		productupgrade.PhaseAccepted,
+		fixture.from,
+		fixture.to,
+	)
+	runUpgradeResult(
+		fixture.t,
+		fixture.harness.upgradeCommand("upgrade-b", "upgrade", "finalize"),
+		productupgrade.PhaseAccepted,
+		fixture.from,
+		fixture.to,
+	)
 	fixture.assertArchived(productupgrade.DecisionAccept)
 	validateUpgradeReleaseImages(fixture.t, fixture.harness, &fixture.from)
 	fixture.harness.setBackend(fixture.harness.mappedComposeServiceEndpoint("proxy", 8080))
@@ -1223,9 +1133,43 @@ func (fixture *upgradeFixture) rollbackAfterExchangeInterruption() {
 		fixture.t.Fatal("frozen A rollback tree identity is invalid")
 	}
 
-	fixture.runDeploymentOrchestrator(productupgrade.DecisionRollback, "completed")
-	fixture.runDeploymentOrchestrator(productupgrade.DecisionRollback, "already_complete")
-	fixture.assertTerminalServices(fixture.from, false)
+	resumed := runUpgradeResult(
+		fixture.t,
+		fixture.harness.upgradeCommand("rollback-a", "rollback", "apply"),
+		productupgrade.PhaseRolledBack,
+		fixture.from,
+		fixture.to,
+	)
+	if resumed.UpgradeID != rolledBack.UpgradeID {
+		fixture.t.Fatal("replayed rollback changed the immutable terminal decision")
+	}
+	fixture.harness.selectProductionRelease(fixture.from)
+	fixture.harness.compose(
+		"up",
+		"--detach",
+		"--wait",
+		"--wait-timeout",
+		"180",
+		"vaultwarden",
+		"backup",
+		"proxy",
+	)
+	assertTerminalServices(fixture.t, fixture.harness, fixture.from, false)
+	fixture.harness.resetUpgradeDrill()
+	runUpgradeResult(
+		fixture.t,
+		fixture.harness.upgradeCommand("rollback-a", "upgrade", "cleanup-drill"),
+		productupgrade.PhaseRolledBack,
+		fixture.from,
+		fixture.to,
+	)
+	runUpgradeResult(
+		fixture.t,
+		fixture.harness.upgradeCommand("rollback-a", "upgrade", "finalize"),
+		productupgrade.PhaseRolledBack,
+		fixture.from,
+		fixture.to,
+	)
 	archive := fixture.assertArchived(productupgrade.DecisionRollback)
 	if value, err := os.ReadFile(filepath.Join(archive, "rollback-data", fixture.markerName)); err != nil || string(value) != "candidate-only\n" {
 		fixture.t.Fatalf("B data was not quarantined after rollback: %q/%v", value, err)

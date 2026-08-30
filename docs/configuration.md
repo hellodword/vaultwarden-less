@@ -1,28 +1,31 @@
 # Configuration
 
 This document shows how to create deployment inputs. Exact validators and
-limits are normative in [the schema 1 contracts](contracts.md). Storage-specific
+limits are normative in [the product contracts](contracts.md). Storage-specific
 endpoints and permissions are in [Storage providers](providers.md).
 
 ## Private layout and ownership
 
-The ordinary Git clone is the deployment directory. Tracked `*.example*` files
-are public templates; their private counterparts and all runtime directories
-are ignored. Never put real credentials in an example and never run
-`git clean -x` or `git clean -X` in this clone.
+The Git clone contains tracked Compose files and public `*.example*` templates.
+Its ignored `.env` points at an existing absolute `DEPLOYMENT_ROOT`; private
+counterparts and runtime directories live under that separate root. Never put
+real credentials in an example and never run `git clean -x` or `git clean -X`
+in a deployment clone.
 
 Create the layout as the account whose identity will run the containers:
 
 ```sh
-install -d -m 0700 config credentials credentials/restic
-install -d -m 0700 data staging cache restore state dist tmp
+vwless_root=/srv/vaultwarden-less
+install -d -m 0700 "$vwless_root"
+install -d -m 0700 "$vwless_root/config" "$vwless_root/credentials" "$vwless_root/credentials/restic"
+install -d -m 0700 "$vwless_root/data" "$vwless_root/import" "$vwless_root/staging" "$vwless_root/cache" "$vwless_root/restore" "$vwless_root/state"
 install -m 0600 .env.example .env
-install -m 0600 config/backup.example.yaml config/backup.yaml
-install -m 0600 config/vaultwarden.example.env config/vaultwarden.env
-install -m 0600 credentials/backup.example.yaml credentials/backup.yaml
-install -m 0600 credentials/maintenance.example.yaml credentials/maintenance.yaml
-install -m 0600 credentials/notifiers.example.yaml credentials/notifiers.yaml
-install -m 0600 credentials/restic/primary.example credentials/restic/primary
+install -m 0600 config/backup.example.yaml "$vwless_root/config/backup.yaml"
+install -m 0600 config/vaultwarden.example.env "$vwless_root/config/vaultwarden.env"
+install -m 0600 credentials/backup.example.yaml "$vwless_root/credentials/backup.yaml"
+install -m 0600 credentials/maintenance.example.yaml "$vwless_root/credentials/maintenance.yaml"
+install -m 0600 credentials/notifiers.example.yaml "$vwless_root/credentials/notifiers.yaml"
+install -m 0600 credentials/restic/primary.example "$vwless_root/credentials/restic/primary"
 ```
 
 Every private directory must be a real, non-symlink directory with mode
@@ -38,23 +41,25 @@ path.
 
 ## Deployment environment
 
-`.env` contains exactly five unquoted assignments and no comments or blank
-lines:
+The tracked `.env.example` shows five canonical unquoted assignments. Docker
+Compose owns actual `.env` quoting, escaping, and interpolation; the product
+validates only the five resolved values passed to its containers:
 
 ```dotenv
-DEPLOYMENT_SCHEMA_VERSION=1
+DEPLOYMENT_ROOT=/srv/vaultwarden-less
 RUNTIME_UID=1000
 RUNTIME_GID=1000
 LISTEN_PORT=8080
 DRILL_PORT=8081
 ```
 
+- `DEPLOYMENT_ROOT` resolves to an existing absolute directory other than `/`.
 - IDs are canonical decimal `1..4294967294` and must match private-path
   ownership.
 - ports are canonical decimal `1024..65535`, must differ, and are published
   only on loopback by tracked Compose.
-- leading zeros, signs, whitespace, quotes, interpolation, extra variables,
-  and symlinks are rejected.
+- resolved IDs and ports reject leading zeros, signs, or whitespace. Private
+  roots, files, and directories reject symlinks.
 
 The normal and drill ports may be chosen freely inside those bounds. Do not
 publish either port directly on an untrusted interface.
@@ -213,11 +218,11 @@ docker compose --env-file .env --file compose.yml --profile maintenance run --rm
 docker compose --env-file .env --file compose.yml --profile maintenance run --rm --no-deps config-check-maintenance
 ```
 
-Each command must print one schema-1 JSON success document and exit zero.
-Together they check the five-field environment, exact YAML, ownership, modes,
-symlink containment, target/password key sets, both role files, notifier
-credentials, and required runtime directories. They intentionally do not
-contact a repository.
+Each command must print one versionless JSON success document and exit zero.
+Together they check the five resolved values, exact YAML, actual Compose bind
+identity, ownership, modes, symlink containment, target/password key sets,
+both role files, notifier credentials, and required runtime directories. They
+intentionally do not contact a repository.
 
 After validation, initialize every newly created repository with the
 maintenance role:

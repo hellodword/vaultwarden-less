@@ -161,7 +161,7 @@ func gateTestEnvironment() gateEnvironment {
 	return gateEnvironment{
 		ready:    func() bool { return true },
 		identity: func() deployment.Identity { return identity },
-		loadDeployment: func(string) (config.Deployment, error) {
+		loadDeployment: func() (config.Deployment, error) {
 			return config.Deployment{Root: config.DeploymentRoot, RuntimeUID: uint32(os.Geteuid()), RuntimeGID: uint32(os.Getegid()), ListenPort: 8080, DrillPort: 8081}, nil
 		},
 		requireActive: func(string, deployment.Identity) (deployment.Active, error) {
@@ -185,7 +185,6 @@ func gateTestEnvironment() gateEnvironment {
 			return nil
 		},
 		start:           func() error { return nil },
-		deploymentPath:  "/deployment/.env",
 		stateDir:        "/state",
 		dataDir:         "/data",
 		importSourceDir: "/import/source",

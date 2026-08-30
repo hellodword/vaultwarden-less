@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	productcli "github.com/hellodword/vaultwarden-less/internal/cli"
 	productworker "github.com/hellodword/vaultwarden-less/internal/worker"
 )
 
@@ -59,11 +58,10 @@ func (h *e2eHarness) createMotoBucket(target string) {
 }
 
 type snapshotList struct {
-	SchemaVersion int    `json:"schema_version"`
-	Target        string `json:"target"`
-	Limit         int    `json:"limit"`
-	Truncated     bool   `json:"truncated"`
-	Snapshots     []struct {
+	Target    string `json:"target"`
+	Limit     int    `json:"limit"`
+	Truncated bool   `json:"truncated"`
+	Snapshots []struct {
 		ID            string `json:"id"`
 		Time          string `json:"time"`
 		ProjectCommit string `json:"project_commit"`
@@ -83,13 +81,11 @@ func (h *e2eHarness) repositoryCheckTarget(target string) {
 		"--config", "/config/backup.yaml",
 	)
 	var result struct {
-		SchemaVersion int    `json:"schema_version"`
-		Operation     string `json:"operation"`
-		Target        string `json:"target"`
-		Success       bool   `json:"success"`
+		Operation string `json:"operation"`
+		Target    string `json:"target"`
+		Success   bool   `json:"success"`
 	}
-	if decodeExactJSON(output, &result) != nil ||
-		result.SchemaVersion != productcli.ResultSchemaVersion || result.Operation != "check" ||
+	if decodeExactJSON(output, &result) != nil || result.Operation != "check" ||
 		result.Target != target || !result.Success {
 		h.t.Fatalf("invalid repository check result: %s", harnessDiagnostics(output))
 	}
@@ -120,7 +116,6 @@ func (h *e2eHarness) targetSnapshots(target string) (snapshotList, error) {
 	}
 	var result snapshotList
 	if err := decodeExactJSON(output, &result); err != nil ||
-		result.SchemaVersion != productcli.ResultSchemaVersion ||
 		result.Target != target || result.Limit != 100 ||
 		result.Snapshots == nil || result.Truncated {
 		return snapshotList{}, fmt.Errorf("invalid snapshots response")
@@ -146,8 +141,7 @@ func (h *e2eHarness) status() productworker.Status {
 	h.t.Helper()
 	output := h.compose("exec", "--no-TTY", "backup", "/bin/vaultwarden-less-backup", "status")
 	var status productworker.Status
-	if err := decodeExactJSON(output, &status); err != nil ||
-		status.SchemaVersion != productworker.SchemaVersion || status.Targets == nil {
+	if err := decodeExactJSON(output, &status); err != nil || status.Targets == nil {
 		h.t.Fatalf("invalid worker status: %v: %s", err, harnessDiagnostics(output))
 	}
 	return status
@@ -157,11 +151,9 @@ func (h *e2eHarness) requestBackup() {
 	h.t.Helper()
 	output := h.compose("exec", "--no-TTY", "backup", "/bin/vaultwarden-less-backup", "request-backup")
 	var result struct {
-		SchemaVersion int  `json:"schema_version"`
-		Accepted      bool `json:"accepted"`
+		Accepted bool `json:"accepted"`
 	}
-	if err := decodeExactJSON(output, &result); err != nil ||
-		result.SchemaVersion != productworker.SchemaVersion || !result.Accepted {
+	if err := decodeExactJSON(output, &result); err != nil || !result.Accepted {
 		h.t.Fatalf("invalid backup request result: %v: %s", err, harnessDiagnostics(output))
 	}
 }
@@ -188,7 +180,6 @@ func (h *e2eHarness) waitSnapshotCount(count int, timeout time.Duration) snapsho
 }
 
 type restoreOutput struct {
-	SchemaVersion int    `json:"schema_version"`
 	Target        string `json:"target"`
 	SnapshotID    string `json:"snapshot_id"`
 	ProjectCommit string `json:"project_commit"`
@@ -226,7 +217,6 @@ func (h *e2eHarness) restoreTarget(target, snapshotID, outputName string) restor
 	output := h.compose(arguments...)
 	var result restoreOutput
 	if err := decodeExactJSON(output, &result); err != nil ||
-		result.SchemaVersion != productcli.ResultSchemaVersion ||
 		result.Target != target || result.Output != "/restore/"+outputName ||
 		!lowerHex64Pattern.MatchString(result.SnapshotID) ||
 		!lowerHex40Pattern.MatchString(result.ProjectCommit) ||
@@ -256,15 +246,15 @@ func decodeExactJSON(value string, destination any) error {
 func TestDecodeExactJSONRejectsUnknownAndAdditionalDocuments(t *testing.T) {
 	t.Parallel()
 	type result struct {
-		SchemaVersion int `json:"schema_version"`
+		Value string `json:"value"`
 	}
 	var decoded result
-	if err := decodeExactJSON(`{"schema_version":2}`, &decoded); err != nil || decoded.SchemaVersion != 2 {
+	if err := decodeExactJSON(`{"value":"valid"}`, &decoded); err != nil || decoded.Value != "valid" {
 		t.Fatalf("valid result = %#v/%v", decoded, err)
 	}
 	for name, value := range map[string]string{
-		"unknown":    `{"schema_version":2,"extra":true}`,
-		"additional": `{"schema_version":2} {"schema_version":2}`,
+		"unknown":    `{"value":"valid","extra":true}`,
+		"additional": `{"value":"valid"} {"value":"valid"}`,
 	} {
 		withResult := result{}
 		if err := decodeExactJSON(value, &withResult); err == nil {

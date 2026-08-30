@@ -14,12 +14,13 @@ import (
 )
 
 type composeGateService struct {
-	Command     []string `json:"command"`
-	User        string   `json:"user"`
-	NetworkMode string   `json:"network_mode"`
-	ReadOnly    bool     `json:"read_only"`
-	CapDrop     []string `json:"cap_drop"`
-	SecurityOpt []string `json:"security_opt"`
+	Command     []string          `json:"command"`
+	Environment map[string]string `json:"environment"`
+	User        string            `json:"user"`
+	NetworkMode string            `json:"network_mode"`
+	ReadOnly    bool              `json:"read_only"`
+	CapDrop     []string          `json:"cap_drop"`
+	SecurityOpt []string          `json:"security_opt"`
 	Volumes     []struct {
 		Type     string `json:"type"`
 		Source   string `json:"source"`
@@ -40,8 +41,8 @@ func TestComposeStartupGateModel(t *testing.T) {
 		}
 	}
 	deploymentEnvironment := fmt.Sprintf(
-		"DEPLOYMENT_SCHEMA_VERSION=1\nRUNTIME_UID=%d\nRUNTIME_GID=%d\nLISTEN_PORT=18080\nDRILL_PORT=18081\n",
-		os.Geteuid(), os.Getegid(),
+		"DEPLOYMENT_ROOT=%s\nRUNTIME_UID=%d\nRUNTIME_GID=%d\nLISTEN_PORT=18080\nDRILL_PORT=18081\n",
+		root, os.Geteuid(), os.Getegid(),
 	)
 	writePrivateFile(t, filepath.Join(root, ".env"), deploymentEnvironment)
 	writePrivateFile(t, filepath.Join(root, "config", "vaultwarden.env"), "DOMAIN=https://vaultwarden.example.test\n")
@@ -49,31 +50,31 @@ func TestComposeStartupGateModel(t *testing.T) {
 	base := renderComposeModel(t, root, filepath.Join(root, ".env"),
 		filepath.Join(repository, "compose.yml"), "--profile", "deployment", "--profile", "drill", "--profile", "import")
 	assertGateCommand(t, base["vaultwarden"], "normal")
-	assertGateMount(t, base["vaultwarden"], filepath.Join(root, ".env"), "/deployment/.env", true)
+	assertGateDeploymentEnvironment(t, base["vaultwarden"], root)
 	assertGateMount(t, base["vaultwarden"], filepath.Join(root, "state"), "/state", true)
 	assertGateMount(t, base["vaultwarden"], filepath.Join(root, "data"), "/data", false)
 	proxy := base["proxy"]
-	if len(proxy.Volumes) != 2 {
+	if len(proxy.Volumes) != 1 {
 		t.Fatalf("proxy gained a data or workflow mount: %#v", proxy.Volumes)
 	}
-	assertGateMount(t, proxy, filepath.Join(root, ".env"), "/deployment/.env", true)
+	assertGateDeploymentEnvironment(t, proxy, root)
 	assertGateMount(t, proxy, filepath.Join(root, "state"), "/state", true)
 
 	assertGateCommand(t, base["drill-vaultwarden"], "drill")
-	assertGateMount(t, base["drill-vaultwarden"], filepath.Join(root, ".env"), "/deployment/.env", true)
+	assertGateDeploymentEnvironment(t, base["drill-vaultwarden"], root)
 	assertGateMount(t, base["drill-vaultwarden"], filepath.Join(root, "state"), "/state", true)
 	assertGateMount(t, base["drill-vaultwarden"], filepath.Join(root, "restore", "drill"), "/recovery", true)
 	assertGateCommand(t, base["import-vaultwarden"], "import")
-	assertGateMount(t, base["import-vaultwarden"], filepath.Join(root, ".env"), "/deployment/.env", true)
+	assertGateDeploymentEnvironment(t, base["import-vaultwarden"], root)
 	assertGateMount(t, base["import-vaultwarden"], filepath.Join(root, "import", "source"), "/import/source", true)
 	assertGateMount(t, base["import-vaultwarden"], filepath.Join(root, "import", "candidate"), "/data", false)
 	assertGateMount(t, base["import-vaultwarden"], filepath.Join(root, "state"), "/state", true)
 
 	admin, exists := base["deployment-admin"]
-	if !exists || admin.NetworkMode != "none" || len(admin.Volumes) != 4 {
+	if !exists || admin.NetworkMode != "none" || len(admin.Volumes) != 3 {
 		t.Fatalf("deployment-admin isolation = exists:%t network:%q volumes:%#v", exists, admin.NetworkMode, admin.Volumes)
 	}
-	assertGateMount(t, admin, filepath.Join(root, ".env"), "/deployment/.env", true)
+	assertGateDeploymentEnvironment(t, admin, root)
 	assertGateMount(t, admin, filepath.Join(root, "data"), "/data", true)
 	assertGateMount(t, admin, filepath.Join(root, "state"), "/state", false)
 	assertGateMount(t, admin, root, "/deployment-root", false)
@@ -113,12 +114,26 @@ func TestComposeStartupGateModel(t *testing.T) {
 	)
 	assertGateCommand(t, upgradeModel["vaultwarden"], "normal")
 	assertGateCommand(t, upgradeModel["upgrade-vaultwarden-b"], "upgrade-candidate")
-	assertGateMount(t, upgradeModel["upgrade-vaultwarden-b"], filepath.Join(root, ".env"), "/deployment/.env", true)
+	assertGateDeploymentEnvironment(t, upgradeModel["upgrade-vaultwarden-b"], root)
 	assertGateMount(t, upgradeModel["upgrade-vaultwarden-b"], filepath.Join(root, "state"), "/state", true)
 	assertGateCommand(t, upgradeModel["rollback-vaultwarden-a"], "rollback")
-	assertGateMount(t, upgradeModel["rollback-vaultwarden-a"], filepath.Join(root, ".env"), "/deployment/.env", true)
+	assertGateDeploymentEnvironment(t, upgradeModel["rollback-vaultwarden-a"], root)
 	assertGateMount(t, upgradeModel["rollback-vaultwarden-a"], filepath.Join(root, "state"), "/state", true)
 	assertRollbackAdminIsolation(t, upgradeModel["rollback-a"], root)
+}
+
+func assertGateDeploymentEnvironment(t *testing.T, service composeGateService, root string) {
+	t.Helper()
+	if service.Environment["DEPLOYMENT_ROOT"] != root || service.Environment["RUNTIME_UID"] != strconv.Itoa(os.Geteuid()) ||
+		service.Environment["RUNTIME_GID"] != strconv.Itoa(os.Getegid()) || service.Environment["LISTEN_PORT"] != "18080" ||
+		service.Environment["DRILL_PORT"] != "18081" {
+		t.Fatalf("gate deployment environment is invalid: %#v", service.Environment)
+	}
+	for _, volume := range service.Volumes {
+		if volume.Target == "/deployment/.env" {
+			t.Fatalf("gate retained a container-side dotenv mount: %#v", service.Volumes)
+		}
+	}
 }
 
 func renderComposeModel(t *testing.T, root, environment, compose string, extra ...string) map[string]composeGateService {

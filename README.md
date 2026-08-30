@@ -14,17 +14,17 @@ releases with the same actual Vaultwarden version can fully verify the upgrade
 orchestrator without leaving a cross-version support gap. See the normative
 [supported component set](docs/contracts.md#supported-component-set).
 
-The deployment host needs only Git, Python 3, Docker Engine, the Docker Compose
-plugin, and a release directory containing `images.tar.gz` and `SHA256SUMS`.
-Python runs the standard-library-only terminal upgrade/import orchestrator;
-the host does not need Nix, Go, Restic, or a registry.
+The deployment host needs only Git, Docker Engine, the Docker Compose plugin,
+gzip/checksum tools, and a release directory containing `images.tar.gz` and
+`SHA256SUMS`. It does not need Python, Nix, Just, Go, Restic, or a registry.
 
 ## Ten-minute local start
 
 Start from the exact clean Git commit named by the release producer. Do not
 mix a release archive with another commit, and never run `git clean -x` or
-`git clean -X` in a deployment clone: ignored credentials and Vaultwarden data
-are deliberately stored there.
+`git clean -X` in a deployment clone: the ignored `.env` is deployment input.
+All real credentials and Vaultwarden state live under a separate explicit
+`DEPLOYMENT_ROOT`, not in the source checkout.
 
 ```sh
 git clone <repository-url> vaultwarden-less
@@ -38,26 +38,29 @@ and GID will run the containers, or change ownership to that identity before
 validation.
 
 ```sh
-install -d -m 0700 config credentials credentials/restic
-install -d -m 0700 data import staging cache restore state dist tmp
+vwless_root=/srv/vaultwarden-less
+install -d -m 0700 "$vwless_root"
+install -d -m 0700 "$vwless_root/config" "$vwless_root/credentials" "$vwless_root/credentials/restic"
+install -d -m 0700 "$vwless_root/data" "$vwless_root/import" "$vwless_root/staging" "$vwless_root/cache" "$vwless_root/restore" "$vwless_root/state"
 install -m 0600 .env.example .env
-install -m 0600 config/backup.example.yaml config/backup.yaml
-install -m 0600 config/vaultwarden.example.env config/vaultwarden.env
-install -m 0600 credentials/backup.example.yaml credentials/backup.yaml
-install -m 0600 credentials/maintenance.example.yaml credentials/maintenance.yaml
-install -m 0600 credentials/notifiers.example.yaml credentials/notifiers.yaml
-install -m 0600 credentials/restic/primary.example credentials/restic/primary
+install -m 0600 config/backup.example.yaml "$vwless_root/config/backup.yaml"
+install -m 0600 config/vaultwarden.example.env "$vwless_root/config/vaultwarden.env"
+install -m 0600 credentials/backup.example.yaml "$vwless_root/credentials/backup.yaml"
+install -m 0600 credentials/maintenance.example.yaml "$vwless_root/credentials/maintenance.yaml"
+install -m 0600 credentials/notifiers.example.yaml "$vwless_root/credentials/notifiers.yaml"
+install -m 0600 credentials/restic/primary.example "$vwless_root/credentials/restic/primary"
 ```
 
 Edit the private copies. In particular:
 
 - `.env` must contain exactly the five documented assignments. Set
-  `RUNTIME_UID` and `RUNTIME_GID` to the owner of every private path, choose two
-  different unprivileged loopback ports, and keep `DEPLOYMENT_SCHEMA_VERSION=1`.
-- Set `DOMAIN` in `config/vaultwarden.env` to the public HTTPS origin. Review
+  `DEPLOYMENT_ROOT` to the absolute root created above, set `RUNTIME_UID` and
+  `RUNTIME_GID` to the owner of every private path, and choose two different
+  unprivileged loopback ports.
+- Set `DOMAIN` in `$vwless_root/config/vaultwarden.env` to the public HTTPS origin. Review
   every security-sensitive Vaultwarden setting rather than enabling examples
   blindly.
-- Set the repository and provider options in `config/backup.yaml`, put the same
+- Set the repository and provider options in `$vwless_root/config/backup.yaml`, put the same
   target keys in both role credential files, and replace each Restic password.
 - Configure the notifier credentials, or set `notifiers: []` in
   `config/backup.yaml` and use `notifiers: {}` in
@@ -123,7 +126,7 @@ commands.
 
 - [Architecture](docs/architecture.md): dataflow, networks, recovery identity,
   and ownership boundaries.
-- [Schema 1 contracts](docs/contracts.md): normative machine behavior.
+- [Product contracts](docs/contracts.md): normative machine behavior.
 - [Configuration](docs/configuration.md): private files, modes, identities, and
   examples.
 - [Storage providers](docs/providers.md): six S3-compatible provider recipes.

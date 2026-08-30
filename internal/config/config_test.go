@@ -234,29 +234,40 @@ func TestPasswordDirectoryRequiresExactSetAndOnePrivateLine(t *testing.T) {
 	}
 }
 
-func TestDeploymentEnvIsExactCanonicalAndOwned(t *testing.T) {
-	t.Parallel()
-	valid := fmt.Sprintf("DEPLOYMENT_ROOT=/srv/vaultwarden-less\nRUNTIME_UID=%d\nRUNTIME_GID=%d\nLISTEN_PORT=8080\nDRILL_PORT=8081\n", os.Geteuid(), os.Getegid())
-	path := writePrivateFile(t, valid)
-	deployment, err := LoadDeployment(path)
+func TestDeploymentEnvironmentUsesExactResolvedValues(t *testing.T) {
+	valid := map[string]string{
+		"DEPLOYMENT_ROOT": "/srv/vaultwarden-less",
+		"RUNTIME_UID":     fmt.Sprint(os.Geteuid()),
+		"RUNTIME_GID":     fmt.Sprint(os.Getegid()),
+		"LISTEN_PORT":     "8080",
+		"DRILL_PORT":      "8081",
+	}
+	for name, value := range valid {
+		t.Setenv(name, value)
+	}
+	deployment, err := LoadDeployment()
 	if err != nil || deployment.ListenPort != 8080 || deployment.DrillPort != 8081 {
 		t.Fatalf("deployment = %#v/%v", deployment, err)
 	}
-	for name, invalid := range map[string]string{
-		"blank":        valid + "\n",
-		"duplicate":    valid + "LISTEN_PORT=8082\n",
-		"unknown":      strings.Replace(valid, "LISTEN_PORT", "OTHER_PORT", 1),
-		"quote":        strings.Replace(valid, "8080", `"8080"`, 1),
-		"leading zero": strings.Replace(valid, "8080", "08080", 1),
-		"same ports":   strings.Replace(valid, "8081", "8080", 1),
-		"low port":     strings.Replace(valid, "8080", "80", 1),
-		"CR":           strings.Replace(valid, "\n", "\r\n", 1),
-		"comment":      valid + "# comment\n",
-		"root":         strings.Replace(valid, "/srv/vaultwarden-less", "/", 1),
+	for name, mutate := range map[string]func(map[string]string){
+		"missing":      func(values map[string]string) { delete(values, "LISTEN_PORT") },
+		"quote":        func(values map[string]string) { values["LISTEN_PORT"] = `"8080"` },
+		"leading zero": func(values map[string]string) { values["LISTEN_PORT"] = "08080" },
+		"same ports":   func(values map[string]string) { values["DRILL_PORT"] = "8080" },
+		"low port":     func(values map[string]string) { values["LISTEN_PORT"] = "80" },
+		"root":         func(values map[string]string) { values["DEPLOYMENT_ROOT"] = "/" },
+		"relative root": func(values map[string]string) {
+			values["DEPLOYMENT_ROOT"] = "deployment"
+		},
+		"mismatched uid": func(values map[string]string) { values["RUNTIME_UID"] = "4294967294" },
 	} {
 		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-			if _, err := LoadDeployment(writePrivateFile(t, invalid)); err == nil {
+			values := make(map[string]string, len(valid))
+			for key, value := range valid {
+				values[key] = value
+			}
+			mutate(values)
+			if _, err := decodeDeploymentEnvironment(values); err == nil {
 				t.Fatal("invalid deployment environment was accepted")
 			}
 		})

@@ -40,11 +40,6 @@ status:
 backup:
     {{ compose }} exec --no-TTY backup /bin/vaultwarden-less-backup request-backup
 
-# Route state operations and resumable terminal workflows through the host orchestrator.
-[group('operations')]
-deployment *args:
-    nix develop --command python3 scripts/deployment.py "$@"
-
 # Run an explicit networked maintenance command with structured argv.
 [group('operations')]
 maintenance *args: _config-validate
@@ -91,16 +86,6 @@ upgrade-verify:
     {{ upgrade_compose }} --profile upgrade stop proxy backup vaultwarden upgrade-vaultwarden-b
     {{ upgrade_compose }} --profile upgrade run --rm --no-deps upgrade-b upgrade verify
     {{ upgrade_compose }} --profile drill up --detach --wait --wait-timeout 180 drill-vaultwarden
-
-# Resume the immutable accept decision through healthy B services and finalize.
-[group('upgrade')]
-upgrade-accept:
-    nix develop --command python3 scripts/deployment.py upgrade accept
-
-# Resume the immutable rollback decision through healthy A services and finalize.
-[group('upgrade')]
-upgrade-rollback:
-    nix develop --command python3 scripts/deployment.py upgrade rollback
 
 [private]
 _fmt:

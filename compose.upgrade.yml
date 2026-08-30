@@ -15,59 +15,60 @@ x-upgrade-service-defaults: &upgrade-service-defaults
       max-size: 20m
       max-file: "3"
 
+x-upgrade-deployment-environment: &upgrade-deployment-environment
+  DEPLOYMENT_ROOT: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}"
+  RUNTIME_UID: "${RUNTIME_UID:?RUNTIME_UID is required}"
+  RUNTIME_GID: "${RUNTIME_GID:?RUNTIME_GID is required}"
+  LISTEN_PORT: "${LISTEN_PORT:?LISTEN_PORT is required}"
+  DRILL_PORT: "${DRILL_PORT:?DRILL_PORT is required}"
+
 x-upgrade-maintenance-volumes: &upgrade-maintenance-volumes
   - type: bind
-    source: ./.env
-    target: /deployment/.env
-    read_only: true
-    bind:
-      create_host_path: false
-  - type: bind
-    source: ./config/vaultwarden.env
+    source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/config/vaultwarden.env"
     target: /deployment/vaultwarden.env
     read_only: true
     bind:
       create_host_path: false
   - type: bind
-    source: ./config/backup.yaml
+    source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/config/backup.yaml"
     target: /config/backup.yaml
     read_only: true
     bind:
       create_host_path: false
   - type: bind
-    source: ./credentials/maintenance.yaml
+    source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/credentials/maintenance.yaml"
     target: /run/credentials/role.yaml
     read_only: true
     bind:
       create_host_path: false
   - type: bind
-    source: ./credentials/restic
+    source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/credentials/restic"
     target: /run/credentials/restic
     read_only: true
     bind:
       create_host_path: false
   - type: bind
-    source: ./cache
+    source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/cache"
     target: /cache
     bind:
       create_host_path: false
   - type: bind
-    source: ./data
+    source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/data"
     target: /data
     bind:
       create_host_path: false
   - type: bind
-    source: ./staging
+    source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/staging"
     target: /staging
     bind:
       create_host_path: false
   - type: bind
-    source: ./restore
+    source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/restore"
     target: /restore
     bind:
       create_host_path: false
   - type: bind
-    source: ./state
+    source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/state"
     target: /state
     bind:
       create_host_path: false
@@ -108,22 +109,17 @@ services:
     restart: "no"
     hostname: vaultwarden
     command: [upgrade-candidate]
+    environment: *upgrade-deployment-environment
     env_file:
-      - ./config/vaultwarden.env
+      - "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/config/vaultwarden.env"
     volumes:
       - type: bind
-        source: ./.env
-        target: /deployment/.env
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ./data
+        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/data"
         target: /data
         bind:
           create_host_path: false
       - type: bind
-        source: ./state
+        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/state"
         target: /state
         read_only: true
         bind:
@@ -146,6 +142,7 @@ services:
     restart: "no"
     entrypoint: [/bin/vaultwarden-less-backup]
     command: [--help]
+    environment: *upgrade-deployment-environment
     volumes: *upgrade-maintenance-volumes
     networks:
       - maintenance-outbound
@@ -158,6 +155,7 @@ services:
     restart: "no"
     entrypoint: [/bin/vaultwarden-less-backup]
     command: [--help]
+    environment: *upgrade-deployment-environment
     volumes: *upgrade-maintenance-volumes
     networks:
       - maintenance-outbound
@@ -172,9 +170,10 @@ services:
     network_mode: none
     entrypoint: [/bin/vaultwarden-less-backup]
     command: [--help]
+    environment: *upgrade-deployment-environment
     volumes:
       - type: bind
-        source: .
+        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}"
         target: /deployment-root
         bind:
           create_host_path: false
@@ -187,22 +186,17 @@ services:
     restart: unless-stopped
     hostname: vaultwarden
     command: [rollback]
+    environment: *upgrade-deployment-environment
     env_file:
-      - ./config/vaultwarden.env
+      - "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/config/vaultwarden.env"
     volumes:
       - type: bind
-        source: ./.env
-        target: /deployment/.env
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ./data
+        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/data"
         target: /data
         bind:
           create_host_path: false
       - type: bind
-        source: ./state
+        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/state"
         target: /state
         read_only: true
         bind:
@@ -226,54 +220,49 @@ services:
     hostname: backup
     entrypoint: [/bin/vaultwarden-less-backup]
     command: [serve]
+    environment: *upgrade-deployment-environment
     volumes:
       - type: bind
-        source: ./.env
-        target: /deployment/.env
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ./config/backup.yaml
+        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/config/backup.yaml"
         target: /config/backup.yaml
         read_only: true
         bind:
           create_host_path: false
       - type: bind
-        source: ./credentials/restic
+        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/credentials/restic"
         target: /run/credentials/restic
         read_only: true
         bind:
           create_host_path: false
       - type: bind
-        source: ./cache
+        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/cache"
         target: /cache
         bind:
           create_host_path: false
       - type: bind
-        source: ./data
+        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/data"
         target: /data
         read_only: true
         bind:
           create_host_path: false
       - type: bind
-        source: ./staging
+        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/staging"
         target: /staging
         bind:
           create_host_path: false
       - type: bind
-        source: ./state
+        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/state"
         target: /state
         bind:
           create_host_path: false
       - type: bind
-        source: ./credentials/backup.yaml
+        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/credentials/backup.yaml"
         target: /run/credentials/role.yaml
         read_only: true
         bind:
           create_host_path: false
       - type: bind
-        source: ./credentials/notifiers.yaml
+        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/credentials/notifiers.yaml"
         target: /run/credentials/notifiers.yaml
         read_only: true
         bind:
@@ -297,6 +286,7 @@ services:
     hostname: proxy
     entrypoint: [/bin/vaultwarden-less-proxy]
     command: [serve]
+    environment: *upgrade-deployment-environment
     depends_on:
       rollback-vaultwarden-a:
         condition: service_healthy
@@ -306,13 +296,7 @@ services:
       - "127.0.0.1:${LISTEN_PORT:?LISTEN_PORT is required}:8080"
     volumes:
       - type: bind
-        source: ./.env
-        target: /deployment/.env
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ./state
+        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/state"
         target: /state
         read_only: true
         bind:

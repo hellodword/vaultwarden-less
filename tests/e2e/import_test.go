@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -23,7 +22,6 @@ import (
 const importWALMarker = 82801
 
 type initialImportResult struct {
-	SchemaVersion        int    `json:"schema_version"`
 	ImportID             string `json:"import_id"`
 	Phase                string `json:"phase"`
 	ProjectCommit        string `json:"project_commit"`
@@ -155,15 +153,10 @@ func TestInitialImportLifecycle(t *testing.T) {
 		t.Fatal("candidate retained the external RSA identity")
 	}
 
-	materializeImportCompose(t, harness)
-	completed := runImportOrchestrator(t, harness)
-	if completed.Status != "completed" {
-		t.Fatalf("first terminal import status = %q", completed.Status)
-	}
-	repeated := runImportOrchestrator(t, harness)
-	if repeated.Status != "already_complete" || repeated.ActiveProjectCommit != completed.ActiveProjectCommit ||
-		repeated.ActiveRelease != completed.ActiveRelease {
-		t.Fatalf("repeated terminal import = %#v, first %#v", repeated, completed)
+	accepted := runImportTerminalSequence(t, harness)
+	if accepted.Phase != "finalized" || accepted.ProjectCommit != verified.ProjectCommit ||
+		accepted.Release != verified.Release {
+		t.Fatalf("terminal import = %#v, verified %#v", accepted, verified)
 	}
 	if _, err := os.Lstat(candidate); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("finalized candidate survived: %v", err)
@@ -222,7 +215,7 @@ func tryImportAdmin(harness *e2eHarness, arguments ...string) (string, error) {
 func parseInitialImportResult(t *testing.T, output, phase string) initialImportResult {
 	t.Helper()
 	var result initialImportResult
-	if decodeExactJSON(output, &result) != nil || result.SchemaVersion != 1 || result.ImportID != "initial" ||
+	if decodeExactJSON(output, &result) != nil || result.ImportID != "initial" ||
 		result.Phase != phase || !lowerHex40Pattern.MatchString(result.ProjectCommit) || result.Release == "" ||
 		!contentIDPattern.MatchString(result.SourceTreeID) || !contentIDPattern.MatchString(result.CandidateTreeID) {
 		t.Fatalf("invalid %s import result: %s", phase, harnessDiagnostics(output))
@@ -230,55 +223,33 @@ func parseInitialImportResult(t *testing.T, output, phase string) initialImportR
 	return result
 }
 
-type importOrchestratorResult struct {
-	SchemaVersion       int    `json:"schema_version"`
-	Status              string `json:"status"`
-	Workflow            string `json:"workflow"`
-	Decision            string `json:"decision"`
-	ImportID            string `json:"import_id"`
-	ActiveProjectCommit string `json:"active_project_commit"`
-	ActiveRelease       string `json:"active_release"`
-}
-
-func runImportOrchestrator(t *testing.T, harness *e2eHarness) importOrchestratorResult {
+func runImportTerminalSequence(t *testing.T, harness *e2eHarness) initialImportResult {
 	t.Helper()
-	python, err := exec.LookPath("python3")
-	if err != nil {
-		t.Fatal(err)
-	}
-	output, err := runCommandWithEnvironment(
-		harness.ctx,
-		harness.localRoot,
-		nil,
-		harness.dockerEnv,
-		python,
-		filepath.Join(harness.repository, "scripts", "deployment.py"),
-		"--deployment-root",
-		harness.localRoot,
-		"--project-name",
-		harness.project,
-		"import",
-		"accept",
+	harness.compose("--profile", "import", "stop", "import-vaultwarden")
+	harness.compose("--profile", "import", "rm", "--force", "--stop", "import-vaultwarden")
+	accepted := parseInitialImportResult(
+		t,
+		runImportAdmin(t, harness, "deployment", "import", "accept"),
+		"accepted",
 	)
-	if err != nil {
-		t.Fatalf("terminal import orchestration: %v: %s", err, harnessDiagnostics(output))
+	// Replay the immutable Go boundary before any host-side runtime action. It
+	// must continue the same decision and must not exchange the trees twice.
+	replayed := parseInitialImportResult(
+		t,
+		runImportAdmin(t, harness, "deployment", "import", "accept"),
+		"accepted",
+	)
+	if replayed.ProjectCommit != accepted.ProjectCommit || replayed.Release != accepted.Release ||
+		replayed.CandidateTreeID != accepted.CandidateTreeID {
+		t.Fatalf("replayed import decision changed identity: first=%#v replay=%#v", accepted, replayed)
 	}
-	var result importOrchestratorResult
-	if decodeExactJSON(output, &result) != nil || result.SchemaVersion != 1 || result.Workflow != "import" ||
-		result.Decision != "accept" || result.ImportID != "initial" ||
-		!lowerHex40Pattern.MatchString(result.ActiveProjectCommit) || result.ActiveRelease == "" {
-		t.Fatalf("invalid terminal import result: %s", harnessDiagnostics(output))
-	}
-	return result
-}
-
-func materializeImportCompose(t *testing.T, harness *e2eHarness) {
-	t.Helper()
-	data, err := os.ReadFile(harness.productionCompose)
-	if err != nil {
-		t.Fatal(err)
-	}
-	writePrivateFile(t, filepath.Join(harness.localRoot, "compose.yml"), string(data))
+	harness.compose("up", "--detach", "--wait", "--wait-timeout", "180", "vaultwarden", "backup", "proxy")
+	assertTerminalServices(t, harness, upgradeRelease{commit: accepted.ProjectCommit, release: accepted.Release}, false)
+	return parseInitialImportResult(
+		t,
+		runImportAdmin(t, harness, "deployment", "import", "finalize"),
+		"finalized",
+	)
 }
 
 func resetImportTarget(t *testing.T, harness *e2eHarness, externalSource string) {

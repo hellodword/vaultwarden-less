@@ -29,7 +29,7 @@ func deploymentCommand(environment commandEnvironment) *cobra.Command {
 			if environment.loadDeployment == nil {
 				return commandFailure(codeInternal, "Deployment validation is unavailable", nil)
 			}
-			if _, err := environment.loadDeployment(environment.deploymentPath); err != nil {
+			if _, err := environment.loadDeployment(); err != nil {
 				return commandFailure(codeInvalidConfig, "The deployment environment is invalid", err)
 			}
 			result, err := (deployment.Manager{
@@ -144,7 +144,7 @@ func importManager(environment commandEnvironment) (importer.Manager, error) {
 	if environment.loadDeployment == nil {
 		return importer.Manager{}, commandFailure(codeInternal, "Deployment validation is unavailable", nil)
 	}
-	if _, err := environment.loadDeployment(environment.deploymentPath); err != nil {
+	if _, err := environment.loadDeployment(); err != nil {
 		return importer.Manager{}, commandFailure(codeInvalidConfig, "The deployment environment is invalid", err)
 	}
 	root := environment.deploymentRoot

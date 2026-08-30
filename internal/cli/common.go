@@ -8,6 +8,8 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -39,12 +41,13 @@ type restoreFunc func(context.Context, restoretool.Repository, restoretool.Reque
 
 type commandEnvironment struct {
 	loadBackup        func(string) (*config.Backup, error)
-	loadDeployment    func(string) (config.Deployment, error)
+	loadDeployment    func() (config.Deployment, error)
 	loadCredentials   func(string, *config.Backup) (*config.RoleCredentials, error)
 	loadNotifiers     func(string, *config.Backup) ([]config.Notifier, error)
 	validatePasswords func(string, *config.Backup) error
 	validateDirectory func(string) error
 	validateFile      func(string) error
+	validateMount     func(string, string) error
 	repository        func(*config.Backup) (repository, error)
 	restore           restoreFunc
 	requireActive     func(string, string, string) error
@@ -52,7 +55,6 @@ type commandEnvironment struct {
 	drillCheck        func(context.Context) error
 	httpClient        *http.Client
 	workerURL         string
-	deploymentPath    string
 	deploymentRoot    string
 	vaultwardenPath   string
 	credentialsPath   string
@@ -88,7 +90,8 @@ func defaultEnvironment(stderr io.Writer) commandEnvironment {
 			}
 			return nil
 		},
-		restore: restoretool.Run,
+		validateMount: validateMountedPath,
+		restore:       restoretool.Run,
 		requireActive: func(stateDir, projectCommit, release string) error {
 			_, err := deployment.RequireActive(stateDir, deployment.Identity{ProjectCommit: projectCommit, Release: release})
 			return err
@@ -107,7 +110,6 @@ func defaultEnvironment(stderr io.Writer) commandEnvironment {
 			},
 		},
 		workerURL:       config.WorkerURL,
-		deploymentPath:  config.DeploymentEnvPath,
 		deploymentRoot:  config.DeploymentRoot,
 		vaultwardenPath: config.VaultwardenEnvPath,
 		credentialsPath: config.RoleCredentialsPath,
@@ -138,6 +140,26 @@ func defaultEnvironment(stderr io.Writer) commandEnvironment {
 		), nil
 	}
 	return environment
+}
+
+func validateMountedPath(expected, mounted string) error {
+	if !filepath.IsAbs(expected) || filepath.Clean(expected) != expected ||
+		!filepath.IsAbs(mounted) || filepath.Clean(mounted) != mounted {
+		return fmt.Errorf("mounted path boundary is invalid")
+	}
+	expectedInfo, err := os.Lstat(expected)
+	if err != nil {
+		return err
+	}
+	mountedInfo, err := os.Lstat(mounted)
+	if err != nil {
+		return err
+	}
+	if expectedInfo.Mode()&os.ModeSymlink != 0 || mountedInfo.Mode()&os.ModeSymlink != 0 ||
+		expectedInfo.IsDir() != mountedInfo.IsDir() || !os.SameFile(expectedInfo, mountedInfo) {
+		return fmt.Errorf("mounted path does not match the deployment root")
+	}
+	return nil
 }
 
 func (environment commandEnvironment) isReady() bool {

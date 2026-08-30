@@ -32,7 +32,7 @@ func serveCommand(configPath *string, environment commandEnvironment) *cobra.Com
 			if environment.loadDeployment == nil {
 				return commandFailure(codeInternal, "Deployment validation is unavailable", nil)
 			}
-			configured, err := environment.loadDeployment(environment.deploymentPath)
+			configured, err := environment.loadDeployment()
 			if err != nil {
 				return commandFailure(codeInvalidConfig, "The deployment environment is invalid", err)
 			}

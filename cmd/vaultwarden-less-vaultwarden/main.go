@@ -44,7 +44,7 @@ type drillManifest struct {
 type gateEnvironment struct {
 	ready             func() bool
 	identity          func() deployment.Identity
-	loadDeployment    func(string) (config.Deployment, error)
+	loadDeployment    func() (config.Deployment, error)
 	requireActive     func(string, deployment.Identity) (deployment.Active, error)
 	readActive        func(string) (deployment.Active, error)
 	allowNormal       func(context.Context, string, string, deployment.Identity, config.Deployment) error
@@ -54,7 +54,6 @@ type gateEnvironment struct {
 	allowRollback     func(context.Context, string, string, deployment.Identity, config.Deployment) error
 	allowImport       func(context.Context, string, string, string, deployment.Identity, config.Deployment) error
 	start             func() error
-	deploymentPath    string
 	stateDir          string
 	dataDir           string
 	importSourceDir   string
@@ -93,7 +92,6 @@ func defaultGateEnvironment() gateEnvironment {
 		start: func() error {
 			return syscall.Exec(vaultwardenBinary, []string{vaultwardenBinary}, os.Environ())
 		},
-		deploymentPath:  config.DeploymentEnvPath,
 		stateDir:        config.StateDir,
 		dataDir:         config.DataDir,
 		importSourceDir: filepath.Join(config.ImportRoot, "source"),
@@ -130,7 +128,7 @@ func evaluateGate(ctx context.Context, mode string, identity deployment.Identity
 	if environment.loadDeployment == nil {
 		return fmt.Errorf("deployment loader is unavailable")
 	}
-	configured, err := environment.loadDeployment(environment.deploymentPath)
+	configured, err := environment.loadDeployment()
 	if err != nil {
 		return err
 	}

@@ -48,7 +48,7 @@ func execute(ctx context.Context, arguments []string, stdout, stderr io.Writer) 
 	environment := proxyEnvironment{
 		ready: buildinfo.Ready,
 		allowServe: func() error {
-			deployment, err := config.LoadDeployment(config.DeploymentEnvPath)
+			deployment, err := config.LoadDeployment()
 			if err != nil {
 				return err
 			}

@@ -18,9 +18,16 @@ x-service-defaults: &service-defaults
       max-size: 20m
       max-file: "3"
 
+x-deployment-environment: &deployment-environment
+  DEPLOYMENT_ROOT: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}"
+  RUNTIME_UID: "${RUNTIME_UID:?RUNTIME_UID is required}"
+  RUNTIME_GID: "${RUNTIME_GID:?RUNTIME_GID is required}"
+  LISTEN_PORT: "${LISTEN_PORT:?LISTEN_PORT is required}"
+  DRILL_PORT: "${DRILL_PORT:?DRILL_PORT is required}"
+
 x-backup-config-mount: &backup-config-mount
   type: bind
-  source: ./config/backup.yaml
+  source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/config/backup.yaml"
   target: /config/backup.yaml
   read_only: true
   bind:
@@ -28,7 +35,7 @@ x-backup-config-mount: &backup-config-mount
 
 x-restic-credentials-mount: &restic-credentials-mount
   type: bind
-  source: ./credentials/restic
+  source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/credentials/restic"
   target: /run/credentials/restic
   read_only: true
   bind:
@@ -36,7 +43,7 @@ x-restic-credentials-mount: &restic-credentials-mount
 
 x-cache-mount: &cache-mount
   type: bind
-  source: ./cache
+  source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/cache"
   target: /cache
   bind:
     create_host_path: false
@@ -48,22 +55,17 @@ services:
     pull_policy: never
     hostname: vaultwarden
     command: [normal]
+    environment: *deployment-environment
     env_file:
-      - ./config/vaultwarden.env
+      - "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/config/vaultwarden.env"
     volumes:
       - type: bind
-        source: ./.env
-        target: /deployment/.env
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ./data
+        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/data"
         target: /data
         bind:
           create_host_path: false
       - type: bind
-        source: ./state
+        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/state"
         target: /state
         read_only: true
         bind:
@@ -85,40 +87,35 @@ services:
     hostname: backup
     entrypoint: [/bin/vaultwarden-less-backup]
     command: [serve]
+    environment: *deployment-environment
     volumes:
       - *backup-config-mount
       - *restic-credentials-mount
       - *cache-mount
       - type: bind
-        source: ./.env
-        target: /deployment/.env
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ./data
+        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/data"
         target: /data
         read_only: true
         bind:
           create_host_path: false
       - type: bind
-        source: ./staging
+        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/staging"
         target: /staging
         bind:
           create_host_path: false
       - type: bind
-        source: ./state
+        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/state"
         target: /state
         bind:
           create_host_path: false
       - type: bind
-        source: ./credentials/backup.yaml
+        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/credentials/backup.yaml"
         target: /run/credentials/role.yaml
         read_only: true
         bind:
           create_host_path: false
       - type: bind
-        source: ./credentials/notifiers.yaml
+        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/credentials/notifiers.yaml"
         target: /run/credentials/notifiers.yaml
         read_only: true
         bind:
@@ -140,6 +137,7 @@ services:
     hostname: proxy
     entrypoint: [/bin/vaultwarden-less-proxy]
     command: [serve]
+    environment: *deployment-environment
     depends_on:
       vaultwarden:
         condition: service_healthy
@@ -149,13 +147,7 @@ services:
       - "127.0.0.1:${LISTEN_PORT:?LISTEN_PORT is required}:8080"
     volumes:
       - type: bind
-        source: ./.env
-        target: /deployment/.env
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ./state
+        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/state"
         target: /state
         read_only: true
         bind:
@@ -179,51 +171,52 @@ services:
     network_mode: none
     entrypoint: [/bin/vaultwarden-less-backup]
     command: [config, validate, --role, backup]
+    environment: *deployment-environment
     volumes:
       - *backup-config-mount
       - *restic-credentials-mount
       - *cache-mount
       - type: bind
-        source: ./.env
-        target: /deployment/.env
+        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}"
+        target: /deployment-root
         read_only: true
         bind:
           create_host_path: false
       - type: bind
-        source: ./config/vaultwarden.env
+        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/config/vaultwarden.env"
         target: /deployment/vaultwarden.env
         read_only: true
         bind:
           create_host_path: false
       - type: bind
-        source: ./data
+        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/data"
         target: /data
         read_only: true
         bind:
           create_host_path: false
       - type: bind
-        source: ./staging
+        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/staging"
         target: /staging
         bind:
           create_host_path: false
       - type: bind
-        source: ./restore
+        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/restore"
         target: /restore
         bind:
           create_host_path: false
       - type: bind
-        source: ./state
+        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/state"
         target: /state
         bind:
           create_host_path: false
       - type: bind
-        source: ./credentials/backup.yaml
+        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/credentials/backup.yaml"
         target: /run/credentials/role.yaml
         read_only: true
         bind:
           create_host_path: false
       - type: bind
-        source: ./credentials/notifiers.yaml
+        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/credentials/notifiers.yaml"
         target: /run/credentials/notifiers.yaml
         read_only: true
         bind:
@@ -238,45 +231,46 @@ services:
     network_mode: none
     entrypoint: [/bin/vaultwarden-less-backup]
     command: [config, validate, --role, maintenance]
+    environment: *deployment-environment
     volumes:
       - *backup-config-mount
       - *restic-credentials-mount
       - *cache-mount
       - type: bind
-        source: ./.env
-        target: /deployment/.env
+        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}"
+        target: /deployment-root
         read_only: true
         bind:
           create_host_path: false
       - type: bind
-        source: ./config/vaultwarden.env
+        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/config/vaultwarden.env"
         target: /deployment/vaultwarden.env
         read_only: true
         bind:
           create_host_path: false
       - type: bind
-        source: ./data
+        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/data"
         target: /data
         read_only: true
         bind:
           create_host_path: false
       - type: bind
-        source: ./staging
+        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/staging"
         target: /staging
         bind:
           create_host_path: false
       - type: bind
-        source: ./restore
+        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/restore"
         target: /restore
         bind:
           create_host_path: false
       - type: bind
-        source: ./state
+        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/state"
         target: /state
         bind:
           create_host_path: false
       - type: bind
-        source: ./credentials/maintenance.yaml
+        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/credentials/maintenance.yaml"
         target: /run/credentials/role.yaml
         read_only: true
         bind:
@@ -290,39 +284,34 @@ services:
     restart: "no"
     entrypoint: [/bin/vaultwarden-less-backup]
     command: [--help]
+    environment: *deployment-environment
     volumes:
       - *backup-config-mount
       - *restic-credentials-mount
       - *cache-mount
       - type: bind
-        source: ./.env
-        target: /deployment/.env
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ./data
+        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/data"
         target: /data
         read_only: true
         bind:
           create_host_path: false
       - type: bind
-        source: ./staging
+        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/staging"
         target: /staging
         bind:
           create_host_path: false
       - type: bind
-        source: ./restore
+        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/restore"
         target: /restore
         bind:
           create_host_path: false
       - type: bind
-        source: ./state
+        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/state"
         target: /state
         bind:
           create_host_path: false
       - type: bind
-        source: ./credentials/maintenance.yaml
+        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/credentials/maintenance.yaml"
         target: /run/credentials/role.yaml
         read_only: true
         bind:
@@ -339,26 +328,21 @@ services:
     network_mode: none
     entrypoint: [/bin/vaultwarden-less-backup]
     command: [--help]
+    environment: *deployment-environment
     volumes:
       - type: bind
-        source: .
+        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}"
         target: /deployment-root
         bind:
           create_host_path: false
       - type: bind
-        source: ./.env
-        target: /deployment/.env
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ./data
+        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/data"
         target: /data
         read_only: true
         bind:
           create_host_path: false
       - type: bind
-        source: ./state
+        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/state"
         target: /state
         bind:
           create_host_path: false
@@ -372,8 +356,9 @@ services:
     hostname: import-vaultwarden
     command: [import]
     env_file:
-      - ./config/vaultwarden.env
+      - "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/config/vaultwarden.env"
     environment:
+      <<: *deployment-environment
       DATA_FOLDER: /data
       DATABASE_URL: sqlite:///data/db.sqlite3
       RSA_KEY_FILENAME: /data/rsa_key
@@ -387,24 +372,18 @@ services:
       DISABLE_ICON_DOWNLOAD: "true"
     volumes:
       - type: bind
-        source: ./.env
-        target: /deployment/.env
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ./import/source
+        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/import/source"
         target: /import/source
         read_only: true
         bind:
           create_host_path: false
       - type: bind
-        source: ./import/candidate
+        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/import/candidate"
         target: /data
         bind:
           create_host_path: false
       - type: bind
-        source: ./state
+        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/state"
         target: /state
         read_only: true
         bind:
@@ -429,22 +408,23 @@ services:
     restart: "no"
     entrypoint: [/bin/vaultwarden-less-backup]
     command: [--help]
+    environment: *deployment-environment
     volumes:
       - *backup-config-mount
       - *restic-credentials-mount
       - *cache-mount
       - type: bind
-        source: ./restore
+        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/restore"
         target: /restore
         bind:
           create_host_path: false
       - type: bind
-        source: ./state
+        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/state"
         target: /state
         bind:
           create_host_path: false
       - type: bind
-        source: ./credentials/maintenance.yaml
+        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/credentials/maintenance.yaml"
         target: /run/credentials/role.yaml
         read_only: true
         bind:
@@ -461,13 +441,12 @@ services:
     user: "0:0"
     network_mode: none
     environment:
-      RUNTIME_UID: "${RUNTIME_UID:?RUNTIME_UID is required}"
-      RUNTIME_GID: "${RUNTIME_GID:?RUNTIME_GID is required}"
+      <<: *deployment-environment
     cap_add: [CHOWN, DAC_OVERRIDE, FOWNER]
     entrypoint: [/bin/vaultwarden-less-drill-copy]
     volumes:
       - type: bind
-        source: ./restore/drill
+        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/restore/drill"
         target: /source
         read_only: true
         bind:
@@ -487,6 +466,7 @@ services:
       drill-copy:
         condition: service_completed_successfully
     environment:
+      <<: *deployment-environment
       DOMAIN: "http://127.0.0.1:${DRILL_PORT:?DRILL_PORT is required}"
       DATA_FOLDER: /data
       DATABASE_URL: sqlite:///data/db.sqlite3
@@ -504,19 +484,13 @@ services:
         source: drill-data
         target: /data
       - type: bind
-        source: ./.env
-        target: /deployment/.env
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: ./restore/drill
+        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/restore/drill"
         target: /recovery
         read_only: true
         bind:
           create_host_path: false
       - type: bind
-        source: ./state
+        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/state"
         target: /state
         read_only: true
         bind:

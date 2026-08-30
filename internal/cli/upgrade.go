@@ -191,7 +191,6 @@ func rollbackManager(environment commandEnvironment) (upgrade.Manager, error) {
 	if err != nil || !metadata.IsDir() || metadata.Mode()&os.ModeSymlink != 0 {
 		return upgrade.Manager{}, commandFailure(codeInternal, "The rollback filesystem boundary is invalid", err)
 	}
-	environment.deploymentPath = filepath.Join(root, ".env")
 	environment.dataDir = filepath.Join(root, "data")
 	environment.restoreRoot = filepath.Join(root, "restore")
 	environment.stateDir = filepath.Join(root, "state")
@@ -224,7 +223,7 @@ func upgradeManager(environment commandEnvironment) (upgrade.Manager, error) {
 	if environment.loadDeployment == nil {
 		return upgrade.Manager{}, commandFailure(codeInternal, "Deployment validation is unavailable", nil)
 	}
-	deployment, err := environment.loadDeployment(environment.deploymentPath)
+	deployment, err := environment.loadDeployment()
 	if err != nil {
 		return upgrade.Manager{}, commandFailure(codeInvalidConfig, "The deployment environment is invalid", err)
 	}
