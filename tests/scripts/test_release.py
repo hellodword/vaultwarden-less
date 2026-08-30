@@ -347,7 +347,10 @@ class ReleaseScriptTest(unittest.TestCase):
             mock.patch.object(
                 release,
                 "image_version",
-                side_effect=('{"version":"0.19.1"}', "vaultwarden 1.37.2"),
+                side_effect=(
+                    '{"version":"0.19.1"}',
+                    "Vaultwarden 1.37.2\nWeb-Vault Version file missing",
+                ),
             ) as version,
         ):
             release.validate_upstream_versions(IDENTITY)
@@ -361,6 +364,35 @@ class ReleaseScriptTest(unittest.TestCase):
                 "--json",
             ),
         )
+        self.assertEqual(
+            version.call_args_list[1].args,
+            (
+                f"vaultwarden-less-vaultwarden:{IDENTITY.release}",
+                "/bin/vaultwarden",
+                "--version",
+            ),
+        )
+
+        for invalid in (
+            "",
+            "vaultwarden 1.37.2",
+            "Vaultwarden 1.37.1\nWeb-Vault Version file missing",
+            "1.37.2",
+        ):
+            with (
+                mock.patch.object(
+                    release,
+                    "upstream_versions",
+                    return_value=("0.19.1", "1.37.2"),
+                ),
+                mock.patch.object(
+                    release,
+                    "image_version",
+                    side_effect=('{"version":"0.19.1"}', invalid),
+                ),
+                self.assertRaisesRegex(ValueError, "Vaultwarden image version"),
+            ):
+                release.validate_upstream_versions(IDENTITY)
 
     def test_artifact_evidence_is_canonical_private_and_hash_bound(self) -> None:
         pair = self.root / "pair"

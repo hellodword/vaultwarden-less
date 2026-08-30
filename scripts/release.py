@@ -293,9 +293,10 @@ def validate_upstream_versions(identity: Identity) -> None:
         "/bin/vaultwarden",
         "--version",
     )
-    if vaultwarden_output.split() not in (
-        [expected_vaultwarden],
-        ["vaultwarden", expected_vaultwarden],
+    vaultwarden_lines = vaultwarden_output.splitlines()
+    if (
+        not vaultwarden_lines
+        or vaultwarden_lines[0] != f"Vaultwarden {expected_vaultwarden}"
     ):
         raise ValueError("Vaultwarden image version does not match UPSTREAMS.toml")
 
