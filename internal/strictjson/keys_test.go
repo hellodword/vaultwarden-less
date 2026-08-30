@@ -6,7 +6,7 @@ func TestRejectDuplicateKeysAcceptsOneNestedJSONValue(t *testing.T) {
 	t.Parallel()
 	for _, value := range []string{
 		`null`,
-		`{"schema_version":1,"nested":{"value":true},"items":[{"name":"a"},{"name":"b"}]}`,
+		`{"identifier":1,"nested":{"value":true},"items":[{"name":"a"},{"name":"b"}]}`,
 	} {
 		if err := RejectDuplicateKeys([]byte(value)); err != nil {
 			t.Fatalf("valid JSON %q rejected: %v", value, err)

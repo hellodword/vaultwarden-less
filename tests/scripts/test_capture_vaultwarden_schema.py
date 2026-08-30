@@ -72,6 +72,15 @@ class CaptureVaultwardenSchemaTest(unittest.TestCase):
 
         self.assertEqual(first, second)
         document = json.loads(first)
+        self.assertEqual(
+            list(document),
+            [
+                "vaultwarden_version",
+                "database_migration",
+                "fingerprint",
+                "objects",
+            ],
+        )
         self.assertEqual(document["database_migration"], self.migration)
         self.assertEqual(document["vaultwarden_version"], "1.37.2")
         self.assertIn("wal_only", {item["name"] for item in document["objects"]})

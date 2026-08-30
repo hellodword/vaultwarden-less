@@ -26,13 +26,12 @@ func requestBackupCommand(environment commandEnvironment) *cobra.Command {
 		Args:  noArguments,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			var result struct {
-				SchemaVersion int  `json:"schema_version"`
-				Accepted      bool `json:"accepted"`
+				Accepted bool `json:"accepted"`
 			}
 			if err := callWorker(cmd.Context(), environment, http.MethodPost, worker.CheckPath, http.StatusAccepted, &result); err != nil {
 				return commandFailure(codeInternal, "The backup request could not be delivered", err)
 			}
-			if result.SchemaVersion != worker.SchemaVersion || !result.Accepted {
+			if !result.Accepted {
 				return commandFailure(codeInternal, "The worker returned an invalid response", nil)
 			}
 			return writeJSON(cmd.OutOrStdout(), result)
@@ -68,9 +67,8 @@ func healthcheckCommand(environment commandEnvironment) *cobra.Command {
 				return commandFailure(codeNotReady, "The backup worker is not healthy", err)
 			}
 			return writeJSON(cmd.OutOrStdout(), struct {
-				SchemaVersion int  `json:"schema_version"`
-				Healthy       bool `json:"healthy"`
-			}{ResultSchemaVersion, true})
+				Healthy bool `json:"healthy"`
+			}{true})
 		},
 	}
 }
@@ -82,7 +80,7 @@ func callWorker(ctx context.Context, environment commandEnvironment, method, pat
 	}
 	var body io.Reader
 	if method == http.MethodPost {
-		body = bytes.NewReader([]byte(fmt.Sprintf("{\"schema_version\":%d}\n", worker.SchemaVersion)))
+		body = bytes.NewReader([]byte("{}\n"))
 	}
 	request, err := http.NewRequestWithContext(ctx, method, endpoint, body)
 	if err != nil {
@@ -138,7 +136,7 @@ func workerEndpoint(base, path string) (string, error) {
 }
 
 func validateWorkerStatus(status worker.Status) error {
-	if status.SchemaVersion != worker.SchemaVersion || !oneOf(status.State, "idle", "debouncing", "checking", "partial", "degraded") || status.Targets == nil {
+	if !oneOf(status.State, "idle", "debouncing", "checking", "partial", "degraded") || status.Targets == nil {
 		return fmt.Errorf("worker returned an invalid status document")
 	}
 	if !validUTCTime(status.StartedAt) || status.NextCheckAt != nil && !validUTCTime(*status.NextCheckAt) {

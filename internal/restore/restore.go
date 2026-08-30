@@ -14,8 +14,6 @@ import (
 	"github.com/hellodword/vaultwarden-less/internal/snapshot"
 )
 
-const ResultSchemaVersion = 1
-
 type Repository interface {
 	ResolveSnapshot(context.Context, config.Target, string) (restic.Snapshot, error)
 	Restore(context.Context, config.Target, string, string) error
@@ -29,7 +27,6 @@ type Request struct {
 }
 
 type Result struct {
-	SchemaVersion int    `json:"schema_version"`
 	Target        string `json:"target"`
 	SnapshotID    string `json:"snapshot_id"`
 	ProjectCommit string `json:"project_commit"`
@@ -79,7 +76,6 @@ func Run(ctx context.Context, repository Repository, request Request) (_ Result,
 		return Result{}, fmt.Errorf("sync verified restore publication: %w", err)
 	}
 	return Result{
-		SchemaVersion: ResultSchemaVersion,
 		Target:        request.Target.Name,
 		SnapshotID:    selected.ID,
 		ProjectCommit: manifest.ProjectCommit,

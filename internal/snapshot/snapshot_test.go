@@ -408,7 +408,7 @@ func TestCanonicalPrimitiveEncodingGoldenBytes(t *testing.T) {
 func TestCanonicalFullStreamGoldenDigest(t *testing.T) {
 	data := syntheticData(t, true)
 	manifest, _ := buildFixture(t, data.dataDir)
-	const want = "sha256:f4a5a4e76917a13093955755102b68438c8fc797955dd3730d966631491fbe5e"
+	const want = "sha256:17a2af62d4430695e0f257f6cb1954a65847d00709d62599e6bd6aacc26bdcfd"
 	if manifest.ContentID != want {
 		t.Fatalf("canonical content ID = %s, want %s", manifest.ContentID, want)
 	}
@@ -976,7 +976,7 @@ func TestVerifyRejectsEveryTreeMismatch(t *testing.T) {
 	}
 }
 
-func TestManifestSchemaOneSortsAndValidatesExactFields(t *testing.T) {
+func TestVersionlessManifestSortsAndValidatesExactFields(t *testing.T) {
 	t.Parallel()
 	files := []File{
 		{Path: "sends/" + testSendID + "/" + testSendFileID, Size: 1, SHA256: "sha256:" + strings.Repeat("a", 64)},
@@ -993,7 +993,7 @@ func TestManifestSchemaOneSortsAndValidatesExactFields(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Equal(first.Files, second.Files) || first.SchemaVersion != 1 || first.ProjectCommit != testProjectCommit || first.ContentID != contentID || first.ArchiveID != archiveID {
+	if !slices.Equal(first.Files, second.Files) || first.ProjectCommit != testProjectCommit || first.ContentID != contentID || first.ArchiveID != archiveID {
 		t.Fatalf("manifest = %#v", first)
 	}
 }
@@ -1013,13 +1013,16 @@ func TestManifestStrictlyRejectsMalformedJSONAndIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	withUnknown := strings.Replace(string(data), `"schema_version":1`, `"schema_version":1,"unknown":true`, 1)
+	withUnknown := strings.Replace(string(data), "{", `{"unknown":true,`, 1)
 	if _, err := DecodeManifest([]byte(withUnknown)); err == nil {
 		t.Fatal("unknown manifest field was accepted")
 	}
-	duplicate := strings.Replace(string(data), `"schema_version":1`, `"schema_version":1,"schema_version":1`, 1)
+	duplicate := strings.Replace(string(data), `"project_commit":"`+testProjectCommit+`"`, `"project_commit":"`+testProjectCommit+`","project_commit":"`+testProjectCommit+`"`, 1)
+	retiredVersionField := "schema_" + "version"
+	retired := strings.Replace(string(data), "{", `{"`+retiredVersionField+`":1,`, 1)
 	for name, malformed := range map[string][]byte{
 		"duplicate":    []byte(duplicate),
+		"retired":      []byte(retired),
 		"invalid utf8": append(slices.Clone(data), 0xff),
 		"trailing":     append(slices.Clone(data), []byte(` {}`)...),
 	} {
@@ -1031,7 +1034,6 @@ func TestManifestStrictlyRejectsMalformedJSONAndIdentity(t *testing.T) {
 
 func TestVerifyRejectsEveryManifestIdentityAndFileTamper(t *testing.T) {
 	for name, mutate := range map[string]func(*Manifest){
-		"schema": func(manifest *Manifest) { manifest.SchemaVersion = 2 },
 		"project commit": func(manifest *Manifest) {
 			manifest.ProjectCommit = strings.Repeat("f", 40)
 		},

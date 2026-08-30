@@ -13,26 +13,18 @@ import (
 )
 
 const (
-	SchemaVersion = 1
-
 	HealthPath = "/healthz"
-	EventsPath = "/v1/events"
-	CheckPath  = "/v1/checks"
-	StatusPath = "/v1/status"
+	EventsPath = "/events"
+	CheckPath  = "/checks"
+	StatusPath = "/status"
 )
 
-type eventRequest struct {
-	SchemaVersion int `json:"schema_version"`
-}
-
 type acceptedResponse struct {
-	SchemaVersion int  `json:"schema_version"`
-	Accepted      bool `json:"accepted"`
+	Accepted bool `json:"accepted"`
 }
 
 type errorResponse struct {
-	SchemaVersion int `json:"schema_version"`
-	Error         struct {
+	Error struct {
 		Code    string `json:"code"`
 		Message string `json:"message"`
 	} `json:"error"`
@@ -79,7 +71,7 @@ func Handler(worker *Worker) http.Handler {
 				writer.WriteHeader(http.StatusNoContent)
 				return
 			}
-			writeJSON(writer, http.StatusAccepted, acceptedResponse{SchemaVersion: SchemaVersion, Accepted: true})
+			writeJSON(writer, http.StatusAccepted, acceptedResponse{Accepted: true})
 		default:
 			writeError(writer, http.StatusNotFound, "usage_error", "Endpoint not found")
 		}
@@ -120,39 +112,27 @@ func decodeEventRequest(writer http.ResponseWriter, request *http.Request) *requ
 	if !utf8.Valid(data) {
 		return &requestFailure{status: http.StatusBadRequest, code: "usage_error", message: "Request body is invalid"}
 	}
-	body, err := decodeStrictEventRequest(data)
-	if err != nil {
-		return &requestFailure{status: http.StatusBadRequest, code: "usage_error", message: "Request must contain only schema_version"}
-	}
-	if body.SchemaVersion != SchemaVersion {
-		return &requestFailure{status: http.StatusBadRequest, code: "unsupported_schema", message: "Request schema_version is unsupported"}
+	if err := decodeStrictEventRequest(data); err != nil {
+		return &requestFailure{status: http.StatusBadRequest, code: "usage_error", message: "Request must be an empty JSON object"}
 	}
 	return nil
 }
 
-func decodeStrictEventRequest(data []byte) (eventRequest, error) {
+func decodeStrictEventRequest(data []byte) error {
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	token, err := decoder.Token()
-	if err != nil || token != json.Delim('{') || !decoder.More() {
-		return eventRequest{}, errors.New("invalid request object")
-	}
-	key, err := decoder.Token()
-	if err != nil || key != "schema_version" {
-		return eventRequest{}, errors.New("invalid request key")
-	}
-	var result eventRequest
-	if err := decoder.Decode(&result.SchemaVersion); err != nil || decoder.More() {
-		return eventRequest{}, errors.New("invalid request value")
+	if err != nil || token != json.Delim('{') || decoder.More() {
+		return errors.New("invalid request object")
 	}
 	closing, err := decoder.Token()
 	if err != nil || closing != json.Delim('}') {
-		return eventRequest{}, errors.New("invalid request object")
+		return errors.New("invalid request object")
 	}
 	var extra any
 	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
-		return eventRequest{}, errors.New("trailing request value")
+		return errors.New("trailing request value")
 	}
-	return result, nil
+	return nil
 }
 
 func emptyRequestBody(request *http.Request) bool {
@@ -173,7 +153,7 @@ func methodNotAllowed(writer http.ResponseWriter, allowed string) {
 }
 
 func writeError(writer http.ResponseWriter, status int, code, message string) {
-	response := errorResponse{SchemaVersion: SchemaVersion}
+	response := errorResponse{}
 	response.Error.Code = code
 	response.Error.Message = message
 	writeJSON(writer, status, response)

@@ -58,7 +58,6 @@ func testRunner(t *testing.T, execute executeFunc) (Runner, config.Target, *[]re
 		},
 	}
 	credentials := &config.RoleCredentials{
-		SchemaVersion: config.SchemaVersion,
 		Targets: map[string]config.RoleTarget{
 			"primary": {Environment: map[string]string{
 				"AWS_ACCESS_KEY_ID": "synthetic-access", "AWS_SECRET_ACCESS_KEY": "synthetic-secret",
@@ -112,7 +111,6 @@ func rawRecoverySnapshot(id, content, when string) rawSnapshot {
 		Time:     when,
 		Hostname: SnapshotHost,
 		Tags: []string{
-			SnapshotSchemaTag,
 			"project_commit=" + firstCommit,
 			"content_id=" + content,
 			"archive_id=" + firstArchiveID,
@@ -244,7 +242,6 @@ func TestEnsureBacksUpDifferentContentOnceWithFixedIdentity(t *testing.T) {
 		"--option", "s3.bucket-lookup=path",
 		"backup", "--json",
 		"--host", SnapshotHost,
-		"--tag", SnapshotSchemaTag,
 		"--tag", "project_commit=" + manifest.ProjectCommit,
 		"--tag", "content_id=" + manifest.ContentID,
 		"--tag", "archive_id=" + manifest.ArchiveID,
@@ -401,10 +398,11 @@ func TestPruneRejectsMalformedIdentityBeforeForget(t *testing.T) {
 		if operation(arguments) != "snapshots" {
 			t.Fatalf("mutating operation ran after malformed preflight: %#v", arguments)
 		}
-		return []byte(`[{"id":"` + firstSnapshotID + `","time":"2026-08-27T12:00:00Z","hostname":"` + SnapshotHost + `","paths":["` + config.RecoveryPointPath + `"],"tags":["` + SnapshotSchemaTag + `"]}]`), nil
+		legacyTag := "schema=" + "1"
+		return []byte(`[{"id":"` + firstSnapshotID + `","time":"2026-08-27T12:00:00Z","hostname":"` + SnapshotHost + `","paths":["` + config.RecoveryPointPath + `"],"tags":["` + legacyTag + `"]}]`), nil
 	})
 	if _, err := runner.Prune(context.Background(), target, true); err == nil {
-		t.Fatal("malformed schema-1 snapshot identity was accepted")
+		t.Fatal("legacy snapshot identity was accepted")
 	}
 	if len(*calls) != 1 || operation((*calls)[0].arguments) != "snapshots" {
 		t.Fatalf("preflight calls = %#v", *calls)

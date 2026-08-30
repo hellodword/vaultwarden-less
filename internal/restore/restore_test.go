@@ -157,7 +157,7 @@ func TestRunPublishesOneVerifiedDirectory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.SchemaVersion != ResultSchemaVersion || result.Target != "primary" || result.SnapshotID != repository.selected.ID || result.ProjectCommit != manifest.ProjectCommit || result.ContentID != manifest.ContentID || result.ArchiveID != manifest.ArchiveID || result.Output != output {
+	if result.Target != "primary" || result.SnapshotID != repository.selected.ID || result.ProjectCommit != manifest.ProjectCommit || result.ContentID != manifest.ContentID || result.ArchiveID != manifest.ArchiveID || result.Output != output {
 		t.Fatalf("result = %#v", result)
 	}
 	if repository.resolveCalls != 1 || repository.restoreCalls != 1 || repository.resolvedWith != "" {

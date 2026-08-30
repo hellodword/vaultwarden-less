@@ -326,7 +326,7 @@ func collectUpgradeEvidence(
 		if err != nil {
 			return nil, commandFailure(codeVerification, "Upgrade target restore verification failed", err)
 		}
-		if restored.SchemaVersion != restoretool.ResultSchemaVersion || restored.Target != target.Name ||
+		if restored.Target != target.Name ||
 			restored.SnapshotID != synchronized.SnapshotID || restored.ProjectCommit != projectCommit ||
 			restored.ContentID != synchronized.ContentID || restored.ArchiveID != synchronized.ArchiveID || restored.Output != output {
 			return nil, commandFailure(codeVerification, "Upgrade restored evidence does not match the target snapshot", nil)

@@ -106,7 +106,7 @@ func TestMotoResticIntegration(t *testing.T) {
 			{Name: "s3.bucket-lookup", Value: "path"}, {Name: "s3.region", Value: "us-east-1"},
 		},
 	}
-	credentials := &config.RoleCredentials{SchemaVersion: config.SchemaVersion, Targets: map[string]config.RoleTarget{
+	credentials := &config.RoleCredentials{Targets: map[string]config.RoleTarget{
 		"moto": {Environment: map[string]string{"AWS_ACCESS_KEY_ID": "test", "AWS_SECRET_ACCESS_KEY": "test"}},
 	}}
 	runner := restic.NewRunner(resticBinary, cacheDir, credentialsDir, recoveryPath, credentials, nil)
@@ -180,7 +180,7 @@ func TestMotoResticIntegration(t *testing.T) {
 		if err := os.Mkdir(recoveryPath, 0o700); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(filepath.Join(recoveryPath, "manifest.json"), []byte("{\"schema_version\":1}\n"), 0o600); err != nil {
+		if err := os.WriteFile(filepath.Join(recoveryPath, "manifest.json"), []byte("{\"unexpected\":true}\n"), 0o600); err != nil {
 			t.Fatal(err)
 		}
 		invalidContent := strings.Repeat("c", 64)
@@ -371,7 +371,6 @@ func rawResticBackupAt(
 		"--option", "s3.region=us-east-1",
 		"backup", "--json",
 		"--host", host,
-		"--tag", restic.SnapshotSchemaTag,
 		"--tag", "project_commit=" + motoProjectCommit,
 		"--tag", "content_id=sha256:" + contentHex,
 		"--tag", "archive_id=sha256:" + strings.Repeat("2", 64),

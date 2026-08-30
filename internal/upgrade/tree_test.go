@@ -17,7 +17,7 @@ func TestRollbackTreeIdentityGoldenAndStableCopy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const golden = "sha256:9f8e26f31b80de718cd3966cf14e28a9ccf7e1e36fdc62890fb17bd91d943a70"
+	const golden = "sha256:000b2fff07f17e7e03c3dda077114c738141a4abfd8262e18883063d64b54630"
 	if identity != golden {
 		t.Fatalf("rollback identity = %s, want %s", identity, golden)
 	}
@@ -135,14 +135,14 @@ func TestStrictUpgradeJSONRejectsDuplicateUnknownAndTrailingData(t *testing.T) {
 	}
 	path := filepath.Join(root, "state.json")
 	for _, document := range []string{
-		`{"schema_version":1,"schema_version":1}`,
-		`{"schema_version":1,"unknown":true}`,
-		`{"schema_version":1} {"schema_version":1}`,
-		`{ "schema_version": 1 }`,
+		`{"value":"a","value":"b"}`,
+		`{"value":"a","unknown":true}`,
+		`{"value":"a"} {"value":"a"}`,
+		`{ "value": "a" }`,
 	} {
 		writePrivateFile(t, path, []byte(document+"\n"))
 		var destination struct {
-			SchemaVersion int `json:"schema_version"`
+			Value string `json:"value"`
 		}
 		if err := readStrictJSON(path, &destination); err == nil {
 			t.Fatalf("invalid state JSON was accepted: %s", document)

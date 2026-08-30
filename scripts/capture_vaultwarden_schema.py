@@ -92,7 +92,6 @@ def capture(database_path: Path, upstreams_path: Path) -> bytes:
     if not objects:
         raise ValueError("source database has no application schema objects")
     contract = {
-        "contract_version": 1,
         "vaultwarden_version": source_tag,
         "database_migration": expected_migration,
         "fingerprint": schema_fingerprint(objects),

@@ -22,8 +22,6 @@ import (
 	"github.com/hellodword/vaultwarden-less/internal/upgrade"
 )
 
-const schemaVersion = 1
-
 type proxyEnvironment struct {
 	ready      func() bool
 	allowServe func() error
@@ -97,11 +95,10 @@ func executeWithEnvironment(ctx context.Context, arguments []string, stdout, std
 	switch command {
 	case "version":
 		result := struct {
-			SchemaVersion int     `json:"schema_version"`
 			ProjectCommit *string `json:"project_commit"`
 			Release       string  `json:"release"`
 			Clean         bool    `json:"clean"`
-		}{SchemaVersion: schemaVersion, Release: "development", Clean: false}
+		}{Release: "development", Clean: false}
 		if buildinfo.Ready() {
 			commit := buildinfo.ProjectCommit
 			result.ProjectCommit = &commit
@@ -115,9 +112,8 @@ func executeWithEnvironment(ctx context.Context, arguments []string, stdout, std
 			return writeProxyError(stderr, &proxyCommandError{code: "not_ready", message: "The proxy is not healthy"})
 		}
 		_ = json.NewEncoder(stdout).Encode(struct {
-			SchemaVersion int  `json:"schema_version"`
-			Healthy       bool `json:"healthy"`
-		}{schemaVersion, true})
+			Healthy bool `json:"healthy"`
+		}{true})
 		return 0
 	case "serve":
 		if environment.ready == nil || !environment.ready() {
@@ -143,12 +139,11 @@ func executeWithEnvironment(ctx context.Context, arguments []string, stdout, std
 
 func writeProxyError(writer io.Writer, err *proxyCommandError) int {
 	document := struct {
-		SchemaVersion int `json:"schema_version"`
-		Error         struct {
+		Error struct {
 			Code    string `json:"code"`
 			Message string `json:"message"`
 		} `json:"error"`
-	}{SchemaVersion: schemaVersion}
+	}{}
 	document.Error.Code = err.code
 	document.Error.Message = err.message
 	_ = json.NewEncoder(writer).Encode(document)

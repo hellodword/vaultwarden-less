@@ -26,8 +26,6 @@ import (
 )
 
 const (
-	SchemaVersion = 1
-
 	MaxConfigBytes   = 1 << 20
 	MaxPasswordBytes = 64 << 10
 
@@ -77,10 +75,9 @@ var (
 
 var errUnknownYAMLField = errors.New("unknown YAML field")
 
-// Backup is the complete human-authored schema 1 configuration. Scheduling,
+// Backup is the complete human-authored configuration. Scheduling,
 // retry, timeout, retention, filesystem and HTTP behavior are product constants.
 type Backup struct {
-	SchemaVersion              int        `yaml:"schema_version"`
 	UpgradeVerificationTargets []string   `yaml:"upgrade_verification_targets"`
 	Targets                    []Target   `yaml:"targets"`
 	Notifiers                  []Notifier `yaml:"notifiers"`
@@ -123,8 +120,7 @@ type NotifierSecrets struct {
 }
 
 type NotifierCredentials struct {
-	SchemaVersion int                        `yaml:"schema_version"`
-	Notifiers     map[string]NotifierSecrets `yaml:"notifiers"`
+	Notifiers map[string]NotifierSecrets `yaml:"notifiers"`
 }
 
 type RoleTarget struct {
@@ -132,16 +128,15 @@ type RoleTarget struct {
 }
 
 type RoleCredentials struct {
-	SchemaVersion int                   `yaml:"schema_version"`
-	Targets       map[string]RoleTarget `yaml:"targets"`
+	Targets map[string]RoleTarget `yaml:"targets"`
 }
 
 type Deployment struct {
-	SchemaVersion int
-	RuntimeUID    uint32
-	RuntimeGID    uint32
-	ListenPort    uint16
-	DrillPort     uint16
+	Root       string
+	RuntimeUID uint32
+	RuntimeGID uint32
+	ListenPort uint16
+	DrillPort  uint16
 }
 
 func LoadBackup(path string) (*Backup, error) {
@@ -216,8 +211,8 @@ func decodeOneYAML(data []byte, destination any) error {
 	}
 	visitor := &strictYAMLVisitor{}
 	ast.Walk(visitor, file.Docs[0])
-	if visitor.err != nil || visitor.schemaIntegers != 1 {
-		return fmt.Errorf("YAML must use explicit strings and one integer schema_version")
+	if visitor.err != nil {
+		return fmt.Errorf("YAML must use explicit strings")
 	}
 	decoder := yaml.NewDecoder(bytes.NewReader(data), yaml.DisallowUnknownField())
 	if err := decoder.Decode(destination); err != nil {
@@ -230,8 +225,7 @@ func decodeOneYAML(data []byte, destination any) error {
 }
 
 type strictYAMLVisitor struct {
-	err            error
-	schemaIntegers int
+	err error
 }
 
 func (visitor *strictYAMLVisitor) Visit(node ast.Node) ast.Visitor {
@@ -244,19 +238,13 @@ func (visitor *strictYAMLVisitor) Visit(node ast.Node) ast.Visitor {
 		visitor.err = fmt.Errorf("forbidden YAML node")
 		return nil
 	case ast.IntegerType:
-		if node.GetPath() != "$.schema_version" || node.String() != "1" {
-			visitor.err = fmt.Errorf("implicit scalar conversion is forbidden")
-			return nil
-		}
-		visitor.schemaIntegers++
+		visitor.err = fmt.Errorf("implicit scalar conversion is forbidden")
+		return nil
 	}
 	return visitor
 }
 
 func (c *Backup) Validate() error {
-	if c.SchemaVersion != SchemaVersion {
-		return fmt.Errorf("schema_version must be %d", SchemaVersion)
-	}
 	if len(c.Targets) < 1 || len(c.Targets) > 32 {
 		return fmt.Errorf("targets must contain 1 to 32 entries")
 	}
@@ -335,9 +323,6 @@ func (t Target) Validate() error {
 }
 
 func (c RoleCredentials) Validate(cfg *Backup) error {
-	if c.SchemaVersion != SchemaVersion {
-		return fmt.Errorf("schema_version must be %d", SchemaVersion)
-	}
 	if c.Targets == nil || len(c.Targets) != len(cfg.Targets) {
 		return fmt.Errorf("target key set must exactly match backup config")
 	}
@@ -403,9 +388,6 @@ func (n Notifier) validateReference() error {
 }
 
 func (c NotifierCredentials) Resolve(cfg *Backup) ([]Notifier, error) {
-	if c.SchemaVersion != SchemaVersion {
-		return nil, fmt.Errorf("schema_version must be %d", SchemaVersion)
-	}
 	if c.Notifiers == nil || len(c.Notifiers) != len(cfg.Notifiers) {
 		return nil, fmt.Errorf("notifier key set must exactly match backup config")
 	}
@@ -525,10 +507,11 @@ func LoadDeployment(path string) (Deployment, error) {
 	if err != nil {
 		return Deployment{}, err
 	}
-	deployment := Deployment{SchemaVersion: SchemaVersion}
-	if values["DEPLOYMENT_SCHEMA_VERSION"] != "1" {
-		return Deployment{}, fmt.Errorf("deployment schema version must be 1")
+	root := values["DEPLOYMENT_ROOT"]
+	if root == "" || root == string(filepath.Separator) || !filepath.IsAbs(root) || filepath.Clean(root) != root {
+		return Deployment{}, fmt.Errorf("DEPLOYMENT_ROOT is invalid")
 	}
+	deployment := Deployment{Root: root}
 	uid, err := parseCanonicalUint(values["RUNTIME_UID"], 1, 4294967294)
 	if err != nil {
 		return Deployment{}, fmt.Errorf("RUNTIME_UID is invalid")
@@ -568,7 +551,7 @@ func parseDeploymentAssignments(data []byte) (map[string]string, error) {
 	text = strings.TrimSuffix(text, "\n")
 	lines := strings.Split(text, "\n")
 	expected := map[string]struct{}{
-		"DEPLOYMENT_SCHEMA_VERSION": {}, "RUNTIME_UID": {}, "RUNTIME_GID": {}, "LISTEN_PORT": {}, "DRILL_PORT": {},
+		"DEPLOYMENT_ROOT": {}, "RUNTIME_UID": {}, "RUNTIME_GID": {}, "LISTEN_PORT": {}, "DRILL_PORT": {},
 	}
 	if len(lines) != len(expected) {
 		return nil, fmt.Errorf("deployment environment must contain exactly five assignments")

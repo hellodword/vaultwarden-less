@@ -18,7 +18,6 @@ type ProjectionTable struct {
 }
 
 type RecoveryProjection struct {
-	SchemaVersion  int               `json:"schema_version"`
 	SchemaContract string            `json:"schema_contract"`
 	Tables         []ProjectionTable `json:"tables"`
 }
@@ -48,8 +47,7 @@ func VaultwardenRecoveryProjection() (RecoveryProjection, error) {
 }
 
 func validateProjection(projection RecoveryProjection) error {
-	if projection.SchemaVersion != 1 ||
-		projection.SchemaContract != "internal/upstream/vaultwarden-schema.json" ||
+	if projection.SchemaContract != "internal/upstream/vaultwarden-schema.json" ||
 		len(projection.Tables) == 0 {
 		return fmt.Errorf("embedded recovery projection header is inconsistent")
 	}

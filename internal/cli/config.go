@@ -8,11 +8,9 @@ import (
 )
 
 type configValidationResult struct {
-	SchemaVersion int      `json:"schema_version"`
-	Valid         bool     `json:"valid"`
-	Role          string   `json:"role"`
-	Targets       []string `json:"targets"`
-	Warnings      []string `json:"warnings"`
+	Valid   bool     `json:"valid"`
+	Role    string   `json:"role"`
+	Targets []string `json:"targets"`
 }
 
 func configCommand(configPath *string, environment commandEnvironment) *cobra.Command {
@@ -86,11 +84,9 @@ func configCommand(configPath *string, environment commandEnvironment) *cobra.Co
 				targets = append(targets, target.Name)
 			}
 			return writeJSON(cmd.OutOrStdout(), configValidationResult{
-				SchemaVersion: ResultSchemaVersion,
-				Valid:         true,
-				Role:          role,
-				Targets:       targets,
-				Warnings:      []string{},
+				Valid:   true,
+				Role:    role,
+				Targets: targets,
 			})
 		},
 	}

@@ -37,12 +37,11 @@ type TargetStatus struct {
 }
 
 type Status struct {
-	SchemaVersion int            `json:"schema_version"`
-	State         string         `json:"state"`
-	StartedAt     string         `json:"started_at"`
-	NextCheckAt   *string        `json:"next_check_at"`
-	LastCheck     *LastCheck     `json:"last_check"`
-	Targets       []TargetStatus `json:"targets"`
+	State       string         `json:"state"`
+	StartedAt   string         `json:"started_at"`
+	NextCheckAt *string        `json:"next_check_at"`
+	LastCheck   *LastCheck     `json:"last_check"`
+	Targets     []TargetStatus `json:"targets"`
 }
 
 type failureState struct {
@@ -95,10 +94,9 @@ func newWithClock(
 		config: cfg, build: build, ensure: ensure, enqueue: enqueue, logger: logger, clock: currentClock,
 		demand: make(chan struct{}, 1),
 		status: Status{
-			SchemaVersion: SchemaVersion,
-			State:         "idle",
-			StartedAt:     formatTime(started),
-			Targets:       targets,
+			State:     "idle",
+			StartedAt: formatTime(started),
+			Targets:   targets,
 		},
 		targetFailures: make([]failureState, len(cfg.Targets)),
 	}

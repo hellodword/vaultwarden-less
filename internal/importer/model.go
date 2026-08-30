@@ -12,7 +12,6 @@ import (
 )
 
 const (
-	SchemaVersion = 1
 	MaxStateBytes = 1 << 20
 
 	ImportIDInitial = "initial"
@@ -61,7 +60,6 @@ func IsKind(err error, kind ErrorKind) bool {
 }
 
 type Prepare struct {
-	SchemaVersion    int    `json:"schema_version"`
 	ImportID         string `json:"import_id"`
 	Phase            string `json:"phase"`
 	ProjectCommit    string `json:"project_commit"`
@@ -81,7 +79,7 @@ func (prepare Prepare) Identity() deployment.Identity {
 }
 
 func (prepare Prepare) validate() error {
-	if prepare.SchemaVersion != SchemaVersion || prepare.ImportID != ImportIDInitial || prepare.Phase != PhasePrepared ||
+	if prepare.ImportID != ImportIDInitial || prepare.Phase != PhasePrepared ||
 		prepare.SourcePath != sourceRelative || prepare.CandidatePath != candidateRelative || prepare.DataPath != dataRelative ||
 		prepare.FilesystemDevice == 0 || !validDigest(prepare.SourceTreeID) || !validDigest(prepare.CandidateTreeID) ||
 		!validDigest(prepare.SourceRSAKeyID) || !validTimestamp(prepare.PreparedAt) {
@@ -94,7 +92,6 @@ func (prepare Prepare) validate() error {
 }
 
 type Verification struct {
-	SchemaVersion             int    `json:"schema_version"`
 	ImportID                  string `json:"import_id"`
 	Phase                     string `json:"phase"`
 	ProjectCommit             string `json:"project_commit"`
@@ -110,7 +107,7 @@ type Verification struct {
 }
 
 func (verification Verification) validate(prepare Prepare) error {
-	if verification.SchemaVersion != SchemaVersion || verification.ImportID != ImportIDInitial ||
+	if verification.ImportID != ImportIDInitial ||
 		verification.Phase != PhaseVerified || verification.ProjectCommit != prepare.ProjectCommit ||
 		verification.Release != prepare.Release || verification.SourceTreeID != prepare.SourceTreeID ||
 		!validDigest(verification.CandidateTreeID) || verification.DatabaseMigration == "" ||
@@ -123,7 +120,6 @@ func (verification Verification) validate(prepare Prepare) error {
 }
 
 type Decision struct {
-	SchemaVersion       int    `json:"schema_version"`
 	ImportID            string `json:"import_id"`
 	Decision            string `json:"decision"`
 	ActiveProjectCommit string `json:"active_project_commit"`
@@ -136,7 +132,7 @@ func (decision Decision) Identity() deployment.Identity {
 }
 
 func (decision Decision) validate(prepare Prepare) error {
-	if decision.SchemaVersion != SchemaVersion || decision.ImportID != ImportIDInitial || decision.Decision != DecisionAccept ||
+	if decision.ImportID != ImportIDInitial || decision.Decision != DecisionAccept ||
 		decision.Identity() != prepare.Identity() || !validTimestamp(decision.DecidedAt) {
 		return fmt.Errorf("import decision is invalid")
 	}
@@ -159,7 +155,6 @@ func (evidence CandidateEvidence) validate() error {
 }
 
 type Result struct {
-	SchemaVersion        int    `json:"schema_version"`
 	ImportID             string `json:"import_id"`
 	Phase                string `json:"phase"`
 	ProjectCommit        string `json:"project_commit"`
@@ -171,7 +166,6 @@ type Result struct {
 
 func result(phase string, prepare Prepare, candidateTreeID string, confirmed bool) Result {
 	return Result{
-		SchemaVersion: SchemaVersion,
 		ImportID:      ImportIDInitial,
 		Phase:         phase,
 		ProjectCommit: prepare.ProjectCommit,

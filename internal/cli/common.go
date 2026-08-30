@@ -22,8 +22,6 @@ import (
 	"github.com/hellodword/vaultwarden-less/internal/upgrade"
 )
 
-const ResultSchemaVersion = 1
-
 type repository interface {
 	VerifyVersion(context.Context) error
 	Ensure(context.Context, config.Target, snapshot.Manifest) (restic.SyncResult, error)

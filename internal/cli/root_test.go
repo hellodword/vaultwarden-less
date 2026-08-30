@@ -89,7 +89,7 @@ func TestCLIExactCommandSetHelpAndDevelopmentVersion(t *testing.T) {
 		t.Fatalf("help = %d/%q/%q", code, stdout, stderr)
 	}
 	stdout, stderr, code = executeCommand(environment, "version")
-	if code != 0 || stderr != "" || stdout != "{\"schema_version\":1,\"project_commit\":null,\"release\":\"development\",\"clean\":false}\n" {
+	if code != 0 || stderr != "" || stdout != "{\"project_commit\":null,\"release\":\"development\",\"clean\":false}\n" {
 		t.Fatalf("version = %d/%q/%q", code, stdout, stderr)
 	}
 }
@@ -98,7 +98,7 @@ func TestCLICleanVersionGolden(t *testing.T) {
 	commit := strings.Repeat("a", 40)
 	setBuildIdentity(t, commit, "RELEASE.2026-08-27T12-34-56Z-gaaaaaaaaaaaa", "true")
 	stdout, stderr, code := executeCommand(testEnvironment(nil, nil), "version")
-	want := `{"schema_version":1,"project_commit":"` + commit + `","release":"RELEASE.2026-08-27T12-34-56Z-gaaaaaaaaaaaa","clean":true}` + "\n"
+	want := `{"project_commit":"` + commit + `","release":"RELEASE.2026-08-27T12-34-56Z-gaaaaaaaaaaaa","clean":true}` + "\n"
 	if code != 0 || stderr != "" || stdout != want {
 		t.Fatalf("clean version = %d/%q/%q", code, stdout, stderr)
 	}
@@ -161,7 +161,7 @@ func TestDeploymentInitGoldenAndActiveServeGate(t *testing.T) {
 	environment.dataDir = dataDir
 
 	stdout, stderr, code := executeCommand(environment, "deployment", "init")
-	want := `{"schema_version":1,"status":"initialized","project_commit":"` + commit + `","release":"` + release + `"}` + "\n"
+	want := `{"status":"initialized","project_commit":"` + commit + `","release":"` + release + `"}` + "\n"
 	if code != 0 || stderr != "" || stdout != want {
 		t.Fatalf("deployment init = %d/%q/%q", code, stdout, stderr)
 	}
@@ -246,13 +246,12 @@ func TestDeploymentImportPrepareAndCancelCLI(t *testing.T) {
 		t.Fatalf("import prepare = %d/%q/%q", code, stdout, stderr)
 	}
 	var prepared struct {
-		SchemaVersion int    `json:"schema_version"`
 		ImportID      string `json:"import_id"`
 		Phase         string `json:"phase"`
 		ProjectCommit string `json:"project_commit"`
 		Release       string `json:"release"`
 	}
-	if err := json.Unmarshal([]byte(stdout), &prepared); err != nil || prepared.SchemaVersion != 1 || prepared.ImportID != "initial" ||
+	if err := json.Unmarshal([]byte(stdout), &prepared); err != nil || prepared.ImportID != "initial" ||
 		prepared.Phase != "prepared" || prepared.ProjectCommit != commit || prepared.Release != release {
 		t.Fatalf("import prepare JSON = %#v/%v", prepared, err)
 	}
@@ -328,7 +327,7 @@ func TestVerifyImportCandidateUsesAuditedSnapshotClosure(t *testing.T) {
 func TestConfigValidateRoleGoldenAndFailureClassification(t *testing.T) {
 	for _, role := range []string{"backup", "maintenance"} {
 		stdout, stderr, code := executeCommand(testEnvironment(nil, nil), "config", "validate", "--role", role)
-		want := `{"schema_version":1,"valid":true,"role":"` + role + `","targets":["primary"],"warnings":[]}` + "\n"
+		want := `{"valid":true,"role":"` + role + `","targets":["primary"]}` + "\n"
 		if code != 0 || stderr != "" || stdout != want {
 			t.Fatalf("config validate %s = %d/%q/%q", role, code, stdout, stderr)
 		}
@@ -369,7 +368,7 @@ func TestUpgradePrepareGoldenAndServingGateClassification(t *testing.T) {
 		environment,
 		"upgrade", "prepare", "--to-commit", toCommit, "--to-release", toRelease,
 	)
-	want := `{"schema_version":1,"upgrade_id":"` + strings.Repeat("a", 40) + `..` + toCommit +
+	want := `{"upgrade_id":"` + strings.Repeat("a", 40) + `..` + toCommit +
 		`","phase":"prepared","from_commit":"` + strings.Repeat("a", 40) + `","to_commit":"` + toCommit + `","targets":[]}` + "\n"
 	if code != 0 || stderr != "" || stdout != want {
 		t.Fatalf("upgrade prepare = %d/%q/%q", code, stdout, stderr)
@@ -503,16 +502,16 @@ func TestWorkerClientCommandsHaveExactJSON(t *testing.T) {
 		switch request.URL.Path {
 		case worker.CheckPath:
 			body, _ := io.ReadAll(request.Body)
-			if request.Method != http.MethodPost || request.Header.Get("Content-Type") != "application/json" || string(body) != "{\"schema_version\":1}\n" {
+			if request.Method != http.MethodPost || request.Header.Get("Content-Type") != "application/json" || string(body) != "{}\n" {
 				writer.WriteHeader(http.StatusBadRequest)
 				return
 			}
 			writer.Header().Set("Content-Type", "application/json")
 			writer.WriteHeader(http.StatusAccepted)
-			_, _ = writer.Write([]byte("{\"schema_version\":1,\"accepted\":true}\n"))
+			_, _ = writer.Write([]byte("{\"accepted\":true}\n"))
 		case worker.StatusPath:
 			writer.Header().Set("Content-Type", "application/json")
-			_, _ = writer.Write([]byte("{\"schema_version\":1,\"state\":\"idle\",\"started_at\":\"2026-08-27T12:00:00.000Z\",\"next_check_at\":null,\"last_check\":null,\"targets\":[]}"))
+			_, _ = writer.Write([]byte("{\"state\":\"idle\",\"started_at\":\"2026-08-27T12:00:00.000Z\",\"next_check_at\":null,\"last_check\":null,\"targets\":[]}"))
 		case worker.HealthPath:
 			writer.WriteHeader(http.StatusNoContent)
 		default:
@@ -525,9 +524,9 @@ func TestWorkerClientCommandsHaveExactJSON(t *testing.T) {
 		command string
 		want    string
 	}{
-		{"request-backup", "{\"schema_version\":1,\"accepted\":true}\n"},
-		{"status", "{\"schema_version\":1,\"state\":\"idle\",\"started_at\":\"2026-08-27T12:00:00.000Z\",\"next_check_at\":null,\"last_check\":null,\"targets\":[]}\n"},
-		{"healthcheck", "{\"schema_version\":1,\"healthy\":true}\n"},
+		{"request-backup", "{\"accepted\":true}\n"},
+		{"status", "{\"state\":\"idle\",\"started_at\":\"2026-08-27T12:00:00.000Z\",\"next_check_at\":null,\"last_check\":null,\"targets\":[]}\n"},
+		{"healthcheck", "{\"healthy\":true}\n"},
 	} {
 		stdout, stderr, code := executeCommand(environment, test.command)
 		if code != 0 || stderr != "" || stdout != test.want {
@@ -545,10 +544,10 @@ func TestRepositoryCommandsAndRestoreGolden(t *testing.T) {
 		arguments []string
 		want      string
 	}{
-		{[]string{"repo", "init", "--target", "primary"}, `{"schema_version":1,"operation":"init","target":"primary","success":true}` + "\n"},
-		{[]string{"repo", "check", "--target", "primary"}, `{"schema_version":1,"operation":"check","target":"primary","success":true}` + "\n"},
-		{[]string{"repo", "unlock", "--target", "primary"}, `{"schema_version":1,"operation":"unlock","target":"primary","success":true}` + "\n"},
-		{[]string{"repo", "prune", "--target", "primary"}, `{"schema_version":1,"operation":"prune","target":"primary","applied":false,"groups":[{"host":"vaultwarden-less","paths":["/staging/point"],"keep_snapshot_ids":[],"remove_snapshot_ids":[]}]}` + "\n"},
+		{[]string{"repo", "init", "--target", "primary"}, `{"operation":"init","target":"primary","success":true}` + "\n"},
+		{[]string{"repo", "check", "--target", "primary"}, `{"operation":"check","target":"primary","success":true}` + "\n"},
+		{[]string{"repo", "unlock", "--target", "primary"}, `{"operation":"unlock","target":"primary","success":true}` + "\n"},
+		{[]string{"repo", "prune", "--target", "primary"}, `{"operation":"prune","target":"primary","applied":false,"groups":[{"host":"vaultwarden-less","paths":["/staging/point"],"keep_snapshot_ids":[],"remove_snapshot_ids":[]}]}` + "\n"},
 	} {
 		repository := &fakeRepository{prune: restic.PruneResult{Applied: false, Groups: []restic.PruneGroup{{Host: "vaultwarden-less", Paths: []string{"/staging/point"}, KeepSnapshotIDs: []string{}, RemoveSnapshotIDs: []string{}}}}}
 		stdout, stderr, code := executeCommand(testEnvironment(repository, nil), test.arguments...)
@@ -558,20 +557,20 @@ func TestRepositoryCommandsAndRestoreGolden(t *testing.T) {
 	}
 	repository := &fakeRepository{snapshots: []restic.Snapshot{{ID: snapshotID, Time: "2026-08-27T12:00:00.000Z", ProjectCommit: commit, ContentID: contentID, ArchiveID: archiveID}}}
 	stdout, stderr, code := executeCommand(testEnvironment(repository, nil), "repo", "snapshots", "--target", "primary")
-	wantSnapshots := `{"schema_version":1,"target":"primary","limit":100,"truncated":false,"snapshots":[{"id":"` + snapshotID + `","time":"2026-08-27T12:00:00.000Z","project_commit":"` + commit + `","content_id":"` + contentID + `","archive_id":"` + archiveID + `"}]}` + "\n"
+	wantSnapshots := `{"target":"primary","limit":100,"truncated":false,"snapshots":[{"id":"` + snapshotID + `","time":"2026-08-27T12:00:00.000Z","project_commit":"` + commit + `","content_id":"` + contentID + `","archive_id":"` + archiveID + `"}]}` + "\n"
 	if code != 0 || stderr != "" || stdout != wantSnapshots {
 		t.Fatalf("snapshots = %d/%q/%q", code, stdout, stderr)
 	}
 
 	restore := func(_ context.Context, _ restoretool.Repository, request restoretool.Request) (restoretool.Result, error) {
 		return restoretool.Result{
-			SchemaVersion: restoretool.ResultSchemaVersion, Target: request.Target.Name,
+			Target:     request.Target.Name,
 			SnapshotID: snapshotID, ProjectCommit: commit, ContentID: contentID,
 			ArchiveID: archiveID, Output: request.Output,
 		}, nil
 	}
 	stdout, stderr, code = executeCommand(testEnvironment(&fakeRepository{}, nil, restore), "restore", "--target", "primary", "--output", "drill")
-	wantRestore := `{"schema_version":1,"target":"primary","snapshot_id":"` + snapshotID + `","project_commit":"` + commit + `","content_id":"` + contentID + `","archive_id":"` + archiveID + `","output":"/restore/drill"}` + "\n"
+	wantRestore := `{"target":"primary","snapshot_id":"` + snapshotID + `","project_commit":"` + commit + `","content_id":"` + contentID + `","archive_id":"` + archiveID + `","output":"/restore/drill"}` + "\n"
 	if code != 0 || stderr != "" || stdout != wantRestore {
 		t.Fatalf("restore = %d/%q/%q", code, stdout, stderr)
 	}
@@ -584,18 +583,18 @@ func testEnvironment(repositoryClient repository, server *httptest.Server, resto
 	environment := commandEnvironment{
 		loadBackup: func(string) (*config.Backup, error) {
 			return &config.Backup{
-				SchemaVersion: config.SchemaVersion, UpgradeVerificationTargets: []string{"primary"},
-				Targets: []config.Target{{Name: "primary", Repository: "s3:https://objects.example.test/bucket", Options: []config.Option{}}}, Notifiers: []config.Notifier{},
+				UpgradeVerificationTargets: []string{"primary"},
+				Targets:                    []config.Target{{Name: "primary", Repository: "s3:https://objects.example.test/bucket", Options: []config.Option{}}}, Notifiers: []config.Notifier{},
 			}, nil
 		},
 		loadDeployment: func(string) (config.Deployment, error) {
 			return config.Deployment{
-				SchemaVersion: 1, RuntimeUID: uint32(os.Geteuid()), RuntimeGID: uint32(os.Getegid()),
+				Root: "/srv/vaultwarden-less", RuntimeUID: uint32(os.Geteuid()), RuntimeGID: uint32(os.Getegid()),
 				ListenPort: 8080, DrillPort: 8081,
 			}, nil
 		},
 		loadCredentials: func(string, *config.Backup) (*config.RoleCredentials, error) {
-			return &config.RoleCredentials{SchemaVersion: config.SchemaVersion, Targets: map[string]config.RoleTarget{"primary": {Environment: map[string]string{"AWS_ACCESS_KEY_ID": "test"}}}}, nil
+			return &config.RoleCredentials{Targets: map[string]config.RoleTarget{"primary": {Environment: map[string]string{"AWS_ACCESS_KEY_ID": "test"}}}}, nil
 		},
 		loadNotifiers:     func(string, *config.Backup) ([]config.Notifier, error) { return []config.Notifier{}, nil },
 		validatePasswords: func(string, *config.Backup) error { return nil },
@@ -640,13 +639,12 @@ func assertErrorJSON(t *testing.T, output, code string) {
 	t.Helper()
 	decoder := json.NewDecoder(strings.NewReader(output))
 	var document struct {
-		SchemaVersion int `json:"schema_version"`
-		Error         struct {
+		Error struct {
 			Code    string `json:"code"`
 			Message string `json:"message"`
 		} `json:"error"`
 	}
-	if err := decoder.Decode(&document); err != nil || document.SchemaVersion != 1 || document.Error.Code != code || document.Error.Message == "" {
+	if err := decoder.Decode(&document); err != nil || document.Error.Code != code || document.Error.Message == "" {
 		t.Fatalf("error document = %#v/%v", document, err)
 	}
 	var extra any

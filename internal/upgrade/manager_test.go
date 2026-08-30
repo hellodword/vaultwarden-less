@@ -44,7 +44,7 @@ func TestUpgradeAcceptedPathIsDurableAcrossManagerRestarts(t *testing.T) {
 	}
 	assertStateModes(t, fixture.state)
 	if repeated, err := fixture.manager(testACommit, testARelease).Prepare(testBCommit, testBRelease); err != nil ||
-		repeated.SchemaVersion != prepared.SchemaVersion || repeated.UpgradeID != prepared.UpgradeID ||
+		repeated.UpgradeID != prepared.UpgradeID ||
 		repeated.Phase != prepared.Phase || repeated.FromCommit != prepared.FromCommit ||
 		repeated.ToCommit != prepared.ToCommit || !equalEvidence(repeated.Targets, prepared.Targets) {
 		t.Fatalf("idempotent prepare = %#v/%v", repeated, err)
@@ -267,7 +267,7 @@ func TestTerminalStateWriteTransientsAreValidatedAndRecovered(t *testing.T) {
 			t.Fatal(err)
 		}
 		state := paths(fixture.state)
-		operatorEntry := filepath.Join(state.current, stateWritePrefix+decisionName+"-operator")
+		operatorEntry := filepath.Join(state.current, ".vaultwarden-less-state-"+decisionName+"-operator")
 		writePrivateFile(t, operatorEntry, []byte("not upgrade-owned"))
 		if _, err := b.Accept(context.Background(), func(context.Context) error { return nil }); !IsKind(err, ErrorInvalidState) {
 			t.Fatalf("similarly named unexpected entry = %v", err)
@@ -279,10 +279,8 @@ func TestTerminalStateWriteTransientsAreValidatedAndRecovered(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		transient, err := createSyncedTemporary(state.current, decisionName, []byte("partial decision"))
-		if err != nil {
-			t.Fatal(err)
-		}
+		transient := filepath.Join(state.current, ".vaultwarden-less-state-"+decisionName+"-interrupted.tmp")
+		writePrivateFile(t, transient, []byte("partial decision"))
 		if err := CandidateServingAllowed(
 			fixture.state, testBCommit, testBRelease, testACommit, testARelease, fixture.deployment,
 		); err != nil {
@@ -320,10 +318,8 @@ func TestTerminalStateWriteTransientsAreValidatedAndRecovered(t *testing.T) {
 		}
 		writePrivateFile(t, filepath.Join(fixture.data, "b-only"), []byte("candidate B"))
 		state := paths(fixture.state)
-		transient, err := createSyncedTemporary(state.current, decisionName, []byte("partial decision"))
-		if err != nil {
-			t.Fatal(err)
-		}
+		transient := filepath.Join(state.current, ".vaultwarden-less-state-"+decisionName+"-interrupted.tmp")
+		writePrivateFile(t, transient, []byte("partial decision"))
 		rolledBack, err := a.Rollback(context.Background())
 		if err != nil || rolledBack.Phase != PhaseRolledBack {
 			t.Fatalf("rollback after interrupted state write = %#v/%v", rolledBack, err)
@@ -376,7 +372,7 @@ func TestPrepareWritesExactComposeEnvironment(t *testing.T) {
 	if _, err := fixture.manager(testACommit, testARelease).Prepare(testBCommit, testBRelease); err != nil {
 		t.Fatal(err)
 	}
-	want := "DEPLOYMENT_SCHEMA_VERSION=1\n" +
+	want := "DEPLOYMENT_ROOT=/srv/vaultwarden-less\n" +
 		"RUNTIME_UID=" + strconv.Itoa(os.Geteuid()) + "\n" +
 		"RUNTIME_GID=" + strconv.Itoa(os.Getegid()) + "\n" +
 		"LISTEN_PORT=8080\n" +
@@ -605,7 +601,7 @@ func TestUpgradeRejectsCorruptStateWrongOwnerAndCandidateTampering(t *testing.T)
 			t.Fatal(err)
 		}
 		state := paths(fixture.state)
-		writePrivateFile(t, state.prepare, []byte(`{"schema_version":1,"schema_version":1}`+"\n"))
+		writePrivateFile(t, state.prepare, []byte(`{"upgrade_id":"duplicate","upgrade_id":"duplicate"}`+"\n"))
 		called := false
 		_, err := a.Freeze(context.Background(), []string{"primary"}, func(context.Context, string, []string) ([]TargetEvidence, error) {
 			called = true
@@ -936,7 +932,7 @@ func TestServingGateAllowsAOnlyBeforeFreezeAndFailsClosed(t *testing.T) {
 		t.Fatalf("tampered compose serve = %v", err)
 	}
 	writePrivateFile(t, state.compose, compose)
-	writePrivateFile(t, state.ticket, []byte(`{"schema_version":1}`+"\n"))
+	writePrivateFile(t, state.ticket, []byte(`{"unexpected":true}`+"\n"))
 	if err := fixture.serving(testACommit, testARelease); !IsKind(err, ErrorInvalidState) {
 		t.Fatalf("corrupt frozen serve = %v", err)
 	}
@@ -1045,11 +1041,11 @@ func newManagerFixture(t *testing.T) managerFixture {
 		data:    data,
 		restore: restore,
 		deployment: config.Deployment{
-			SchemaVersion: config.SchemaVersion,
-			RuntimeUID:    uint32(os.Geteuid()),
-			RuntimeGID:    uint32(os.Getegid()),
-			ListenPort:    8080,
-			DrillPort:     8081,
+			Root:       "/srv/vaultwarden-less",
+			RuntimeUID: uint32(os.Geteuid()),
+			RuntimeGID: uint32(os.Getegid()),
+			ListenPort: 8080,
+			DrillPort:  8081,
 		},
 		now: time.Date(2026, 8, 27, 12, 34, 56, 789_000_000, time.UTC),
 	}

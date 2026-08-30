@@ -10,7 +10,6 @@ import (
 )
 
 const (
-	SchemaVersion = 1
 	MaxStateBytes = 1 << 20
 
 	PhasePrepared   = "prepared"
@@ -72,27 +71,24 @@ type DatabaseContract struct {
 }
 
 type Result struct {
-	SchemaVersion int              `json:"schema_version"`
-	UpgradeID     string           `json:"upgrade_id"`
-	Phase         string           `json:"phase"`
-	FromCommit    string           `json:"from_commit"`
-	ToCommit      string           `json:"to_commit"`
-	Targets       []TargetEvidence `json:"targets"`
+	UpgradeID  string           `json:"upgrade_id"`
+	Phase      string           `json:"phase"`
+	FromCommit string           `json:"from_commit"`
+	ToCommit   string           `json:"to_commit"`
+	Targets    []TargetEvidence `json:"targets"`
 }
 
 type Prepare struct {
-	SchemaVersion int    `json:"schema_version"`
-	UpgradeID     string `json:"upgrade_id"`
-	Phase         string `json:"phase"`
-	FromCommit    string `json:"from_commit"`
-	FromRelease   string `json:"from_release"`
-	ToCommit      string `json:"to_commit"`
-	ToRelease     string `json:"to_release"`
-	PreparedAt    string `json:"prepared_at"`
+	UpgradeID   string `json:"upgrade_id"`
+	Phase       string `json:"phase"`
+	FromCommit  string `json:"from_commit"`
+	FromRelease string `json:"from_release"`
+	ToCommit    string `json:"to_commit"`
+	ToRelease   string `json:"to_release"`
+	PreparedAt  string `json:"prepared_at"`
 }
 
 type RollbackTicket struct {
-	SchemaVersion  int              `json:"schema_version"`
 	UpgradeID      string           `json:"upgrade_id"`
 	Phase          string           `json:"phase"`
 	FromCommit     string           `json:"from_commit"`
@@ -109,7 +105,6 @@ type RollbackTicket struct {
 }
 
 type Candidate struct {
-	SchemaVersion             int              `json:"schema_version"`
 	UpgradeID                 string           `json:"upgrade_id"`
 	Phase                     string           `json:"phase"`
 	FromCommit                string           `json:"from_commit"`
@@ -121,7 +116,6 @@ type Candidate struct {
 }
 
 type Decision struct {
-	SchemaVersion       int    `json:"schema_version"`
 	UpgradeID           string `json:"upgrade_id"`
 	Decision            string `json:"decision"`
 	ActiveProjectCommit string `json:"active_project_commit"`
@@ -130,7 +124,7 @@ type Decision struct {
 }
 
 func (prepare Prepare) validate() error {
-	if prepare.SchemaVersion != SchemaVersion || prepare.Phase != PhasePrepared ||
+	if prepare.Phase != PhasePrepared ||
 		!ValidCommit(prepare.FromCommit) || !ValidCommit(prepare.ToCommit) || prepare.FromCommit == prepare.ToCommit ||
 		!ValidRelease(prepare.FromRelease, prepare.FromCommit) || !ValidRelease(prepare.ToRelease, prepare.ToCommit) ||
 		prepare.UpgradeID != upgradeID(prepare.FromCommit, prepare.ToCommit) || !validTimestamp(prepare.PreparedAt) {
@@ -140,7 +134,7 @@ func (prepare Prepare) validate() error {
 }
 
 func (ticket RollbackTicket) validate(prepare Prepare) error {
-	if ticket.SchemaVersion != SchemaVersion || ticket.Phase != PhaseFrozen ||
+	if ticket.Phase != PhaseFrozen ||
 		ticket.UpgradeID != prepare.UpgradeID || ticket.FromCommit != prepare.FromCommit ||
 		ticket.FromRelease != prepare.FromRelease || ticket.ToCommit != prepare.ToCommit ||
 		ticket.ToRelease != prepare.ToRelease || ticket.ActivePath != "data" ||
@@ -153,7 +147,7 @@ func (ticket RollbackTicket) validate(prepare Prepare) error {
 }
 
 func (candidate Candidate) validate(prepare Prepare) error {
-	if candidate.SchemaVersion != SchemaVersion || candidate.UpgradeID != prepare.UpgradeID ||
+	if candidate.UpgradeID != prepare.UpgradeID ||
 		candidate.FromCommit != prepare.FromCommit || candidate.ToCommit != prepare.ToCommit ||
 		candidate.DatabaseMigration == "" || !validDigest(candidate.DatabaseSchemaFingerprint) ||
 		!validTimestamp(candidate.UpdatedAt) || candidate.Targets == nil {
@@ -175,7 +169,7 @@ func (candidate Candidate) validate(prepare Prepare) error {
 }
 
 func (decision Decision) validate(prepare Prepare) error {
-	if decision.SchemaVersion != SchemaVersion || decision.UpgradeID != prepare.UpgradeID ||
+	if decision.UpgradeID != prepare.UpgradeID ||
 		!validTimestamp(decision.DecidedAt) {
 		return fmt.Errorf("upgrade decision is invalid")
 	}
@@ -217,12 +211,11 @@ func result(phase string, prepare Prepare, targets []TargetEvidence) Result {
 		targets = []TargetEvidence{}
 	}
 	return Result{
-		SchemaVersion: SchemaVersion,
-		UpgradeID:     prepare.UpgradeID,
-		Phase:         phase,
-		FromCommit:    prepare.FromCommit,
-		ToCommit:      prepare.ToCommit,
-		Targets:       targets,
+		UpgradeID:  prepare.UpgradeID,
+		Phase:      phase,
+		FromCommit: prepare.FromCommit,
+		ToCommit:   prepare.ToCommit,
+		Targets:    targets,
 	}
 }
 

@@ -2,26 +2,20 @@
 package deployment
 
 import (
-	"bytes"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
-	"syscall"
 	"time"
-	"unicode/utf8"
 
 	"github.com/hellodword/vaultwarden-less/internal/privatefs"
-	"github.com/hellodword/vaultwarden-less/internal/strictjson"
+	"github.com/hellodword/vaultwarden-less/internal/statefile"
 )
 
 const (
-	SchemaVersion = 1
 	MaxStateBytes = 1 << 20
 
 	StatusInitialized        = "initialized"
@@ -78,7 +72,6 @@ func (identity Identity) Validate() error {
 }
 
 type Active struct {
-	SchemaVersion int    `json:"schema_version"`
 	ProjectCommit string `json:"project_commit"`
 	Release       string `json:"release"`
 	ActivatedAt   string `json:"activated_at"`
@@ -89,9 +82,6 @@ func (active Active) Identity() Identity {
 }
 
 func (active Active) validate() error {
-	if active.SchemaVersion != SchemaVersion {
-		return fmt.Errorf("active schema version is unsupported")
-	}
 	if err := active.Identity().Validate(); err != nil {
 		return err
 	}
@@ -103,7 +93,6 @@ func (active Active) validate() error {
 }
 
 type InitResult struct {
-	SchemaVersion int    `json:"schema_version"`
 	Status        string `json:"status"`
 	ProjectCommit string `json:"project_commit"`
 	Release       string `json:"release"`
@@ -183,7 +172,6 @@ func (manager Manager) Init() (InitResult, error) {
 		}
 	}
 	active := Active{
-		SchemaVersion: SchemaVersion,
 		ProjectCommit: identity.ProjectCommit,
 		Release:       identity.Release,
 		ActivatedAt:   manager.now().Format(timestampLayout),
@@ -258,7 +246,6 @@ func (manager Manager) PublishInitialAtOrAfter(notBefore time.Time) (Active, err
 		activatedAt = notBefore.UTC()
 	}
 	active := Active{
-		SchemaVersion: SchemaVersion,
 		ProjectCommit: identity.ProjectCommit,
 		Release:       identity.Release,
 		ActivatedAt:   activatedAt.Format(timestampLayout),
@@ -324,7 +311,6 @@ func (manager Manager) activateAtOrAfter(expected Identity, notBefore time.Time)
 	}
 
 	next := Active{
-		SchemaVersion: SchemaVersion,
 		ProjectCommit: target.ProjectCommit,
 		Release:       target.Release,
 		ActivatedAt:   activatedAt.Format(timestampLayout),
@@ -350,16 +336,12 @@ func ReadActive(stateDir string) (Active, error) {
 		}
 		return Active{}, stateError(ErrorInvalidState, fmt.Errorf("validate deployment state directory: %w", err))
 	}
-	data, err := readActiveBytes(activePath)
-	if err != nil {
+	var active Active
+	if err := statefile.ReadJSON(activePath, MaxStateBytes, &active); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return Active{}, stateError(ErrorNotInitialized, err)
 		}
 		return Active{}, stateError(ErrorInvalidState, fmt.Errorf("read active identity: %w", err))
-	}
-	var active Active
-	if err := decodeStrictJSON(data, &active); err != nil {
-		return Active{}, stateError(ErrorInvalidState, fmt.Errorf("decode active identity: %w", err))
 	}
 	if err := active.validate(); err != nil {
 		return Active{}, stateError(ErrorInvalidState, err)
@@ -398,7 +380,6 @@ func (manager Manager) now() time.Time {
 
 func initResult(status string, identity Identity) InitResult {
 	return InitResult{
-		SchemaVersion: SchemaVersion,
 		Status:        status,
 		ProjectCommit: identity.ProjectCommit,
 		Release:       identity.Release,
@@ -410,152 +391,18 @@ func activePaths(stateDir string) (string, string) {
 	return deploymentDir, filepath.Join(deploymentDir, "active.json")
 }
 
-func readActiveBytes(path string) ([]byte, error) {
-	info, err := os.Lstat(path)
-	if err != nil {
-		return nil, err
-	}
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || !ok || stat.Nlink != 1 || info.Size() > MaxStateBytes {
-		return nil, fmt.Errorf("active state is not one bounded non-linked regular file")
-	}
-	data, err := privatefs.ReadBytes(path, MaxStateBytes)
-	if err != nil {
-		return nil, err
-	}
-	latest, err := os.Lstat(path)
-	if err != nil {
-		return nil, err
-	}
-	latestStat, ok := latest.Sys().(*syscall.Stat_t)
-	if !ok || latestStat.Nlink != 1 || !privatefs.SameFileVersion(info, latest) {
-		return nil, fmt.Errorf("active state changed while reading")
-	}
-	return data, nil
-}
-
-func decodeStrictJSON(data []byte, destination any) error {
-	if len(data) == 0 || !utf8.Valid(data) {
-		return fmt.Errorf("state JSON is empty or invalid UTF-8")
-	}
-	if err := strictjson.RejectDuplicateKeys(data); err != nil {
-		return err
-	}
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(destination); err != nil {
-		return err
-	}
-	var extra any
-	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
-		return fmt.Errorf("state JSON contains trailing values")
-	}
-	canonical, err := json.Marshal(destination)
-	if err != nil {
-		return err
-	}
-	canonical = append(canonical, '\n')
-	if !bytes.Equal(data, canonical) {
-		return fmt.Errorf("state JSON is not in canonical form")
-	}
-	return nil
-}
-
 func writeNewActive(path string, active Active) error {
-	data, err := activeBytes(active)
-	if err != nil {
+	if err := active.validate(); err != nil {
 		return err
 	}
-	parent := filepath.Dir(path)
-	if err := privatefs.ValidatePrivateDirectory(parent); err != nil {
-		return err
-	}
-	file, err := os.CreateTemp(parent, ".active.json-")
-	if err != nil {
-		return err
-	}
-	temporary := file.Name()
-	open := true
-	defer func() {
-		if open {
-			_ = file.Close()
-		}
-		_ = os.Remove(temporary)
-	}()
-	if err := file.Chmod(0o600); err != nil {
-		return err
-	}
-	if _, err := file.Write(data); err != nil {
-		return err
-	}
-	if err := file.Sync(); err != nil {
-		return err
-	}
-	if err := file.Close(); err != nil {
-		open = false
-		return err
-	}
-	open = false
-	if err := privatefs.RenameNoReplace(temporary, path); err != nil {
-		return err
-	}
-	return privatefs.SyncDirectory(parent)
+	return statefile.WriteNewJSON(path, MaxStateBytes, active)
 }
 
 func replaceActive(path string, active Active) error {
-	if _, err := readActiveBytes(path); err != nil {
-		return err
-	}
-	data, err := activeBytes(active)
-	if err != nil {
-		return err
-	}
-	parent := filepath.Dir(path)
-	file, err := os.CreateTemp(parent, ".active.json-")
-	if err != nil {
-		return err
-	}
-	temporary := file.Name()
-	open := true
-	defer func() {
-		if open {
-			_ = file.Close()
-		}
-		_ = os.Remove(temporary)
-	}()
-	if err := file.Chmod(0o600); err != nil {
-		return err
-	}
-	if _, err := file.Write(data); err != nil {
-		return err
-	}
-	if err := file.Sync(); err != nil {
-		return err
-	}
-	if err := file.Close(); err != nil {
-		open = false
-		return err
-	}
-	open = false
-	if err := os.Rename(temporary, path); err != nil {
-		return err
-	}
-	return privatefs.SyncDirectory(parent)
-}
-
-func activeBytes(active Active) ([]byte, error) {
 	if err := active.validate(); err != nil {
-		return nil, err
+		return err
 	}
-	data, err := json.Marshal(active)
-	if err != nil {
-		return nil, err
-	}
-	data = append(data, '\n')
-	if len(data) == 0 || int64(len(data)) > MaxStateBytes {
-		return nil, fmt.Errorf("active state has invalid size")
-	}
-	return data, nil
+	return statefile.ReplaceJSON(path, MaxStateBytes, active)
 }
 
 func pathExists(path string) (bool, error) {

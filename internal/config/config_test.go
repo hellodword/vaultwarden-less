@@ -15,8 +15,7 @@ import (
 	"time"
 )
 
-const minimalBackupYAML = `schema_version: 1
-upgrade_verification_targets:
+const minimalBackupYAML = `upgrade_verification_targets:
   - primary
 targets:
   - name: primary
@@ -27,8 +26,7 @@ notifiers: []
 
 func TestBackupSchemaPreservesSemanticOrder(t *testing.T) {
 	t.Parallel()
-	document := `schema_version: 1
-upgrade_verification_targets: [cold, primary]
+	document := `upgrade_verification_targets: [cold, primary]
 targets:
   - name: cold
     repository: /srv/cold
@@ -59,6 +57,7 @@ notifiers: []
 
 func TestBackupRejectsEveryStrictYAMLAndShapeViolation(t *testing.T) {
 	t.Parallel()
+	retiredVersionField := "schema_" + "version"
 	tests := map[string]string{
 		"empty targets":          strings.Replace(minimalBackupYAML, "  - name: primary\n    repository: rest:https://repository.example.test/vaultwarden\n    options: []\n", "", 1),
 		"missing verification":   strings.Replace(minimalBackupYAML, "upgrade_verification_targets:\n  - primary\n", "", 1),
@@ -66,9 +65,9 @@ func TestBackupRejectsEveryStrictYAMLAndShapeViolation(t *testing.T) {
 		"missing options":        strings.Replace(minimalBackupYAML, "    options: []\n", "", 1),
 		"missing notifiers":      strings.Replace(minimalBackupYAML, "notifiers: []\n", "", 1),
 		"unknown field":          minimalBackupYAML + "state_dir: /elsewhere\n",
-		"duplicate key":          minimalBackupYAML + "schema_version: 1\n",
-		"multiple documents":     minimalBackupYAML + "---\nschema_version: 1\n",
-		"quoted schema":          strings.Replace(minimalBackupYAML, "schema_version: 1", `schema_version: "1"`, 1),
+		"duplicate key":          minimalBackupYAML + "notifiers: []\n",
+		"multiple documents":     minimalBackupYAML + "---\nnotifiers: []\n",
+		"retired version field":  retiredVersionField + ": 1\n" + minimalBackupYAML,
 		"boolean string":         strings.Replace(minimalBackupYAML, "repository: rest:", "repository: true # rest:", 1),
 		"numeric option value":   strings.Replace(minimalBackupYAML, "options: []", "options: [{name: connections, value: 3}]", 1),
 		"anchor":                 strings.Replace(minimalBackupYAML, "repository: rest:", "repository: &repository rest:", 1),
@@ -106,8 +105,7 @@ func TestRoleCredentialsRequireExactTargetsAndCleanEnvironment(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	valid := `schema_version: 1
-targets:
+	valid := `targets:
   primary:
     environment:
       AWS_ACCESS_KEY_ID: synthetic-access
@@ -160,8 +158,7 @@ func TestNotifierFieldsAndBarkKeyAreStrict(t *testing.T) {
 		t.Fatal(err)
 	}
 	key := p256PKCS8(t)
-	validCredentials := `schema_version: 1
-notifiers:
+	validCredentials := `notifiers:
   operations:
     webhook_url: https://example.test/hooks/send?key=placeholder
   phone:
@@ -198,11 +195,11 @@ func TestEmptyNotifierSetStillRequiresStrictCredentialFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolved, err := LoadNotifierCredentials(writePrivateFile(t, "schema_version: 1\nnotifiers: {}\n"), cfg)
+	resolved, err := LoadNotifierCredentials(writePrivateFile(t, "notifiers: {}\n"), cfg)
 	if err != nil || resolved == nil || len(resolved) != 0 {
 		t.Fatalf("empty notifier credentials = %#v/%v", resolved, err)
 	}
-	if _, err := LoadNotifierCredentials(writePrivateFile(t, "schema_version: 1\nnotifiers: {}\nunknown: value\n"), cfg); err == nil {
+	if _, err := LoadNotifierCredentials(writePrivateFile(t, "notifiers: {}\nunknown: value\n"), cfg); err == nil {
 		t.Fatal("invalid empty notifier credential file was accepted")
 	}
 }
@@ -239,7 +236,7 @@ func TestPasswordDirectoryRequiresExactSetAndOnePrivateLine(t *testing.T) {
 
 func TestDeploymentEnvIsExactCanonicalAndOwned(t *testing.T) {
 	t.Parallel()
-	valid := fmt.Sprintf("DEPLOYMENT_SCHEMA_VERSION=1\nRUNTIME_UID=%d\nRUNTIME_GID=%d\nLISTEN_PORT=8080\nDRILL_PORT=8081\n", os.Geteuid(), os.Getegid())
+	valid := fmt.Sprintf("DEPLOYMENT_ROOT=/srv/vaultwarden-less\nRUNTIME_UID=%d\nRUNTIME_GID=%d\nLISTEN_PORT=8080\nDRILL_PORT=8081\n", os.Geteuid(), os.Getegid())
 	path := writePrivateFile(t, valid)
 	deployment, err := LoadDeployment(path)
 	if err != nil || deployment.ListenPort != 8080 || deployment.DrillPort != 8081 {
@@ -255,6 +252,7 @@ func TestDeploymentEnvIsExactCanonicalAndOwned(t *testing.T) {
 		"low port":     strings.Replace(valid, "8080", "80", 1),
 		"CR":           strings.Replace(valid, "\n", "\r\n", 1),
 		"comment":      valid + "# comment\n",
+		"root":         strings.Replace(valid, "/srv/vaultwarden-less", "/", 1),
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()

@@ -127,7 +127,6 @@ func (manager Manager) Prepare(ctx context.Context) (Result, error) {
 		return Result{}, stateError(ErrorConflict, err)
 	}
 	prepare := Prepare{
-		SchemaVersion:    SchemaVersion,
 		ImportID:         ImportIDInitial,
 		Phase:            PhasePrepared,
 		ProjectCommit:    manager.ProjectCommit,
@@ -318,7 +317,6 @@ func (manager Manager) Verify(ctx context.Context, confirmClientLogin bool) (Res
 		return Result{}, err
 	}
 	verification := Verification{
-		SchemaVersion:             SchemaVersion,
 		ImportID:                  ImportIDInitial,
 		Phase:                     PhaseVerified,
 		ProjectCommit:             prepare.ProjectCommit,
@@ -378,7 +376,6 @@ func (manager Manager) Accept(ctx context.Context) (Result, error) {
 			return Result{}, err
 		}
 		decision = Decision{
-			SchemaVersion:       SchemaVersion,
 			ImportID:            ImportIDInitial,
 			Decision:            DecisionAccept,
 			ActiveProjectCommit: prepare.ProjectCommit,
@@ -566,7 +563,7 @@ func CandidateServingAllowed(
 	identity deployment.Identity,
 	configured config.Deployment,
 ) error {
-	if err := identity.Validate(); err != nil || configured.SchemaVersion != config.SchemaVersion ||
+	if err := identity.Validate(); err != nil ||
 		configured.RuntimeUID != uint32(os.Geteuid()) || configured.RuntimeGID != uint32(os.Getegid()) {
 		return stateError(ErrorInvalidState, fmt.Errorf("import serving identity is invalid"))
 	}

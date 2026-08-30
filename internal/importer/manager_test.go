@@ -210,10 +210,8 @@ func TestStateWriteTransientsAreRecoveredWithoutWideningTheCurrentAllowlist(t *t
 	}
 	writePrivateFile(t, filepath.Join(fixture.importRoot, "candidate", "rsa_key.pem"), []byte("rotated"))
 	current := paths(fixture.state).current
-	verificationTransient, err := createSyncedTemporary(current, verificationName, []byte("partial verification"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	verificationTransient := filepath.Join(current, ".vaultwarden-less-state-"+verificationName+"-interrupted.tmp")
+	writePrivateFile(t, verificationTransient, []byte("partial verification"))
 	stagingTransient := manager.verificationTransientPath()
 	if err := os.Mkdir(stagingTransient, 0o700); err != nil {
 		t.Fatal(err)
@@ -229,7 +227,7 @@ func TestStateWriteTransientsAreRecoveredWithoutWideningTheCurrentAllowlist(t *t
 		t.Fatalf("verification staging transient survived retry: %v", err)
 	}
 
-	operatorEntry := filepath.Join(current, stateWritePrefix+decisionName+"-operator")
+	operatorEntry := filepath.Join(current, ".vaultwarden-less-state-"+decisionName+"-operator")
 	writePrivateFile(t, operatorEntry, []byte("not importer-owned"))
 	if _, err := manager.Accept(ctx); !IsKind(err, ErrorInvalidState) {
 		t.Fatalf("similarly named unexpected entry = %v", err)
@@ -241,10 +239,8 @@ func TestStateWriteTransientsAreRecoveredWithoutWideningTheCurrentAllowlist(t *t
 		t.Fatal(err)
 	}
 
-	decisionTransient, err := createSyncedTemporary(current, decisionName, []byte("partial decision"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	decisionTransient := filepath.Join(current, ".vaultwarden-less-state-"+decisionName+"-interrupted.tmp")
+	writePrivateFile(t, decisionTransient, []byte("partial decision"))
 	if err := os.Chmod(decisionTransient, 0o640); err != nil {
 		t.Fatal(err)
 	}
@@ -422,11 +418,11 @@ func TestImportServingGatesRequirePreparedCandidateAndPublishedDecision(t *testi
 	}
 	identity := deployment.Identity{ProjectCommit: testCommit, Release: testRelease}
 	configured := config.Deployment{
-		SchemaVersion: config.SchemaVersion,
-		RuntimeUID:    uint32(os.Geteuid()),
-		RuntimeGID:    uint32(os.Getegid()),
-		ListenPort:    8080,
-		DrillPort:     8081,
+		Root:       "/srv/vaultwarden-less",
+		RuntimeUID: uint32(os.Geteuid()),
+		RuntimeGID: uint32(os.Getegid()),
+		ListenPort: 8080,
+		DrillPort:  8081,
 	}
 	if err := CandidateServingAllowed(ctx, fixture.state, fixture.source, filepath.Join(fixture.importRoot, "candidate"), identity, configured); err != nil {
 		t.Fatalf("prepared candidate gate = %v", err)
@@ -467,7 +463,7 @@ func TestImportStateRejectsNonCanonicalAndUnsafeDocuments(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			changed := bytes.Replace(data, []byte(`"schema_version":1`), []byte(`"schema_version":1,"schema_version":1`), 1)
+			changed := bytes.Replace(data, []byte(`"import_id":"initial"`), []byte(`"import_id":"initial","import_id":"initial"`), 1)
 			if err := os.WriteFile(path, changed, 0o600); err != nil {
 				t.Fatal(err)
 			}

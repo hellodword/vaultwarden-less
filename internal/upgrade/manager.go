@@ -80,14 +80,13 @@ func (manager Manager) Prepare(toCommit, toRelease string) (Result, error) {
 	}
 
 	prepare := Prepare{
-		SchemaVersion: SchemaVersion,
-		UpgradeID:     upgradeID(manager.ProjectCommit, toCommit),
-		Phase:         PhasePrepared,
-		FromCommit:    manager.ProjectCommit,
-		FromRelease:   manager.Release,
-		ToCommit:      toCommit,
-		ToRelease:     toRelease,
-		PreparedAt:    formatTimestamp(manager.now()),
+		UpgradeID:   upgradeID(manager.ProjectCommit, toCommit),
+		Phase:       PhasePrepared,
+		FromCommit:  manager.ProjectCommit,
+		FromRelease: manager.Release,
+		ToCommit:    toCommit,
+		ToRelease:   toRelease,
+		PreparedAt:  formatTimestamp(manager.now()),
 	}
 	if err := prepare.validate(); err != nil {
 		return Result{}, stateError(ErrorInvalidState, err)
@@ -240,7 +239,6 @@ func (manager Manager) Freeze(ctx context.Context, targetNames []string, collect
 		return Result{}, stateError(ErrorInvalidState, err)
 	}
 	ticket := RollbackTicket{
-		SchemaVersion:  SchemaVersion,
 		UpgradeID:      prepare.UpgradeID,
 		Phase:          PhaseFrozen,
 		FromCommit:     prepare.FromCommit,
@@ -285,7 +283,6 @@ func (manager Manager) MigrateCheck(ctx context.Context) (Result, error) {
 		return Result{}, stateError(ErrorVerification, err)
 	}
 	candidate := Candidate{
-		SchemaVersion:             SchemaVersion,
 		UpgradeID:                 prepare.UpgradeID,
 		Phase:                     PhaseMigrated,
 		FromCommit:                prepare.FromCommit,
@@ -423,7 +420,6 @@ func (manager Manager) Accept(ctx context.Context, drillCheck func(context.Conte
 			return Result{}, err
 		}
 		decision = Decision{
-			SchemaVersion:       SchemaVersion,
 			UpgradeID:           prepare.UpgradeID,
 			Decision:            DecisionAccept,
 			ActiveProjectCommit: prepare.ToCommit,
@@ -517,7 +513,6 @@ func (manager Manager) Rollback(ctx context.Context) (Result, error) {
 			return Result{}, err
 		}
 		decision = Decision{
-			SchemaVersion:       SchemaVersion,
 			UpgradeID:           prepare.UpgradeID,
 			Decision:            DecisionRollback,
 			ActiveProjectCommit: prepare.FromCommit,
@@ -989,7 +984,7 @@ func (manager Manager) validate() error {
 		manager.StateDir == string(filepath.Separator) || manager.DataDir == string(filepath.Separator) {
 		return stateError(ErrorInvalidState, fmt.Errorf("manager paths are invalid"))
 	}
-	if manager.Deployment.SchemaVersion != config.SchemaVersion || manager.Deployment.RuntimeUID == 0 ||
+	if manager.Deployment.Root == "" || manager.Deployment.RuntimeUID == 0 ||
 		manager.Deployment.RuntimeGID == 0 || manager.Deployment.ListenPort < 1024 ||
 		manager.Deployment.DrillPort < 1024 || manager.Deployment.ListenPort == manager.Deployment.DrillPort {
 		return stateError(ErrorInvalidState, fmt.Errorf("deployment identity is invalid"))

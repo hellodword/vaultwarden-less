@@ -18,7 +18,7 @@ import (
 	"github.com/hellodword/vaultwarden-less/internal/privatefs"
 )
 
-const importTreeMagic = "vaultwarden-less-import-tree-v1\x00"
+const importTreeMagic = "vaultwarden-less-import-tree\x00"
 const candidateTransientName = ".candidate-initial"
 
 var excludedSourceFiles = map[string]struct{}{

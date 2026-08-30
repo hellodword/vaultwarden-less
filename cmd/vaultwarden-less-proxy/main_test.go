@@ -26,7 +26,7 @@ func TestProxyCLIHelpVersionAndUsageGolden(t *testing.T) {
 		{[]string{"--help"}, 0, "serve|healthcheck|version", ""},
 		{[]string{"serve", "--help"}, 0, "vaultwarden-less-proxy serve", ""},
 		{[]string{"healthcheck", "--help"}, 0, "vaultwarden-less-proxy healthcheck", ""},
-		{[]string{"version"}, 0, "{\"schema_version\":1,\"project_commit\":null,\"release\":\"development\",\"clean\":false}\n", ""},
+		{[]string{"version"}, 0, "{\"project_commit\":null,\"release\":\"development\",\"clean\":false}\n", ""},
 		{nil, 2, "", "usage_error"},
 		{[]string{"unknown"}, 2, "", "usage_error"},
 		{[]string{"serve", "extra"}, 2, "", "usage_error"},
@@ -55,7 +55,7 @@ func TestProxyCLICleanVersionGolden(t *testing.T) {
 	setProxyBuildIdentity(t, commit, "RELEASE.2026-08-27T12-34-56Z-gbbbbbbbbbbbb", "true")
 	var stdout, stderr bytes.Buffer
 	code := executeWithEnvironment(context.Background(), []string{"version"}, &stdout, &stderr, proxyEnvironment{})
-	want := `{"schema_version":1,"project_commit":"` + commit + `","release":"RELEASE.2026-08-27T12-34-56Z-gbbbbbbbbbbbb","clean":true}` + "\n"
+	want := `{"project_commit":"` + commit + `","release":"RELEASE.2026-08-27T12-34-56Z-gbbbbbbbbbbbb","clean":true}` + "\n"
 	if code != 0 || stdout.String() != want || stderr.Len() != 0 {
 		t.Fatalf("version = %d/%q/%q", code, stdout.String(), stderr.String())
 	}
@@ -70,7 +70,7 @@ func TestProxyCLIHealthcheckGoldenAndFailure(t *testing.T) {
 		code := executeWithEnvironment(context.Background(), []string{"healthcheck"}, &stdout, &stderr, proxyEnvironment{healthURL: server.URL})
 		server.Close()
 		if status == http.StatusNoContent {
-			if code != 0 || stdout.String() != "{\"schema_version\":1,\"healthy\":true}\n" || stderr.Len() != 0 {
+			if code != 0 || stdout.String() != "{\"healthy\":true}\n" || stderr.Len() != 0 {
 				t.Fatalf("healthcheck success = %d/%q/%q", code, stdout.String(), stderr.String())
 			}
 		} else {
@@ -115,13 +115,12 @@ func assertProxyError(t *testing.T, output, code string) {
 	t.Helper()
 	decoder := json.NewDecoder(strings.NewReader(output))
 	var document struct {
-		SchemaVersion int `json:"schema_version"`
-		Error         struct {
+		Error struct {
 			Code    string `json:"code"`
 			Message string `json:"message"`
 		} `json:"error"`
 	}
-	if err := decoder.Decode(&document); err != nil || document.SchemaVersion != 1 || document.Error.Code != code || document.Error.Message == "" {
+	if err := decoder.Decode(&document); err != nil || document.Error.Code != code || document.Error.Message == "" {
 		t.Fatalf("error document = %#v/%v", document, err)
 	}
 	var extra any

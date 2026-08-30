@@ -21,7 +21,6 @@ const (
 	codeNotReady           = "not_ready"
 	codeConflict           = "conflict"
 	codeSourceInconsistent = "source_inconsistent"
-	codeUnsupportedSchema  = "unsupported_schema"
 	codeRepositoryFailure  = "repository_failure"
 	codeVerification       = "verification_failure"
 	codeTimeout            = "timeout"
@@ -33,7 +32,7 @@ const (
 
 var stableErrorCodes = map[string]struct{}{
 	codeUsageError: {}, codeInvalidConfig: {}, codeInvalidCredentials: {}, codeUnsafePath: {}, codeNotReady: {},
-	codeConflict: {}, codeSourceInconsistent: {}, codeUnsupportedSchema: {}, codeRepositoryFailure: {},
+	codeConflict: {}, codeSourceInconsistent: {}, codeRepositoryFailure: {},
 	codeVerification: {}, codeTimeout: {}, codeUpgradeState: {}, codeImportState: {}, codeDeploymentState: {}, codeInternal: {},
 }
 
@@ -48,8 +47,7 @@ func (err *CommandError) Error() string { return err.Message }
 func (err *CommandError) Unwrap() error { return err.Cause }
 
 type errorDocument struct {
-	SchemaVersion int `json:"schema_version"`
-	Error         struct {
+	Error struct {
 		Code    string `json:"code"`
 		Message string `json:"message"`
 	} `json:"error"`
@@ -71,7 +69,7 @@ func WriteError(writer io.Writer, err error) {
 		return
 	}
 	classified := classifyError(err)
-	document := errorDocument{SchemaVersion: ResultSchemaVersion}
+	document := errorDocument{}
 	document.Error.Code = classified.Code
 	document.Error.Message = classified.Message
 	_ = json.NewEncoder(writer).Encode(document)
@@ -162,7 +160,6 @@ func dirtyAllowed(command *cobra.Command) bool {
 }
 
 type versionResult struct {
-	SchemaVersion int     `json:"schema_version"`
 	ProjectCommit *string `json:"project_commit"`
 	Release       string  `json:"release"`
 	Clean         bool    `json:"clean"`
@@ -172,7 +169,7 @@ func versionCommand() *cobra.Command {
 	return &cobra.Command{
 		Use: "version", Short: "Print the build recovery identity", Args: noArguments,
 		RunE: func(command *cobra.Command, _ []string) error {
-			result := versionResult{SchemaVersion: ResultSchemaVersion, Release: "development", Clean: false}
+			result := versionResult{Release: "development", Clean: false}
 			if buildinfo.Ready() {
 				commit := buildinfo.ProjectCommit
 				result.ProjectCommit = &commit

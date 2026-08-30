@@ -1,19 +1,14 @@
 package importer
 
 import (
-	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
-	"strings"
 	"syscall"
-	"unicode/utf8"
 
 	"github.com/hellodword/vaultwarden-less/internal/privatefs"
-	"github.com/hellodword/vaultwarden-less/internal/strictjson"
+	"github.com/hellodword/vaultwarden-less/internal/statefile"
 )
 
 const (
@@ -22,8 +17,6 @@ const (
 	decisionName     = "decision.json"
 	currentTransient = ".current-initial"
 	verifyTransient  = ".verification-initial"
-	stateWritePrefix = ".vaultwarden-less-import-state-"
-	stateWriteSuffix = ".tmp"
 )
 
 type statePaths struct {
@@ -115,122 +108,11 @@ func readDecision(state statePaths, prepare Prepare) (Decision, error) {
 }
 
 func readStrictJSON(path string, destination any) error {
-	data, err := readStateBytes(path)
-	if err != nil {
-		return err
-	}
-	if len(data) == 0 || !utf8.Valid(data) {
-		return fmt.Errorf("state JSON is empty or invalid UTF-8")
-	}
-	if err := strictjson.RejectDuplicateKeys(data); err != nil {
-		return err
-	}
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(destination); err != nil {
-		return err
-	}
-	var extra any
-	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
-		return fmt.Errorf("state JSON contains trailing values")
-	}
-	canonical, err := json.Marshal(destination)
-	if err != nil {
-		return err
-	}
-	canonical = append(canonical, '\n')
-	if !bytes.Equal(data, canonical) {
-		return fmt.Errorf("state JSON is not canonical")
-	}
-	return nil
-}
-
-func readStateBytes(path string) ([]byte, error) {
-	info, err := os.Lstat(path)
-	if err != nil {
-		return nil, err
-	}
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || !ok || stat.Nlink != 1 || info.Size() > MaxStateBytes {
-		return nil, fmt.Errorf("state path is not one bounded non-linked regular file")
-	}
-	data, err := privatefs.ReadBytes(path, MaxStateBytes)
-	if err != nil {
-		return nil, err
-	}
-	latest, err := os.Lstat(path)
-	if err != nil {
-		return nil, err
-	}
-	latestStat, ok := latest.Sys().(*syscall.Stat_t)
-	if !ok || latestStat.Nlink != 1 || !privatefs.SameFileVersion(info, latest) {
-		return nil, fmt.Errorf("state path changed while reading")
-	}
-	return data, nil
+	return statefile.ReadJSON(path, MaxStateBytes, destination)
 }
 
 func writeNewJSON(path string, value any) error {
-	data, err := json.Marshal(value)
-	if err != nil {
-		return err
-	}
-	data = append(data, '\n')
-	return writeNewFile(path, data)
-}
-
-func writeNewFile(path string, data []byte) error {
-	if len(data) == 0 || int64(len(data)) > MaxStateBytes {
-		return fmt.Errorf("state file has invalid size")
-	}
-	parent := filepath.Dir(path)
-	if err := privatefs.ValidatePrivateDirectory(parent); err != nil {
-		return err
-	}
-	temporary, err := createSyncedTemporary(parent, filepath.Base(path), data)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = os.Remove(temporary) }()
-	if err := privatefs.RenameNoReplace(temporary, path); err != nil {
-		return err
-	}
-	return privatefs.SyncDirectory(parent)
-}
-
-func createSyncedTemporary(parent, target string, data []byte) (string, error) {
-	if !stateWriteTarget(target) {
-		return "", fmt.Errorf("import state write target is invalid")
-	}
-	file, err := os.CreateTemp(parent, stateWritePrefix+target+"-*"+stateWriteSuffix)
-	if err != nil {
-		return "", err
-	}
-	path := file.Name()
-	open := true
-	defer func() {
-		if open {
-			_ = file.Close()
-		}
-	}()
-	if err := file.Chmod(0o600); err != nil {
-		_ = os.Remove(path)
-		return "", err
-	}
-	if _, err := file.Write(data); err != nil {
-		_ = os.Remove(path)
-		return "", err
-	}
-	if err := file.Sync(); err != nil {
-		_ = os.Remove(path)
-		return "", err
-	}
-	if err := file.Close(); err != nil {
-		open = false
-		_ = os.Remove(path)
-		return "", err
-	}
-	open = false
-	return path, nil
+	return statefile.WriteNewJSON(path, MaxStateBytes, value)
 }
 
 func validateCurrentEntries(current string) error {
@@ -280,17 +162,9 @@ func cleanupCurrentWriteTransients(current string) error {
 	return nil
 }
 
-func stateWriteTarget(name string) bool {
-	return name == prepareName || name == verificationName || name == decisionName
-}
-
 func stateWriteTemporary(name string) bool {
-	if !strings.HasSuffix(name, stateWriteSuffix) {
-		return false
-	}
 	for _, target := range []string{prepareName, verificationName, decisionName} {
-		prefix := stateWritePrefix + target + "-"
-		if strings.HasPrefix(name, prefix) && len(name) > len(prefix)+len(stateWriteSuffix) {
+		if statefile.IsOwnedTemporary(target, name) {
 			return true
 		}
 	}

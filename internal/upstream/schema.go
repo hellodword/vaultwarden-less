@@ -22,7 +22,6 @@ type SchemaObject struct {
 }
 
 type SchemaContract struct {
-	ContractVersion    int            `json:"contract_version"`
 	VaultwardenVersion string         `json:"vaultwarden_version"`
 	DatabaseMigration  string         `json:"database_migration"`
 	Fingerprint        string         `json:"fingerprint"`
@@ -44,8 +43,7 @@ func VaultwardenSchemaContract() (SchemaContract, error) {
 			loadedSchemaErr = fmt.Errorf("decode embedded Vaultwarden schema contract: %w", err)
 			return
 		}
-		if loadedSchema.ContractVersion != 1 ||
-			loadedSchema.VaultwardenVersion == "" ||
+		if loadedSchema.VaultwardenVersion == "" ||
 			loadedSchema.DatabaseMigration == "" ||
 			!validDigest(loadedSchema.Fingerprint) ||
 			len(loadedSchema.Objects) == 0 ||

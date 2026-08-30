@@ -11,26 +11,23 @@ import (
 type repoOperation func(context.Context, repository, config.Target) (any, error)
 
 type operationResult struct {
-	SchemaVersion int    `json:"schema_version"`
-	Operation     string `json:"operation"`
-	Target        string `json:"target"`
-	Success       bool   `json:"success"`
+	Operation string `json:"operation"`
+	Target    string `json:"target"`
+	Success   bool   `json:"success"`
 }
 
 type snapshotsResult struct {
-	SchemaVersion int               `json:"schema_version"`
-	Target        string            `json:"target"`
-	Limit         int               `json:"limit"`
-	Truncated     bool              `json:"truncated"`
-	Snapshots     []restic.Snapshot `json:"snapshots"`
+	Target    string            `json:"target"`
+	Limit     int               `json:"limit"`
+	Truncated bool              `json:"truncated"`
+	Snapshots []restic.Snapshot `json:"snapshots"`
 }
 
 type pruneResult struct {
-	SchemaVersion int                 `json:"schema_version"`
-	Operation     string              `json:"operation"`
-	Target        string              `json:"target"`
-	Applied       bool                `json:"applied"`
-	Groups        []restic.PruneGroup `json:"groups"`
+	Operation string              `json:"operation"`
+	Target    string              `json:"target"`
+	Applied   bool                `json:"applied"`
+	Groups    []restic.PruneGroup `json:"groups"`
 }
 
 func repoCommand(configPath *string, environment commandEnvironment) *cobra.Command {
@@ -96,11 +93,10 @@ func repoCommand(configPath *string, environment commandEnvironment) *cobra.Comm
 			snapshots = []restic.Snapshot{}
 		}
 		return snapshotsResult{
-			SchemaVersion: ResultSchemaVersion,
-			Target:        target.Name,
-			Limit:         limit,
-			Truncated:     truncated,
-			Snapshots:     snapshots,
+			Target:    target.Name,
+			Limit:     limit,
+			Truncated: truncated,
+			Snapshots: snapshots,
 		}, nil
 	})
 	snapshotsCommand.Flags().IntVar(&limit, "limit", restic.DefaultSnapshotsLimit, "maximum snapshots to return (1-1000)")
@@ -132,11 +128,10 @@ func repoCommand(configPath *string, environment commandEnvironment) *cobra.Comm
 			result.Groups = []restic.PruneGroup{}
 		}
 		return pruneResult{
-			SchemaVersion: ResultSchemaVersion,
-			Operation:     "prune",
-			Target:        target.Name,
-			Applied:       result.Applied,
-			Groups:        result.Groups,
+			Operation: "prune",
+			Target:    target.Name,
+			Applied:   result.Applied,
+			Groups:    result.Groups,
 		}, nil
 	})
 	pruneCommand.Flags().BoolVar(&apply, "apply", false, "perform deletion; default is Restic dry-run")
@@ -145,5 +140,5 @@ func repoCommand(configPath *string, environment commandEnvironment) *cobra.Comm
 }
 
 func successfulOperation(operation, target string) operationResult {
-	return operationResult{SchemaVersion: ResultSchemaVersion, Operation: operation, Target: target, Success: true}
+	return operationResult{Operation: operation, Target: target, Success: true}
 }

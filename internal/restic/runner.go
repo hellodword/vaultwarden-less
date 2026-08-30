@@ -34,7 +34,6 @@ const (
 	maxStderrOutput  = 64 << 10
 
 	SnapshotHost          = "vaultwarden-less"
-	SnapshotSchemaTag     = "schema=1"
 	DefaultSnapshotsLimit = 100
 	MaxSnapshotsLimit     = 1000
 )
@@ -144,7 +143,6 @@ func (r Runner) ensure(ctx context.Context, target config.Target, manifest snaps
 	arguments := append(base,
 		"backup", "--json",
 		"--host", SnapshotHost,
-		"--tag", SnapshotSchemaTag,
 		"--tag", "project_commit="+manifest.ProjectCommit,
 		"--tag", "content_id=sha256:"+contentHex,
 		"--tag", "archive_id="+manifest.ArchiveID,
@@ -244,7 +242,6 @@ func (r Runner) snapshotQuery(ctx context.Context, target config.Target, additio
 		"snapshots", "--json",
 		"--host", SnapshotHost,
 		"--path", r.recoveryPath,
-		"--tag", SnapshotSchemaTag,
 	)
 	arguments = append(arguments, additional...)
 	output, err := r.runTargetCommand(ctx, target, "snapshots", arguments, environment, "")
@@ -288,7 +285,7 @@ func (r Runner) Check(ctx context.Context, target config.Target) error {
 }
 
 func (r Runner) Prune(ctx context.Context, target config.Target, apply bool) (PruneResult, error) {
-	// Restic cannot express prefix-presence tag filters. Validate every schema-1
+	// Restic cannot express prefix-presence tag filters. Validate every
 	// candidate before the mutating forget command so malformed identities are
 	// never silently included in retention decisions.
 	if _, err := r.snapshotQuery(ctx, target, nil); err != nil {
@@ -298,7 +295,6 @@ func (r Runner) Prune(ctx context.Context, target config.Target, apply bool) (Pr
 		"forget", "--json", "--prune",
 		"--host", SnapshotHost,
 		"--path", r.recoveryPath,
-		"--tag", SnapshotSchemaTag,
 		"--group-by", "host,paths",
 		"--keep-within", "24h",
 		"--keep-hourly", "48",
@@ -611,11 +607,10 @@ type identityTags struct {
 
 func snapshotIdentity(tags []string) (identityTags, bool) {
 	var result identityTags
-	schemaCount := 0
 	for _, tag := range tags {
 		switch {
-		case tag == SnapshotSchemaTag:
-			schemaCount++
+		case strings.HasPrefix(tag, "schema="):
+			return identityTags{}, false
 		case strings.HasPrefix(tag, "project_commit="):
 			if result.projectCommit != "" {
 				return identityTags{}, false
@@ -633,7 +628,7 @@ func snapshotIdentity(tags []string) (identityTags, bool) {
 			result.archiveID = strings.TrimPrefix(tag, "archive_id=")
 		}
 	}
-	return result, schemaCount == 1 && validCommit(result.projectCommit) && validDigest(result.contentID) && validDigest(result.archiveID)
+	return result, validCommit(result.projectCommit) && validDigest(result.contentID) && validDigest(result.archiveID)
 }
 
 func parseBackupSnapshotID(data []byte) (string, error) {

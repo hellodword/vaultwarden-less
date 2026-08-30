@@ -122,7 +122,7 @@ func TestReadDrillManifestIsStrictAndPrivate(t *testing.T) {
 	if err := os.Mkdir(root, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	manifest := `{"schema_version":1,"project_commit":"` + gateCommit + `","content_id":"sha256:` + strings.Repeat("a", 64) + `","archive_id":"sha256:` + strings.Repeat("b", 64) + `","files":[{"path":"db.sqlite3"}]}` + "\n"
+	manifest := `{"project_commit":"` + gateCommit + `","content_id":"sha256:` + strings.Repeat("a", 64) + `","archive_id":"sha256:` + strings.Repeat("b", 64) + `","files":[{"path":"db.sqlite3"}]}` + "\n"
 	path := filepath.Join(root, "manifest.json")
 	if err := os.WriteFile(path, []byte(manifest), 0o600); err != nil {
 		t.Fatal(err)
@@ -162,20 +162,20 @@ func gateTestEnvironment() gateEnvironment {
 		ready:    func() bool { return true },
 		identity: func() deployment.Identity { return identity },
 		loadDeployment: func(string) (config.Deployment, error) {
-			return config.Deployment{SchemaVersion: 1, RuntimeUID: uint32(os.Geteuid()), RuntimeGID: uint32(os.Getegid()), ListenPort: 8080, DrillPort: 8081}, nil
+			return config.Deployment{Root: config.DeploymentRoot, RuntimeUID: uint32(os.Geteuid()), RuntimeGID: uint32(os.Getegid()), ListenPort: 8080, DrillPort: 8081}, nil
 		},
 		requireActive: func(string, deployment.Identity) (deployment.Active, error) {
-			return deployment.Active{SchemaVersion: 1, ProjectCommit: gateCommit, Release: gateRelease}, nil
+			return deployment.Active{ProjectCommit: gateCommit, Release: gateRelease}, nil
 		},
 		readActive: func(string) (deployment.Active, error) {
-			return deployment.Active{SchemaVersion: 1, ProjectCommit: gateCommit, Release: gateRelease}, nil
+			return deployment.Active{ProjectCommit: gateCommit, Release: gateRelease}, nil
 		},
 		allowNormal:    func(context.Context, string, string, deployment.Identity, config.Deployment) error { return nil },
 		allowCandidate: func(string, string, string, string, string, config.Deployment) error { return nil },
 		readDrillManifest: func(context.Context, string) (drillManifest, error) {
 			return drillManifest{
-				SchemaVersion: 1, ProjectCommit: gateCommit,
-				ContentID: "sha256:" + strings.Repeat("a", 64), ArchiveID: "sha256:" + strings.Repeat("b", 64),
+				ProjectCommit: gateCommit,
+				ContentID:     "sha256:" + strings.Repeat("a", 64), ArchiveID: "sha256:" + strings.Repeat("b", 64),
 				Files: []json.RawMessage{json.RawMessage(`{"path":"db.sqlite3"}`)},
 			}, nil
 		},

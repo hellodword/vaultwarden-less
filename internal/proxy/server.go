@@ -19,7 +19,7 @@ const (
 	HealthPath    = "/.vaultwarden-less/healthz"
 	ListenAddress = "0.0.0.0:8080"
 	UpstreamURL   = "http://vaultwarden:80"
-	EventsURL     = "http://backup:9090/v1/events"
+	EventsURL     = "http://backup:9090/events"
 
 	MaxRequestBytes               = int64(600 << 20)
 	ReadHeaderTimeout             = 10 * time.Second
@@ -185,5 +185,5 @@ func writeError(w http.ResponseWriter, status int, code, message string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
-	_, _ = fmt.Fprintf(w, "{\"schema_version\":1,\"error\":{\"code\":%s,\"message\":%s}}\n", strconv.Quote(code), strconv.Quote(message))
+	_, _ = fmt.Fprintf(w, "{\"error\":{\"code\":%s,\"message\":%s}}\n", strconv.Quote(code), strconv.Quote(message))
 }

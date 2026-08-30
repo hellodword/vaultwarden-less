@@ -7,8 +7,6 @@ import (
 	"strings"
 )
 
-const ManifestVersion = 1
-
 type File struct {
 	Path   string `json:"path"`
 	Size   int64  `json:"size"`
@@ -16,7 +14,6 @@ type File struct {
 }
 
 type Manifest struct {
-	SchemaVersion int    `json:"schema_version"`
 	ProjectCommit string `json:"project_commit"`
 	ContentID     string `json:"content_id"`
 	ArchiveID     string `json:"archive_id"`
@@ -32,7 +29,6 @@ func NewManifest(projectCommit, contentID, archiveID string, files []File) (Mani
 		return strings.Compare(left.Path, right.Path)
 	})
 	manifest := Manifest{
-		SchemaVersion: ManifestVersion,
 		ProjectCommit: projectCommit,
 		ContentID:     contentID,
 		ArchiveID:     archiveID,
@@ -45,9 +41,6 @@ func NewManifest(projectCommit, contentID, archiveID string, files []File) (Mani
 }
 
 func (m Manifest) Validate() error {
-	if m.SchemaVersion != ManifestVersion {
-		return fmt.Errorf("unsupported manifest schema")
-	}
 	if !validCommit(m.ProjectCommit) {
 		return fmt.Errorf("invalid project commit")
 	}

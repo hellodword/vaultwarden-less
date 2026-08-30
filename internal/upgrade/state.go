@@ -2,20 +2,17 @@ package upgrade
 
 import (
 	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
-	"unicode/utf8"
 
 	"github.com/hellodword/vaultwarden-less/internal/config"
 	"github.com/hellodword/vaultwarden-less/internal/privatefs"
-	"github.com/hellodword/vaultwarden-less/internal/strictjson"
+	"github.com/hellodword/vaultwarden-less/internal/statefile"
 )
 
 const (
@@ -136,34 +133,7 @@ func readDecision(state statePaths, prepare Prepare) (Decision, error) {
 }
 
 func readStrictJSON(path string, destination any) error {
-	data, err := readStateBytes(path)
-	if err != nil {
-		return err
-	}
-	if len(data) == 0 || !utf8.Valid(data) {
-		return fmt.Errorf("state JSON is empty or invalid UTF-8")
-	}
-	if err := strictjson.RejectDuplicateKeys(data); err != nil {
-		return err
-	}
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(destination); err != nil {
-		return err
-	}
-	var extra any
-	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
-		return fmt.Errorf("state JSON contains trailing values")
-	}
-	canonical, err := json.Marshal(destination)
-	if err != nil {
-		return err
-	}
-	canonical = append(canonical, '\n')
-	if !bytes.Equal(data, canonical) {
-		return fmt.Errorf("state JSON is not in canonical form")
-	}
-	return nil
+	return statefile.ReadJSON(path, MaxStateBytes, destination)
 }
 
 func readStateBytes(path string) ([]byte, error) {
@@ -191,35 +161,11 @@ func readStateBytes(path string) ([]byte, error) {
 }
 
 func writeNewJSON(path string, value any) error {
-	data, err := json.Marshal(value)
-	if err != nil {
-		return err
-	}
-	data = append(data, '\n')
-	return writeNewFile(path, data)
+	return statefile.WriteNewJSON(path, MaxStateBytes, value)
 }
 
 func replaceJSON(path string, value any) error {
-	data, err := json.Marshal(value)
-	if err != nil {
-		return err
-	}
-	data = append(data, '\n')
-	if int64(len(data)) > MaxStateBytes {
-		return fmt.Errorf("state file exceeds limit")
-	}
-	if _, err := readStateBytes(path); err != nil {
-		return fmt.Errorf("validate replaced state file: %w", err)
-	}
-	temporary, err := createSyncedTemporary(filepath.Dir(path), filepath.Base(path), data)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = os.Remove(temporary) }()
-	if err := os.Rename(temporary, path); err != nil {
-		return err
-	}
-	return privatefs.SyncDirectory(filepath.Dir(path))
+	return statefile.ReplaceJSON(path, MaxStateBytes, value)
 }
 
 func writeNewFile(path string, data []byte) error {
@@ -242,7 +188,7 @@ func writeNewFile(path string, data []byte) error {
 }
 
 func createSyncedTemporary(parent, target string, data []byte) (string, error) {
-	if !stateWriteTarget(target) {
+	if target != composeName {
 		return "", fmt.Errorf("upgrade state write target is invalid")
 	}
 	file, err := os.CreateTemp(parent, stateWritePrefix+target+"-*"+stateWriteSuffix)
@@ -279,7 +225,7 @@ func createSyncedTemporary(parent, target string, data []byte) (string, error) {
 
 func composeEnvironment(deployment config.Deployment, prepare Prepare) []byte {
 	return []byte(strings.Join([]string{
-		"DEPLOYMENT_SCHEMA_VERSION=1",
+		"DEPLOYMENT_ROOT=" + deployment.Root,
 		"RUNTIME_UID=" + strconv.FormatUint(uint64(deployment.RuntimeUID), 10),
 		"RUNTIME_GID=" + strconv.FormatUint(uint64(deployment.RuntimeGID), 10),
 		"LISTEN_PORT=" + strconv.FormatUint(uint64(deployment.ListenPort), 10),
@@ -349,21 +295,15 @@ func cleanupCurrentWriteTransients(current string) error {
 	return nil
 }
 
-func stateWriteTarget(name string) bool {
-	return name == prepareName || name == ticketName || name == candidateName || name == decisionName || name == composeName
-}
-
 func stateWriteTemporary(name string) bool {
-	if !strings.HasSuffix(name, stateWriteSuffix) {
-		return false
-	}
-	for _, target := range []string{prepareName, ticketName, candidateName, decisionName, composeName} {
-		prefix := stateWritePrefix + target + "-"
-		if strings.HasPrefix(name, prefix) && len(name) > len(prefix)+len(stateWriteSuffix) {
+	for _, target := range []string{prepareName, ticketName, candidateName, decisionName} {
+		if statefile.IsOwnedTemporary(target, name) {
 			return true
 		}
 	}
-	return false
+	prefix := stateWritePrefix + composeName + "-"
+	return strings.HasPrefix(name, prefix) && strings.HasSuffix(name, stateWriteSuffix) &&
+		len(name) > len(prefix)+len(stateWriteSuffix)
 }
 
 func validateStateWriteTemporary(current, name string) error {

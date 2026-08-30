@@ -18,7 +18,7 @@ import (
 	"github.com/hellodword/vaultwarden-less/internal/privatefs"
 )
 
-const rollbackMagic = "vaultwarden-less-rollback-v1\x00"
+const rollbackMagic = "vaultwarden-less-rollback\x00"
 
 type treeFile struct {
 	path     string

@@ -35,7 +35,6 @@ const (
 )
 
 type drillManifest struct {
-	SchemaVersion int               `json:"schema_version"`
 	ProjectCommit string            `json:"project_commit"`
 	ContentID     string            `json:"content_id"`
 	ArchiveID     string            `json:"archive_id"`
@@ -231,7 +230,7 @@ func readDrillManifest(ctx context.Context, root string) (drillManifest, error) 
 	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
 		return drillManifest{}, fmt.Errorf("recovery manifest contains trailing values")
 	}
-	if manifest.SchemaVersion != 1 || !validHex(manifest.ProjectCommit, 40) ||
+	if !validHex(manifest.ProjectCommit, 40) ||
 		!validDigest(manifest.ContentID) || !validDigest(manifest.ArchiveID) || len(manifest.Files) == 0 {
 		return drillManifest{}, fmt.Errorf("recovery manifest identity is invalid")
 	}

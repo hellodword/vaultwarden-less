@@ -397,16 +397,17 @@ func TestWorkerHTTPContract(t *testing.T) {
 	handler := Handler(worker)
 
 	assertHTTP(t, handler, http.MethodGet, HealthPath, "", "", http.StatusNoContent, "")
-	assertHTTP(t, handler, http.MethodPost, EventsPath, "application/json", `{"schema_version":1}`, http.StatusNoContent, "")
-	assertHTTP(t, handler, http.MethodPost, CheckPath, "application/json", `{"schema_version":1}`, http.StatusAccepted, "{\"schema_version\":1,\"accepted\":true}\n")
-	assertHTTP(t, handler, http.MethodPost, EventsPath, "application/json", `{"schema_version":1,"extra":true}`, http.StatusBadRequest, "")
-	assertHTTP(t, handler, http.MethodPost, EventsPath, "application/json", `{"schema_version":1,"schema_version":1}`, http.StatusBadRequest, "")
-	assertHTTP(t, handler, http.MethodPost, EventsPath, "application/json", `{"schema_version":"1"}`, http.StatusBadRequest, "")
-	assertHTTP(t, handler, http.MethodPost, EventsPath, "application/json", `{"schema_version":2}`, http.StatusBadRequest, "")
-	assertHTTP(t, handler, http.MethodPost, EventsPath, "", `{"schema_version":1}`, http.StatusBadRequest, "")
-	assertHTTP(t, handler, http.MethodPost, EventsPath, "application/json; charset=utf-8", `{"schema_version":1}`, http.StatusBadRequest, "")
+	assertHTTP(t, handler, http.MethodPost, EventsPath, "application/json", `{}`, http.StatusNoContent, "")
+	assertHTTP(t, handler, http.MethodPost, CheckPath, "application/json", `{}`, http.StatusAccepted, "{\"accepted\":true}\n")
+	assertHTTP(t, handler, http.MethodPost, EventsPath, "application/json", `{"extra":true}`, http.StatusBadRequest, "")
+	retiredVersion := `{"` + "schema_" + `version":1}`
+	assertHTTP(t, handler, http.MethodPost, EventsPath, "application/json", retiredVersion, http.StatusBadRequest, "")
+	assertHTTP(t, handler, http.MethodPost, EventsPath, "application/json", `[]`, http.StatusBadRequest, "")
+	assertHTTP(t, handler, http.MethodPost, EventsPath, "application/json", `null`, http.StatusBadRequest, "")
+	assertHTTP(t, handler, http.MethodPost, EventsPath, "", `{}`, http.StatusBadRequest, "")
+	assertHTTP(t, handler, http.MethodPost, EventsPath, "application/json; charset=utf-8", `{}`, http.StatusBadRequest, "")
 	assertHTTP(t, handler, http.MethodPost, EventsPath, "application/json", strings.Repeat(" ", config.EventMaxBytes+1), http.StatusBadRequest, "")
-	assertHTTP(t, handler, http.MethodPost, EventsPath, "application/json", `{"schema_version":1}`+strings.Repeat(" ", config.EventMaxBytes), http.StatusBadRequest, "")
+	assertHTTP(t, handler, http.MethodPost, EventsPath, "application/json", `{}`+strings.Repeat(" ", config.EventMaxBytes), http.StatusBadRequest, "")
 	assertHTTP(t, handler, http.MethodGet, HealthPath, "", "unexpected", http.StatusBadRequest, "")
 	assertHTTP(t, handler, http.MethodGet, StatusPath, "", "unexpected", http.StatusBadRequest, "")
 	assertHTTP(t, handler, http.MethodGet, EventsPath, "", "", http.StatusMethodNotAllowed, "")
@@ -430,13 +431,12 @@ func assertHTTP(t *testing.T, handler http.Handler, method, path, contentType, b
 	}
 	if wantStatus >= 400 {
 		var document struct {
-			SchemaVersion int `json:"schema_version"`
-			Error         struct {
+			Error struct {
 				Code    string `json:"code"`
 				Message string `json:"message"`
 			} `json:"error"`
 		}
-		if err := json.Unmarshal(response.Body.Bytes(), &document); err != nil || document.SchemaVersion != 1 || document.Error.Code == "" || document.Error.Message == "" {
+		if err := json.Unmarshal(response.Body.Bytes(), &document); err != nil || document.Error.Code == "" || document.Error.Message == "" {
 			t.Fatalf("%s %s error envelope = %#v/%v", method, path, document, err)
 		}
 	}
@@ -461,7 +461,7 @@ func workerConfig(names ...string) *config.Backup {
 	for _, name := range names {
 		targets = append(targets, config.Target{Name: name})
 	}
-	return &config.Backup{SchemaVersion: config.SchemaVersion, Targets: targets}
+	return &config.Backup{Targets: targets}
 }
 
 func syncResult(character byte, contentID string, created bool) restic.SyncResult {

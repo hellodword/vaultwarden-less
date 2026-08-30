@@ -20,8 +20,8 @@ import (
 )
 
 const (
-	logicalMagic = "vaultwarden-less-logical-v1\x00"
-	archiveMagic = "vaultwarden-less-archive-v1\x00"
+	logicalMagic = "vaultwarden-less-logical\x00"
+	archiveMagic = "vaultwarden-less-archive\x00"
 )
 
 func calculateContentID(ctx context.Context, databasePath, projectCommit string, files []File) (string, error) {
