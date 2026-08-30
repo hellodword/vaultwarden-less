@@ -202,6 +202,14 @@ type checkOutcome struct {
 	cancelled bool
 }
 
+const targetConcurrency = 2
+
+type targetAttempt struct {
+	result     restic.SyncResult
+	err        error
+	finishedAt time.Time
+}
+
 func (worker *Worker) check(ctx context.Context) checkOutcome {
 	var built snapshot.Manifest
 	for {
@@ -233,34 +241,35 @@ func (worker *Worker) check(ctx context.Context) checkOutcome {
 		}
 	}
 
-	targetNotifications := make([]notify.TargetStatus, 0, len(worker.config.Targets))
+	attempts, completed := worker.synchronizeTargets(ctx, built)
+	if !completed {
+		return checkOutcome{cancelled: true}
+	}
+	targetNotifications := make([]notify.TargetStatus, len(worker.config.Targets))
 	created := 0
 	succeeded := 0
 	failed := 0
 	for index, target := range worker.config.Targets {
-		attemptedAt := worker.clock.Now()
-		worker.recordTargetAttempt(index, attemptedAt)
-		targetContext, cancel := context.WithTimeout(ctx, config.TargetTimeout)
-		result, err := worker.ensure(targetContext, target, built)
-		cancel()
+		attempt := attempts[index]
+		result, err := attempt.result, attempt.err
 		if err == nil && !validSyncResult(result, built) {
 			err = fmt.Errorf("invalid target sync result")
 		}
 		if err != nil {
 			code := targetErrorCode(err)
-			worker.targetFailed(index, worker.clock.Now(), code)
-			targetNotifications = append(targetNotifications, notify.TargetStatus{Name: target.Name, State: "failed", ErrorCode: code})
+			worker.targetFailed(index, attempt.finishedAt, code)
+			targetNotifications[index] = notify.TargetStatus{Name: target.Name, State: "failed", ErrorCode: code}
 			worker.logFailure("target backup failed", code, target.Name)
 			failed++
 			continue
 		}
-		worker.targetSucceeded(index, worker.clock.Now(), result)
+		worker.targetSucceeded(index, attempt.finishedAt, result)
 		state := "synced"
 		if result.Created {
 			state = "created"
 			created++
 		}
-		targetNotifications = append(targetNotifications, notify.TargetStatus{Name: target.Name, State: state})
+		targetNotifications[index] = notify.TargetStatus{Name: target.Name, State: state}
 		succeeded++
 	}
 
@@ -280,6 +289,30 @@ func (worker *Worker) check(ctx context.Context) checkOutcome {
 		return checkOutcome{result: "partial", contentID: built.ContentID, archiveID: built.ArchiveID, errorCode: "target_failed", retry: true}
 	}
 	return checkOutcome{result: "failed", contentID: built.ContentID, archiveID: built.ArchiveID, errorCode: "all_targets_failed", retry: true}
+}
+
+func (worker *Worker) synchronizeTargets(ctx context.Context, built snapshot.Manifest) ([]targetAttempt, bool) {
+	attempts := make([]targetAttempt, len(worker.config.Targets))
+	semaphore := make(chan struct{}, targetConcurrency)
+	var wait sync.WaitGroup
+	for index, target := range worker.config.Targets {
+		select {
+		case semaphore <- struct{}{}:
+		case <-ctx.Done():
+			wait.Wait()
+			return nil, false
+		}
+		worker.recordTargetAttempt(index, worker.clock.Now())
+		wait.Go(func() {
+			defer func() { <-semaphore }()
+			targetContext, cancel := context.WithTimeout(ctx, config.TargetTimeout)
+			result, err := worker.ensure(targetContext, target, built)
+			cancel()
+			attempts[index] = targetAttempt{result: result, err: err, finishedAt: worker.clock.Now()}
+		})
+	}
+	wait.Wait()
+	return attempts, ctx.Err() == nil
 }
 
 func (worker *Worker) sourceFailed(now time.Time, code string) {

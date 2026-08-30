@@ -10,7 +10,7 @@ from pathlib import Path
 REPOSITORY = Path(__file__).resolve().parents[2]
 
 GROUPS = {
-    "development": {"check", "check-release", "release", "soak"},
+    "development": {"check", "check-release", "release"},
     "operations": {
         "up",
         "status",
@@ -52,17 +52,6 @@ DRY_RUNS = {
     "release": (
         ["/tmp/vaultwarden-less-release"],
         ['nix run .#release -- --output-root "$1"'],
-    ),
-    "soak": (
-        [],
-        [
-            (
-                "nix develop --command python3 scripts/verify_go_test.py --require "
-                "github.com/hellodword/vaultwarden-less/tests/e2e:TestMultiTargetSoak "
-                "-- go test -json ./tests/e2e -run '^TestMultiTargetSoak$' -count=1 "
-                "-timeout=50m -args -run-multitarget-soak-e2e"
-            )
-        ],
     ),
     "up": (
         [],
@@ -290,6 +279,18 @@ PRIVATE_DRY_RUNS = {
             )
         ],
     ),
+    "_integration-worker-timing": (
+        [],
+        [
+            (
+                "nix develop --command python3 scripts/verify_go_test.py --require "
+                "github.com/hellodword/vaultwarden-less/internal/worker:"
+                "TestWorkerAcceleratedTargetDegradationIntegration -- go test -json "
+                "./internal/worker -run '^TestWorkerAcceleratedTargetDegradationIntegration$' "
+                "-count=1 -timeout=5m -args -run-accelerated-worker-integration"
+            )
+        ],
+    ),
     "_e2e-backup": (
         [],
         [
@@ -339,17 +340,6 @@ PRIVATE_DRY_RUNS = {
                 "-count=1 -timeout=95m -args -run-upgrade-accept-e2e "
                 '-run-upgrade-rollback-e2e -upgrade-from-commit "$1" '
                 '-upgrade-to-commit "$2"'
-            )
-        ],
-    ),
-    "_e2e-soak": (
-        [],
-        [
-            (
-                "nix develop --command python3 scripts/verify_go_test.py --require "
-                "github.com/hellodword/vaultwarden-less/tests/e2e:TestMultiTargetSoak "
-                "-- go test -json ./tests/e2e -run '^TestMultiTargetSoak$' -count=1 "
-                "-timeout=50m -args -run-multitarget-soak-e2e"
             )
         ],
     ),
@@ -403,7 +393,7 @@ class JustfileContractTest(unittest.TestCase):
         recipes = self.document["recipes"]
         public = {name for name, recipe in recipes.items() if not recipe["private"]}
         self.assertEqual(public, set().union(*GROUPS.values()))
-        self.assertEqual(len(public), 15)
+        self.assertEqual(len(public), 14)
 
         for group, names in GROUPS.items():
             for name in names:
@@ -443,6 +433,7 @@ class JustfileContractTest(unittest.TestCase):
             "test",
             "vet",
             "lint",
+            "soak",
         }
         self.assertTrue(retired.isdisjoint(self.document["recipes"]))
 

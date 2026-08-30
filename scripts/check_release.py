@@ -19,6 +19,7 @@ GATES: tuple[tuple[str, ...], ...] = (
     ("just", "_security"),
     ("just", "_build"),
     ("just", "_integration"),
+    ("just", "_integration-worker-timing"),
     ("just", "_e2e-backup"),
     ("just", "_e2e-multitarget-fast"),
     ("just", "_e2e-import"),

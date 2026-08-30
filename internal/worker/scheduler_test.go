@@ -174,6 +174,59 @@ type orderedRepository struct {
 	release chan struct{}
 }
 
+type controlledRepository struct {
+	mu        sync.Mutex
+	active    int
+	maximum   int
+	started   chan string
+	release   map[string]chan struct{}
+	results   map[string]restic.SyncResult
+	errors    map[string]error
+	completed []string
+}
+
+func (repository *controlledRepository) Ensure(
+	ctx context.Context,
+	target config.Target,
+	manifest snapshot.Manifest,
+) (restic.SyncResult, error) {
+	repository.mu.Lock()
+	repository.active++
+	if repository.active > repository.maximum {
+		repository.maximum = repository.active
+	}
+	release := repository.release[target.Name]
+	repository.mu.Unlock()
+	repository.started <- target.Name
+	select {
+	case <-release:
+	case <-ctx.Done():
+		repository.mu.Lock()
+		repository.active--
+		repository.mu.Unlock()
+		return restic.SyncResult{}, ctx.Err()
+	}
+	repository.mu.Lock()
+	repository.active--
+	repository.completed = append(repository.completed, target.Name)
+	err := repository.errors[target.Name]
+	result := repository.results[target.Name]
+	repository.mu.Unlock()
+	if err != nil {
+		return restic.SyncResult{}, err
+	}
+	if result.ContentID == "" {
+		result.ContentID = manifest.ContentID
+	}
+	return result, nil
+}
+
+func (repository *controlledRepository) concurrency() (int, int) {
+	repository.mu.Lock()
+	defer repository.mu.Unlock()
+	return repository.active, repository.maximum
+}
+
 func (repository *orderedRepository) Ensure(ctx context.Context, target config.Target, manifest snapshot.Manifest) (restic.SyncResult, error) {
 	repository.mu.Lock()
 	repository.order = append(repository.order, target.Name)
@@ -273,26 +326,112 @@ func TestWorkerConsistencyFailureRetriesEveryThirtySeconds(t *testing.T) {
 	}
 }
 
-func TestWorkerTargetsAreSerialAndPartialResultRetries(t *testing.T) {
-	t.Parallel()
+func TestWorkerTargetsUseTwoSlotsAndPublishConfiguredOrder(t *testing.T) {
 	manifest := workerManifest(t)
-	repository := &orderedRepository{
-		results: map[string]restic.SyncResult{"primary": syncResult('a', manifest.ContentID, true)},
+	names := []string{"primary", "secondary", "tertiary", "quaternary"}
+	repository := &controlledRepository{
+		started: make(chan string, len(names)),
+		release: map[string]chan struct{}{},
+		results: map[string]restic.SyncResult{},
 		errors:  map[string]error{"secondary": &restic.OperationError{Code: "backup_failed"}},
+	}
+	for index, name := range names {
+		repository.release[name] = make(chan struct{})
+		repository.results[name] = syncResult(byte('a'+index), manifest.ContentID, index != 1)
 	}
 	collector := &eventCollector{}
 	source := &fixedSource{manifest: manifest}
-	worker := New(workerConfig("primary", "secondary"), source.Build, repository.Ensure, collector.Enqueue, discardLogger())
-	outcome := worker.check(context.Background())
+	worker := New(workerConfig(names...), source.Build, repository.Ensure, collector.Enqueue, discardLogger())
+	done := make(chan checkOutcome, 1)
+	go func() { done <- worker.check(context.Background()) }()
+
+	first := map[string]bool{waitTargetStart(t, repository.started): true, waitTargetStart(t, repository.started): true}
+	if !first["primary"] || !first["secondary"] || len(first) != 2 {
+		t.Fatalf("first two dispatched targets = %v", first)
+	}
+	status := worker.Status()
+	if status.Targets[0].LastAttemptAt == nil || status.Targets[1].LastAttemptAt == nil ||
+		status.Targets[2].LastAttemptAt != nil || status.Targets[3].LastAttemptAt != nil {
+		t.Fatalf("initial configured dispatch status = %#v", status.Targets)
+	}
+	close(repository.release["secondary"])
+	if next := waitTargetStart(t, repository.started); next != "tertiary" {
+		t.Fatalf("next target after a free slot = %q", next)
+	}
+	close(repository.release["primary"])
+	if next := waitTargetStart(t, repository.started); next != "quaternary" {
+		t.Fatalf("fourth dispatched target = %q", next)
+	}
+	close(repository.release["tertiary"])
+	close(repository.release["quaternary"])
+	outcome := <-done
 	if outcome.result != "partial" || !outcome.retry || outcome.errorCode != "target_failed" {
 		t.Fatalf("partial outcome = %#v", outcome)
 	}
-	if got := strings.Join(repository.order, ","); got != "primary,secondary" {
-		t.Fatalf("target order = %s", got)
+	if active, maximum := repository.concurrency(); active != 0 || maximum != targetConcurrency {
+		t.Fatalf("target concurrency active/maximum = %d/%d", active, maximum)
 	}
 	events := collector.snapshot()
-	if len(events) != 1 || events[0].Type != "recovery_point_created" || len(events[0].Targets) != 2 || events[0].Targets[1].State != "failed" {
+	if len(events) != 1 || events[0].Type != "recovery_point_created" || len(events[0].Targets) != len(names) {
 		t.Fatalf("recovery event = %#v", events)
+	}
+	for index, target := range events[0].Targets {
+		wantState := "created"
+		if index == 1 {
+			wantState = "failed"
+		}
+		if target.Name != names[index] || target.State != wantState {
+			t.Fatalf("ordered recovery event targets = %#v", events[0].Targets)
+		}
+	}
+}
+
+func TestWorkerCancellationStopsDispatchAndWaitsForBothTargets(t *testing.T) {
+	manifest := workerManifest(t)
+	names := []string{"primary", "secondary", "tertiary"}
+	repository := &controlledRepository{
+		started: make(chan string, len(names)), release: map[string]chan struct{}{},
+		results: map[string]restic.SyncResult{}, errors: map[string]error{},
+	}
+	for index, name := range names {
+		repository.release[name] = make(chan struct{})
+		repository.results[name] = syncResult(byte('a'+index), manifest.ContentID, true)
+	}
+	worker := New(workerConfig(names...), (&fixedSource{manifest: manifest}).Build, repository.Ensure, nil, discardLogger())
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan checkOutcome, 1)
+	go func() { done <- worker.check(ctx) }()
+	first := map[string]bool{waitTargetStart(t, repository.started): true, waitTargetStart(t, repository.started): true}
+	if !first["primary"] || !first["secondary"] || len(first) != 2 {
+		t.Fatalf("first two cancellation targets = %v", first)
+	}
+	cancel()
+	select {
+	case outcome := <-done:
+		if !outcome.cancelled {
+			t.Fatalf("cancelled outcome = %#v", outcome)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker did not wait for and join cancelled target operations")
+	}
+	if active, maximum := repository.concurrency(); active != 0 || maximum != targetConcurrency {
+		t.Fatalf("cancelled target concurrency active/maximum = %d/%d", active, maximum)
+	}
+	select {
+	case target := <-repository.started:
+		t.Fatalf("target %s started after cancellation", target)
+	default:
+	}
+}
+
+func waitTargetStart(t *testing.T, started <-chan string) string {
+	t.Helper()
+	select {
+	case target := <-started:
+		return target
+	case <-time.After(2 * time.Second):
+		t.Fatal("target operation did not start")
+		return ""
 	}
 }
 
@@ -363,7 +502,7 @@ func TestWorkerDegradedTransitionsOccurOnceAndRecoverOnce(t *testing.T) {
 	source, repository := &fixedSource{}, &orderedRepository{}
 	worker := New(workerConfig("primary"), source.Build, repository.Ensure, collector.Enqueue, discardLogger())
 	worker.targetFailed(0, base, "backup_failed")
-	worker.targetFailed(0, base.Add(config.DegradedAfter-time.Second), "backup_failed")
+	worker.targetFailed(0, base.Add(config.DegradedAfter-time.Millisecond), "backup_failed")
 	if got := len(collector.snapshot()); got != 0 {
 		t.Fatalf("events before degraded threshold = %d", got)
 	}

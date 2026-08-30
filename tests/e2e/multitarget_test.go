@@ -12,10 +12,7 @@ import (
 	productworker "github.com/hellodword/vaultwarden-less/internal/worker"
 )
 
-var (
-	runMultiTargetFastE2E = flag.Bool("run-multitarget-fast-e2e", false, "run the fast real multi-target catch-up lifecycle")
-	runMultiTargetSoakE2E = flag.Bool("run-multitarget-soak-e2e", false, "run the real 30-minute multi-target degradation soak")
-)
+var runMultiTargetFastE2E = flag.Bool("run-multitarget-fast-e2e", false, "run the fast real multi-target catch-up lifecycle")
 
 type multiTargetFixture struct {
 	t                 *testing.T
@@ -37,45 +34,6 @@ func TestMultiTargetFastCatchUp(t *testing.T) {
 	fixture := newMultiTargetFixture(t, 25*time.Minute)
 	primarySnapshots, secondarySnapshots := fixture.recoverSecondary()
 	fixture.verifyBothRestores(primarySnapshots, secondarySnapshots)
-}
-
-func TestMultiTargetSoak(t *testing.T) {
-	if !*runMultiTargetSoakE2E {
-		t.Skip("pass -run-multitarget-soak-e2e to run the real 30-minute multi-target degradation soak")
-	}
-	fixture := newMultiTargetFixture(t, 50*time.Minute)
-	degraded := waitMultiTargetStatus(t, fixture.harness, 37*time.Minute, func(status productworker.Status) bool {
-		primary, secondary := exactTwoTargets(t, status)
-		return status.State == "degraded" && primary.State == "healthy" &&
-			secondary.State == "degraded" && secondary.ErrorCode != nil
-	})
-	degradedPrimary, degradedSecondary := exactTwoTargets(t, degraded)
-	if degradedPrimary.SnapshotID == nil || *degradedPrimary.SnapshotID != fixture.primarySnapshotID ||
-		degradedSecondary.ErrorCode == nil || fixture.secondaryStatus.ErrorCode == nil ||
-		*degradedSecondary.ErrorCode != *fixture.secondaryStatus.ErrorCode {
-		t.Fatalf("degraded status changed the wrong target: %#v", degraded)
-	}
-	fixture.harness.waitNotificationContains(30*time.Second, "target secondary is degraded", *degradedSecondary.ErrorCode)
-	fixture.assertOneDegradedNotification()
-
-	// Observe one complete real retry interval after degradation. This is the
-	// wall-clock soak boundary: there is deliberately no product clock hook.
-	observationDeadline := time.Now().Add(6 * time.Minute)
-	for time.Now().Before(observationDeadline) {
-		primary, err := fixture.harness.targetSnapshots("primary")
-		if err != nil || len(primary.Snapshots) != 1 || primary.Snapshots[0].ID != fixture.primarySnapshotID ||
-			primary.Snapshots[0].ContentID != fixture.contentID {
-			t.Fatalf("soak created a duplicate primary snapshot: %#v/%v", primary, err)
-		}
-		select {
-		case <-fixture.ctx.Done():
-			t.Fatal(fixture.ctx.Err())
-		case <-time.After(15 * time.Second):
-		}
-	}
-	fixture.assertOneDegradedNotification()
-	fixture.recoverSecondary()
-	fixture.harness.waitNotificationContains(30*time.Second, "target secondary has recovered")
 }
 
 func newMultiTargetFixture(t *testing.T, timeout time.Duration) *multiTargetFixture {
@@ -201,22 +159,6 @@ func (fixture *multiTargetFixture) verifyBothRestores(primarySnapshots, secondar
 		fixture.t.Fatal("secondary target drill did not restore the source item")
 	}
 	fixture.harness.stopDrill()
-}
-
-func (fixture *multiTargetFixture) assertOneDegradedNotification() {
-	fixture.t.Helper()
-	fixture.harness.notificationMu.Lock()
-	messages := append([]string(nil), fixture.harness.notifications...)
-	fixture.harness.notificationMu.Unlock()
-	count := 0
-	for _, message := range messages {
-		if strings.Contains(message, "target secondary is degraded") {
-			count++
-		}
-	}
-	if count != 1 {
-		fixture.t.Fatalf("degraded notification count = %d, want 1", count)
-	}
 }
 
 const rejectingS3Endpoint = `from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer

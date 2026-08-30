@@ -21,10 +21,6 @@ check-release from_commit:
 release output_root:
     nix run .#release -- --output-root "$1"
 
-# Run only the real 30-minute multi-target degradation scenario.
-[group('development')]
-soak: _e2e-soak
-
 # Start the production topology only after both configuration roles pass.
 [group('operations')]
 up: _config-validate
@@ -127,6 +123,10 @@ _integration:
     nix develop --command python3 scripts/verify_go_test.py --require github.com/hellodword/vaultwarden-less/internal/restore:TestMotoResticIntegration -- go test -json ./internal/restore -run '^TestMotoResticIntegration$' -count=1 -timeout=20m -args -run-moto-integration
 
 [private]
+_integration-worker-timing:
+    nix develop --command python3 scripts/verify_go_test.py --require github.com/hellodword/vaultwarden-less/internal/worker:TestWorkerAcceleratedTargetDegradationIntegration -- go test -json ./internal/worker -run '^TestWorkerAcceleratedTargetDegradationIntegration$' -count=1 -timeout=5m -args -run-accelerated-worker-integration
+
+[private]
 _e2e-backup:
     nix develop --command python3 scripts/verify_go_test.py --require github.com/hellodword/vaultwarden-less/tests/e2e:TestBackupRestoreLifecycle -- go test -json ./tests/e2e -run '^TestBackupRestoreLifecycle$' -count=1 -timeout=30m -args -run-backup-e2e
 
@@ -141,10 +141,6 @@ _e2e-import:
 [private]
 _e2e-upgrade from_commit to_commit:
     nix develop --command python3 scripts/verify_go_test.py --require github.com/hellodword/vaultwarden-less/tests/e2e:TestUpgradeAcceptLifecycle --require github.com/hellodword/vaultwarden-less/tests/e2e:TestUpgradeRollbackLifecycle -- go test -json ./tests/e2e -run '^(TestUpgradeAcceptLifecycle|TestUpgradeRollbackLifecycle)$' -count=1 -timeout=95m -args -run-upgrade-accept-e2e -run-upgrade-rollback-e2e -upgrade-from-commit "$1" -upgrade-to-commit "$2"
-
-[private]
-_e2e-soak:
-    nix develop --command python3 scripts/verify_go_test.py --require github.com/hellodword/vaultwarden-less/tests/e2e:TestMultiTargetSoak -- go test -json ./tests/e2e -run '^TestMultiTargetSoak$' -count=1 -timeout=50m -args -run-multitarget-soak-e2e
 
 [private]
 _config-validate:
