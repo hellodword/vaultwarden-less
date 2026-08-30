@@ -22,31 +22,57 @@ func TestBackupRestoreLifecycle(t *testing.T) {
 	harness.startVaultwarden()
 
 	unique := time.Now().UnixNano()
-	email := fmt.Sprintf("vaultwarden-less-e2e-backup-%d@example.com", unique)
-	_ = registerAccount(ctx, t, harness.publicHTTP, email, testPassword)
-	client := newBitwardenCLI(
+	firstEmail := fmt.Sprintf("vaultwarden-less-e2e-backup-a-%d@example.com", unique)
+	secondEmail := fmt.Sprintf("vaultwarden-less-e2e-backup-b-%d@example.com", unique)
+	_ = registerAccount(ctx, t, harness.publicHTTP, firstEmail, testPassword)
+	_ = registerAccount(ctx, t, harness.publicHTTP, secondEmail, secondPassword)
+	firstClient := newBitwardenCLI(
 		t,
-		filepath.Join(harness.localRoot, "bw-backup"),
+		filepath.Join(harness.localRoot, "bw-backup-a"),
 		harness.publicTLS,
 		harness.tlsCAFile,
-		email,
+		firstEmail,
 	)
-	client.login(ctx)
-	itemID := client.createItem(ctx, "Recovery Login", initialItemPassword, "")
+	secondClient := newBitwardenCLIWithPassword(
+		t,
+		filepath.Join(harness.localRoot, "bw-backup-b"),
+		harness.publicTLS,
+		harness.tlsCAFile,
+		secondEmail,
+		secondPassword,
+	)
+	firstClient.login(ctx)
+	secondClient.login(ctx)
+	firstFolderID := firstClient.createFolder(ctx, "Recovery Folder A")
+	secondFolderID := secondClient.createFolder(ctx, "Recovery Folder B")
+	firstItemID := firstClient.createItem(ctx, "Recovery Login A", initialItemPassword, firstFolderID)
+	secondItemID := secondClient.createItem(ctx, "Recovery Login B", secondItemPassword, secondFolderID)
 
 	attachmentData := []byte("vaultwarden-less attachment\nwith a stable payload\n")
 	if len(attachmentData) > 4<<10 {
 		t.Fatal("attachment fixture exceeds the bounded scenario contract")
 	}
 	attachmentPath := privateTestPath(t, harness.localRoot, "attachment.txt", attachmentData)
-	attachmentID := client.createAttachment(ctx, itemID, attachmentPath)
+	attachmentID := firstClient.createAttachment(ctx, firstItemID, attachmentPath)
 
 	sendData := bytes.Repeat([]byte("vaultwarden-less file Send payload\n"), 512)
 	if len(sendData) > 32<<10 {
 		t.Fatal("Send fixture exceeds the bounded scenario contract")
 	}
 	sendPath := privateTestPath(t, harness.localRoot, "send.bin", sendData)
-	sendID := client.createFileSend(ctx, sendPath, "Recovery Send")
+	sendID := firstClient.createFileSend(ctx, sendPath, "Recovery Send")
+
+	limitedSendData := bytes.Repeat([]byte("vaultwarden-less exhausted Send payload\n"), 128)
+	limitedSendPath := privateTestPath(t, harness.localRoot, "limited-send.bin", limitedSendData)
+	limitedSendID := secondClient.createFileSendWithLimit(ctx, limitedSendPath, "Exhausted Recovery Send", 1)
+	consumedLimitedSend := filepath.Join(harness.localRoot, "consumed-limited-send.bin")
+	secondClient.getFileSend(ctx, limitedSendID, consumedLimitedSend)
+	assertFileContent(t, consumedLimitedSend, limitedSendData)
+	secondClient.expectFileSendExhausted(
+		ctx,
+		limitedSendID,
+		filepath.Join(harness.localRoot, "unexpected-second-limited-send.bin"),
+	)
 
 	harness.startBackup()
 	firstSnapshots := harness.waitSnapshotCount(1, 4*time.Minute)
@@ -56,9 +82,9 @@ func TestBackupRestoreLifecycle(t *testing.T) {
 	}
 	harness.startProxy()
 
-	updated := client.getItem(ctx, itemID)
+	updated := firstClient.getItem(ctx, firstItemID)
 	setItemPassword(t, updated, newItemPassword)
-	client.editItem(ctx, itemID, updated)
+	firstClient.editItem(ctx, firstItemID, updated)
 	secondSnapshots := harness.waitSnapshotCount(2, 7*time.Minute)
 	latestSnapshot := secondSnapshots.Snapshots[0]
 	if latestSnapshot.ContentID == firstSnapshot.ContentID {
@@ -73,25 +99,49 @@ func TestBackupRestoreLifecycle(t *testing.T) {
 	}
 	harness.stopProduction()
 	harness.startDrill("drill")
-	client.expectSyncFailure(ctx)
+	firstClient.expectSyncFailure(ctx)
+	secondClient.expectSyncFailure(ctx)
 
-	restored := newBitwardenCLI(
+	restoredFirst := newBitwardenCLI(
 		t,
-		filepath.Join(harness.localRoot, "bw-restored"),
+		filepath.Join(harness.localRoot, "bw-restored-a"),
 		harness.publicTLS,
 		harness.tlsCAFile,
-		email,
+		firstEmail,
 	)
-	restored.login(ctx)
-	if itemPassword(t, restored.getItem(ctx, itemID)) != newItemPassword {
+	restoredSecond := newBitwardenCLIWithPassword(
+		t,
+		filepath.Join(harness.localRoot, "bw-restored-b"),
+		harness.publicTLS,
+		harness.tlsCAFile,
+		secondEmail,
+		secondPassword,
+	)
+	restoredFirst.login(ctx)
+	restoredSecond.login(ctx)
+	firstItem := restoredFirst.getItem(ctx, firstItemID)
+	if itemPassword(t, firstItem) != newItemPassword || stringValue(firstItem["folderId"]) != firstFolderID {
 		t.Fatal("latest login generation did not survive restore")
 	}
+	secondItem := restoredSecond.getItem(ctx, secondItemID)
+	if itemPassword(t, secondItem) != secondItemPassword || stringValue(secondItem["folderId"]) != secondFolderID {
+		t.Fatal("second user's independent folder item did not survive restore")
+	}
+	if stringValue(restoredFirst.getFolder(ctx, firstFolderID)["name"]) != "Recovery Folder A" ||
+		stringValue(restoredSecond.getFolder(ctx, secondFolderID)["name"]) != "Recovery Folder B" {
+		t.Fatal("independent user folders did not survive restore")
+	}
 	restoredAttachment := filepath.Join(harness.localRoot, "restored-attachment.txt")
-	restored.getAttachment(ctx, attachmentID, itemID, restoredAttachment)
+	restoredFirst.getAttachment(ctx, attachmentID, firstItemID, restoredAttachment)
 	assertFileContent(t, restoredAttachment, attachmentData)
 	restoredSend := filepath.Join(harness.localRoot, "restored-send.bin")
-	restored.getFileSend(ctx, sendID, restoredSend)
+	restoredFirst.getFileSend(ctx, sendID, restoredSend)
 	assertFileContent(t, restoredSend, sendData)
+	restoredSecond.expectFileSendExhausted(
+		ctx,
+		limitedSendID,
+		filepath.Join(harness.localRoot, "unexpected-restored-limited-send.bin"),
+	)
 	harness.stopDrill()
 }
 

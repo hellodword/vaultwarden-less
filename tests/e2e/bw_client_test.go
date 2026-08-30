@@ -27,8 +27,11 @@ type bitwardenCLI struct {
 }
 
 func newBitwardenCLI(t *testing.T, appdata, server, caFile, email string) *bitwardenCLI {
+	return newBitwardenCLIWithPassword(t, appdata, server, caFile, email, testPassword)
+}
+
+func newBitwardenCLIWithPassword(t *testing.T, appdata, server, caFile, email, password string) *bitwardenCLI {
 	t.Helper()
-	password := testPassword
 	path, err := exec.LookPath("bw")
 	if err != nil {
 		t.Fatal(err)
@@ -129,6 +132,14 @@ func (client *bitwardenCLI) createItem(ctx context.Context, name, password, fold
 		"fields": []any{}, "secureNote": nil, "card": nil,
 	}
 	return client.createEncodedObject(ctx, "item", item)
+}
+
+func (client *bitwardenCLI) createFolder(ctx context.Context, name string) string {
+	return client.createEncodedObject(ctx, "folder", map[string]any{"name": name})
+}
+
+func (client *bitwardenCLI) getFolder(ctx context.Context, id string) map[string]any {
+	return decodeJSONObject(client.t, client.run(ctx, nil, "--raw", "get", "folder", id), "folder")
 }
 
 func (client *bitwardenCLI) createEncodedObject(ctx context.Context, objectType string, object map[string]any) string {

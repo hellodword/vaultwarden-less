@@ -165,6 +165,7 @@ func TestMotoResticIntegration(t *testing.T) {
 		if _, err := snapshot.Verify(ctx, latestOutput); err != nil {
 			t.Fatal(err)
 		}
+		assertSyntheticOrganizationFixture(t, filepath.Join(latestOutput, "db.sqlite3"))
 		explicitOutput := filepath.Join(restoreRoot, "explicit-earlier")
 		explicit, err := restoretool.Run(ctx, runner, restoretool.Request{Target: target, SnapshotID: firstSync.SnapshotID, Output: explicitOutput, RestoreRoot: restoreRoot})
 		if err != nil || explicit.ContentID != first.ContentID {

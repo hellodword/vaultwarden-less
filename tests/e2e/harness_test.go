@@ -37,6 +37,7 @@ const (
 	initialItemPassword      = "initial-e2e-item-password"
 	newItemPassword          = "new-e2e-item-password"
 	secondPassword           = "second-user-password"
+	secondItemPassword       = "second-user-item-password"
 	organizationItemPassword = "organization-item-password"
 )
 
@@ -921,6 +922,7 @@ func harnessDiagnostics(value string) string {
 		initialItemPassword,
 		newItemPassword,
 		secondPassword,
+		secondItemPassword,
 		organizationItemPassword,
 		"e2e-restic-password",
 		"BW_SESSION",

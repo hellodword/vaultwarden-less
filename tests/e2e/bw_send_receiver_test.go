@@ -53,6 +53,24 @@ func (client *bitwardenCLI) getFileSend(ctx context.Context, id, output string) 
 	}
 }
 
+func (client *bitwardenCLI) expectFileSendExhausted(ctx context.Context, id, output string) {
+	client.t.Helper()
+	sendURL := client.fileSendURL(ctx, id)
+	receiver := newBitwardenSendReceiver(client.t, ctx, client.server, client.caFile)
+	stdout, diagnostics, err := receiver.tryReceive(ctx, sendURL, output, false)
+	if err == nil {
+		client.t.Fatal("access-limited file Send remained available after exhaustion")
+	}
+	if _, statError := os.Lstat(output); !os.IsNotExist(statError) {
+		client.t.Fatalf("exhausted file Send published output: %v", statError)
+	}
+	redacted := string(stdout) + "\n" + diagnostics
+	redacted = strings.ReplaceAll(redacted, sendURL, "<redacted-send-url>")
+	if containsSecret(redacted, client.password, client.session) {
+		client.t.Fatal("exhausted file Send diagnostics exposed a secret")
+	}
+}
+
 func newBitwardenSendReceiver(
 	t *testing.T, ctx context.Context, server, caFile string,
 ) *bitwardenSendReceiver {

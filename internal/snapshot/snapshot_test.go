@@ -23,10 +23,15 @@ import (
 )
 
 const (
-	testCipherID      = "11111111-1111-4111-8111-111111111111"
-	testAttachmentID  = "0123456789abcdefabcd"
-	testSendID        = "22222222-2222-4222-8222-222222222222"
-	testProjectCommit = "0123456789abcdef0123456789abcdef01234567"
+	testCipherID             = "11111111-1111-4111-8111-111111111111"
+	testAttachmentID         = "0123456789abcdefabcd"
+	testSendID               = "22222222-2222-4222-8222-222222222222"
+	testUserID               = "44444444-4444-4444-8444-444444444444"
+	testOrganizationID       = "55555555-5555-4555-8555-555555555555"
+	testMembershipID         = "66666666-6666-4666-8666-666666666666"
+	testCollectionID         = "77777777-7777-4777-8777-777777777777"
+	testOrganizationCipherID = "88888888-8888-4888-8888-888888888888"
+	testProjectCommit        = "0123456789abcdef0123456789abcdef01234567"
 )
 
 var testSendFileID = strings.Repeat("b", 64)
@@ -72,7 +77,19 @@ func syntheticData(t *testing.T, includeFiles bool) fixture {
 		args  []any
 	}{
 		{"INSERT INTO __diesel_schema_migrations(version, run_on) VALUES (?, '2026-05-05')", []any{contract.DatabaseMigration}},
-		{"INSERT INTO ciphers(uuid, created_at, updated_at, atype, name, data) VALUES (?, '2026-05-05', '2026-05-05', 2, 'cipher', '{}')", []any{testCipherID}},
+		{`INSERT INTO users(
+			uuid, created_at, updated_at, email, name, password_hash, salt,
+			password_iterations, akey, security_stamp, equivalent_domains, excluded_globals
+		) VALUES (?, '2026-05-05', '2026-05-05', 'member@example.test', 'member', x'01', x'02', 600000, 'user-key', 'stamp', '[]', '[]')`, []any{testUserID}},
+		{"INSERT INTO organizations(uuid, name, billing_email) VALUES (?, 'Synthetic Organization', 'billing@example.test')", []any{testOrganizationID}},
+		{`INSERT INTO users_organizations(
+			uuid, user_uuid, org_uuid, access_all, akey, status, atype
+		) VALUES (?, ?, ?, 0, 'membership-key', 2, 2)`, []any{testMembershipID, testUserID, testOrganizationID}},
+		{"INSERT INTO collections(uuid, org_uuid, name) VALUES (?, ?, 'Synthetic Collection')", []any{testCollectionID, testOrganizationID}},
+		{"INSERT INTO users_collections(user_uuid, collection_uuid, read_only, hide_passwords, manage) VALUES (?, ?, 0, 0, 1)", []any{testUserID, testCollectionID}},
+		{"INSERT INTO ciphers(uuid, created_at, updated_at, user_uuid, atype, name, data) VALUES (?, '2026-05-05', '2026-05-05', ?, 2, 'cipher', '{}')", []any{testCipherID, testUserID}},
+		{"INSERT INTO ciphers(uuid, created_at, updated_at, organization_uuid, atype, name, data) VALUES (?, '2026-05-05', '2026-05-05', ?, 2, 'organization cipher', '{}')", []any{testOrganizationCipherID, testOrganizationID}},
+		{"INSERT INTO ciphers_collections(cipher_uuid, collection_uuid) VALUES (?, ?)", []any{testOrganizationCipherID, testCollectionID}},
 		{"INSERT INTO attachments(id, cipher_uuid, file_name, file_size) VALUES (?, ?, 'encrypted', ?)", []any{testAttachmentID, testCipherID, len(attachmentData)}},
 		{`INSERT INTO sends(
 			uuid, name, atype, data, akey, access_count, creation_date,
@@ -183,6 +200,42 @@ func buildFixture(t *testing.T, dataDir string) (Manifest, string) {
 	return manifest, filepath.Join(stagingDir, "point")
 }
 
+func assertOrganizationFixture(t *testing.T, databasePath string) {
+	t.Helper()
+	database, err := sql.Open("sqlite3", "file:"+databasePath+"?mode=ro")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = database.Close() }()
+	var email, organization, collection, cipher string
+	var accessAll, manage bool
+	err = database.QueryRow(`SELECT
+		u.email, o.name, c.name, i.name, uo.access_all, uc.manage
+		FROM users_organizations AS uo
+		JOIN users AS u ON u.uuid = uo.user_uuid
+		JOIN organizations AS o ON o.uuid = uo.org_uuid
+		JOIN collections AS c ON c.org_uuid = o.uuid
+		JOIN users_collections AS uc
+			ON uc.user_uuid = u.uuid AND uc.collection_uuid = c.uuid
+		JOIN ciphers_collections AS cc ON cc.collection_uuid = c.uuid
+		JOIN ciphers AS i
+			ON i.uuid = cc.cipher_uuid AND i.organization_uuid = o.uuid
+		WHERE uo.uuid = ?`, testMembershipID).Scan(
+		&email, &organization, &collection, &cipher, &accessAll, &manage,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if email != "member@example.test" || organization != "Synthetic Organization" ||
+		collection != "Synthetic Collection" || cipher != "organization cipher" ||
+		accessAll || !manage {
+		t.Fatalf(
+			"organization relationship fixture = %q/%q/%q/%q/%t/%t",
+			email, organization, collection, cipher, accessAll, manage,
+		)
+	}
+}
+
 func rewriteManifest(t *testing.T, point string, mutate func(*Manifest)) {
 	t.Helper()
 	path := filepath.Join(point, "manifest.json")
@@ -230,6 +283,7 @@ func TestBuilderCreatesAndVerifiesExactRecoverySet(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	assertOrganizationFixture(t, filepath.Join(point, "db.sqlite3"))
 	paths := make([]string, 0, len(verified.Files))
 	for _, file := range verified.Files {
 		paths = append(paths, file.Path)
@@ -408,7 +462,7 @@ func TestCanonicalPrimitiveEncodingGoldenBytes(t *testing.T) {
 func TestCanonicalFullStreamGoldenDigest(t *testing.T) {
 	data := syntheticData(t, true)
 	manifest, _ := buildFixture(t, data.dataDir)
-	const want = "sha256:17a2af62d4430695e0f257f6cb1954a65847d00709d62599e6bd6aacc26bdcfd"
+	const want = "sha256:baa6784dc9d46674f0d5f08a72d4535f048f5a3f35bc6467230d158ea29234d5"
 	if manifest.ContentID != want {
 		t.Fatalf("canonical content ID = %s, want %s", manifest.ContentID, want)
 	}
