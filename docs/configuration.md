@@ -70,7 +70,6 @@ publish either port directly on an untrusted interface.
 upgrade, and optional notifiers:
 
 ```yaml
-schema_version: 1
 upgrade_verification_targets:
   - primary
 targets:
@@ -85,16 +84,17 @@ notifiers:
 ```
 
 Target names use lowercase letters, digits, and hyphens and begin with a
-letter. Target order is semantic: backup and maintenance run serially in that
-order. Each option is a separate name/value pair so arguments are passed to
-Restic without shell interpretation. Repository and option values are never
-logged.
+letter. Target order is semantic. Resident synchronization dispatches in that
+order with at most two targets in flight, then reports results and notifications
+in the same order; one target failure does not cancel another. Upgrade
+verification is serial. Each option is a separate name/value pair so arguments
+are passed to Restic without shell interpretation. Repository and option values
+are never logged.
 
 For two repositories, add the second target and its independent password and
 role credentials:
 
 ```yaml
-schema_version: 1
 upgrade_verification_targets:
   - primary
   - secondary
@@ -122,7 +122,6 @@ still attempts every configured target regardless of this subset.
 schema and must contain exactly the configured target keys:
 
 ```yaml
-schema_version: 1
 targets:
   primary:
     environment:
@@ -158,11 +157,10 @@ coordinated configuration change.
 
 ## Notifiers
 
-The only supported notifier type is WeCom/WeChat Work. For a configured
-notifier, `credentials/notifiers.yaml` contains the matching key exactly:
+Supported notifier types are `wechat` and `bark`. For a configured WeCom/WeChat
+Work notifier, `credentials/notifiers.yaml` contains the matching key exactly:
 
 ```yaml
-schema_version: 1
 notifiers:
   operations:
     webhook_url: https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=replace-me
@@ -177,9 +175,14 @@ notifiers: []
 
 ```yaml
 # credentials/notifiers.yaml
-schema_version: 1
 notifiers: {}
 ```
+
+A Bark notifier uses exactly `device_token`, a PKCS#8 P-256 `auth_key`,
+`key_id`, `team_id`, `topic`, and optional `sound`. Keep the multiline private
+key only in the private credential file; use the tracked example as the field
+shape and replace every placeholder. The configured notifier names and the
+credential keys must agree exactly.
 
 Notifier delivery is bounded and best effort. It reports safe target names,
 stable codes, and shortened digests; it is not durable backup evidence. Protect

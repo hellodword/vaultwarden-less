@@ -46,6 +46,27 @@ a separate claim available only when the actual Vaultwarden versions differ
 and the complete scenario runs with both. Neither claim covers substituted or
 independently upgraded components outside the project-managed set.
 
+## First versionless release from a legacy deployment
+
+The first versionless release is not an ordinary A/B upgrade. B must not read,
+convert, or infer meaning from legacy project configuration, state, manifests,
+snapshot tags, or repositories. Use the documented
+[one-time external SQLite import](operations.md#one-time-external-sqlite-import)
+with all legacy services stopped, a fresh `DEPLOYMENT_ROOT`, a fresh Restic
+repository prefix, and B-created configuration and state. Copy only the stopped
+legacy Vaultwarden raw data into `import/source`; B validates and imports it as
+external data, rotates RSA identity, verifies the official-client path, and
+creates new B recovery evidence.
+
+Retain the complete legacy commit, images, root, data, and repositories as the
+rollback boundary. Before traffic moves to B, recovery is to stop the isolated
+B attempt and restart the intact legacy deployment. After traffic moves, keep
+the legacy boundary until B backup, restore, drill, client, and observation
+evidence has been accepted under a separately authorized production plan.
+Neither the product nor this runbook deletes it. Automated C→B acceptance proves
+the versionless state machine; an isolated synthetic L→B rehearsal proves the
+raw-data procedure. Neither performs or authorizes a production cutover.
+
 ## Production command surface
 
 The production interface is the raw Docker Compose and product-CLI sequence

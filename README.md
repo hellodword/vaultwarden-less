@@ -106,21 +106,22 @@ Development, release creation, and automated acceptance use the pinned Nix
 environment. Do not install project tools globally.
 
 ```sh
-nix develop --command just --list
-nix develop --command just check
-nix develop --command just check-release <A-full-commit>
-nix develop --command just soak
-nix develop --command just release <ignored-output-root>
+just --list
+just check
+just check-release <A-full-commit>
+just release <A-full-commit> <previously-absent-ignored-output-directory>
 ```
 
-`check` is the daily format, ordinary-test, vet, lint, and flake gate; it does
-not run full-tree race or real container scenarios. `check-release` requires a
-distinct clean A commit and clean HEAD B, then runs the full-tree race,
-vulnerability/product/integration checks, lean backup, fast multi-target,
-initial-import, and both A/B upgrade lifecycles. `soak` is the separate real
-30-minute multi-target degradation gate. Cold-host and same-commit release
-reproducibility remain conditional acceptance procedures rather than daily
-commands.
+`check` is the daily flake gate for formatting, ordinary tests, vet, lint,
+scripts, contracts, and pinned toolchain wiring. `check-release` requires a
+distinct clean A commit and clean HEAD B, then runs full-tree race and coverage,
+vulnerability and product checks, real Moto/Restic and recovery lifecycles, the
+accelerated worker threshold, two repositories, initial import, and the two
+A/B terminal paths. It writes exact private candidate evidence. `release`
+requires that evidence, independently builds the three images twice, verifies
+their bytes, labels, entrypoints, references, and upstream versions through a
+standard image load, and creates a previously absent two-file output. Cold-host
+and real-provider acceptance remain separately recorded operational evidence.
 
 ## Documentation map
 

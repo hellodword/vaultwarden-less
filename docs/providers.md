@@ -7,6 +7,11 @@ binary. The examples below use Restic's
 Confirm the current provider documentation, account, region, bucket, prefix,
 and key scope before initializing a repository.
 
+Every provider recipe in this document is a configuration starting point, not
+an acceptance claim. Its result remains `unverified` until the exact account,
+endpoint, roles, project release, Restic round trip, prune preview, and drill
+are recorded in the form below. Moto never substitutes for this provider run.
+
 ## Common contract
 
 For each target, put the repository and options in `config/backup.yaml`:
@@ -254,21 +259,62 @@ different from expiring current objects by age. Verify the exact rule with a
 disposable repository and do not let either lifecycle or lock settings
 invalidate Restic's own retention and pruning model.
 
-## Provider acceptance
+## Provider acceptance evidence form
 
 Configuration validation proves syntax, modes, ownership, and role isolation;
-it does not contact the provider. Before production use, run this sequence for
-each target with both roles where applicable:
+it does not contact the provider. Complete one copy of this eight-step form per
+target and per material provider-policy change. Store no secret, token, Restic
+password, or personal data in the evidence. Keep the completed record in its
+authorized private evidence system because the exact account, endpoint, bucket,
+and prefix may themselves be operationally sensitive.
 
-1. initialize a known-empty dedicated prefix;
-2. create at least two real recovery snapshots with changed Vaultwarden data;
-3. list bounded snapshots and run `repo check`;
-4. preview the fixed prune set without applying it;
-5. restore latest and one explicit earlier full snapshot ID;
-6. start an isolated drill and verify data with fresh sessions;
-7. rotate each role key and repeat validation plus a real repository action;
-8. document provider-side lock/lifecycle settings and repeat after any change.
+```yaml
+provider_acceptance:
+  1_provider_identity:
+    provider: <official-provider-name>
+    account: <exact-account-id-or-unambiguous-reviewed-alias>
+  2_location_and_endpoint:
+    region: <exact-signing-or-provider-region>
+    endpoint: <exact-provider-endpoint>
+  3_repository_scope:
+    bucket: <exact-dedicated-bucket>
+    prefix: <exact-dedicated-prefix>
+  4_credential_roles:
+    backup_role: <non-secret-key-or-role-alias>
+    maintenance_role: <different-non-secret-key-or-role-alias>
+    least_privilege_review: unverified
+  5_product_identity:
+    project_commit: <full-lowercase-commit>
+    release: <exact-immutable-release>
+  6_round_trip:
+    init: unverified
+    write_changed_points: unverified
+    list: unverified
+    check: unverified
+    restore_latest_and_explicit: unverified
+    isolated_drill: unverified
+  7_prune_preview:
+    command_result: unverified
+    reviewed_retained_and_removed_ids: unverified
+    apply_performed: false
+  8_attestation:
+    date_utc: <YYYY-MM-DD>
+    operator: <non-secret-operator-id>
+    result: unverified
+    evidence_reference: <ignored-or-external-non-secret-record>
+```
 
-Provider dashboards and successful uploads are not enough. The acceptance fact
-is a verified Restic round trip and drill using the exact production endpoint,
-credentials, password, prefix, and policy.
+For step 6, initialize only a known-empty dedicated prefix, write at least two
+points with changed Vaultwarden data, list bounded snapshots, run `repo check`,
+restore latest and one explicit earlier full ID, and complete an isolated drill
+with fresh sessions and exact data checks. Step 7 is always a non-destructive
+preview first; applying prune is a separate authorized operation and is not
+required merely to fill the preview result. Exercise both roles where their
+permissions apply, and repeat after credential, endpoint, lifecycle, lock, or
+material IAM changes.
+
+Set the final result to `passed` only when every required field was observed on
+that exact provider boundary and the drill passed. Use `failed` for an attempted
+failure and `unverified` whenever it was not actually run or evidence is
+incomplete. Provider dashboards, successful uploads, local emulation, Compose
+rendering, and Moto are not a provider acceptance result.

@@ -250,9 +250,9 @@ docker compose --env-file .env --file compose.yml --profile maintenance run --rm
 
 The fixed retention is within 24 hours, 48 hourly, 14 daily, 8 weekly, 12
 monthly, and 3 yearly snapshots. Selection is limited to this product's exact
-host, path, schema, project, content, and archive identity. Provider lifecycle
-rules must not independently expire active Restic objects. Object lock may make
-unlock or prune fail; see [Storage providers](providers.md).
+host, path, project commit, content identity, and archive identity. Provider
+lifecycle rules must not independently expire active Restic objects. Object
+lock may make unlock or prune fail; see [Storage providers](providers.md).
 
 ## Verified restore
 
@@ -419,16 +419,21 @@ outage or revoke production credentials without exact authorization.
    `content_id` with their own verified snapshots.
 3. Make only the secondary target unavailable through the controlled test
    mechanism, create another change, and request a backup.
-4. Prove the primary succeeds, the secondary retries, and after 30 minutes the
-   worker reports partial/degraded rather than complete success.
+4. Prove the primary succeeds while the secondary reports retrying and the
+   worker reports partial rather than complete success. Use the release gate's
+   exact-boundary fake-clock test and accelerated real-adapter test as the
+   degradation-threshold evidence; do not turn a wall-clock observation into a
+   stronger timing claim.
 5. Restore secondary access without changing source data. The worker must
    catch that target up to the same latest `content_id`.
 6. Run `repo check`, latest restore, and drill from each target. Do not accept
    equality based only on snapshot count or timestamp.
 
-Targets execute serially, so a slow first target delays later targets. Catch-up
-stores the newest verified point; it does not synthesize every missed
-intermediate state.
+The resident worker dispatches in configuration order with at most two target
+operations in flight, then publishes results and notifications in configuration
+order. A slow target occupies one slot but does not erase another target's
+result. Catch-up stores the newest verified point; it does not synthesize every
+missed intermediate state.
 
 ## Cold deployment acceptance
 

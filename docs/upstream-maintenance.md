@@ -1,8 +1,9 @@
 # Upstream maintenance
 
 Upstream changes are deliberate, one-component reviews. The goal is not to
-follow the newest tag; it is to preserve the implemented schema-1 behavior with
-auditable evidence, exact inputs, a small diff, and a complete rollback path.
+follow the newest tag; it is to preserve the implemented versionless behavior
+with auditable evidence, exact inputs, a small diff, and a complete rollback
+path.
 
 An upstream candidate is outside the project's compatibility and support scope
 until a reviewed project commit locks it, records it in the audited inventory,
@@ -28,7 +29,7 @@ Start from a clean branch at a passing commit:
 
 ```sh
 git status --short --branch
-nix develop --command just check
+just check
 nix develop --command go test -race ./... -count=1
 nix develop --command govulncheck ./...
 nix build --no-link .#backup .#proxy .#backup-image .#proxy-image .#vaultwarden-image .#moto-image
@@ -215,34 +216,32 @@ Run focused tests first, then the complete fast release-candidate gate from a
 distinct clean prior A commit to clean HEAD B:
 
 ```sh
-nix develop --command just check-release <A-full-commit>
+just check-release <A-full-commit>
 ```
 
-This runs daily checks, full-tree race, `govulncheck`, all products,
-Moto/Restic integration, lean backup, fast multi-target, initial import, and
-both A/B upgrade cases. Required-test JSON must prove run/PASS and package PASS
-with no skip/fail for every real scenario. It intentionally excludes soak,
-cold-host acceptance, and same-commit reproducibility.
-
-Run the real 30-minute gate when worker timing, retries, notifications,
-multi-target behavior, or a dependency on those boundaries changes:
-
-```sh
-nix develop --command just soak
-```
+This runs the ordinary flake checks, full-tree race and coverage,
+`govulncheck`, all products, Moto/Restic integration, full recovery, accelerated
+target-threshold evidence, two repositories, initial import, and both A/B
+terminal cases. Required-test JSON must prove run/PASS and package PASS with no
+skip/fail for every real scenario. Exact fake-clock boundaries and the
+accelerated real Restic/HTTPS-adapter test replace a wall-clock waiting claim;
+the production clock has no test override. The gate intentionally excludes
+cold-host and real-provider acceptance.
 
 When Nix image composition, entrypoints, labels, or release logic changes,
-generate the release twice from the same exact clean commit into two previously
-absent ignored roots:
+generate the release from the checked exact A/B pair into one previously absent
+ignored root:
 
 ```sh
-nix develop --command just release <first-ignored-output-root>
-nix develop --command just release <second-ignored-output-root>
+just release <A-full-commit> <previously-absent-ignored-output-root>
 ```
 
-Require byte-identical `images.tar.gz` and `SHA256SUMS`, successful checksum and
-standard `docker image load`, exactly six references for three image IDs,
-matching OCI labels, no Moto image, and the actual expected upstream versions.
+The release command itself performs two independent builds and requires their
+image archive bytes to match before publication. Require successful checksum
+and standard `docker image load`, exactly six references for three image IDs,
+matching OCI labels and entrypoints, no Moto image, the actual expected upstream
+versions, exact candidate binding, canonical artifact evidence, and only
+`images.tar.gz` plus `SHA256SUMS` in the output.
 Repeat the archive-only cold deployment acceptance in
 [Operations](operations.md) when Compose, image entrypoints, permissions, bind
 paths, directory exchange, or deployment orchestration changes. Record a

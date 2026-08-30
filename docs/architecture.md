@@ -1,8 +1,8 @@
 # Architecture
 
 This document explains the implemented system shape. Exact fields, limits,
-paths, JSON, and failure codes are normative only in
-[the schema 1 contracts](contracts.md).
+paths, JSON, and failure codes are normative only in the
+[product contracts](contracts.md).
 
 ## Dataflow
 
@@ -24,7 +24,7 @@ trusted TLS and header-cleaning edge
                                                  |
                                                  | verified manifest + identities
                                                  v
-                                      Restic target 1, then target 2, ...
+                                      Restic targets (maximum two in flight)
 ```
 
 The proxy is transparent: it forwards root-path traffic and emits one bounded
@@ -40,10 +40,13 @@ attachments and file-Send payloads. A changing, missing, unsafe, or unexpected
 file prevents publication. Staging is disposable; Restic snapshots are the
 durable recovery record.
 
-Targets execute serially in configuration order. A target can be degraded
-while another succeeds. When a failed target returns, it catches up to the
-newest verified recovery point; the product does not invent intermediate
-points that were never stored there.
+Resident synchronization dispatches configured targets in order with at most
+two operations in flight. It collects every result and publishes status and
+notifications in configuration order. A target can be degraded while another
+succeeds; cancellation joins all started work. When a failed target returns,
+it catches up to the newest verified recovery point, and the product does not
+invent intermediate points that were never stored there. Upgrade repository
+verification remains deliberately serial.
 
 ## Network boundaries
 
@@ -66,21 +69,28 @@ published, all on loopback and never simultaneously as ordinary serving paths.
 
 ## Filesystem and identity boundaries
 
-The deployment directory is both the ordinary Git clone and the root of
-ignored private/runtime state:
+The source checkout and deployment root are separate ownership boundaries. The
+checkout contains tracked code, public templates, Compose files, documentation,
+and one ignored `.env` selector:
 
 ```text
-.env                         exact deployment identity and ports
-config/                      private product and Vaultwarden configuration
-credentials/                 isolated backup/maintenance/notifier/password inputs
-data/                        live Vaultwarden data
-import/                      immutable import copy and disposable candidate
-staging/                     disposable recovery-point construction
-cache/                       disposable Restic cache
-restore/                     verified, operator-named restore outputs
-state/                       active deployment identity and workflow evidence
-dist/                        ignored release output
-tmp/                         ignored task output
+<checkout>/
+  .env                       five Compose-owned deployment values
+  compose.yml
+  compose.upgrade.yml
+  config/*.example*
+  credentials/*.example*
+  docs/
+
+<DEPLOYMENT_ROOT>/
+  config/                    private product and Vaultwarden configuration
+  credentials/               isolated role/notifier/password inputs
+  data/                      live Vaultwarden data
+  import/                    immutable import copy and disposable candidate
+  staging/                   disposable recovery-point construction
+  cache/                     disposable Restic cache
+  restore/                   verified, operator-named restore outputs
+  state/                     active identity and workflow evidence
 ```
 
 Private directories are mode `0700`; private files are mode `0600`; both are
@@ -103,9 +113,9 @@ state plus frozen rollback evidence without gaining a `/data` mount; roles that
 open data additionally validate the live data filesystem device. Upgrade,
 rollback, drill, and import use explicit Compose argv
 and their narrower durable workflow evidence; no mode is inferred from tags or
-the presence of a database. The host-side Python orchestrator owns only
-structured Docker argv, exact image/runtime verification, drill cleanup, and
-resumption; Go remains the sole owner of decisions and data-state transitions.
+the presence of a database. Operators execute the documented raw Compose
+terminal sequence. Go owns every decision and durable data-state transition;
+Compose owns process start, stop, health inspection, and explicit cleanup.
 
 Role credentials are intentionally duplicated and checked independently:
 
@@ -130,11 +140,13 @@ Each point has two independent identities:
 - `archive_id` covers the exact recovery-tree entries and bytes that Restic
   stores.
 
-The manifest records both IDs, the full clean product commit, and the creation
-instant. Restic snapshots repeat schema, project, content, and archive identity
-as tags. Backup can reuse an existing snapshot only after all of those facts
-agree; restore recomputes and checks them all. This separates semantic equality
-from exact archive equality and prevents a tag alone from authorizing recovery.
+The manifest records both IDs, the full clean product commit, and the exact
+sorted file set. Restic snapshots repeat project, content, and archive identity
+as tags; their timestamp is Restic metadata rather than a field in the recovery
+manifest. Backup can reuse an existing snapshot only after all owned identity
+facts agree, and restore recomputes and checks them all. This separates
+semantic equality from exact archive equality and prevents a tag alone from
+authorizing recovery.
 
 The recovery closure contains the copied database and only the attachment and
 file-Send payloads referenced by it. It excludes RSA keys, SQLite sidecars,
@@ -225,12 +237,12 @@ Vaultwarden generates the new identity.
 The networkless non-root deployment-admin sees the deployment root because
 Linux can atomically exchange `data` and `import/candidate` only through one
 common mount. Its code treats source as immutable, validates it again across
-every boundary, and has no container-engine socket. The host Python
-orchestrator owns only candidate stop/removal, structured Compose argv, exact
-normal image/health verification, and finalize resumption. A decision is made
-only in Go. Before decision cancel removes only disposable state; after
-decision the only legal direction is accept/start/finalize. The empty exchanged
-candidate is the only data directory finalize may remove.
+every boundary, and has no container-engine socket. The documented terminal
+sequence explicitly stops/removes the candidate, verifies normal image and
+health state, and resumes finalize; none of those host operations invent a Go
+decision. Before decision, cancel removes only disposable state. After decision
+the only legal direction is accept/start/finalize. The empty exchanged candidate
+is the only data directory finalize may remove.
 
 ## Failure semantics
 

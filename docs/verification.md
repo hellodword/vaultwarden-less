@@ -1,372 +1,250 @@
 # Verification evidence and acceptance
 
-The project separates fast/static evidence, built products, real container
-boundaries, upgrade A/B evidence, deterministic release evidence, and an
-archive-only cold deployment. A later layer does not retroactively turn an
-earlier skipped or static check into a real pass.
+Verification is layered. A static check, a compiled opt-in test, a local S3
+emulator, a release build, and a real provider drill prove different things.
+Skipped or unrun work is `unverified`; a non-triggered conditional boundary is
+`not applicable`. Neither may be reported as passed.
 
-All project commands run in the pinned Nix environment:
+## Public command surface
 
-```sh
-nix develop --command just --list
-```
-
-## Fast gate
+Run development commands from the repository root with the pinned Nix tooling
+available:
 
 ```sh
-nix develop --command just check
+just --list
+just check
+just check-release <A-full-commit>
+just release <A-full-commit> <previously-absent-ignored-output-directory>
 ```
 
-`check` runs:
+`just --list` exposes exactly `check`, `check-release`, and `release`.
+Deployment hosts do not need any of them; production operations use the raw
+Compose commands in [Operations](operations.md).
 
-- repository formatting verification;
-- every ordinary Go test and all seven Python/Just contract-test files;
-- `go vet`, GolangCI-Lint, Ruff lint, and Ruff formatting checks;
-- all declared flake checks, including package/toolchain, Compose contract,
-  recovery projection, script set, and formatting boundaries.
-
-It deliberately does not run full-tree race, `govulncheck`, product image
-builds outside declared flake checks, or any real Docker E2E. Those belong to
-the release-candidate layer.
-
-External Go tests compile during ordinary `go test`, but their first action
-checks an explicit runtime flag and skips before Docker lookup, image work,
-ports, or network access. A green `check` therefore proves the skip-safe test
-packages compile; it does not prove a real container scenario ran.
-
-The unit suites include strict configuration/YAML/private-path validation,
-fixed environment isolation, Restic JSON/framing/redaction/cancellation,
-SQLite online backup during concurrent WAL writes, complete schema and
-projection validation, canonical content and archive identities, stable-copy
-races, exact restore verification, proxy event policy, worker retry/degraded
-state, import source/WAL/exchange/resumption, upgrade state/tamper/idempotency,
-deterministic crypto vectors, and pure
-port boundaries.
-
-## Release-candidate race, security, and products
+## Ordinary flake gate
 
 ```sh
-nix develop --command go test -race ./... -count=1
-nix develop --command govulncheck ./...
-nix build --no-link .#backup .#proxy .#backup-image .#proxy-image .#vaultwarden-image .#moto-image
+just check
 ```
 
-The public `check-release <A-full-commit>` gate runs these after `check`.
-Full-tree race is release evidence, not a daily cost. `govulncheck ./...` is a
-reachability scan using the locked Go toolchain; it does not claim a complete
-container, operating-system, JavaScript, provider, or supply-chain
-vulnerability inventory.
+This is exactly one `nix flake check`. Its declared checks own:
 
-The product command builds both public binaries plus backup, proxy,
-Vaultwarden, and test-only Moto images. The Vaultwarden gate remains
-image-internal rather than a public flake package. A build proves Nix can
-realize the declared products from locked inputs; it does not start them or
-prove their deployment configuration.
+- repository formatting;
+- ordinary full-package Go tests, `go vet`, and GolangCI-Lint;
+- Ruff lint and formatting plus all Python contract tests;
+- the upstream inventory, complete Vaultwarden schema, recovery projection,
+  durable script set, and pinned toolchain wiring.
 
-## Required-test verifier
+Ordinary Go execution compiles opt-in real tests, but those tests skip before
+Docker, image, port, or network work unless their explicit test-only flag is
+present. A green ordinary gate therefore does not claim any real container
+scenario, full-tree race run, vulnerability scan, or cloud-provider behavior.
 
-Every real Go scenario is run with `go test -json` through
-`scripts/verify_go_test.py`. The verifier requires the exact
-`<package>:<top-level-test>` identity and accepts it only after:
-
-1. the required test emits `run`;
-2. it emits `pass`, never `skip` or `fail`;
-3. the exact package later emits `pass`;
-4. the subprocess exits zero;
-5. every input line is valid Go test JSON in the required order.
-
-A shell exit code, similarly named test in another package, subtest-only pass,
-malformed output, or missing final package pass is rejected. Successful output
-includes one explicit `go test verification passed: ...` line.
-The verifier checks the event stream, not whether child argv contains the
-literal token `-json`: project recipes use `go test -json`, while the
-repository-external runner may supply the equivalent locked
-`go tool test2json` stream.
-
-## Moto/Restic integration
+## Exact release-candidate gate
 
 ```sh
-nix develop --command python3 scripts/verify_go_test.py \
-  --require github.com/hellodword/vaultwarden-less/internal/restore:TestMotoResticIntegration \
-  -- go test -json ./internal/restore -run '^TestMotoResticIntegration$' \
-  -count=1 -timeout=20m -args -run-moto-integration
+just check-release <A-full-commit>
 ```
 
-Required identity:
+A must be one full lowercase commit that resolves exactly, HEAD is B, A and B
+must differ, and the whole worktree including untracked files must remain clean.
+The fixed gate order is:
 
-```text
-github.com/hellodword/vaultwarden-less/internal/restore:TestMotoResticIntegration
-```
+1. `nix flake check`;
+2. full-tree `go test -race ./... -count=1`;
+3. full-tree `go test -cover ./...` with no coverage threshold;
+4. `govulncheck ./...`;
+5. both binaries and all four production/test images;
+6. the real Moto/Restic integration;
+7. the full backup/restore/drill lifecycle;
+8. the accelerated worker degradation boundary;
+9. the two-repository failure/catch-up lifecycle;
+10. the initial external-data import lifecycle;
+11. both terminal A/B paths.
 
-This uses the Nix-built Restic executable and locally built pinned Moto image.
-It proves real S3 HTTP, bucket/repository initialization with exact Restic
-format 2, changed backups, content deduplication, bounded listing, repository
-check/unlock, latest and explicit restore, complete recovery-tree verification,
-no-overwrite behavior, corrupt-latest refusal without fallback, controlled
-fixed-retention preview/apply sets, out-of-scope preservation, and final
-repository check. No product path invokes `restic migrate`.
+The check stops at the first failure, revalidates the unchanged clean pair, and
+atomically writes canonical mode-`0600` evidence to
+`tmp/release-evidence/<A>..<B>/candidate.json`. That ignored document binds
+the exact pair, timestamps, ordered gate allowlist, and passed result. Its
+normative fields and gate names are in [Product contracts](contracts.md).
 
-Moto proves the product/Restic/S3 protocol boundary. It does not prove AWS,
-R2, COS, OSS, Scaleway, or B2 production behavior, IAM, throttling, object lock,
-lifecycle, durability, billing, or regional outage behavior.
+### Required-test proof
 
-## Ordinary backup, restore, and drill lifecycle
+Every opt-in Go scenario runs through `scripts/verify_go_test.py` with a
+`go test -json` stream. A required top-level test is accepted only when the
+stream contains its `run`, then `pass`, never `skip` or `fail`, followed
+by the exact package `pass`, and the subprocess exits zero. Malformed JSON,
+a same-named test in another package, a subtest-only pass, or a missing package
+result is a failure.
 
-```sh
-nix develop --command python3 scripts/verify_go_test.py \
-  --require github.com/hellodword/vaultwarden-less/tests/e2e:TestBackupRestoreLifecycle \
-  -- go test -json ./tests/e2e -run '^TestBackupRestoreLifecycle$' \
-  -count=1 -timeout=30m -args -run-backup-e2e
-```
+## Real scenario boundaries
 
-Required identity:
+### Moto and Restic
 
-```text
-github.com/hellodword/vaultwarden-less/tests/e2e:TestBackupRestoreLifecycle
-```
+`TestMotoResticIntegration` uses the pinned Restic executable and locally
+built pinned Moto image. It exercises S3 HTTP, dedicated format-2 repository
+initialization, changed backups, content reuse, bounded listing, check/unlock,
+latest and explicit restore, complete recovery verification, no-overwrite and
+corrupt-latest refusal, fixed prune preview/apply, preservation of out-of-scope
+objects, and a final repository check.
 
-The scenario uses the exact audited Vaultwarden image, project proxy/worker,
-Moto, pinned Restic, and exact Nix Bitwarden CLI. A narrow protocol fixture
-performs only account registration, which the CLI does not expose; all later
-vault operations use the real CLI.
+Moto proves the product/Restic/S3 protocol boundary only. It does not prove a
+cloud vendor's IAM, endpoint, throttling, lifecycle, lock, durability, billing,
+or regional behavior. Each real provider remains `unverified` until its
+[provider evidence form](providers.md#provider-acceptance-evidence-form) is
+completed with the production-shaped account, endpoint, prefix, roles, and
+drill.
 
-It proves:
+### Backup, restore, and drill
 
-1. one synthetic user, one login, one attachment no larger than 4 KiB, and one
-   file Send no larger than 32 KiB;
-2. a first verified recovery point, then one login update and a second logical
-   generation with a different content identity;
-3. a real repository check and latest restore whose snapshot/content/archive
-   identities match the newest point;
-4. an isolated drill in which the pre-recovery session fails, a fresh official
-   CLI login succeeds, the updated login is present, and attachment/Send bytes
-   match exactly;
-5. task-scoped containers, networks, volumes, credentials, appdata, and
-   temporary outputs are removed.
+`TestBackupRestoreLifecycle` uses the exact project images, pinned Vaultwarden,
+Restic, Moto, and Bitwarden CLI. A narrow registration fixture creates two
+synthetic accounts because the CLI cannot register them; later vault operations
+use the real CLI. The scenario proves:
 
-This proves the exercised API/CLI paths for the exact project-managed and
-audited component set. It is not a full Vaultwarden feature test, browser UI
-test, email/push test, production TLS edge test, or evidence for a substituted
-Vaultwarden or Bitwarden CLI version.
+- independent folders and items for both users, including a later generation;
+- an ordinary file Send and an access-limited file Send whose exhausted state
+  remains exhausted after recovery;
+- exact attachment and Send bytes;
+- changed content/archive identities, repository check, and latest restore;
+- an isolated drill where both pre-recovery sessions fail and both fresh logins
+  succeed;
+- organization, membership, collection, organization-item, user-collection,
+  and cipher-collection relationships in the recovery closure;
+- cleanup of only scenario-owned containers, networks, volumes, credentials,
+  client state, and temporary outputs.
 
-## Initial SQLite import lifecycle
+This is not browser, email, push, production TLS-edge, or arbitrary upstream
+compatibility evidence. A real organization invitation remains a manual drill.
 
-The release-candidate gate runs the focused scenario equivalently to:
+### Worker timing and two repositories
 
-```sh
-nix develop --command python3 scripts/verify_go_test.py \
-  --require github.com/hellodword/vaultwarden-less/tests/e2e:TestInitialImportLifecycle \
-  -- go test -json ./tests/e2e -run '^TestInitialImportLifecycle$' -args -run-import-e2e
-```
+`TestWorkerAcceleratedTargetDegradationIntegration` joins a real local
+format-2 Restic repository and the HTTPS notification adapter to the
+test-injected clock. Unit boundaries prove that `29:59.999` of continuous
+failure is not degraded and `30:00.000` is degraded, with one degradation
+notification, no duplicate on another failure, and one recovery notification.
+The clock injection is not reachable through a production flag or environment
+variable.
 
-Required identity:
+`TestMultiTargetFastCatchUp` uses two independently initialized real
+Moto/Restic repositories and a controlled failing adapter. The healthy target
+stores the point while the other reports partial/retrying; restoration catches
+the failed target up to the same latest content without another source change.
+Both repositories then pass check, exact restore, and an isolated client drill.
+This short test proves container/network/adapter behavior without claiming a
+real wall-clock wait or a cloud outage.
 
-```text
-github.com/hellodword/vaultwarden-less/tests/e2e:TestInitialImportLifecycle
-```
+Resident synchronization has at most two targets in flight and publishes
+results in configuration order. Focused race tests cover four-target dispatch,
+failure isolation, cancellation, join, and deterministic result/notification
+ordering.
 
-The scenario uses the exact clean production images, current pinned
-Vaultwarden, Moto/Restic, the official pinned `bw` CLI, and a test-owned HTTPS
-edge. It creates one external stopped source with a real login, a small
-attachment, a small file Send, the old RSA identity, and a committed persistent
-WAL marker. It then proves:
+### Initial import
 
-1. prepare leaves the external/project source tree byte-identical, absorbs the
-   WAL transaction through Online Backup, and leaves no candidate sidecar or
-   old RSA file;
-2. the import gate starts only the candidate on loopback, the old official-CLI
-   session fails after RSA rotation, and a new login through HTTPS reads the
-   login, attachment, and Send exactly;
-3. missing client confirmation and accept-before-verification fail with the
-   exact structured codes;
-4. stopped-candidate verification records real client confirmation, the
-   audited migration/schema and snapshot closure, private modes, no sidecars,
-   and a different RSA digest;
-5. terminal accept atomically promotes the verified tree, starts the exact
-   normal three-service runtime, finalizes history, and an exact rerun reports
-   `already_complete`;
-6. source remains unchanged through finalize, the newly authenticated session
-   survives promotion, the old session remains invalid, and another fresh
-   normal HTTPS login reads every test object byte-for-byte;
-7. only the scenario's Compose resources, credentials, client stores, and
-   temporary trees are removed.
+`TestInitialImportLifecycle` creates a stopped synthetic external Vaultwarden
+tree with committed WAL state, attachment, file Send, and old RSA identity. It
+proves immutable-source preparation, Online Backup WAL absorption, exclusion
+and rotation of RSA/sidecars, candidate-only startup, old-session rejection,
+fresh official-client verification, strict confirmation before accept, the
+single same-filesystem exchange, exact normal three-service startup, durable
+history, finalization, and source preservation.
 
-This is evidence for the fixed initial-import contract and current pinned
-Vaultwarden migration boundary. It does not authorize importing a live source,
-merging into active data, substituting another upstream version, or deleting
-the external original.
+It does not authorize importing a live source, merging into nonempty data,
+recognizing legacy project state, deleting the original, or performing a real
+production cutover.
 
-## Two-repository fast catch-up and soak
+### Upgrade and rollback
 
-The release-candidate fast case runs equivalently to:
+`TestUpgradeAcceptLifecycle` runs A-owned prepare/freeze, B migration,
+repository evidence and drill, records the immutable accept decision, interrupts
+before host service completion, and resumes to healthy exact B services and
+history while retaining A images.
 
-```sh
-nix develop --command python3 scripts/verify_go_test.py \
-  --require github.com/hellodword/vaultwarden-less/tests/e2e:TestMultiTargetFastCatchUp \
-  -- go test -json ./tests/e2e -run '^TestMultiTargetFastCatchUp$' \
-  -count=1 -timeout=25m -args -run-multitarget-fast-e2e
-```
+`TestUpgradeRollbackLifecycle` reaches verified B, invalidates the final
+drill/accept boundary, records rollback, interrupts during the frozen-tree
+exchange, and resumes to exact A data/RSA/service identity with B quarantined.
+Focused statefile and domain tests own the other write, permission, tamper,
+conflict, cleanup, finalize, and restart boundaries.
 
-It uses two independently initialized real Moto/Restic repositories and a
-test-only deterministic 403 endpoint. Primary creates the point while
-secondary reports partial/retrying; removal of the exact adapter and restoration
-of the real secondary catches up the same content ID without another source
-mutation. Both repositories must pass check and exact restore, and both restore
-trees must pass an isolated official-client drill. There is no degradation
-wait in this fast case.
-
-The separate conditional wall-clock gate is:
-
-```sh
-nix develop --command just soak
-```
-
-Required identity:
-
-```text
-github.com/hellodword/vaultwarden-less/tests/e2e:TestMultiTargetSoak
-```
-
-The soak holds the secondary failure for at least 30 real minutes, requires the
-retrying-to-degraded transition, exactly one degraded notification, a healthy
-primary with no duplicate logical snapshot through another full retry
-interval, then restores and catches up secondary. It has no product clock hook
-and is never part of `check` or `check-release`.
-
-Neither case proves cross-provider consistency or a cloud vendor's outage
-behavior. Repeat the controlled procedure on production-like targets before
-acceptance.
-
-## Upgrade and rollback lifecycle
-
-```sh
-nix develop --command just check-release <A-full-commit>
-```
-
-The clean current HEAD is B. The final release-candidate phase requires both:
-
-```text
-github.com/hellodword/vaultwarden-less/tests/e2e:TestUpgradeAcceptLifecycle
-github.com/hellodword/vaultwarden-less/tests/e2e:TestUpgradeRollbackLifecycle
-```
-
-Both commits must be clean schema-1 products with deterministic immutable
-releases. The accept case runs A-owned prepare/freeze, B migration/evidence and
-healthy drill, writes the accept decision, simulates an interruption before
-host service orchestration, then resumes to exact healthy B services, history,
-retained immutable A images, client data, and an `already_complete` replay.
-The rollback case reaches verified B, corrupts the final drill/accept boundary,
-writes rollback and exchanges the frozen tree, simulates an interruption before
-active A publication, then resumes to exact A RSA/data/service identity,
-quarantined B, fresh client verification, and an `already_complete` replay.
-The focused Go/Python fault matrix owns the remaining decision, active write,
-service start, cleanup, finalize, conflict, tamper, permission, and restart
-boundaries without repeating costly full lifecycles.
-
-The tests inspect actual Vaultwarden and Restic versions inside both immutable
-image sets. Equal Vaultwarden versions record the cross-version claim as not
-applicable while preserving complete exact-pair orchestration evidence.
-Different Vaultwarden versions permit an exact-pair claim only after both
-cases pass. Equal Restic versions similarly make its matrix not applicable;
-different versions additionally require A format-2 init/write, B
-list/check/restore/write, and A list/check/restore of B's point. No result
-extends to a component version or image outside the project-managed pair.
-
-## Release-candidate gate
-
-```sh
-nix develop --command just check-release <A-full-commit>
-```
-
-The argument must be one full lowercase A commit. HEAD is B; A and B must be
-different complete commits, and the worktree including untracked files must be
-clean before and after. The gate is exactly: daily `check`, full-tree race,
-`govulncheck`, all production images/binaries plus Moto, Moto/Restic
-integration, lean backup, fast multi-target, initial import, and finally both
-A/B upgrade cases. It stops on the first failure and emits one schema-1 success
-document only after revalidating the unchanged pair.
-
-The gate intentionally excludes the 30-minute soak, archive-only cold-host
-acceptance, and same-commit double release. Run those separately when their
-documented conditions trigger; never describe a non-triggered condition as a
-pass.
-
-Optional nonzero real-test ports are loopback-only, canonical decimal
-`1024..65535`, and must differ inside one scenario. Omit them to use ephemeral
-ports. A test must never publish a verification endpoint publicly.
+The two project commits may carry the same actual Vaultwarden version; that
+still proves orchestration for the exact managed pair. A cross-version claim is
+allowed only when the image-reported versions differ and both complete paths
+pass. Restic follows the independent exact-pair rule documented in
+[Upstream maintenance](upstream-maintenance.md). No gate invokes repository
+format migration.
 
 ## Deterministic release
 
-Release creation requires an exact clean commit and a previously absent output
-directory:
+After the candidate gate passes:
 
 ```sh
-nix develop --command just release <ignored-output-root>
+just release <A-full-commit> <previously-absent-ignored-output-directory>
 ```
 
-Acceptance requires:
+Release creation revalidates the exact private candidate evidence and clean
+HEAD B, builds each production image twice independently, requires byte-identical
+image archives, standard-loads the result, and verifies:
 
-- exactly `images.tar.gz` and `SHA256SUMS`;
-- checksum verification and direct standard `docker image load`;
-- exactly six production references, no Moto reference, and three distinct
-  image IDs with local/immutable pairs;
-- OCI revision, version, and created labels derived from the clean commit;
-- expected wrapper entrypoints and actual audited upstream versions;
-- byte-identical outputs from two builds of the same commit and inputs;
-- atomic refusal to overwrite an existing output and no half-release on
-  failure.
+- exactly six local/immutable references for three distinct image IDs;
+- exact OCI revision, release, and commit-derived creation labels;
+- exact project entrypoints and audited Vaultwarden/Restic versions;
+- no Moto reference;
+- exactly `images.tar.gz` and `SHA256SUMS` in the new output;
+- checksum success, no replacement of an existing output, and task-only cleanup
+  on failure.
 
-The release has no bundle manifest, source archive, SBOM, license archive,
-registry reference, or generated deployment tree. `NOTICE.md` describes the
-project's actual provenance boundary without claiming those absent artifacts.
+Canonical `artifact.json` is atomically written beside candidate evidence and
+binds its hash, output hashes, references, image IDs, labels, entrypoints,
+upstream versions, and successful standard-load check. The release contains no
+source bundle, deployment tree, registry reference, SBOM, or license archive.
 
-## Archive-only cold acceptance
+External verification uses ordinary tools:
 
-Run [the cold deployment procedure](operations.md#cold-deployment-acceptance)
-on an ordinary isolated Linux/amd64 host. Deployment operations there use only
-Git, Docker Engine, Compose, the tracked clone, and the two-file archive—no Nix,
-Go, Python, Restic installation, source-derived helper, or hidden generated
-deployment tree.
+```sh
+(cd <output-directory> && sha256sum --check SHA256SUMS)
+gzip --decompress --stdout <output-directory>/images.tar.gz | docker image load
+find <output-directory> -mindepth 1 -maxdepth 1 -printf '%f\n' | sort
+```
 
-Acceptance includes exact clone/release identity, private-copy modes, standard
-image load, both role checks, production startup, real client data, durable
-backup across a full service restart, latest and earlier restore, data and
-session-invalidation checks in a drill, two-target degradation/catch-up, and
-zero acceptance-owned resources afterward.
+The final command must list only `SHA256SUMS` and `images.tar.gz`.
 
-An external normal Bitwarden client may act as the data verifier; it is not a
-dependency installed on the deployment host. The operator deployment steps
-must remain executable from the documentation without reading Go/Nix source.
+## Conditional operational evidence
+
+Archive-only cold-host acceptance, each real cloud provider, and an actual
+production L→B cutover are separate boundaries. Run only in an isolated,
+authorized environment using [Operations](operations.md), [Providers](providers.md),
+and the first-release section of [Upgrades](upgrades.md). Record exact
+commit/release, commands, timestamps, identities, client facts, rollback facts,
+and task-resource cleanup. If a boundary was not actually run, record
+`unverified`; never promote Moto, Compose rendering, a health check, or a
+framework test into that result.
+
+An isolated synthetic L→B rehearsal uses a fresh deployment root and repository
+prefix, imports only a stopped raw Vaultwarden data copy, retains all legacy
+assets, rejects old sessions, proves two fresh users/data, then proves new B
+backup, restore, drill, and rollback. It must never teach B to decode legacy
+project state or snapshots.
 
 ## Documentation and contract audit
 
 Before final acceptance:
 
-- validate every tracked relative Markdown link and every documented file,
-  service, profile, command, flag, and output against the current tree;
-- render all Compose profiles and the upgrade overlay with ignored private
-  fixtures;
-- prove `scripts/` contains exactly the six documented durable Python scripts,
-  `tests/scripts/` contains their six same-named contract tests plus the Just
-  contract test, and each has a live command/test reference;
-- prove `just --list` exposes exactly the documented 18 names and three groups,
-  every other recipe is private, and every public/private dry-run argv matches
-  its contract;
-- search for obsolete schema, bundle, generated deployment, patch, command,
-  test, and compatibility terminology;
-- scan tracked content and the full diff for credentials, private addresses,
-  runtime artifacts, databases, captures, logs, and task paths;
-- run formatting, focused docs/static checks, and the final full gates from the
-  exact clean commit being accepted.
+- validate tracked relative Markdown links and every documented file, service,
+  profile, command, flag, and output against the tree;
+- render all Compose profiles and the upgrade overlay with ignored synthetic
+  private fixtures;
+- prove `scripts/` contains the five durable Python tools and
+  `tests/scripts/` their five matching tests plus `test_justfile.py`;
+- prove the Just allowlist is exactly three recipes and their final argv matches;
+- search for retired project-version markers, command names, checkout-relative
+  private paths, host orchestration, hidden generated deployment trees, and
+  stale timing claims;
+- scan the diff and tracked content for secrets, private addresses, databases,
+  logs, captures, runtime artifacts, and task paths;
+- run focused checks before the complete clean-commit gates.
 
-## Evidence discipline
-
-For every command record its exact invocation, start/end time, exit status,
-required-test and package result, cleanup state, and failure classification.
-On failure, rerun the narrowest command and classify it as introduced,
-pre-existing, or environment-caused before using a safe alternate path.
-
-Do not mark a gate complete because the framework exists, a package compiled,
-a test skipped, static Compose rendered, a subprocess exited without required
-events, or cleanup merely appeared likely. Known boundaries—especially real
-provider behavior and distinct-version A/B—remain explicit until actually run.
+For every failure record the exact command, timing, result, narrow rerun, and
+`introduced`, `pre-existing`, or `environment-caused` classification.
+Compilation, skipped scenarios, framework existence, or likely cleanup are
+never substitutes for observed required-test and package passes.
