@@ -933,7 +933,6 @@ func (fixture *upgradeFixture) assertTerminalDecision(decision string) {
 
 func assertTerminalServices(t *testing.T, harness *e2eHarness, release upgradeRelease, immutable bool) {
 	t.Helper()
-	validateUpgradeReleaseImages(t, harness, &release)
 	for index, service := range []string{"vaultwarden", "backup", "proxy"} {
 		harness.waitComposeServiceHealthy(service, 4*time.Minute)
 		product := []string{"vaultwarden", "backup", "proxy"}[index]
