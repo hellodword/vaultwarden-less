@@ -17,6 +17,8 @@ const (
 	EventsPath = "/events"
 	CheckPath  = "/checks"
 	StatusPath = "/status"
+
+	NoBackupTargetsMessage = "No backup targets are configured; Vaultwarden data is not being backed up"
 )
 
 type acceptedResponse struct {
@@ -66,11 +68,16 @@ func Handler(worker *Worker) http.Handler {
 				writeError(writer, failure.status, failure.code, failure.message)
 				return
 			}
-			worker.Request()
 			if request.URL.Path == EventsPath {
+				worker.Request()
 				writer.WriteHeader(http.StatusNoContent)
 				return
 			}
+			if worker.targetless() {
+				writeError(writer, http.StatusServiceUnavailable, "not_ready", NoBackupTargetsMessage)
+				return
+			}
+			worker.Request()
 			writeJSON(writer, http.StatusAccepted, acceptedResponse{Accepted: true})
 		default:
 			writeError(writer, http.StatusNotFound, "usage_error", "Endpoint not found")

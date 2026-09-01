@@ -156,6 +156,7 @@ class ReleaseCheckTest(unittest.TestCase):
                 "go-coverage",
                 "govulncheck",
                 "products",
+                "targetless-deployment",
                 "moto-restic",
             ],
         )
@@ -185,6 +186,7 @@ class ReleaseCheckTest(unittest.TestCase):
                 "go-coverage",
                 "govulncheck",
                 "products",
+                "targetless-deployment",
                 "moto-restic",
                 "backup-restore-drill",
                 "multitarget-threshold",

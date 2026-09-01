@@ -3,11 +3,16 @@ package e2e_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	productworker "github.com/hellodword/vaultwarden-less/internal/worker"
 )
 
 func TestBackupRestoreLifecycle(t *testing.T) {
@@ -143,6 +148,169 @@ func TestBackupRestoreLifecycle(t *testing.T) {
 		filepath.Join(harness.localRoot, "unexpected-restored-limited-send.bin"),
 	)
 	harness.stopDrill()
+}
+
+func TestTargetlessDeploymentLifecycle(t *testing.T) {
+	if !*runBackupE2E {
+		t.Skip("pass -run-backup-e2e to run the targetless deployment lifecycle")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
+	defer cancel()
+	harness := newTargetlessE2EHarness(t, ctx)
+
+	for _, role := range []string{"backup", "maintenance"} {
+		output := harness.compose(
+			"--profile", "maintenance", "run", "--rm", "--no-deps", "config-check-"+role,
+		)
+		var result struct {
+			Valid   bool     `json:"valid"`
+			Role    string   `json:"role"`
+			Targets []string `json:"targets"`
+		}
+		if err := decodeExactJSON(output, &result); err != nil || !result.Valid || result.Role != role || result.Targets == nil || len(result.Targets) != 0 {
+			t.Fatalf("targetless %s config validation = %#v/%v: %s", role, result, err, harnessDiagnostics(output))
+		}
+	}
+	if entries, err := os.ReadDir(filepath.Join(harness.localRoot, "credentials", "restic")); err != nil || len(entries) != 0 {
+		t.Fatalf("targetless Restic password directory = %#v/%v", entries, err)
+	}
+	harness.initializeDeployment()
+	harness.startVaultwarden()
+	harness.startBackup()
+	harness.startProxy()
+	for _, service := range []string{"moto-primary", "moto-secondary"} {
+		output, err := harness.tryCompose(ctx, "ps", "--all", "--quiet", service)
+		if err != nil || strings.TrimSpace(output) != "" {
+			t.Fatalf("targetless lifecycle started %s: %v: %s", service, err, harnessDiagnostics(output))
+		}
+	}
+
+	backupContainer := strings.TrimSpace(harness.compose("ps", "--quiet", "backup"))
+	logs, err := harness.docker("logs", backupContainer)
+	if err != nil {
+		t.Fatalf("read targetless backup logs: %v: %s", err, harnessDiagnostics(logs))
+	}
+	if strings.Count(logs, `"warning_code":"no_backup_targets"`) != 1 ||
+		!strings.Contains(logs, `"level":"WARN"`) ||
+		!strings.Contains(logs, "Vaultwarden data is not being backed up") {
+		t.Fatalf("targetless startup warning is missing or duplicated: %s", harnessDiagnostics(logs))
+	}
+	status := harness.status()
+	if status.State != "idle" || status.NextCheckAt != nil || status.LastCheck != nil || status.Targets == nil || len(status.Targets) != 0 {
+		t.Fatalf("targetless worker status = %#v", status)
+	}
+	if _, err := os.Lstat(filepath.Join(harness.localRoot, "staging", "point")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("targetless worker created a staging point: %v", err)
+	}
+	requestOutput, requestErr := harness.tryCompose(
+		ctx, "exec", "--no-TTY", "backup", "/bin/vaultwarden-less-backup", "request-backup",
+	)
+	if requestErr == nil || exactCommandErrorCode(t, requestOutput) != "not_ready" ||
+		!strings.Contains(requestOutput, productworker.NoBackupTargetsMessage) {
+		t.Fatalf("targetless request-backup = %v: %s", requestErr, harnessDiagnostics(requestOutput))
+	}
+
+	unique := time.Now().UnixNano()
+	email := fmt.Sprintf("vaultwarden-less-e2e-targetless-%d@example.com", unique)
+	_ = registerAccount(ctx, t, harness.publicHTTP, email, testPassword)
+	client := newBitwardenCLI(
+		t, filepath.Join(harness.localRoot, "bw-targetless-initial"), harness.publicTLS, harness.tlsCAFile, email,
+	)
+	client.login(ctx)
+	folderID := client.createFolder(ctx, "Targetless Persistence Folder")
+	itemID := client.createItem(ctx, "Targetless Persistence Login", initialItemPassword, folderID)
+	if itemPassword(t, client.getItem(ctx, itemID)) != initialItemPassword {
+		t.Fatal("targetless proxy write was not readable before recreation")
+	}
+
+	setTargetlessSignups(t, filepath.Join(harness.localRoot, "config", "vaultwarden.env"), false)
+	oldVaultwarden := strings.TrimSpace(harness.compose("ps", "--quiet", "vaultwarden"))
+	harness.compose("up", "--detach", "--force-recreate", "vaultwarden")
+	harness.waitHealthy("vaultwarden", 3*time.Minute)
+	newVaultwarden := strings.TrimSpace(harness.compose("ps", "--quiet", "vaultwarden"))
+	if oldVaultwarden == "" || newVaultwarden == "" || oldVaultwarden == newVaultwarden {
+		t.Fatalf("Vaultwarden was not force-recreated: %q/%q", oldVaultwarden, newVaultwarden)
+	}
+
+	restarted := newBitwardenCLI(
+		t, filepath.Join(harness.localRoot, "bw-targetless-restarted"), harness.publicTLS, harness.tlsCAFile, email,
+	)
+	restarted.login(ctx)
+	item := restarted.getItem(ctx, itemID)
+	if itemPassword(t, item) != initialItemPassword || stringValue(item["folderId"]) != folderID {
+		t.Fatal("existing targetless user data did not survive Vaultwarden recreation")
+	}
+	expectRegistrationRejected(
+		ctx, t, harness.publicHTTP,
+		fmt.Sprintf("vaultwarden-less-e2e-targetless-rejected-%d@example.com", unique), secondPassword,
+	)
+	status = harness.status()
+	if status.State != "idle" || status.NextCheckAt != nil || status.LastCheck != nil || len(status.Targets) != 0 {
+		t.Fatalf("targetless worker changed state after proxy writes: %#v", status)
+	}
+	if _, err := os.Lstat(filepath.Join(harness.localRoot, "staging", "point")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("targetless proxy events created a staging point: %v", err)
+	}
+}
+
+func setTargetlessSignups(t *testing.T, path string, allowed bool) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	from, to := "SIGNUPS_ALLOWED=true\n", "SIGNUPS_ALLOWED=false\n"
+	if allowed {
+		from, to = to, from
+	}
+	if strings.Count(string(data), from) != 1 || strings.Contains(string(data), to) {
+		t.Fatalf("Vaultwarden signup setting has an unexpected shape")
+	}
+	data = []byte(strings.Replace(string(data), from, to, 1))
+	parent := filepath.Dir(path)
+	file, err := os.CreateTemp(parent, ".vaultwarden.env-*.tmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	temporary := file.Name()
+	open := true
+	defer func() {
+		if open {
+			_ = file.Close()
+		}
+		_ = os.Remove(temporary)
+	}()
+	if err := file.Chmod(0o600); err != nil {
+		t.Fatal(err)
+	}
+	if written, err := file.Write(data); err != nil || written != len(data) {
+		if err == nil {
+			err = io.ErrShortWrite
+		}
+		t.Fatal(err)
+	}
+	if err := file.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		open = false
+		t.Fatal(err)
+	}
+	open = false
+	if err := os.Rename(temporary, path); err != nil {
+		t.Fatal(err)
+	}
+	directory, err := os.Open(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := directory.Sync(); err != nil {
+		_ = directory.Close()
+		t.Fatal(err)
+	}
+	if err := directory.Close(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func assertFileContent(t *testing.T, path string, expected []byte) {

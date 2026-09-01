@@ -14,14 +14,17 @@ labels, or `compose.env` by hand.
 
 Before `prepare`:
 
-- A is an exact clean versionless release and its three production services are
+- A is an exact clean managed release and its three production services are
   healthy; `state/deployment/active.json` exactly names A.
 - No initial import is current; a prepared, verified, decided, or incomplete
   `state/import/current` must be cancelled before decision or completed before
   any upgrade preparation.
 - A has recent verified snapshots on every configured upgrade-verification
   target, and a latest restore plus drill has passed.
-- B is an exact clean versionless commit with a separately generated and checked
+- At least one backup target is configured. Targetless deployments must add and
+  verify a target before `upgrade prepare`; the command otherwise returns
+  `not_ready` before creating upgrade state.
+- B is an exact clean managed commit with a separately generated and checked
   two-file release.
 - A and B immutable image references are available locally or their release
   archives are available for standard loading.
@@ -45,27 +48,6 @@ does not leave a compatibility gap. Exact-pair cross-version compatibility is
 a separate claim available only when the actual Vaultwarden versions differ
 and the complete scenario runs with both. Neither claim covers substituted or
 independently upgraded components outside the project-managed set.
-
-## First versionless release from a legacy deployment
-
-The first versionless release is not an ordinary A/B upgrade. B must not read,
-convert, or infer meaning from legacy project configuration, state, manifests,
-snapshot tags, or repositories. Use the documented
-[one-time external SQLite import](operations.md#one-time-external-sqlite-import)
-with all legacy services stopped, a fresh `DEPLOYMENT_ROOT`, a fresh Restic
-repository prefix, and B-created configuration and state. Copy only the stopped
-legacy Vaultwarden raw data into `import/source`; B validates and imports it as
-external data, rotates RSA identity, verifies the official-client path, and
-creates new B recovery evidence.
-
-Retain the complete legacy commit, images, root, data, and repositories as the
-rollback boundary. Before traffic moves to B, recovery is to stop the isolated
-B attempt and restart the intact legacy deployment. After traffic moves, keep
-the legacy boundary until B backup, restore, drill, client, and observation
-evidence has been accepted under a separately authorized production plan.
-Neither the product nor this runbook deletes it. Automated C→B acceptance proves
-the versionless state machine; an isolated synthetic L→B rehearsal proves the
-raw-data procedure. Neither performs or authorizes a production cutover.
 
 ## Production command surface
 
@@ -161,7 +143,7 @@ docker compose --env-file "$vwless_upgrade_env" --file compose.yml --file compos
 ```
 
 Verification must succeed on every configured upgrade target. B creates a
-versionless recovery point, checks its immutable identities, performs real Restic
+recovery point, checks its immutable identities, performs real Restic
 restores, validates the rollback evidence, and constructs the drill from B
 data. With a normal Bitwarden client and fresh sessions, verify representative
 items, organization/collection data, attachments, Sends, and expected session
@@ -285,7 +267,7 @@ the durable result. Never delete quarantine to force another exchange.
 - A failure leaves ingress stopped unless the named phase itself completed.
   Never start a proxy merely because Vaultwarden's healthcheck is green.
 - Accept and rollback are mutually exclusive. There is no `--force`, hidden
-  failure hook, automatic compatibility fallback, or legacy state path.
+  failure hook, automatic compatibility fallback, or alternate state path.
 
 ## A/B acceptance evidence
 

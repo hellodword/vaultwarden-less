@@ -29,7 +29,7 @@ func TestEmbeddedSchemaAndProjectionContractsLoad(t *testing.T) {
 	}
 }
 
-func TestRecoveryProjectionMatchesReviewedSchemaOnePolicy(t *testing.T) {
+func TestRecoveryProjectionMatchesReviewedPolicy(t *testing.T) {
 	t.Parallel()
 	projection, err := VaultwardenRecoveryProjection()
 	if err != nil {

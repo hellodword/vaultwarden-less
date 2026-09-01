@@ -36,6 +36,78 @@ separately authorized maintenance event outside this interface.
 
 ## Release transfer and startup
 
+Use one of these three source-transfer models. In every model, the deployment
+checkout is a clean detached checkout of the release's full commit, and the
+release files arrive in a previously absent directory.
+
+1. If the deployment host can reach the Git remote, connect with ordinary SSH,
+   clone or fetch there, and detach to the full release commit. Transfer only
+   the two release files with the `rsync` command below.
+2. For a first `rsync` followed by Git updates, create a dedicated clean clone
+   with no private files, and synchronize the checkout root, including `.git`,
+   to the host with `rsync --archive --checksum`. For each later update on the
+   host, switch back to its tracking branch, run `git pull --ff-only`, and then
+   detach to the reviewed full release commit. Do not use a working deployment
+   checkout as the rsync source.
+3. For an always-rsync host, synchronize each release into a new checkout
+   directory that did not previously exist. Never overlay a prior checkout,
+   never use `--delete` against a directory that contains `.env`, and retain
+   the old checkout until the new deployment is accepted.
+
+Generic commands use placeholders only. For the remote-Git model:
+
+```sh
+ssh -p <ssh-port> <user>@<host>
+git clone -- <git-url> <new-checkout-directory>
+git -C <new-checkout-directory> fetch --prune --tags origin
+git -C <new-checkout-directory> switch --detach <full-release-commit>
+```
+
+For the initial-rsync/later-Git model, prepare and verify a dedicated clone,
+then copy its complete checkout including `.git`:
+
+```sh
+git clone -- <git-url> <dedicated-clean-clone>
+test -z "$(git -C <dedicated-clean-clone> status --porcelain=v1 --untracked-files=all)"
+rsync --archive --checksum -- \
+  <dedicated-clean-clone>/ <user>@<host>:<new-checkout-directory>/
+```
+
+On later releases, update the remote clone only through its tracking branch
+before detaching to the reviewed commit:
+
+```sh
+git -C <remote-checkout-directory> switch <tracking-branch>
+git -C <remote-checkout-directory> pull --ff-only
+git -C <remote-checkout-directory> switch --detach <full-release-commit>
+```
+
+For the always-rsync model, verify the destination is absent and copy from a
+dedicated clean checkout without `--delete`:
+
+```sh
+ssh -p <ssh-port> <user>@<host> 'test ! -e <new-checkout-directory>'
+rsync --archive --checksum -- \
+  <dedicated-clean-release-checkout>/ <user>@<host>:<new-checkout-directory>/
+```
+
+For every model, transfer the release artifact in exactly this shape:
+
+```sh
+rsync --archive --checksum -- \
+  <release>/images.tar.gz <release>/SHA256SUMS \
+  <user>@<host>:<new-release-directory>/
+```
+
+On the deployment host, require the exact commit and a clean checkout before
+using the artifact:
+
+```sh
+cd <new-checkout-directory>
+test "$(git rev-parse --verify HEAD)" = <full-clean-commit>
+test -z "$(git status --porcelain=v1 --untracked-files=all)"
+```
+
 A release directory must contain exactly `images.tar.gz` and `SHA256SUMS` from
 one clean commit. Verify and load it before changing the running stack:
 
@@ -84,6 +156,115 @@ Only the proxy is bound to loopback. A trusted TLS edge must present the
 configured public `DOMAIN`, remove untrusted forwarding headers, and send
 root-path HTTP and WebSocket traffic to the proxy. The worker API and direct
 Vaultwarden endpoint remain on internal networks.
+
+### Explicit targetless bootstrap and first account
+
+Use this procedure only when no Restic target is currently available. It
+starts Vaultwarden, backup, and proxy, but it deliberately creates no recovery
+point. Every byte written until a target is later configured and proven is
+unprotected. A trusted external HTTPS/TLS edge and operator-only access must
+already protect the proxy before registration is enabled; this project does
+not terminate TLS.
+
+Create a dedicated private root as the runtime account, separate from the
+checkout:
+
+```sh
+vwless_root=/srv/vaultwarden-less
+umask 077
+install -d -m 0700 "$vwless_root"
+install -d -m 0700 "$vwless_root/config" "$vwless_root/credentials" "$vwless_root/credentials/restic"
+install -d -m 0700 "$vwless_root/data" "$vwless_root/import" "$vwless_root/staging" "$vwless_root/cache" "$vwless_root/restore" "$vwless_root/state"
+install -m 0600 .env.example .env
+install -m 0600 config/vaultwarden.example.env "$vwless_root/config/vaultwarden.env"
+```
+
+Set the five `.env` values and the public HTTPS `DOMAIN` as described in
+[Configuration](configuration.md). Write these three private YAML documents
+exactly:
+
+```yaml
+# config/backup.yaml
+upgrade_verification_targets: []
+targets: []
+notifiers: []
+```
+
+```yaml
+# credentials/backup.yaml and credentials/maintenance.yaml
+targets: {}
+```
+
+```yaml
+# credentials/notifiers.yaml
+notifiers: {}
+```
+
+All three files are owned by the runtime UID/GID and mode `0600`; the private
+Restic password directory is mode `0700` and completely empty. Set
+`SIGNUPS_ALLOWED=true` in the private Vaultwarden environment only for the
+first-account window. Then validate both roles and initialize the deployment
+identity. Both validation results must contain `"targets":[]` and no
+`warnings` field:
+
+```sh
+docker compose --env-file .env --file compose.yml --profile maintenance run --rm --no-deps config-check-backup
+docker compose --env-file .env --file compose.yml --profile maintenance run --rm --no-deps config-check-maintenance
+docker compose --env-file .env --file compose.yml --profile deployment run --rm --no-deps deployment-admin deployment init
+```
+
+Do not run `repo init`. Start the three production services and prove the
+targetless boundary:
+
+```sh
+docker compose --env-file .env --file compose.yml up --detach vaultwarden backup proxy
+docker compose --env-file .env --file compose.yml ps vaultwarden backup proxy
+docker compose --env-file .env --file compose.yml logs --tail 200 backup
+docker compose --env-file .env --file compose.yml exec --no-TTY backup /bin/vaultwarden-less-backup status
+test ! -e "$vwless_root/staging/point"
+if docker compose --env-file .env --file compose.yml exec --no-TTY backup /bin/vaultwarden-less-backup request-backup; then
+  exit 1
+fi
+```
+
+All three services must be healthy. Each backup-process start writes exactly
+one WARN with `warning_code=no_backup_targets` and an explicit statement that
+Vaultwarden data is not being backed up. Status remains `idle` with
+`targets: []`, `last_check: null`, and `next_check_at: null`. The manual request
+must fail nonzero with the ordinary `not_ready` error. Proxy events continue to
+return success and must not block Vaultwarden writes.
+
+Through the trusted public HTTPS origin, configure an official Bitwarden
+desktop or mobile client for this server, create the first account, log in,
+sync, and create then read a representative vault item. A health response or
+direct plaintext request is not account verification.
+
+Immediately close registration with a same-directory atomic replacement. Run
+this as the owner of the private environment file:
+
+```sh
+vwless_env="$vwless_root/config/vaultwarden.env"
+test "$(grep -c '^SIGNUPS_ALLOWED=true$' "$vwless_env")" = 1
+test "$(grep -c '^SIGNUPS_ALLOWED=false$' "$vwless_env" || true)" = 0
+vwless_env_tmp="$(mktemp "$vwless_root/config/.vaultwarden.env.XXXXXX")"
+trap 'rm -f -- "$vwless_env_tmp"' EXIT HUP INT TERM
+chmod 0600 "$vwless_env_tmp"
+sed 's/^SIGNUPS_ALLOWED=true$/SIGNUPS_ALLOWED=false/' "$vwless_env" > "$vwless_env_tmp"
+test "$(grep -c '^SIGNUPS_ALLOWED=false$' "$vwless_env_tmp")" = 1
+sync "$vwless_env_tmp"
+mv -T -- "$vwless_env_tmp" "$vwless_env"
+sync -f "$vwless_root/config"
+trap - EXIT HUP INT TERM
+docker compose --env-file .env --file compose.yml up --detach --force-recreate vaultwarden
+```
+
+`restart` is insufficient because it does not reload `env_file`; the
+`--force-recreate` command is required. After Vaultwarden is healthy again,
+use a fresh official-client login to read the existing item and confirm that a
+new account registration is rejected. Recheck the empty worker status and the
+startup warning. The account is usable, but it still has no recovery point;
+configure, initialize, back up, restore, and drill a real target before
+claiming data protection or attempting an upgrade.
 
 `down` stops and removes only the normal Compose project; bind-mounted data and
 private inputs remain:
@@ -285,8 +466,8 @@ This is a manual incident procedure, not a product command. Do not run it
 without incident-specific authorization for the exact deployment and selected
 restore. The verified restore must already have passed the complete drill. Its
 manifest `project_commit` must exactly equal the current healthy backup
-container's `version` project commit; a legacy point or a point from another
-A/B identity is ineligible. Record both JSON documents and stop on any
+container's `version` project commit; a point from another A/B identity is
+ineligible. Record both JSON documents and stop on any
 mismatch.
 
 Set the following values explicitly from the reviewed incident record; do not

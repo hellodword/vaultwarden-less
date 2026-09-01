@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -529,6 +530,59 @@ func TestWorkerInitialStatusHasNullHistoryAndArrayTargets(t *testing.T) {
 	}
 }
 
+func TestTargetlessWorkerStaysIdleWithoutSchedulingOrRecoveryAccess(t *testing.T) {
+	t.Parallel()
+	buildCalls, ensureCalls := 0, 0
+	worker := New(
+		&config.Backup{Targets: []config.Target{}},
+		func(context.Context) (snapshot.Manifest, error) {
+			buildCalls++
+			return snapshot.Manifest{}, errors.New("targetless build must not run")
+		},
+		func(context.Context, config.Target, snapshot.Manifest) (restic.SyncResult, error) {
+			ensureCalls++
+			return restic.SyncResult{}, errors.New("targetless repository must not run")
+		},
+		nil,
+		discardLogger(),
+	)
+	worker.Request()
+	if len(worker.demand) != 0 {
+		t.Fatal("targetless request queued scheduler demand")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		worker.Run(ctx)
+	}()
+	status := worker.Status()
+	if status.State != "idle" || status.NextCheckAt != nil || status.LastCheck != nil || status.Targets == nil || len(status.Targets) != 0 {
+		t.Fatalf("targetless status = %#v", status)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("targetless worker did not stop")
+	}
+	if buildCalls != 0 || ensureCalls != 0 {
+		t.Fatalf("targetless recovery calls = build:%d ensure:%d", buildCalls, ensureCalls)
+	}
+}
+
+func TestTargetlessWorkerHTTPKeepsEventsHealthyAndRejectsChecks(t *testing.T) {
+	t.Parallel()
+	worker := New(&config.Backup{Targets: []config.Target{}}, nil, nil, nil, discardLogger())
+	handler := Handler(worker)
+	assertHTTP(t, handler, http.MethodGet, HealthPath, "", "", http.StatusNoContent, "")
+	assertHTTP(t, handler, http.MethodPost, EventsPath, "application/json", `{}`, http.StatusNoContent, "")
+	assertHTTP(
+		t, handler, http.MethodPost, CheckPath, "application/json", `{}`, http.StatusServiceUnavailable,
+		`{"error":{"code":"not_ready","message":"`+NoBackupTargetsMessage+`"}}`+"\n",
+	)
+}
+
 func TestWorkerHTTPContract(t *testing.T) {
 	t.Parallel()
 	source, repository := &fixedSource{}, &orderedRepository{}
@@ -539,8 +593,6 @@ func TestWorkerHTTPContract(t *testing.T) {
 	assertHTTP(t, handler, http.MethodPost, EventsPath, "application/json", `{}`, http.StatusNoContent, "")
 	assertHTTP(t, handler, http.MethodPost, CheckPath, "application/json", `{}`, http.StatusAccepted, "{\"accepted\":true}\n")
 	assertHTTP(t, handler, http.MethodPost, EventsPath, "application/json", `{"extra":true}`, http.StatusBadRequest, "")
-	retiredVersion := `{"` + "schema_" + `version":1}`
-	assertHTTP(t, handler, http.MethodPost, EventsPath, "application/json", retiredVersion, http.StatusBadRequest, "")
 	assertHTTP(t, handler, http.MethodPost, EventsPath, "application/json", `[]`, http.StatusBadRequest, "")
 	assertHTTP(t, handler, http.MethodPost, EventsPath, "application/json", `null`, http.StatusBadRequest, "")
 	assertHTTP(t, handler, http.MethodPost, EventsPath, "", `{}`, http.StatusBadRequest, "")

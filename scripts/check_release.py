@@ -77,6 +77,16 @@ GATES: tuple[Gate, ...] = (
         ),
     ),
     Gate(
+        ("targetless-deployment",),
+        verified_go_test(
+            "github.com/hellodword/vaultwarden-less/tests/e2e",
+            "^TestTargetlessDeploymentLifecycle$",
+            ("TestTargetlessDeploymentLifecycle",),
+            "-run-backup-e2e",
+            timeout="20m",
+        ),
+    ),
+    Gate(
         ("moto-restic",),
         verified_go_test(
             "github.com/hellodword/vaultwarden-less/internal/restore",

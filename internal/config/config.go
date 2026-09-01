@@ -243,8 +243,8 @@ func (visitor *strictYAMLVisitor) Visit(node ast.Node) ast.Visitor {
 }
 
 func (c *Backup) Validate() error {
-	if len(c.Targets) < 1 || len(c.Targets) > 32 {
-		return fmt.Errorf("targets must contain 1 to 32 entries")
+	if c.Targets == nil || len(c.Targets) > 32 {
+		return fmt.Errorf("targets must be an array containing 0 to 32 entries")
 	}
 	targetNames := make(map[string]struct{}, len(c.Targets))
 	for index := range c.Targets {
@@ -256,7 +256,11 @@ func (c *Backup) Validate() error {
 		}
 		targetNames[c.Targets[index].Name] = struct{}{}
 	}
-	if len(c.UpgradeVerificationTargets) < 1 || len(c.UpgradeVerificationTargets) > 32 {
+	if len(c.Targets) == 0 {
+		if c.UpgradeVerificationTargets == nil || len(c.UpgradeVerificationTargets) != 0 {
+			return fmt.Errorf("upgrade_verification_targets must be an empty array when targets is empty")
+		}
+	} else if len(c.UpgradeVerificationTargets) < 1 || len(c.UpgradeVerificationTargets) > 32 {
 		return fmt.Errorf("upgrade_verification_targets must contain 1 to 32 entries")
 	}
 	verificationNames := make(map[string]struct{}, len(c.UpgradeVerificationTargets))

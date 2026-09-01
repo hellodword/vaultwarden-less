@@ -1030,7 +1030,7 @@ func TestVerifyRejectsEveryTreeMismatch(t *testing.T) {
 	}
 }
 
-func TestVersionlessManifestSortsAndValidatesExactFields(t *testing.T) {
+func TestManifestSortsAndValidatesExactFields(t *testing.T) {
 	t.Parallel()
 	files := []File{
 		{Path: "sends/" + testSendID + "/" + testSendFileID, Size: 1, SHA256: "sha256:" + strings.Repeat("a", 64)},
@@ -1072,11 +1072,8 @@ func TestManifestStrictlyRejectsMalformedJSONAndIdentity(t *testing.T) {
 		t.Fatal("unknown manifest field was accepted")
 	}
 	duplicate := strings.Replace(string(data), `"project_commit":"`+testProjectCommit+`"`, `"project_commit":"`+testProjectCommit+`","project_commit":"`+testProjectCommit+`"`, 1)
-	retiredVersionField := "schema_" + "version"
-	retired := strings.Replace(string(data), "{", `{"`+retiredVersionField+`":1,`, 1)
 	for name, malformed := range map[string][]byte{
 		"duplicate":    []byte(duplicate),
-		"retired":      []byte(retired),
 		"invalid utf8": append(slices.Clone(data), 0xff),
 		"trailing":     append(slices.Clone(data), []byte(` {}`)...),
 	} {

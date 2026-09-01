@@ -96,6 +96,49 @@ func TestOwnedTemporaryNames(t *testing.T) {
 	}
 }
 
+func TestOwnedTemporaryValidationAndCleanup(t *testing.T) {
+	directory := privateDirectory(t)
+	owned := ".vaultwarden-less-state-prepare.json-interrupted.tmp"
+	ownedPath := filepath.Join(directory, owned)
+	if err := os.WriteFile(ownedPath, []byte("partial"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	operator := ".vaultwarden-less-state-prepare.json-operator"
+	operatorPath := filepath.Join(directory, operator)
+	if err := os.WriteFile(operatorPath, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	matched, err := ValidateOwnedTemporary(directory, owned, 1024, "prepare.json")
+	if err != nil || !matched {
+		t.Fatalf("owned temporary validation = %t/%v", matched, err)
+	}
+	matched, err = ValidateOwnedTemporary(directory, operator, 1024, "prepare.json")
+	if err != nil || matched {
+		t.Fatalf("operator entry validation = %t/%v", matched, err)
+	}
+	if err := CleanupOwnedTemporaries(directory, 1024, "prepare.json"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(ownedPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("owned temporary survived cleanup: %v", err)
+	}
+	if data, err := os.ReadFile(operatorPath); err != nil || string(data) != "keep" {
+		t.Fatalf("operator entry changed: %q/%v", data, err)
+	}
+
+	unsafe := ".vaultwarden-less-state-decision.json-interrupted.tmp"
+	unsafePath := filepath.Join(directory, unsafe)
+	if err := os.WriteFile(unsafePath, []byte("partial"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := CleanupOwnedTemporaries(directory, 1024, "decision.json"); err == nil {
+		t.Fatal("unsafe owned temporary was removed")
+	}
+	if _, err := os.Lstat(unsafePath); err != nil {
+		t.Fatalf("unsafe owned temporary did not survive refusal: %v", err)
+	}
+}
+
 func TestWriteFaultMatrixPreservesAbsentOldOrCompleteNewBoundary(t *testing.T) {
 	originalCreate := createTemp
 	originalChmod := chmodFile

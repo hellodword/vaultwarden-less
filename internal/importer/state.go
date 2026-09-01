@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"syscall"
 
 	"github.com/hellodword/vaultwarden-less/internal/privatefs"
 	"github.com/hellodword/vaultwarden-less/internal/statefile"
@@ -125,63 +124,21 @@ func validateCurrentEntries(current string) error {
 		if _, ok := allowed[entry.Name()]; ok {
 			continue
 		}
-		if !stateWriteTemporary(entry.Name()) {
-			return fmt.Errorf("import current contains an unexpected entry")
-		}
-		if err := validateStateWriteTemporary(current, entry.Name()); err != nil {
+		owned, err := statefile.ValidateOwnedTemporary(
+			current, entry.Name(), MaxStateBytes, prepareName, verificationName, decisionName,
+		)
+		if err != nil {
 			return err
+		}
+		if !owned {
+			return fmt.Errorf("import current contains an unexpected entry")
 		}
 	}
 	return nil
 }
 
 func cleanupCurrentWriteTransients(current string) error {
-	if err := privatefs.ValidatePrivateDirectory(current); err != nil {
-		return err
-	}
-	entries, err := os.ReadDir(current)
-	if err != nil {
-		return err
-	}
-	removed := false
-	for _, entry := range entries {
-		if !stateWriteTemporary(entry.Name()) {
-			continue
-		}
-		if err := validateStateWriteTemporary(current, entry.Name()); err != nil {
-			return err
-		}
-		if err := os.Remove(filepath.Join(current, entry.Name())); err != nil {
-			return err
-		}
-		removed = true
-	}
-	if removed {
-		return privatefs.SyncDirectory(current)
-	}
-	return nil
-}
-
-func stateWriteTemporary(name string) bool {
-	for _, target := range []string{prepareName, verificationName, decisionName} {
-		if statefile.IsOwnedTemporary(target, name) {
-			return true
-		}
-	}
-	return false
-}
-
-func validateStateWriteTemporary(current, name string) error {
-	info, err := os.Lstat(filepath.Join(current, name))
-	if err != nil {
-		return err
-	}
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o600 ||
-		!ok || stat.Uid != uint32(os.Geteuid()) || stat.Gid != uint32(os.Getegid()) || stat.Nlink != 1 || info.Size() > MaxStateBytes {
-		return fmt.Errorf("import current contains an unsafe state-write transient")
-	}
-	return nil
+	return statefile.CleanupOwnedTemporaries(current, MaxStateBytes, prepareName, verificationName, decisionName)
 }
 
 func pathExists(path string) (bool, error) {

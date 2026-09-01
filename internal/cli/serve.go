@@ -62,21 +62,29 @@ func serveCommand(configPath *string, environment commandEnvironment) *cobra.Com
 			if err != nil {
 				return commandFailure(codeInvalidCredentials, "Notifier credentials are invalid", err)
 			}
-			repository, err := environment.repositoryFor(cfg)
-			if err != nil {
-				return commandFailure(codeInvalidCredentials, "Backup role credentials are invalid", err)
-			}
-			if err := repository.VerifyVersion(cmd.Context()); err != nil {
-				return commandFailure(codeRepositoryFailure, "Restic version verification failed", err)
-			}
-
 			ctx, cancel := context.WithCancel(cmd.Context())
 			defer cancel()
-			builder := snapshot.Builder{
-				DataDir: environment.dataDir, StagingDir: environment.stagingDir,
-				ProjectCommit: buildinfo.ProjectCommit,
+			var backupWorker *worker.Worker
+			if len(cfg.Targets) == 0 {
+				logger.Warn(
+					"Vaultwarden data is not being backed up because no backup targets are configured",
+					"warning_code", "no_backup_targets",
+				)
+				backupWorker = worker.New(cfg, nil, nil, notifications.Enqueue, logger)
+			} else {
+				repository, err := environment.repositoryFor(cfg)
+				if err != nil {
+					return commandFailure(codeInvalidCredentials, "Backup role credentials are invalid", err)
+				}
+				if err := repository.VerifyVersion(cmd.Context()); err != nil {
+					return commandFailure(codeRepositoryFailure, "Restic version verification failed", err)
+				}
+				builder := snapshot.Builder{
+					DataDir: environment.dataDir, StagingDir: environment.stagingDir,
+					ProjectCommit: buildinfo.ProjectCommit,
+				}
+				backupWorker = worker.New(cfg, builder.Build, repository.Ensure, notifications.Enqueue, logger)
 			}
-			backupWorker := worker.New(cfg, builder.Build, repository.Ensure, notifications.Enqueue, logger)
 			server := worker.NewHTTPServer(backupWorker)
 			serverError := make(chan error, 1)
 			workerDone := make(chan struct{})

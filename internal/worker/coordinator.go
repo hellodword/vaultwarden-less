@@ -104,10 +104,17 @@ func newWithClock(
 
 // Request coalesces all outstanding demand into one in-memory signal.
 func (worker *Worker) Request() {
+	if worker.targetless() {
+		return
+	}
 	select {
 	case worker.demand <- struct{}{}:
 	default:
 	}
+}
+
+func (worker *Worker) targetless() bool {
+	return len(worker.config.Targets) == 0
 }
 
 func (worker *Worker) Status() Status {
@@ -139,6 +146,10 @@ func (worker *Worker) Status() Status {
 }
 
 func (worker *Worker) Run(ctx context.Context) {
+	if worker.targetless() {
+		<-ctx.Done()
+		return
+	}
 	var scheduling schedule
 	scheduling.demand(worker.clock.Now())
 	for {

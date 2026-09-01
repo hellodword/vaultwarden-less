@@ -29,6 +29,10 @@ func requestBackupCommand(environment commandEnvironment) *cobra.Command {
 				Accepted bool `json:"accepted"`
 			}
 			if err := callWorker(cmd.Context(), environment, http.MethodPost, worker.CheckPath, http.StatusAccepted, &result); err != nil {
+				var responseError *workerResponseError
+				if errors.As(err, &responseError) && responseError.status == http.StatusServiceUnavailable && responseError.code == codeNotReady {
+					return commandFailure(codeNotReady, worker.NoBackupTargetsMessage, err)
+				}
 				return commandFailure(codeInternal, "The backup request could not be delivered", err)
 			}
 			if !result.Accepted {
@@ -37,6 +41,15 @@ func requestBackupCommand(environment commandEnvironment) *cobra.Command {
 			return writeJSON(cmd.OutOrStdout(), result)
 		},
 	}
+}
+
+type workerResponseError struct {
+	status int
+	code   string
+}
+
+func (err *workerResponseError) Error() string {
+	return fmt.Sprintf("worker endpoint returned status %d", err.status)
 }
 
 func statusCommand(environment commandEnvironment) *cobra.Command {
@@ -103,6 +116,19 @@ func callWorker(ctx context.Context, environment commandEnvironment, method, pat
 		return fmt.Errorf("worker response is too large")
 	}
 	if response.StatusCode != expectedStatus {
+		if response.Header.Get("Content-Type") == "application/json" {
+			var document errorDocument
+			decoder := json.NewDecoder(bytes.NewReader(data))
+			decoder.DisallowUnknownFields()
+			decodeError := decoder.Decode(&document)
+			var extra any
+			trailingError := decoder.Decode(&extra)
+			if decodeError == nil && errors.Is(trailingError, io.EOF) && document.Error.Message != "" {
+				if _, stable := stableErrorCodes[document.Error.Code]; stable {
+					return &workerResponseError{status: response.StatusCode, code: document.Error.Code}
+				}
+			}
+		}
 		return fmt.Errorf("worker endpoint returned status %d", response.StatusCode)
 	}
 	if destination == nil {

@@ -1,7 +1,7 @@
 # Upstream maintenance
 
 Upstream changes are deliberate, one-component reviews. The goal is not to
-follow the newest tag; it is to preserve the implemented versionless behavior
+follow the newest tag; it is to preserve the implemented behavior
 with auditable evidence, exact inputs, a small diff, and a complete rollback
 path.
 
@@ -85,7 +85,7 @@ entire diff. A migration number alone is not compatibility evidence.
 
 Update the Vaultwarden tag, commit, migration, schema, and recovery projection
 as one reviewed unit. Then update every exact test expectation and image input
-that is genuinely owned by that change. Do not add a legacy schema or fallback
+that is genuinely owned by that change. Do not add a parallel schema or fallback
 unless a separately authorized durable contract requires it.
 
 Acceptance requires the complete local gate, release reproducibility, real
@@ -220,9 +220,10 @@ just check-release <A-full-commit>
 ```
 
 This runs the ordinary flake checks, full-tree race and coverage,
-`govulncheck`, all products, Moto/Restic integration, full recovery, accelerated
-target-threshold evidence, two repositories, initial import, and both A/B
-terminal cases. Required-test JSON must prove run/PASS and package PASS with no
+`govulncheck`, all products, targetless deployment, Moto/Restic integration,
+full recovery, accelerated target-threshold evidence, two repositories,
+initial import, and both A/B terminal cases. Required-test JSON must prove
+run/PASS and package PASS with no
 skip/fail for every real scenario. Exact fake-clock boundaries and the
 accelerated real Restic/HTTPS-adapter test replace a wall-clock waiting claim;
 the production clock has no test override. The gate intentionally excludes

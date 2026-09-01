@@ -258,10 +258,19 @@ func validateCurrentEntries(current string) error {
 		if _, ok := allowed[entry.Name()]; ok {
 			continue
 		}
-		if !stateWriteTemporary(entry.Name()) {
+		owned, err := statefile.ValidateOwnedTemporary(
+			current, entry.Name(), MaxStateBytes, prepareName, ticketName, candidateName, decisionName,
+		)
+		if err != nil {
+			return err
+		}
+		if owned {
+			continue
+		}
+		if !composeWriteTemporary(entry.Name()) {
 			return fmt.Errorf("upgrade current contains an unexpected entry")
 		}
-		if err := validateStateWriteTemporary(current, entry.Name()); err != nil {
+		if err := validateComposeWriteTemporary(current, entry.Name()); err != nil {
 			return err
 		}
 	}
@@ -272,16 +281,21 @@ func cleanupCurrentWriteTransients(current string) error {
 	if err := privatefs.ValidatePrivateDirectory(current); err != nil {
 		return err
 	}
+	if err := statefile.CleanupOwnedTemporaries(
+		current, MaxStateBytes, prepareName, ticketName, candidateName, decisionName,
+	); err != nil {
+		return err
+	}
 	entries, err := os.ReadDir(current)
 	if err != nil {
 		return err
 	}
 	removed := false
 	for _, entry := range entries {
-		if !stateWriteTemporary(entry.Name()) {
+		if !composeWriteTemporary(entry.Name()) {
 			continue
 		}
-		if err := validateStateWriteTemporary(current, entry.Name()); err != nil {
+		if err := validateComposeWriteTemporary(current, entry.Name()); err != nil {
 			return err
 		}
 		if err := os.Remove(filepath.Join(current, entry.Name())); err != nil {
@@ -295,18 +309,13 @@ func cleanupCurrentWriteTransients(current string) error {
 	return nil
 }
 
-func stateWriteTemporary(name string) bool {
-	for _, target := range []string{prepareName, ticketName, candidateName, decisionName} {
-		if statefile.IsOwnedTemporary(target, name) {
-			return true
-		}
-	}
+func composeWriteTemporary(name string) bool {
 	prefix := stateWritePrefix + composeName + "-"
 	return strings.HasPrefix(name, prefix) && strings.HasSuffix(name, stateWriteSuffix) &&
 		len(name) > len(prefix)+len(stateWriteSuffix)
 }
 
-func validateStateWriteTemporary(current, name string) error {
+func validateComposeWriteTemporary(current, name string) error {
 	info, err := os.Lstat(filepath.Join(current, name))
 	if err != nil {
 		return err

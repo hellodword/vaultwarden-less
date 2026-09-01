@@ -330,6 +330,16 @@ func TestSnapshotsBoundNormalizesTimesAndReportsTruncation(t *testing.T) {
 	}
 }
 
+func TestSnapshotsAcceptAdditionalUnrelatedTags(t *testing.T) {
+	t.Parallel()
+	raw := rawRecoverySnapshot(firstSnapshotID, firstContentID, "2026-08-25T12:00:00Z")
+	raw.Tags = append(raw.Tags, "retention=gold", "operator-note")
+	items, err := parseSnapshots(encodedSnapshots(t, raw), config.RecoveryPointPath)
+	if err != nil || len(items) != 1 || items[0].ID != firstSnapshotID {
+		t.Fatalf("snapshot with unrelated tags = %#v/%v", items, err)
+	}
+}
+
 func TestResolveSnapshotUsesLatestOrOneExactFullID(t *testing.T) {
 	for name, requested := range map[string]string{"latest": "", "explicit": secondSnapshotID} {
 		t.Run(name, func(t *testing.T) {
@@ -398,11 +408,12 @@ func TestPruneRejectsMalformedIdentityBeforeForget(t *testing.T) {
 		if operation(arguments) != "snapshots" {
 			t.Fatalf("mutating operation ran after malformed preflight: %#v", arguments)
 		}
-		legacyTag := "schema=" + "1"
-		return []byte(`[{"id":"` + firstSnapshotID + `","time":"2026-08-27T12:00:00Z","hostname":"` + SnapshotHost + `","paths":["` + config.RecoveryPointPath + `"],"tags":["` + legacyTag + `"]}]`), nil
+		malformed := rawRecoverySnapshot(firstSnapshotID, firstContentID, "2026-08-27T12:00:00Z")
+		malformed.Tags = malformed.Tags[:2]
+		return encodedSnapshots(t, malformed), nil
 	})
 	if _, err := runner.Prune(context.Background(), target, true); err == nil {
-		t.Fatal("legacy snapshot identity was accepted")
+		t.Fatal("snapshot missing a current identity tag was accepted")
 	}
 	if len(*calls) != 1 || operation((*calls)[0].arguments) != "snapshots" {
 		t.Fatalf("preflight calls = %#v", *calls)

@@ -87,6 +87,13 @@ type Runner struct {
 	recoveryPath string
 }
 
+func NewRunner(binary, cacheDir, passwordRoot, recoveryPath string, credentials *config.RoleCredentials, logger *slog.Logger) Runner {
+	return Runner{
+		Binary: binary, CacheDir: cacheDir, PasswordRoot: passwordRoot,
+		Credentials: credentials, Logger: logger, recoveryPath: recoveryPath,
+	}
+}
+
 func (r Runner) VerifyVersion(ctx context.Context) error {
 	output, err := r.runLogged(ctx, "version", "", r.Binary, []string{"version", "--json"}, sanitizedEnvironment(nil), "")
 	if err != nil {
@@ -609,8 +616,6 @@ func snapshotIdentity(tags []string) (identityTags, bool) {
 	var result identityTags
 	for _, tag := range tags {
 		switch {
-		case strings.HasPrefix(tag, "schema="):
-			return identityTags{}, false
 		case strings.HasPrefix(tag, "project_commit="):
 			if result.projectCommit != "" {
 				return identityTags{}, false

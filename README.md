@@ -100,6 +100,13 @@ HTTP and WebSocket traffic. A healthy process is not proof of a completed
 backup; confirm durable snapshots and complete a restore drill before relying
 on the deployment. The exact procedure is in [Operations](docs/operations.md).
 
+The path above is intentionally backup-first. If no repository is available,
+the only supported exception is an explicit `targets: []` bootstrap. It keeps
+Vaultwarden and the proxy usable while warning that the data has no recovery
+point; manual backup and upgrade preparation remain unavailable. Use the
+complete [targetless bootstrap and first-account runbook](docs/operations.md#explicit-targetless-bootstrap-and-first-account)
+and its exact [empty configuration](docs/configuration.md#backup-configuration).
+
 ## Build and verification host
 
 Development, release creation, and automated acceptance use the pinned Nix
@@ -115,9 +122,10 @@ just release <A-full-commit> <previously-absent-ignored-output-directory>
 `check` is the daily flake gate for formatting, ordinary tests, vet, lint,
 scripts, contracts, and pinned toolchain wiring. `check-release` requires a
 distinct clean A commit and clean HEAD B, then runs full-tree race and coverage,
-vulnerability and product checks, real Moto/Restic and recovery lifecycles, the
-accelerated worker threshold, two repositories, initial import, and the two
-A/B terminal paths. It writes exact private candidate evidence. `release`
+vulnerability and product checks, the targetless deployment, real Moto/Restic
+and recovery lifecycles, the accelerated worker threshold, two repositories,
+initial import, and the two A/B terminal paths. It writes exact private
+candidate evidence. `release`
 requires that evidence, independently builds the three images twice, verifies
 their bytes, labels, entrypoints, references, and upstream versions through a
 standard image load, and creates a previously absent two-file output. Cold-host

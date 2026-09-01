@@ -6,7 +6,6 @@ import (
 	"io"
 	"regexp"
 	"strings"
-	"testing"
 	"time"
 
 	productworker "github.com/hellodword/vaultwarden-less/internal/worker"
@@ -241,24 +240,4 @@ func decodeExactJSON(value string, destination any) error {
 		return err
 	}
 	return nil
-}
-
-func TestDecodeExactJSONRejectsUnknownAndAdditionalDocuments(t *testing.T) {
-	t.Parallel()
-	type result struct {
-		Value string `json:"value"`
-	}
-	var decoded result
-	if err := decodeExactJSON(`{"value":"valid"}`, &decoded); err != nil || decoded.Value != "valid" {
-		t.Fatalf("valid result = %#v/%v", decoded, err)
-	}
-	for name, value := range map[string]string{
-		"unknown":    `{"value":"valid","extra":true}`,
-		"additional": `{"value":"valid"} {"value":"valid"}`,
-	} {
-		withResult := result{}
-		if err := decodeExactJSON(value, &withResult); err == nil {
-			t.Fatalf("%s JSON was accepted", name)
-		}
-	}
 }

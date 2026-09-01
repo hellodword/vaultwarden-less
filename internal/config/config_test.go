@@ -24,6 +24,11 @@ targets:
 notifiers: []
 `
 
+const targetlessBackupYAML = `upgrade_verification_targets: []
+targets: []
+notifiers: []
+`
+
 func TestBackupSchemaPreservesSemanticOrder(t *testing.T) {
 	t.Parallel()
 	document := `upgrade_verification_targets: [cold, primary]
@@ -57,17 +62,17 @@ notifiers: []
 
 func TestBackupRejectsEveryStrictYAMLAndShapeViolation(t *testing.T) {
 	t.Parallel()
-	retiredVersionField := "schema_" + "version"
 	tests := map[string]string{
-		"empty targets":          strings.Replace(minimalBackupYAML, "  - name: primary\n    repository: rest:https://repository.example.test/vaultwarden\n    options: []\n", "", 1),
+		"implicit null targets":  strings.Replace(minimalBackupYAML, "  - name: primary\n    repository: rest:https://repository.example.test/vaultwarden\n    options: []\n", "", 1),
+		"missing targets":        strings.Replace(minimalBackupYAML, "targets:\n  - name: primary\n    repository: rest:https://repository.example.test/vaultwarden\n    options: []\n", "", 1),
 		"missing verification":   strings.Replace(minimalBackupYAML, "upgrade_verification_targets:\n  - primary\n", "", 1),
+		"empty verification":     strings.Replace(minimalBackupYAML, "upgrade_verification_targets:\n  - primary", "upgrade_verification_targets: []", 1),
 		"unknown verification":   strings.Replace(minimalBackupYAML, "  - primary\n", "  - missing\n", 1),
 		"missing options":        strings.Replace(minimalBackupYAML, "    options: []\n", "", 1),
 		"missing notifiers":      strings.Replace(minimalBackupYAML, "notifiers: []\n", "", 1),
 		"unknown field":          minimalBackupYAML + "state_dir: /elsewhere\n",
 		"duplicate key":          minimalBackupYAML + "notifiers: []\n",
 		"multiple documents":     minimalBackupYAML + "---\nnotifiers: []\n",
-		"retired version field":  retiredVersionField + ": 1\n" + minimalBackupYAML,
 		"boolean string":         strings.Replace(minimalBackupYAML, "repository: rest:", "repository: true # rest:", 1),
 		"numeric option value":   strings.Replace(minimalBackupYAML, "options: []", "options: [{name: connections, value: 3}]", 1),
 		"anchor":                 strings.Replace(minimalBackupYAML, "repository: rest:", "repository: &repository rest:", 1),
@@ -85,6 +90,41 @@ func TestBackupRejectsEveryStrictYAMLAndShapeViolation(t *testing.T) {
 			t.Parallel()
 			if _, err := DecodeBackup([]byte(document)); err == nil {
 				t.Fatal("invalid configuration was accepted")
+			}
+		})
+	}
+}
+
+func TestTargetlessBackupRequiresExplicitEmptyPrivateMaterial(t *testing.T) {
+	t.Parallel()
+	cfg, err := DecodeBackup([]byte(targetlessBackupYAML))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Targets == nil || len(cfg.Targets) != 0 || cfg.UpgradeVerificationTargets == nil || len(cfg.UpgradeVerificationTargets) != 0 {
+		t.Fatalf("targetless config = %#v", cfg)
+	}
+	credentials, err := LoadRoleCredentials(writePrivateFile(t, "targets: {}\n"), cfg)
+	if err != nil || credentials.Targets == nil || len(credentials.Targets) != 0 {
+		t.Fatalf("targetless role credentials = %#v/%v", credentials, err)
+	}
+	notifiers, err := LoadNotifierCredentials(writePrivateFile(t, "notifiers: {}\n"), cfg)
+	if err != nil || notifiers == nil || len(notifiers) != 0 {
+		t.Fatalf("targetless notifier credentials = %#v/%v", notifiers, err)
+	}
+	if err := ValidatePasswordDirectory(privateDirectory(t), cfg); err != nil {
+		t.Fatalf("empty password directory = %v", err)
+	}
+
+	for name, document := range map[string]string{
+		"missing targets":       "upgrade_verification_targets: []\nnotifiers: []\n",
+		"missing verification":  "targets: []\nnotifiers: []\n",
+		"nonempty verification": "upgrade_verification_targets:\n  - primary\ntargets: []\nnotifiers: []\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if _, err := DecodeBackup([]byte(document)); err == nil {
+				t.Fatal("invalid targetless configuration was accepted")
 			}
 		})
 	}

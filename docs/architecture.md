@@ -33,6 +33,13 @@ successful. The event is demand, not proof that a recovery snapshot exists.
 The worker also performs startup, periodic, and fallback checks, so losing its
 in-memory event queue does not lose the durable state of the repositories.
 
+An explicit empty target list selects targetless mode. The worker stays
+healthy and reports idle empty state, but starts no scheduler, creates no
+staging point, and opens no repository. Proxy write events are still accepted
+without affecting the client response. Each worker start emits one explicit
+warning that Vaultwarden data is not being backed up; manual checks and upgrade
+preparation remain unavailable until a target is configured.
+
 The worker mounts live Vaultwarden data read-only. It uses SQLite's online
 backup interface, validates the complete audited schema and migration, closes
 the reference set from the copied database, and stable-copies only referenced

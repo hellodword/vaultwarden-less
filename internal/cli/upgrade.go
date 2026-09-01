@@ -18,6 +18,7 @@ import (
 	restoretool "github.com/hellodword/vaultwarden-less/internal/restore"
 	"github.com/hellodword/vaultwarden-less/internal/snapshot"
 	"github.com/hellodword/vaultwarden-less/internal/upgrade"
+	"github.com/hellodword/vaultwarden-less/internal/worker"
 	"github.com/spf13/cobra"
 )
 
@@ -37,6 +38,13 @@ func upgradeCommand(configPath *string, environment commandEnvironment) *cobra.C
 			}
 			if !upgrade.ValidCommit(toCommit) || !upgrade.ValidRelease(toRelease, toCommit) {
 				return usageError("--to-commit and --to-release must be one matching immutable clean identity")
+			}
+			cfg, err := environment.backup(*configPath)
+			if err != nil {
+				return commandFailure(codeInvalidConfig, "The backup configuration is invalid", err)
+			}
+			if len(cfg.Targets) == 0 {
+				return commandFailure(codeNotReady, worker.NoBackupTargetsMessage, nil)
 			}
 			manager, err := upgradeManager(environment)
 			if err != nil {

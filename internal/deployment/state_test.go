@@ -131,14 +131,12 @@ func TestInitRejectsUnsafeExistingDeploymentDirectoryWithoutNormalizingIt(t *tes
 
 func TestActiveStrictJSONAndIdentityValidation(t *testing.T) {
 	canonical := `{"project_commit":"` + testCommit + `","release":"` + testRelease + `","activated_at":"2026-08-28T12:34:56.789Z"}` + "\n"
-	retiredVersionField := "schema_" + "version"
 	mutations := map[string]string{
 		"empty":              "",
 		"unknown field":      strings.TrimSuffix(canonical, "}\n") + `,"extra":true}` + "\n",
 		"duplicate key":      strings.Replace(canonical, `"project_commit":"`+testCommit+`"`, `"project_commit":"`+testCommit+`","project_commit":"`+testCommit+`"`, 1),
 		"trailing value":     canonical + "{}\n",
 		"wrong type":         strings.Replace(canonical, `"project_commit":"`+testCommit+`"`, `"project_commit":1`, 1),
-		"retired field":      strings.Replace(canonical, "{", `{"`+retiredVersionField+`":1,`, 1),
 		"noncanonical":       " " + canonical,
 		"uppercase commit":   strings.Replace(canonical, testCommit, strings.ToUpper(testCommit), 1),
 		"mismatched release": strings.Replace(canonical, testRelease, "RELEASE.2026-08-28T12-34-56Z-gffffffffffff", 1),

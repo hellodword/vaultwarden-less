@@ -370,6 +370,27 @@ func TestConfigValidateRoleGoldenAndFailureClassification(t *testing.T) {
 	assertErrorJSON(t, stderr, codeUnsafePath)
 }
 
+func TestConfigValidateTargetlessRolesReturnEmptyTargets(t *testing.T) {
+	environment := testEnvironment(nil, nil)
+	environment.loadBackup = func(string) (*config.Backup, error) {
+		return &config.Backup{
+			UpgradeVerificationTargets: []string{},
+			Targets:                    []config.Target{},
+			Notifiers:                  []config.Notifier{},
+		}, nil
+	}
+	environment.loadCredentials = func(string, *config.Backup) (*config.RoleCredentials, error) {
+		return &config.RoleCredentials{Targets: map[string]config.RoleTarget{}}, nil
+	}
+	for _, role := range []string{"backup", "maintenance"} {
+		stdout, stderr, code := executeCommand(environment, "config", "validate", "--role", role)
+		want := `{"valid":true,"role":"` + role + `","targets":[]}` + "\n"
+		if code != 0 || stderr != "" || stdout != want {
+			t.Fatalf("targetless config validate %s = %d/%q/%q", role, code, stdout, stderr)
+		}
+	}
+}
+
 func TestValidateMountedPathRequiresTheExactNonSymlinkObject(t *testing.T) {
 	root := t.TempDir()
 	expected := filepath.Join(root, "expected")
@@ -437,6 +458,43 @@ func TestUpgradePrepareGoldenAndServingGateClassification(t *testing.T) {
 		t.Fatalf("frozen serve = %d/%q/%q/called=%t", code, stdout, stderr, called)
 	}
 	assertErrorJSON(t, stderr, codeNotReady)
+}
+
+func TestUpgradePrepareTargetlessFailsBeforeStateManagement(t *testing.T) {
+	setBuildIdentity(t, strings.Repeat("a", 40), "RELEASE.2026-08-27T12-00-00Z-gaaaaaaaaaaaa", "true")
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "state")
+	dataDir := filepath.Join(root, "data")
+	for _, directory := range []string{stateDir, dataDir} {
+		if err := os.Mkdir(directory, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	environment := testEnvironment(nil, nil)
+	environment.stateDir = stateDir
+	environment.dataDir = dataDir
+	environment.loadBackup = func(string) (*config.Backup, error) {
+		return &config.Backup{
+			UpgradeVerificationTargets: []string{}, Targets: []config.Target{}, Notifiers: []config.Notifier{},
+		}, nil
+	}
+	deploymentLoaded := false
+	environment.loadDeployment = func() (config.Deployment, error) {
+		deploymentLoaded = true
+		return config.Deployment{}, errors.New("state manager must not start")
+	}
+	toCommit := strings.Repeat("b", 40)
+	toRelease := "RELEASE.2026-08-27T13-00-00Z-gbbbbbbbbbbbb"
+	stdout, stderr, code := executeCommand(
+		environment, "upgrade", "prepare", "--to-commit", toCommit, "--to-release", toRelease,
+	)
+	if code != 1 || stdout != "" || deploymentLoaded {
+		t.Fatalf("targetless upgrade prepare = %d/%q/%q deployment_loaded=%t", code, stdout, stderr, deploymentLoaded)
+	}
+	assertErrorJSON(t, stderr, codeNotReady)
+	if _, err := os.Lstat(filepath.Join(stateDir, "upgrade")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("targetless prepare created upgrade state: %v", err)
+	}
 }
 
 func TestUpgradeDeadlineKeepsStableTimeoutClassification(t *testing.T) {
@@ -577,6 +635,27 @@ func TestWorkerClientCommandsHaveExactJSON(t *testing.T) {
 		if code != 0 || stderr != "" || stdout != test.want {
 			t.Fatalf("%s = %d/%q/%q", test.command, code, stdout, stderr)
 		}
+	}
+}
+
+func TestRequestBackupPassesThroughTargetlessNotReady(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost || request.URL.Path != worker.CheckPath {
+			writer.WriteHeader(http.StatusNotFound)
+			return
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		writer.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = writer.Write([]byte(`{"error":{"code":"not_ready","message":"` + worker.NoBackupTargetsMessage + `"}}` + "\n"))
+	}))
+	defer server.Close()
+	stdout, stderr, code := executeCommand(testEnvironment(nil, server), "request-backup")
+	if code != 1 || stdout != "" {
+		t.Fatalf("targetless request-backup = %d/%q/%q", code, stdout, stderr)
+	}
+	var document errorDocument
+	if err := json.Unmarshal([]byte(stderr), &document); err != nil || document.Error.Code != codeNotReady || document.Error.Message != worker.NoBackupTargetsMessage {
+		t.Fatalf("targetless request-backup error = %#v/%v", document, err)
 	}
 }
 

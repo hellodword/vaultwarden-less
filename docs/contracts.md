@@ -1,18 +1,9 @@
 # Product contracts
 
-This document is the normative machine contract for the versionless product.
-Tracked examples, Compose files, binaries, tests, and operator prose must agree
-with it; none can silently redefine it. The breaking change from the retired
-schema-marked contract is explicitly authorized for the interfaces named here.
-It does not authorize deployment, publication, deletion, or mutation of real
-data.
-
-There is no reader, migration, fallback, or converter for old project
-configuration, state, manifests, hash streams, or Restic snapshots. A first
-versionless deployment uses a fresh deployment root and fresh repository
-prefix, and retains the complete legacy root, repositories, images, and commit
-as the rollback path. Project code must reject old fields and bytes using the
-stable classifications defined below rather than infer compatibility.
+This document is the normative machine contract for the product. Tracked
+examples, Compose files, binaries, tests, and operator prose must agree with it;
+none can silently redefine it. It does not authorize deployment, publication,
+deletion, or mutation of real data.
 
 All instants are UTC RFC 3339 with exactly three fractional digits, for example
 `2026-08-27T12:34:56.789Z`. A full commit is 40 lowercase hexadecimal
@@ -52,7 +43,7 @@ The source checkout contains tracked Compose files, public templates, and
 documentation. Its ignored `.env` selects a separate private deployment root;
 the checkout is not the owner or default location of credentials, state, or
 application data. Existing checkout-relative ignored paths remain protected by
-`.gitignore` only to prevent legacy private material from entering Git. Product
+`.gitignore` only to prevent private material from entering Git. Product
 code and tests never read them as fixtures.
 
 The deployment `.env` is parsed by the locked Docker Compose implementation.
@@ -132,7 +123,7 @@ larger than 1 MiB, owned by that same identity:
 ```
 
 The file is canonical one-line JSON followed by LF. Unknown or duplicate
-fields, trailing values, wrong JSON types, a retired version field, a
+fields, trailing values, wrong JSON types, a
 non-lowercase/full commit, a release that does not contain the matching first
 12 commit characters, and a non-UTC millisecond timestamp are invalid.
 For a terminal workflow, immutable `decided_at` is chosen strictly after the
@@ -186,6 +177,8 @@ ReadJSON(path string, limit int64, destination any) error
 WriteNewJSON(path string, limit int64, value any) error
 ReplaceJSON(path string, limit int64, value any) error
 IsOwnedTemporary(targetName string, candidateName string) bool
+ValidateOwnedTemporary(directory string, candidateName string, limit int64, targetNames ...string) (bool, error)
+CleanupOwnedTemporaries(directory string, limit int64, targetNames ...string) error
 ```
 
 It enforces the private single-link `0600` file and UID/GID contract, rejects
@@ -197,10 +190,6 @@ names owned by the target. Deployment, import, and upgrade retain ownership of
 their fields, phases, identities, validation, and stable domain error codes.
 Injected failure at any write boundary leaves either the complete prior file or
 the complete new file, never a partial durable document.
-
-Retired version fields are unknown fields. Old deployment, import, and upgrade
-JSON map respectively to `deployment_state_invalid`, `import_state_invalid`,
-and `upgrade_state_invalid`; no package removes the field and retries.
 
 ## YAML configuration and credentials
 
@@ -228,7 +217,7 @@ notifiers:
     type: wechat
 ```
 
-There are 1 to 32 targets. A target name matches
+`targets` must be present and contain 0 to 32 entries. A target name matches
 `[a-z][a-z0-9-]{0,62}` and is unique. `repository` is a string of 1 to 4096
 bytes with no NUL, CR, or LF and is passed to Restic as one argument; the
 product does not parse or branch on a provider. `options` is required and is an
@@ -240,8 +229,11 @@ Within the project-managed Restic package, Restic decides whether the
 repository and options are supported. This delegation does not extend project
 support to another Restic build or version.
 
-`upgrade_verification_targets` contains 1 to 32 unique target names, preserves
-order, and is a subset (including the possible full set) of `targets`.
+When `targets` is nonempty, `upgrade_verification_targets` contains 1 to 32
+unique target names, preserves order, and is a subset (including the possible
+full set) of `targets`. When `targets` is the explicit empty array,
+`upgrade_verification_targets` must also be present as the explicit empty
+array. A missing or null value at either boundary is invalid.
 Resident target synchronization uses at most two operations concurrently.
 Targets are dispatched and all results and notifications are published in
 configuration order; one failure does not cancel another target. Upgrade
@@ -270,6 +262,10 @@ with no NUL. Names beginning `RESTIC_`, and the exact names `PATH`, `HOME`,
 forbidden. The backup role is available only to the resident worker. The
 maintenance role is available only to one-shot repository, restore, and
 upgrade commands. Neither role falls back to the other.
+
+For an empty target set, both role files contain `targets: {}`. The private
+Restic password directory is present and empty. Notifier credentials likewise
+use `notifiers: {}` when no notifiers are configured.
 
 Each target has exactly one `credentials/restic/<target>` password file. It is
 1 to 65536 bytes, contains no NUL or CR, and represents one nonempty line. One
@@ -419,19 +415,6 @@ The exhaustive stable codes are `usage_error`, `invalid_config`,
 `internal_error`. The message is safe human context and is not a stable parsing
 surface. No error has extra fields.
 
-Retired inputs fail without compatibility handling:
-
-| Input boundary | Stable result |
-| --- | --- |
-| Backup YAML with a retired field | `invalid_config` |
-| Credential YAML with a retired field | `invalid_credentials` |
-| Versioned HTTP path or nonempty request object | HTTP 400 `usage_error` |
-| Deployment, import, or upgrade state with a retired field | the matching `*_state_invalid` code |
-| Manifest, hash stream, or snapshot carrying retired bytes/tags | `verification_failure` |
-
-These classifications apply before any side effect. There is no automatic
-rewrite, fallback reader, or converter.
-
 A dirty or non-Git build reports development identity. Only `version`,
 `healthcheck`, `config validate`, and help may run in that state. Both `serve`
 commands and every command that reads or changes runtime, repository, restore,
@@ -445,6 +428,8 @@ The complete success documents are:
 {"healthy":true}
 {"accepted":true}
 {"valid":true,"role":"backup","targets":["primary"]}
+{"valid":true,"role":"backup","targets":[]}
+{"valid":true,"role":"maintenance","targets":[]}
 {"status":"initialized","project_commit":"0123456789abcdef0123456789abcdef01234567","release":"RELEASE.2026-08-27T12-34-56Z-g0123456789ab"}
 {"status":"already_initialized","project_commit":"0123456789abcdef0123456789abcdef01234567","release":"RELEASE.2026-08-27T12-34-56Z-g0123456789ab"}
 {"operation":"init","target":"primary","success":true}
@@ -551,15 +536,24 @@ Target state is `unknown`, `healthy`, `retrying`, or `degraded`. Check result is
 source archive observed during that check even when unchanged logical content
 causes no upload.
 
+With an explicit empty target set, the worker starts healthy and writes one
+WARN per process start with `warning_code=no_backup_targets` and the message
+`Vaultwarden data is not being backed up because no backup targets are
+configured`. It does not start a scheduler, create a staging point, or
+instantiate or call repository operations. Its status remains `idle` with
+`targets: []`, `last_check: null`, and `next_check_at: null`.
+
 ## Internal HTTP and proxy events
 
 The private backup HTTP interface is:
 
 - `GET /healthz` accepts no query or body and returns 204 with an empty body.
 - `GET /status` accepts no query or body and returns the CLI status JSON.
-- `POST /events` accepts the strict empty request and returns 204.
-- `POST /checks` accepts the same request and returns 202 plus the
-  `request-backup` JSON.
+- `POST /events` accepts the strict empty request and returns 204, including
+  when no targets are configured.
+- `POST /checks` accepts the same request. With configured targets it returns
+  202 plus the `request-backup` JSON. With no targets it returns 503 and the
+  ordinary `not_ready` envelope stating that no backup targets are configured.
 
 The only request object is `{}`. JSON whitespace is allowed, but the object
 must be empty and no second JSON value may follow. Body size is at most 1024 bytes.
@@ -568,8 +562,6 @@ wrong method, duplicate or unknown key, redirect, or extra document is
 rejected. JSON HTTP errors use the CLI error envelope. Invalid input is 400,
 wrong method is 405, conflict is 409, unsafe path is 422, not-ready is 503,
 timeout is 504, repository failure is 502, and other runtime failures are 500.
-Retired versioned paths and request fields are invalid input and return 400
-`usage_error`; they are not aliases.
 
 The proxy publishes `/.vaultwarden-less/healthz`; every other request and
 response is transparently forwarded. A completed upstream response with a
@@ -585,7 +577,7 @@ The recovery identity is the full clean project commit that created the
 snapshot. That commit uniquely selects `flake.lock`; the manifest does not
 repeat software versions, image digests, source hashes, or the lock hash.
 
-`manifest.json` is strict versionless JSON:
+`manifest.json` is strict JSON:
 
 ```json
 {
@@ -686,8 +678,9 @@ archive_id=sha256:<64-lowercase-hex>
 
 The fixed Restic host is `vaultwarden-less` and fixed path is
 `/staging/point`. Selection and prune require the host, path, and all three
-identity tags. A retired schema tag makes the snapshot invalid rather than
-compatible. Explicit snapshot IDs are full 64-character IDs.
+identity tags. Each required identity tag must occur exactly once and contain a
+valid value. Other tags do not participate in identity and are ignored.
+Explicit snapshot IDs are full 64-character IDs.
 
 For each target, the newest matching snapshot's `content_id` decides upload.
 Equal content skips that target even when the observed `archive_id` differs.
@@ -720,7 +713,7 @@ verified restore tree, and renames that tree without replacement to `data`.
 Every failure preserves both available trees. Rollback while stopped moves a
 failed restore without replacement to `failed-restored-data` and restores the
 original tree without replacement. Active identity is unchanged. A snapshot
-from another commit or from a legacy/versioned contract is rejected.
+from another commit or whose manifest fails the current contract is rejected.
 
 Because the recovery tree excludes RSA material, old sessions must fail and a
 fresh login, backup, restore, and drill must all succeed. Incident material is
@@ -814,8 +807,9 @@ including `soak`, have no alias or compatibility fallback.
 
 `check-release A` requires a full clean A distinct from clean HEAD B and, in
 order, runs: `nix flake check`; full-tree race; full-tree coverage;
-`govulncheck`; every binary and production/Moto image build; Moto/Restic
-integration; expanded backup/restore/drill E2E; accelerated fake-clock
+`govulncheck`; every binary and production/Moto image build; targetless
+deployment E2E; Moto/Restic integration; expanded backup/restore/drill E2E;
+accelerated fake-clock
 multi-target threshold integration; short production-image dual-repository
 failure isolation/catch-up E2E; initial import E2E; A/B accept E2E; and A/B
 rollback E2E. It then revalidates A, B, and the unchanged worktree.
@@ -828,7 +822,7 @@ contains no version field, secret, or raw stderr. Evidence has no wall-clock
 expiry; any mismatched commit or byte content invalidates it.
 
 ```json
-{"from_commit":"<A-full-commit>","to_commit":"<B-full-commit>","started_at":"2026-08-30T10:00:00.000Z","finished_at":"2026-08-30T10:30:00.000Z","gates":["nix-flake-check","go-race","go-coverage","govulncheck","products","moto-restic","backup-restore-drill","multitarget-threshold","dual-repository","initial-import","upgrade-accept","upgrade-rollback"],"status":"passed"}
+{"from_commit":"<A-full-commit>","to_commit":"<B-full-commit>","started_at":"2026-08-30T10:00:00.000Z","finished_at":"2026-08-30T10:30:00.000Z","gates":["nix-flake-check","go-race","go-coverage","govulncheck","products","targetless-deployment","moto-restic","backup-restore-drill","multitarget-threshold","dual-repository","initial-import","upgrade-accept","upgrade-rollback"],"status":"passed"}
 ```
 
 `release A output-directory` requires an absent output, an existing real
@@ -847,41 +841,10 @@ Failure removes only task-owned temporary paths and never replaces output.
 {"candidate_sha256":"sha256:<64-lowercase-hex>","from_commit":"<A-full-commit>","to_commit":"<B-full-commit>","release":"<B-immutable-release>","files":{"SHA256SUMS":"sha256:<64-lowercase-hex>","images.tar.gz":"sha256:<64-lowercase-hex>"},"verified_at":"2026-08-30T10:40:00.000Z","status":"verified"}
 ```
 
-### First versionless release identities
-
-`L` is the last complete legacy/schema-marked commit and release actually kept
-for rollback. `C` is the first complete, fully green, unpublishing versionless
-implementation commit. `B` is a later, distinct, fully green release-candidate
-commit that preserves the same versionless runtime contract.
-
-The first release requires two independent evidence paths. Normal
-`check-release C` and `release C <output>` establish C→B A/B state-machine and
-artifact evidence. Separately, an isolated L→B rehearsal starts with a fresh
-deployment root, fresh Restic repository prefix, and B-owned configuration and
-state. It never parses L project state or snapshots: a completely stopped copy
-of L's raw Vaultwarden data is placed at B's `import/source` and processed by
-B's ordinary external-import flow, including upstream migration, RSA rotation,
-two-client data verification, new-repository backup, restore, and drill.
-
-The complete L commit, images, root, and repository remain intact. Before edge
-traffic switches, failure recovery is to stop B and restart complete L. After
-an authorized switch, L remains until B backup, restore, drill, and a separately
-defined observation period pass. This contract neither authorizes a production
-switch nor deletion of L.
-
-The ignored canonical `tmp/release-evidence/<L>..<B>/cutover.json` shape is:
-
-```json
-{"legacy_commit":"<L-full-commit>","to_commit":"<B-full-commit>","legacy_source_tree_id":"sha256:<64-lowercase-hex>","import":{"project_commit":"<B-full-commit>","active_release":"<B-immutable-release>","source_tree_id":"sha256:<64-lowercase-hex>","candidate_tree_id":"sha256:<64-lowercase-hex>"},"repository":{"prefix":"synthetic-fresh-prefix","snapshot_id":"<64-lowercase-hex>","content_id":"sha256:<64-lowercase-hex>","archive_id":"sha256:<64-lowercase-hex>"},"verification":{"two_users":true,"user_data":true,"old_sessions_rejected":true,"restore":true,"drill":true,"rollback":true},"status":"passed"}
-```
-
-Only synthetic identifiers may enter this evidence. A real endpoint, account,
-credential, personal value, database row, or raw command output is forbidden.
-
 ## Upgrade and explicit rollback
 
 Upgrade applies only between two different clean commits that both implement
-this versionless contract. The upgrade ID is `<A-full-commit>..<B-full-commit>`.
+this contract. The upgrade ID is `<A-full-commit>..<B-full-commit>`.
 A owns `upgrade prepare`, `upgrade freeze`, and `rollback apply`. B owns
 `upgrade migrate-check`, `upgrade verify`, and `upgrade accept`. A never opens,
 decodes, hashes, or makes a decision from `candidate.json`; moving that fixed
@@ -920,6 +883,11 @@ data follows the normal private tree rules.
   "prepared_at": "2026-08-27T12:34:56.789Z"
 }
 ```
+
+After validating its arguments, `upgrade prepare` loads the backup
+configuration. With an empty target set it returns `not_ready` before creating
+or opening upgrade state; a recoverable upgrade requires at least one backup
+target.
 
 `compose.env` contains exactly these seven unique, unquoted assignments in
 this order and no other content:
@@ -1090,7 +1058,7 @@ tags and covers that exact managed release pair. When both releases contain the
 same actual Vaultwarden version, this is complete framework evidence and not an
 unverified compatibility obligation. Exact-pair cross-version verification is
 an additional claim available only after the same scenario runs with two
-managed versionless releases whose actual Vaultwarden versions differ. Neither
+managed releases whose actual Vaultwarden versions differ. Neither
 result promises compatibility for an upstream version or build that the
 project does not manage.
 

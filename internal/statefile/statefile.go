@@ -128,6 +128,59 @@ func IsOwnedTemporary(targetName, candidateName string) bool {
 		len(candidateName) > len(prefix)+len(temporarySuffix)
 }
 
+// ValidateOwnedTemporary validates candidateName when it is a JSON write
+// temporary owned by one of targetNames. The boolean is false for names that
+// are outside that exact namespace.
+func ValidateOwnedTemporary(directory, candidateName string, limit int64, targetNames ...string) (bool, error) {
+	if !filepath.IsAbs(directory) || filepath.Clean(directory) != directory || filepath.Base(candidateName) != candidateName {
+		return false, fmt.Errorf("state temporary path is invalid")
+	}
+	owned := false
+	for _, targetName := range targetNames {
+		if IsOwnedTemporary(targetName, candidateName) {
+			owned = true
+			break
+		}
+	}
+	if !owned {
+		return false, nil
+	}
+	if _, err := validateFile(filepath.Join(directory, candidateName), limit); err != nil {
+		return true, fmt.Errorf("state write temporary is unsafe: %w", err)
+	}
+	return true, nil
+}
+
+// CleanupOwnedTemporaries removes only safe JSON write temporaries for the
+// named targets, then durably records any removal in the containing directory.
+func CleanupOwnedTemporaries(directory string, limit int64, targetNames ...string) error {
+	if err := privatefs.ValidatePrivateDirectory(directory); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		return err
+	}
+	removed := false
+	for _, entry := range entries {
+		owned, err := ValidateOwnedTemporary(directory, entry.Name(), limit, targetNames...)
+		if err != nil {
+			return err
+		}
+		if !owned {
+			continue
+		}
+		if err := os.Remove(filepath.Join(directory, entry.Name())); err != nil {
+			return err
+		}
+		removed = true
+	}
+	if removed {
+		return privatefs.SyncDirectory(directory)
+	}
+	return nil
+}
+
 func canonicalJSON(value any, limit int64) ([]byte, error) {
 	if value == nil || limit < 1 {
 		return nil, fmt.Errorf("state value and positive limit are required")

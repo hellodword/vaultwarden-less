@@ -116,6 +116,24 @@ notifiers: []
 include every repository that must be proven before accepting B. Normal backup
 still attempts every configured target regardless of this subset.
 
+For a bootstrap with no repository, both arrays must be present and explicitly
+empty:
+
+```yaml
+upgrade_verification_targets: []
+targets: []
+notifiers: []
+```
+
+Omitting either field or writing a YAML null is invalid. `targets` contains
+0 to 32 entries. With one or more targets,
+`upgrade_verification_targets` still contains 1 to 32 unique configured names;
+with zero targets, it is exactly `[]`. Targetless mode keeps the services alive
+but deliberately performs no scheduled or manual backup and provides no
+recovery point. Follow the complete
+[targetless bootstrap runbook](operations.md#explicit-targetless-bootstrap-and-first-account)
+and treat all current data as unprotected.
+
 ## Isolated role credentials
 
 `credentials/backup.yaml` and `credentials/maintenance.yaml` have the same
@@ -154,6 +172,16 @@ outside the deployment and test it through a restore.
 The key sets in backup credentials, maintenance credentials, target passwords,
 and `config/backup.yaml` must agree exactly. Adding or removing a target is one
 coordinated configuration change.
+
+For targetless mode, both role files contain exactly:
+
+```yaml
+targets: {}
+```
+
+The private `credentials/restic` directory must still be a real, owned mode-
+`0700` directory, but it is empty. Do not copy the tracked primary password
+example into that private directory.
 
 ## Notifiers
 
@@ -221,14 +249,19 @@ docker compose --env-file .env --file compose.yml --profile maintenance run --rm
 docker compose --env-file .env --file compose.yml --profile maintenance run --rm --no-deps config-check-maintenance
 ```
 
-Each command must print one versionless JSON success document and exit zero.
+Each command must print one strict JSON success document and exit zero.
 Together they check the five resolved values, exact YAML, actual Compose bind
 identity, ownership, modes, symlink containment, target/password key sets,
 both role files, notifier credentials, and required runtime directories. They
 intentionally do not contact a repository.
 
-After validation, initialize every newly created repository with the
-maintenance role:
+In targetless mode the exact results are
+`{"valid":true,"role":"backup","targets":[]}` and
+`{"valid":true,"role":"maintenance","targets":[]}`. There is no
+`warnings` field; the runtime warning is emitted by each backup service start.
+
+After validation, initialize every newly created configured repository with the
+maintenance role. Skip this step when `targets: []`:
 
 ```sh
 docker compose --env-file .env --file compose.yml --profile maintenance run --rm --no-deps maintenance repo init --target primary

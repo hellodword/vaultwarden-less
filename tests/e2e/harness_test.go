@@ -102,6 +102,16 @@ func newE2EHarnessWithImages(t *testing.T, ctx context.Context, prepareImages bo
 	if len(targets) == 0 {
 		targets = []string{"primary"}
 	}
+	return newE2EHarnessForTargets(t, ctx, prepareImages, targets)
+}
+
+func newTargetlessE2EHarness(t *testing.T, ctx context.Context) *e2eHarness {
+	t.Helper()
+	return newE2EHarnessForTargets(t, ctx, !*preloadedImages, []string{})
+}
+
+func newE2EHarnessForTargets(t *testing.T, ctx context.Context, prepareImages bool, targets []string) *e2eHarness {
+	t.Helper()
 	repository := repositoryRoot(t)
 	localRoot := t.TempDir()
 	dockerConfig := filepath.Join(localRoot, "docker-config")
@@ -372,11 +382,11 @@ func (h *e2eHarness) prepareDeployment() {
 	if !strings.HasPrefix(notifierExample, "notifiers:\n") {
 		h.t.Fatal("notifier example has an unexpected shape")
 	}
-	writePrivateFile(
-		h.t,
-		filepath.Join(h.localRoot, "credentials", "notifiers.yaml"),
-		"notifiers:\n  e2e:\n    webhook_url: "+h.notifierWebhook+"\n",
-	)
+	notifierCredentials := "notifiers:\n  e2e:\n    webhook_url: " + h.notifierWebhook + "\n"
+	if len(h.targets) == 0 {
+		notifierCredentials = "notifiers: {}\n"
+	}
+	writePrivateFile(h.t, filepath.Join(h.localRoot, "credentials", "notifiers.yaml"), notifierCredentials)
 	passwordExample := strings.TrimSuffix(readTrackedExample(h.t, filepath.Join(h.repository, "credentials", "restic", "primary.example")), "\n")
 	if passwordExample != "replace-me" {
 		h.t.Fatal("restic password example changed unexpectedly")
@@ -491,6 +501,9 @@ func readTrackedExample(t *testing.T, path string) string {
 
 func renderBackupExample(t *testing.T, example string, targets []string) string {
 	t.Helper()
+	if len(targets) == 0 {
+		return "upgrade_verification_targets: []\ntargets: []\nnotifiers: []\n"
+	}
 	if !slices.Equal(targets, []string{"primary"}) && !slices.Equal(targets, []string{"primary", "secondary"}) {
 		t.Fatalf("unsupported E2E targets: %v", targets)
 	}
@@ -510,6 +523,9 @@ func renderBackupExample(t *testing.T, example string, targets []string) string 
 
 func renderRoleExample(t *testing.T, example string, targets []string) string {
 	t.Helper()
+	if len(targets) == 0 {
+		return "targets: {}\n"
+	}
 	if !strings.HasPrefix(example, "targets:\n") || !strings.Contains(example, "primary:") {
 		t.Fatal("role credential example changed unexpectedly")
 	}
