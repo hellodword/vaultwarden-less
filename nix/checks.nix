@@ -37,10 +37,16 @@ let
         export GOCACHE="$TMPDIR/go-cache"
         export GOMODCACHE="$TMPDIR/go-modules"
         export XDG_CACHE_HOME="$TMPDIR/xdg-cache"
-        mkdir -m 0700 "$GOCACHE" "$GOMODCACHE" "$XDG_CACHE_HOME"
-        cp -R --no-preserve=mode ${packages.backup.goModules}/. "$GOMODCACHE"
-        chmod -R u+w "$GOMODCACHE"
-        cd ${source}
+        export GOFLAGS="-mod=vendor"
+        export GOPROXY="off"
+        export GOSUMDB="off"
+        worktree="$TMPDIR/source"
+        mkdir -m 0700 "$GOCACHE" "$GOMODCACHE" "$XDG_CACHE_HOME" "$worktree"
+        cp -R --no-preserve=mode ${source}/. "$worktree"
+        test ! -e "$worktree/vendor"
+        cp -R --no-preserve=mode ${packages.backup.goModules} "$worktree/vendor"
+        chmod -R u+w "$worktree"
+        cd "$worktree"
         ${command}
         touch "$out"
       '';
