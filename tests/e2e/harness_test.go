@@ -30,6 +30,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/hellodword/vaultwarden-less/internal/privatefs"
 )
 
 const (
@@ -113,7 +115,7 @@ func newTargetlessE2EHarness(t *testing.T, ctx context.Context) *e2eHarness {
 func newE2EHarnessForTargets(t *testing.T, ctx context.Context, prepareImages bool, targets []string) *e2eHarness {
 	t.Helper()
 	repository := repositoryRoot(t)
-	localRoot := t.TempDir()
+	localRoot := newPrivateE2ERoot(t)
 	dockerConfig := filepath.Join(localRoot, "docker-config")
 	if err := os.Mkdir(dockerConfig, 0o700); err != nil {
 		t.Fatal(err)
@@ -164,6 +166,68 @@ func newE2EHarnessForTargets(t *testing.T, ctx context.Context, prepareImages bo
 		harness.prepareImages()
 	}
 	return harness
+}
+
+func newPrivateE2ERoot(t *testing.T) string {
+	t.Helper()
+	if os.Geteuid() == 0 || os.Getegid() == 0 {
+		t.Fatal("E2E harness must run as an unprivileged identity")
+	}
+	parent := t.TempDir()
+	// Nix or a build worker may place TMPDIR below a setgid directory. Clear
+	// inherited special bits before creating the runtime-owned bind root.
+	if err := os.Chmod(parent, 0o700); err != nil {
+		t.Fatalf("secure E2E temporary parent: %v", err)
+	}
+	root := filepath.Join(parent, "deployment-root")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatalf("create private E2E deployment root: %v", err)
+	}
+	if err := privatefs.ValidatePrivateDirectory(root); err != nil {
+		t.Fatalf("validate private E2E deployment root: %v", err)
+	}
+	return root
+}
+
+func TestNewPrivateE2ERootClearsInheritedSetgid(t *testing.T) {
+	if os.Geteuid() == 0 || os.Getegid() == 0 {
+		t.Skip("private E2E roots require an unprivileged identity")
+	}
+	base, err := os.MkdirTemp("", "vwless-e2e-setgid-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(base); err != nil {
+			t.Errorf("remove setgid E2E fixture: %v", err)
+		}
+	})
+	baseInfo, err := os.Lstat(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if baseInfo.Mode()&os.ModeSetgid == 0 {
+		if err := os.Chmod(base, 0o700|os.ModeSetgid); err != nil {
+			t.Skipf("fixture filesystem cannot create a setgid directory: %v", err)
+		}
+		baseInfo, err = os.Lstat(base)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if baseInfo.Mode()&os.ModeSetgid == 0 {
+			t.Skip("fixture filesystem does not preserve setgid directories")
+		}
+	}
+	t.Setenv("TMPDIR", base)
+
+	root := newPrivateE2ERoot(t)
+	parentInfo, err := os.Lstat(filepath.Dir(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parentInfo.Mode()&os.ModeSetgid != 0 {
+		t.Fatal("private E2E root parent retained an inherited setgid bit")
+	}
 }
 
 func repositoryRoot(t *testing.T) string {
@@ -336,9 +400,6 @@ func (h *e2eHarness) setBackend(endpoint string) {
 
 func (h *e2eHarness) prepareDeployment() {
 	h.t.Helper()
-	if os.Geteuid() == 0 || os.Getegid() == 0 {
-		h.t.Fatal("E2E harness must run as an unprivileged identity")
-	}
 	for _, relative := range []string{
 		"config", "credentials", "credentials/restic", "cache", "data", "import", "restore", "staging", "state",
 	} {
