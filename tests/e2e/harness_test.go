@@ -774,7 +774,7 @@ func (h *e2eHarness) waitHealthy(service string, timeout time.Duration) {
 	}
 	logs := ""
 	if lastContainer != "" {
-		logs, _ = h.docker("logs", "--tail", "100", lastContainer)
+		logs, _ = h.dockerLogs("--tail", "100", lastContainer)
 	}
 	h.t.Fatalf(
 		"service %s did not become healthy: state=%s logs=%s",
@@ -916,6 +916,18 @@ func (h *e2eHarness) docker(arguments ...string) (string, error) {
 	return h.dockerContext(h.ctx, arguments...)
 }
 
+func (h *e2eHarness) dockerLogs(arguments ...string) (string, error) {
+	arguments = append([]string{"--config", h.dockerConfig, "logs"}, arguments...)
+	return runCommandWithCombinedOutput(
+		h.ctx,
+		h.repository,
+		nil,
+		h.dockerEnv,
+		h.dockerPath,
+		arguments...,
+	)
+}
+
 func (h *e2eHarness) setDockerEnvironment(name, value string) {
 	prefix := name + "="
 	for index, entry := range h.dockerEnv {
@@ -994,6 +1006,53 @@ func runCommandWithEnvironment(
 		return strings.TrimSpace(stdout.String() + "\n" + stderr.String()), err
 	}
 	return strings.TrimSpace(stdout.String()), nil
+}
+
+func runCommandWithCombinedOutput(
+	ctx context.Context,
+	directory string,
+	input []byte,
+	environment []string,
+	binary string,
+	arguments ...string,
+) (string, error) {
+	command := exec.CommandContext(ctx, binary, arguments...)
+	command.Dir = directory
+	command.Env = environment
+	if input != nil {
+		command.Stdin = bytes.NewReader(input)
+	}
+	output, err := command.CombinedOutput()
+	return strings.TrimSpace(string(output)), err
+}
+
+const combinedOutputHelperEnvironment = "VAULTWARDEN_LESS_E2E_COMBINED_OUTPUT_HELPER"
+
+func TestRunCommandWithCombinedOutputIncludesSuccessfulStderr(t *testing.T) {
+	t.Setenv(combinedOutputHelperEnvironment, "1")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	output, err := runCommandWithCombinedOutput(
+		ctx,
+		t.TempDir(),
+		nil,
+		os.Environ(),
+		os.Args[0],
+		"-test.run=^TestRunCommandWithCombinedOutputHelper$",
+	)
+	if err != nil {
+		t.Fatalf("run combined-output helper: %v: %s", err, output)
+	}
+	if !strings.Contains(output, "successful stderr marker") {
+		t.Fatalf("combined output omitted successful stderr: %q", output)
+	}
+}
+
+func TestRunCommandWithCombinedOutputHelper(t *testing.T) {
+	if os.Getenv(combinedOutputHelperEnvironment) != "1" {
+		return
+	}
+	_, _ = io.WriteString(os.Stderr, "successful stderr marker\n")
 }
 
 func isolatedDockerEnvironment(configDirectory string) []string {

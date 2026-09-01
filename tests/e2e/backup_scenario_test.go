@@ -186,7 +186,7 @@ func TestTargetlessDeploymentLifecycle(t *testing.T) {
 	}
 
 	backupContainer := strings.TrimSpace(harness.compose("ps", "--quiet", "backup"))
-	logs, err := harness.docker("logs", backupContainer)
+	logs, err := harness.dockerLogs(backupContainer)
 	if err != nil {
 		t.Fatalf("read targetless backup logs: %v: %s", err, harnessDiagnostics(logs))
 	}
