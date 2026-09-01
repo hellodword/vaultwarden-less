@@ -117,9 +117,10 @@ audit every package that moves with it. Registration and initial organization
 creation remain bounded fixtures only because the CLI lacks those operations;
 all later behavior must continue through the real CLI.
 
-Run deterministic crypto vectors repeatedly, all fast/race checks, ordinary
-and two-target E2E, and upgrade E2E. A green CLI version command does not prove
-protocol compatibility.
+Run deterministic crypto vectors repeatedly, all fast/race checks, and ordinary
+and two-target E2E. A green CLI version command does not prove protocol
+compatibility. Real A/B client protocol compatibility is operator-owned
+acceptance outside the project release gate.
 
 ## Restic checklist
 
@@ -144,12 +145,12 @@ tag and readable source revision.
 
 Run unit and race tests for the Restic adapter, the real Moto/Restic integration
 including format-2 init/check/prune/restore failures, lean backup, fast
-multi-target, initial-import, both upgrade E2Es, vulnerability checks, and
-deterministic release creation. Compare actual A/B Restic versions: only a
-distinct pair runs and may claim the format-2 cross-version round trip. An
-equal pair records that matrix as not applicable. Never add an implicit
-`restic migrate` call. Moto is not a substitute for a real configured storage
-provider.
+multi-target, initial-import, vulnerability checks, and the pure Nix release
+build. The project gate makes no A/B compatibility claim. When an operator
+needs that claim, separately exercise a real version pair: A initializes and
+writes, B lists/checks/restores and writes, and A lists/checks/restores again.
+Never add an implicit `restic migrate` call. Moto is not a substitute for a
+real configured storage provider.
 
 ## Go checklist
 
@@ -174,9 +175,10 @@ source evidence is established. `GOTOOLCHAIN=local` and the actual toolchain
 version must match the inventory.
 
 Run `govulncheck ./...` before and after the change, all fast and race checks,
-all products, real integration/lifecycles, upgrade E2E, and two clean release
-builds. A toolchain bump is incomplete while any reachable known vulnerability
-remains or any frozen upstream version moved without review.
+all products, real integration/lifecycles, and the clean Nix release build. A
+toolchain bump is incomplete while any reachable known vulnerability remains or
+any frozen upstream version moved without review. Exact A/B toolchain behavior
+remains an operator-owned upgrade acceptance boundary.
 
 ## Moto checklist
 
@@ -186,8 +188,8 @@ creation, list/read/write/delete, multipart, object metadata, failures, and
 cleanup. Confirm the actual Nix package version and readable source revision
 against `UPSTREAMS.toml`.
 
-Run the real integration, lean backup, fast multi-target, initial-import, and
-both upgrade scenarios. Inspect that every required Go test genuinely ran and
+Run the real integration, lean backup, fast multi-target, and initial-import
+scenarios. Inspect that every required Go test genuinely ran and
 passed and that all task-owned containers, networks, and volumes are gone. A
 Moto update does not authorize a production provider claim.
 
@@ -212,51 +214,46 @@ the selected product set is unchanged.
 
 ## Required acceptance
 
-Run focused tests first, then the complete fast release-candidate gate from a
-distinct clean prior A commit to clean HEAD B:
+Run focused tests first, then the complete release-candidate gate from clean
+HEAD B:
 
 ```sh
-just check-release <A-full-commit>
+just check-release
 ```
 
-This runs the ordinary flake checks, full-tree race and coverage,
-`govulncheck`, all products, targetless deployment, Moto/Restic integration,
-full recovery, accelerated target-threshold evidence, two repositories,
-initial import, and both A/B terminal cases. Required-test JSON must prove
-run/PASS and package PASS with no
+This runs the ordinary flake checks, full-tree race, `govulncheck`, all
+products including the Nix release bundle, targetless deployment, Moto/Restic
+integration, full recovery, accelerated target-threshold evidence, two
+repositories, and initial import. Required-test JSON must prove run/PASS and
+package PASS with no
 skip/fail for every real scenario. Exact fake-clock boundaries and the
 accelerated real Restic/HTTPS-adapter test replace a wall-clock waiting claim;
 the production clock has no test override. The gate intentionally excludes
-cold-host and real-provider acceptance.
+cold-host, real-provider, and exact A/B acceptance.
 
 When Nix image composition, entrypoints, labels, or release logic changes,
-generate the release from the checked exact A/B pair into one previously absent
-ignored root:
+generate B's release into one previously absent ignored root:
 
 ```sh
-just release <A-full-commit> <previously-absent-ignored-output-root>
+just release <previously-absent-ignored-output-root>
 ```
 
-The release command itself performs two independent builds and requires their
-image archive bytes to match before publication. Require successful checksum
-and standard `docker image load`, exactly six references for three image IDs,
-matching OCI labels and entrypoints, no Moto image, the actual expected upstream
-versions, exact candidate binding, canonical artifact evidence, and only
-`images.tar.gz` plus `SHA256SUMS` in the output.
+The release command builds the pure Nix bundle once and atomically exports it.
+Require successful checksums and standard `docker image load` for all three
+archives, exact immutable OCI labels and entrypoints, no Moto or local reference,
+the actual expected upstream versions, exact B candidate binding, canonical
+artifact evidence, and only the documented four files in the output.
 Repeat the archive-only cold deployment acceptance in
 [Operations](operations.md) when Compose, image entrypoints, permissions, bind
 paths, directory exchange, or deployment orchestration changes. Record a
 non-triggered condition and its evidence as not applicable, never as passed.
 
-For an actual Vaultwarden change, the upgrade suite must run exactly the full
-accept case interrupted after decision and the deepest rollback case interrupted
-after exchange. The focused unit fault matrix covers the other decision,
-active-write, service-start, cleanup, finalize, conflict, permission, tamper,
-and restart boundaries. A cross-version claim additionally requires the two
-images to report genuinely different Vaultwarden versions; equal versions make
-that conditional claim not applicable while still proving the exact-pair
-orchestrator. The resulting claim applies only to that release pair, not to
-other upstream versions or independently built images.
+For an actual Vaultwarden or Restic change, the deployment operator decides and
+records any exact A/B acceptance using the runbook. The project gate makes no
+cross-version claim. Focused unit tests continue to own decision, active-write,
+cleanup, finalize, conflict, permission, tamper, and restart semantics; real
+client migration, accept, rollback, and Restic bidirectional compatibility
+remain external evidence for only the tested release pair.
 
 ## Final review
 

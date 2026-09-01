@@ -2,10 +2,10 @@
 check:
     nix flake check
 
-# Validate clean A and HEAD B, then write exact candidate evidence.
-check-release from_commit:
-    nix develop --command python3 scripts/check_release.py "{{ from_commit }}"
+# Validate clean HEAD B, then write exact candidate evidence.
+check-release:
+    nix develop --command python3 scripts/check_release.py
 
-# Build and verify the exact two-file HEAD B release for a checked A/B pair.
-release from_commit output_directory:
-    nix develop --command python3 scripts/release.py "{{ from_commit }}" "{{ output_directory }}"
+# Export the exact Nix-built HEAD B release after candidate validation.
+release output_directory:
+    nix develop --command python3 scripts/release.py "{{ output_directory }}"

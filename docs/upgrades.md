@@ -25,7 +25,7 @@ Before `prepare`:
   verify a target before `upgrade prepare`; the command otherwise returns
   `not_ready` before creating upgrade state.
 - B is an exact clean managed commit with a separately generated and checked
-  two-file release.
+  four-file Nix release bundle.
 - A and B immutable image references are available locally or their release
   archives are available for standard loading.
 - `.env`, private configuration, credentials, directories, ownership, and
@@ -41,13 +41,12 @@ the active database, the gate proves that the image is the B named by current
 state, active identity still names A, and frozen rollback evidence exists.
 Ordinary `normal` mode cannot be substituted for this transition.
 
-Framework acceptance needs different clean product commits and immutable tags.
-It is complete orchestration evidence for that exact managed release pair even
-when both releases contain the same actual Vaultwarden version; that outcome
-does not leave a compatibility gap. Exact-pair cross-version compatibility is
-a separate claim available only when the actual Vaultwarden versions differ
-and the complete scenario runs with both. Neither claim covers substituted or
-independently upgraded components outside the project-managed set.
+The project release gate validates B without selecting or rebuilding A. The
+operator owns exact-pair acceptance: retain A's immutable images, verify the
+actual Vaultwarden and Restic versions, rehearse the required accept or rollback
+path on disposable deployment copies, and record the evidence below. The
+product does not read that external evidence or infer compatibility from a
+successful B release.
 
 ## Production command surface
 
@@ -73,8 +72,8 @@ identity. `B_COMMIT` is 40 lowercase hexadecimal characters and `B_RELEASE` is
 the deterministic immutable release label supplied with B.
 
 ```sh
-B_COMMIT=<B-full-commit>
-B_RELEASE=<B-immutable-release>
+B_COMMIT='<B-full-commit>'
+B_RELEASE='<B-immutable-release>'
 test -n "$B_COMMIT"
 test -n "$B_RELEASE"
 docker compose --env-file .env --file compose.yml --profile maintenance run --rm --no-deps config-check-backup
@@ -83,20 +82,28 @@ docker compose --env-file .env --file compose.yml --profile maintenance run --rm
 ```
 
 Prepare binds the current full A commit/release, requested B commit/release,
-deployment identity, exact canonical Compose environment, and upgrade ID. It
-must happen **before** loading B, because the release archive updates the local
-aliases. Running A containers continue to use their existing A image IDs, and
-the generated state preserves A's immutable tags.
+deployment identity, exact canonical Compose environment, and upgrade ID. Run
+it **before** loading B so the transition is anchored while only A is available.
+The new release archives contain no local aliases, so loading them cannot
+retarget the running A services. The generated state preserves A's immutable
+tags.
 
 Now verify and standard-load B's exact release:
 
 ```sh
 (cd <B-release-directory> && sha256sum --check SHA256SUMS)
-gzip --decompress --stdout <B-release-directory>/images.tar.gz | docker image load
+docker image load --input <B-release-directory>/backup.tar.gz
+docker image load --input <B-release-directory>/proxy.tar.gz
+docker image load --input <B-release-directory>/vaultwarden.tar.gz
+for vwless_product in backup proxy vaultwarden; do
+  vwless_image="vaultwarden-less-$vwless_product:$B_RELEASE"
+  test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$vwless_image")" = "$B_COMMIT"
+  test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$vwless_image")" = "$B_RELEASE"
+done
 ```
 
-Do not continue if B's OCI revision/version labels do not match the requested
-full commit and immutable release.
+Do not create B's `local` aliases or continue if its OCI revision/version labels
+do not match the requested full commit and immutable release.
 
 ## 2. Freeze A
 
@@ -171,8 +178,11 @@ docker compose --env-file "$vwless_upgrade_env" --file compose.yml --file compos
 docker compose --env-file "$vwless_upgrade_env" --file compose.yml --file compose.upgrade.yml exec --no-TTY vaultwarden /bin/vaultwarden --version
 for vwless_product in backup proxy vaultwarden; do
   vwless_image="vaultwarden-less-$vwless_product:$vwless_b_release"
+  vwless_local="vaultwarden-less-$vwless_product:local"
   test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$vwless_image")" = "$vwless_b_commit"
   test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$vwless_image")" = "$vwless_b_release"
+  docker image tag "$vwless_image" "$vwless_local"
+  test "$(docker image inspect --format '{{.Id}}' "$vwless_local")" = "$(docker image inspect --format '{{.Id}}' "$vwless_image")"
 done
 docker compose --env-file "$vwless_upgrade_env" --file compose.yml --file compose.upgrade.yml --profile drill stop drill-vaultwarden
 docker compose --env-file "$vwless_upgrade_env" --file compose.yml --file compose.upgrade.yml --profile drill rm --force --stop drill-vaultwarden drill-copy
@@ -190,7 +200,8 @@ docker compose --env-file "$vwless_upgrade_env" --file compose.yml --file compos
 The first command creates or resumes the immutable accept decision and active B
 identity. Before cleanup, require all three `ps` entries to be healthy, require
 the three in-container versions and immutable OCI labels to name the reviewed B
-release, and complete a normal HTTPS client check. If interrupted before
+release, create and verify B's normal `local` aliases, and complete a normal
+HTTPS client check. If interrupted before
 finalize, repeat the sequence from its first line: the Go command can continue
 only accept and cannot exchange or decide twice. Finalize validates only
 durable decision, active, frozen-data, and cleanup evidence before archiving
@@ -270,6 +281,11 @@ the durable result. Never delete quarantine to force another exchange.
   failure hook, automatic compatibility fallback, or alternate state path.
 
 ## A/B acceptance evidence
+
+This evidence is owned and retained by the deployment operator; it is not part
+of `check-release`, is not consumed by the product, and does not block creation
+of B's release bundle. To claim both terminal paths, run accept and rollback on
+separate disposable copies derived from the same verified A recovery point.
 
 For every product upgrade, record:
 

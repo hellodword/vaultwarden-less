@@ -179,20 +179,25 @@ the drill project and volume cannot remove the verified restore.
 ## Release and deployment split
 
 Nix owns builds, tests, and release creation. A clean commit produces three
-images, each tagged with both `local` and one deterministic immutable release
-name. OCI revision, version, and creation labels derive from that commit.
+development images tagged `local` and three release archives tagged only with
+one deterministic immutable release name. Both variants come from the same
+image definitions; OCI revision, version, and creation labels derive from the
+commit.
 
 The release directory contains only:
 
 ```text
-images.tar.gz
 SHA256SUMS
+backup.tar.gz
+proxy.tar.gz
+vaultwarden.tar.gz
 ```
 
-The archive loads directly through standard `docker image load`, contains six
-references for three image IDs, and excludes the test-only Moto image. The
-ordinary deployment host verifies and loads these bytes; it does not compile,
-contact a registry, or need Nix.
+Each archive loads directly through standard `docker image load` and contains
+one immutable production reference; the bundle excludes the test-only Moto
+image. The ordinary deployment host verifies and loads these bytes, validates
+their identity, and explicitly creates the `local` aliases. It does not
+compile, contact a registry, or need Nix.
 
 ## Upgrade ownership
 
@@ -264,7 +269,6 @@ is the only data directory finalize may remove.
   effects and never infer permission to overwrite a real destination.
 - Moto acceptance validates the Restic/S3 protocol boundary, not a cloud
   provider's production behavior.
-- Framework A/B acceptance completely covers its exact project-managed release
-  pair. Same-version pairs create no pending compatibility obligation;
-  cross-version claims require two different managed Vaultwarden versions and
-  apply only to that exact pair.
+- The B release gate does not claim A/B compatibility. The deployment operator
+  owns exact-pair Vaultwarden, Restic, client, accept, and rollback acceptance
+  before using the production upgrade state machine.

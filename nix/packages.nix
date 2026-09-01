@@ -84,34 +84,38 @@ let
     WorkingDir = "/";
   };
 
-  backupImage = pkgs.dockerTools.buildLayeredImage {
-    name = "vaultwarden-less-backup";
-    tag = "local";
-    created = identity.created;
-    contents = [
-      backup
-      pkgs.restic
-      pkgs.cacert
-      pkgs.tzdata
-    ];
-    config = commonImageConfig // {
-      Entrypoint = [ "/bin/vaultwarden-less-backup" ];
-      Cmd = [ "serve" ];
-      Labels = labels "vaultwarden-less backup";
+  backupImage =
+    tag:
+    pkgs.dockerTools.buildLayeredImage {
+      name = "vaultwarden-less-backup";
+      inherit tag;
+      created = identity.created;
+      contents = [
+        backup
+        pkgs.restic
+        pkgs.cacert
+        pkgs.tzdata
+      ];
+      config = commonImageConfig // {
+        Entrypoint = [ "/bin/vaultwarden-less-backup" ];
+        Cmd = [ "serve" ];
+        Labels = labels "vaultwarden-less backup";
+      };
     };
-  };
 
-  proxyImage = pkgs.dockerTools.buildLayeredImage {
-    name = "vaultwarden-less-proxy";
-    tag = "local";
-    created = identity.created;
-    contents = [ proxy ];
-    config = commonImageConfig // {
-      Entrypoint = [ "/bin/vaultwarden-less-proxy" ];
-      Cmd = [ "serve" ];
-      Labels = labels "vaultwarden-less proxy";
+  proxyImage =
+    tag:
+    pkgs.dockerTools.buildLayeredImage {
+      name = "vaultwarden-less-proxy";
+      inherit tag;
+      created = identity.created;
+      contents = [ proxy ];
+      config = commonImageConfig // {
+        Entrypoint = [ "/bin/vaultwarden-less-proxy" ];
+        Cmd = [ "serve" ];
+        Labels = labels "vaultwarden-less proxy";
+      };
     };
-  };
 
   vaultwardenHealthcheck = pkgs.writeShellApplication {
     name = "healthcheck.sh";
@@ -121,34 +125,52 @@ let
     '';
   };
 
-  vaultwardenImage = pkgs.dockerTools.buildLayeredImage {
-    name = "vaultwarden-less-vaultwarden";
-    tag = "local";
-    created = identity.created;
-    extraCommands = ''
-      ln -s ${vaultwardenHealthcheck}/bin/healthcheck.sh healthcheck.sh
-    '';
-    contents = [
-      pkgs.vaultwarden
-      drillCopy
-      vaultwardenHealthcheck
-      vaultwardenGate
-      pkgs.cacert
-      pkgs.tzdata
-    ];
-    config = commonImageConfig // {
-      Entrypoint = [ "/bin/vaultwarden-less-vaultwarden" ];
-      Cmd = [ "normal" ];
-      Env = [
-        "ROCKET_ADDRESS=0.0.0.0"
-        "ROCKET_PORT=80"
+  vaultwardenImage =
+    tag:
+    pkgs.dockerTools.buildLayeredImage {
+      name = "vaultwarden-less-vaultwarden";
+      inherit tag;
+      created = identity.created;
+      extraCommands = ''
+        ln -s ${vaultwardenHealthcheck}/bin/healthcheck.sh healthcheck.sh
+      '';
+      contents = [
+        pkgs.vaultwarden
+        drillCopy
+        vaultwardenHealthcheck
+        vaultwardenGate
+        pkgs.cacert
+        pkgs.tzdata
       ];
-      ExposedPorts = {
-        "80/tcp" = { };
+      config = commonImageConfig // {
+        Entrypoint = [ "/bin/vaultwarden-less-vaultwarden" ];
+        Cmd = [ "normal" ];
+        Env = [
+          "ROCKET_ADDRESS=0.0.0.0"
+          "ROCKET_PORT=80"
+        ];
+        ExposedPorts = {
+          "80/tcp" = { };
+        };
+        Labels = labels "vaultwarden-less Vaultwarden";
       };
-      Labels = labels "vaultwarden-less Vaultwarden";
     };
+
+  releaseImages = {
+    backup = backupImage identity.release;
+    proxy = proxyImage identity.release;
+    vaultwarden = vaultwardenImage identity.release;
   };
+
+  releaseBundle = pkgs.runCommand "vaultwarden-less-release-${identity.release}" { } ''
+    mkdir -p "$out"
+    install -m 0644 ${releaseImages.backup} "$out/backup.tar.gz"
+    install -m 0644 ${releaseImages.proxy} "$out/proxy.tar.gz"
+    install -m 0644 ${releaseImages.vaultwarden} "$out/vaultwarden.tar.gz"
+    cd "$out"
+    sha256sum backup.tar.gz proxy.tar.gz vaultwarden.tar.gz > SHA256SUMS
+    chmod 0644 SHA256SUMS
+  '';
 
   motoPython = pkgs.python3.withPackages (
     pythonPackages: [ pythonPackages.moto ] ++ pythonPackages.moto.optional-dependencies.server
@@ -178,8 +200,9 @@ let
 in
 {
   inherit backup proxy;
-  backup-image = backupImage;
-  proxy-image = proxyImage;
-  vaultwarden-image = vaultwardenImage;
+  backup-image = backupImage "local";
+  proxy-image = proxyImage "local";
+  release = releaseBundle;
+  vaultwarden-image = vaultwardenImage "local";
   moto-image = motoImage;
 }

@@ -1,4 +1,4 @@
-"""Run the fixed release-candidate gates and write exact A/B evidence."""
+"""Run the fixed release-candidate gates and write exact B evidence."""
 
 from __future__ import annotations
 
@@ -22,14 +22,14 @@ EVIDENCE_ROOT = REPOSITORY / "tmp" / "release-evidence"
 
 @dataclass(frozen=True)
 class Gate:
-    names: tuple[str, ...]
+    name: str
     command: tuple[str, ...]
 
 
 def verified_go_test(
     package: str,
     pattern: str,
-    required: Sequence[str],
+    required: str,
     *arguments: str,
     timeout: str,
 ) -> tuple[str, ...]:
@@ -37,8 +37,7 @@ def verified_go_test(
         sys.executable,
         "scripts/verify_go_test.py",
     ]
-    for test in required:
-        command.extend(("--require", f"{package}:{test}"))
+    command.extend(("--require", f"{package}:{required}"))
     command.extend(
         (
             "--",
@@ -58,12 +57,11 @@ def verified_go_test(
 
 
 GATES: tuple[Gate, ...] = (
-    Gate(("nix-flake-check",), ("nix", "flake", "check")),
-    Gate(("go-race",), ("go", "test", "-race", "./...", "-count=1")),
-    Gate(("go-coverage",), ("go", "test", "-cover", "./...")),
-    Gate(("govulncheck",), ("govulncheck", "./...")),
+    Gate("nix-flake-check", ("nix", "flake", "check")),
+    Gate("go-race", ("go", "test", "-race", "./...", "-count=1")),
+    Gate("govulncheck", ("govulncheck", "./...")),
     Gate(
-        ("products",),
+        "products",
         (
             "nix",
             "build",
@@ -74,85 +72,71 @@ GATES: tuple[Gate, ...] = (
             ".#proxy-image",
             ".#vaultwarden-image",
             ".#moto-image",
+            ".#release",
         ),
     ),
     Gate(
-        ("targetless-deployment",),
+        "targetless-deployment",
         verified_go_test(
             "github.com/hellodword/vaultwarden-less/tests/e2e",
             "^TestTargetlessDeploymentLifecycle$",
-            ("TestTargetlessDeploymentLifecycle",),
+            "TestTargetlessDeploymentLifecycle",
             "-run-backup-e2e",
             timeout="20m",
         ),
     ),
     Gate(
-        ("moto-restic",),
+        "moto-restic",
         verified_go_test(
             "github.com/hellodword/vaultwarden-less/internal/restore",
             "^TestMotoResticIntegration$",
-            ("TestMotoResticIntegration",),
+            "TestMotoResticIntegration",
             "-run-moto-integration",
             timeout="20m",
         ),
     ),
     Gate(
-        ("backup-restore-drill",),
+        "backup-restore-drill",
         verified_go_test(
             "github.com/hellodword/vaultwarden-less/tests/e2e",
             "^TestBackupRestoreLifecycle$",
-            ("TestBackupRestoreLifecycle",),
+            "TestBackupRestoreLifecycle",
             "-run-backup-e2e",
             timeout="30m",
         ),
     ),
     Gate(
-        ("multitarget-threshold",),
+        "multitarget-threshold",
         verified_go_test(
             "github.com/hellodword/vaultwarden-less/internal/worker",
             "^TestWorkerAcceleratedTargetDegradationIntegration$",
-            ("TestWorkerAcceleratedTargetDegradationIntegration",),
+            "TestWorkerAcceleratedTargetDegradationIntegration",
             "-run-accelerated-worker-integration",
             timeout="5m",
         ),
     ),
     Gate(
-        ("dual-repository",),
+        "dual-repository",
         verified_go_test(
             "github.com/hellodword/vaultwarden-less/tests/e2e",
             "^TestMultiTargetFastCatchUp$",
-            ("TestMultiTargetFastCatchUp",),
+            "TestMultiTargetFastCatchUp",
             "-run-multitarget-fast-e2e",
             timeout="25m",
         ),
     ),
     Gate(
-        ("initial-import",),
+        "initial-import",
         verified_go_test(
             "github.com/hellodword/vaultwarden-less/tests/e2e",
             "^TestInitialImportLifecycle$",
-            ("TestInitialImportLifecycle",),
+            "TestInitialImportLifecycle",
             "-run-import-e2e",
             timeout="30m",
         ),
     ),
-    Gate(
-        ("upgrade-accept", "upgrade-rollback"),
-        verified_go_test(
-            "github.com/hellodword/vaultwarden-less/tests/e2e",
-            "^(TestUpgradeAcceptLifecycle|TestUpgradeRollbackLifecycle)$",
-            ("TestUpgradeAcceptLifecycle", "TestUpgradeRollbackLifecycle"),
-            "-run-upgrade-accept-e2e",
-            "-run-upgrade-rollback-e2e",
-            "-upgrade-from-commit",
-            "{from_commit}",
-            "-upgrade-to-commit",
-            "{to_commit}",
-            timeout="95m",
-        ),
-    ),
 )
-EVIDENCE_GATES = tuple(name for gate in GATES for name in gate.names)
+EVIDENCE_GATES = tuple(gate.name for gate in GATES)
 
 RunCommand = Callable[..., subprocess.CompletedProcess[str]]
 Now = Callable[[], dt.datetime]
@@ -185,20 +169,13 @@ def git_output(run_command: RunCommand, *arguments: str) -> str:
     return result.stdout.strip()
 
 
-def clean_pair(from_commit: str, run_command: RunCommand) -> tuple[str, str]:
-    if FULL_COMMIT.fullmatch(from_commit) is None:
-        raise ReleaseCheckError("A commit must be full lowercase hexadecimal")
+def clean_commit(run_command: RunCommand) -> str:
     if git_output(run_command, "status", "--porcelain=v1", "--untracked-files=all"):
         raise ReleaseCheckError("release check requires a clean Git worktree")
-    to_commit = git_output(run_command, "rev-parse", "--verify", "HEAD")
-    if FULL_COMMIT.fullmatch(to_commit) is None or from_commit == to_commit:
-        raise ReleaseCheckError("release commits are invalid or equal")
-    resolved_from = git_output(
-        run_command, "rev-parse", "--verify", from_commit + "^{commit}"
-    )
-    if resolved_from != from_commit:
-        raise ReleaseCheckError("A identity does not resolve to the exact commit")
-    return from_commit, to_commit
+    commit = git_output(run_command, "rev-parse", "--verify", "HEAD")
+    if FULL_COMMIT.fullmatch(commit) is None:
+        raise ReleaseCheckError("release commit is invalid")
+    return commit
 
 
 def format_time(value: dt.datetime) -> str:
@@ -281,17 +258,13 @@ def atomic_write(path: Path, data: bytes) -> None:
             pass
 
 
-def candidate_path(
-    from_commit: str,
-    to_commit: str,
-    run_command: RunCommand,
-) -> Path:
+def candidate_path(commit: str, run_command: RunCommand) -> Path:
     temporary_root = EVIDENCE_ROOT.parent
     ensure_directory(temporary_root, private=False)
     ensure_directory(EVIDENCE_ROOT, private=True)
-    pair = EVIDENCE_ROOT / f"{from_commit}..{to_commit}"
-    ensure_directory(pair, private=True)
-    path = pair / "candidate.json"
+    release_directory = EVIDENCE_ROOT / commit
+    ensure_directory(release_directory, private=True)
+    path = release_directory / "candidate.json"
     try:
         relative = path.relative_to(REPOSITORY)
     except ValueError as error:
@@ -305,50 +278,40 @@ def candidate_path(
 
 
 def check_release(
-    from_commit: str,
     run_command: RunCommand = subprocess.run,
     now: Now = lambda: dt.datetime.now(dt.UTC),
 ) -> dict[str, object]:
-    source, target = clean_pair(from_commit, run_command)
+    commit = clean_commit(run_command)
     started_at = format_time(now())
     for gate in GATES:
-        command = tuple(
-            value.format(from_commit=source, to_commit=target) for value in gate.command
-        )
-        run_checked(run_command, command, capture=False)
-    final_source, final_target = clean_pair(from_commit, run_command)
-    if final_source != source or final_target != target:
+        run_checked(run_command, gate.command, capture=False)
+    if clean_commit(run_command) != commit:
         raise ReleaseCheckError("release identity changed while checking")
     result: dict[str, object] = {
-        "from_commit": source,
-        "to_commit": target,
+        "commit": commit,
         "started_at": started_at,
         "finished_at": format_time(now()),
         "gates": list(EVIDENCE_GATES),
         "status": "passed",
     }
     try:
-        atomic_write(
-            candidate_path(source, target, run_command), canonical_json(result)
-        )
+        atomic_write(candidate_path(commit, run_command), canonical_json(result))
     except OSError as error:
         raise ReleaseCheckError("release evidence write failed") from error
     return result
 
 
 def parser() -> argparse.ArgumentParser:
-    command = argparse.ArgumentParser(description=__doc__)
-    command.add_argument("from_commit")
-    return command
+    return argparse.ArgumentParser(description=__doc__)
 
 
 def main(
     arguments: Sequence[str] | None = None,
     run_command: RunCommand = subprocess.run,
 ) -> int:
-    parsed = parser().parse_args(arguments)
+    parser().parse_args(arguments)
     try:
-        result = check_release(parsed.from_commit, run_command)
+        result = check_release(run_command)
     except ReleaseCheckError:
         sys.stderr.buffer.write(
             canonical_json(

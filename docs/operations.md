@@ -95,7 +95,10 @@ For every model, transfer the release artifact in exactly this shape:
 
 ```sh
 rsync --archive --checksum -- \
-  <release>/images.tar.gz <release>/SHA256SUMS \
+  <release>/SHA256SUMS \
+  <release>/backup.tar.gz \
+  <release>/proxy.tar.gz \
+  <release>/vaultwarden.tar.gz \
   <user>@<host>:<new-release-directory>/
 ```
 
@@ -104,21 +107,36 @@ using the artifact:
 
 ```sh
 cd <new-checkout-directory>
-test "$(git rev-parse --verify HEAD)" = <full-clean-commit>
+test "$(git rev-parse --verify HEAD)" = '<full-clean-commit>'
 test -z "$(git status --porcelain=v1 --untracked-files=all)"
 ```
 
-A release directory must contain exactly `images.tar.gz` and `SHA256SUMS` from
-one clean commit. Verify and load it before changing the running stack:
+A release directory must contain exactly `SHA256SUMS`, `backup.tar.gz`,
+`proxy.tar.gz`, and `vaultwarden.tar.gz` from one clean commit. Verify and load
+it, validate the immutable identities, and create the normal Compose aliases
+before changing the running stack:
 
 ```sh
 (cd <release-directory> && sha256sum --check SHA256SUMS)
-gzip --decompress --stdout <release-directory>/images.tar.gz | docker image load
+docker image load --input <release-directory>/backup.tar.gz
+docker image load --input <release-directory>/proxy.tar.gz
+docker image load --input <release-directory>/vaultwarden.tar.gz
+vwless_commit='<full-clean-commit>'
+vwless_release='<immutable-release>'
+for vwless_product in backup proxy vaultwarden; do
+  vwless_immutable="vaultwarden-less-$vwless_product:$vwless_release"
+  vwless_local="vaultwarden-less-$vwless_product:local"
+  test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$vwless_immutable")" = "$vwless_commit"
+  test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$vwless_immutable")" = "$vwless_release"
+  docker image tag "$vwless_immutable" "$vwless_local"
+  test "$(docker image inspect --format '{{.Id}}' "$vwless_local")" = "$(docker image inspect --format '{{.Id}}' "$vwless_immutable")"
+done
 ```
 
-The archive contains local and immutable references for the three production
-images and no test image. A successful load proves transferred image bytes and
-labels, not configuration or repository access.
+Each archive contains one immutable production reference and no test image.
+The explicit tags create only the three local aliases used by `compose.yml`.
+A successful load proves transferred image bytes and labels, not configuration
+or repository access.
 
 Validate both isolated roles:
 
@@ -623,7 +641,8 @@ with only Git, Docker Engine, and Compose for deployment operations:
 
 1. clone the exact clean commit and verify the working tree;
 2. create private copies and modes exactly as in the README;
-3. checksum and standard-load the two-file archive;
+3. checksum and standard-load all three immutable image archives, validate
+   their labels, and create the local aliases;
 4. run both configuration checks, initialize the empty deployment identity,
    and initialize two real repositories;
 5. start production, create real Vaultwarden data through a normal client, and

@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -244,12 +245,60 @@ func runImportTerminalSequence(t *testing.T, harness *e2eHarness) initialImportR
 		t.Fatalf("replayed import decision changed identity: first=%#v replay=%#v", accepted, replayed)
 	}
 	harness.compose("up", "--detach", "--wait", "--wait-timeout", "180", "vaultwarden", "backup", "proxy")
-	assertTerminalServices(t, harness, upgradeRelease{commit: accepted.ProjectCommit, release: accepted.Release}, false)
+	assertImportedTerminalServices(t, harness, accepted.ProjectCommit, accepted.Release)
 	return parseInitialImportResult(
 		t,
 		runImportAdmin(t, harness, "deployment", "import", "finalize"),
 		"finalized",
 	)
+}
+
+func assertImportedTerminalServices(t *testing.T, harness *e2eHarness, commit, release string) {
+	t.Helper()
+	for _, service := range []string{"vaultwarden", "backup", "proxy"} {
+		harness.waitHealthy(service, 4*time.Minute)
+		reference := "vaultwarden-less-" + service + ":local"
+		imageOutput, err := harness.docker("image", "inspect", reference)
+		if err != nil {
+			t.Fatalf("inspect imported %s image: %v: %s", service, err, harnessDiagnostics(imageOutput))
+		}
+		var images []struct {
+			ID     string `json:"Id"`
+			Config struct {
+				Labels map[string]string `json:"Labels"`
+			} `json:"Config"`
+		}
+		if err := json.Unmarshal([]byte(imageOutput), &images); err != nil || len(images) != 1 ||
+			images[0].Config.Labels["org.opencontainers.image.revision"] != commit ||
+			images[0].Config.Labels["org.opencontainers.image.version"] != release {
+			t.Fatalf("imported %s image identity is invalid: %v", service, err)
+		}
+		container := strings.TrimSpace(harness.compose("ps", "--quiet", service))
+		if !lowerHex64Pattern.MatchString(container) {
+			t.Fatalf("imported %s container identity is invalid: %q", service, container)
+		}
+		containerOutput, err := harness.docker("container", "inspect", container)
+		if err != nil {
+			t.Fatalf("inspect imported %s container: %v: %s", service, err, harnessDiagnostics(containerOutput))
+		}
+		var containers []struct {
+			Image  string `json:"Image"`
+			Config struct {
+				Image string `json:"Image"`
+			} `json:"Config"`
+			State struct {
+				Running bool `json:"Running"`
+				Health  struct {
+					Status string `json:"Status"`
+				} `json:"Health"`
+			} `json:"State"`
+		}
+		if err := json.Unmarshal([]byte(containerOutput), &containers); err != nil || len(containers) != 1 ||
+			containers[0].Image != images[0].ID || containers[0].Config.Image != reference ||
+			!containers[0].State.Running || containers[0].State.Health.Status != "healthy" {
+			t.Fatalf("imported %s container identity or health is invalid: %v", service, err)
+		}
+	}
 }
 
 func resetImportTarget(t *testing.T, harness *e2eHarness, externalSource string) {

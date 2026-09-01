@@ -8,20 +8,18 @@ import unittest
 from pathlib import Path
 
 REPOSITORY = Path(__file__).resolve().parents[2]
-COMMIT = "a" * 40
-
 RECIPES = {
     "check": ([], ["nix flake check"]),
     "check-release": (
-        [COMMIT],
-        [f'nix develop --command python3 scripts/check_release.py "{COMMIT}"'],
+        [],
+        ["nix develop --command python3 scripts/check_release.py"],
     ),
     "release": (
-        [COMMIT, "/tmp/vaultwarden-less-release"],
+        ["/tmp/vaultwarden-less-release"],
         [
             (
                 "nix develop --command python3 scripts/release.py "
-                f'"{COMMIT}" "/tmp/vaultwarden-less-release"'
+                '"/tmp/vaultwarden-less-release"'
             )
         ],
     ),

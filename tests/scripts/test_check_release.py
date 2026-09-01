@@ -1,4 +1,4 @@
-"""Contract tests for direct release gates and private candidate evidence."""
+"""Contract tests for the B-only release gate and candidate evidence."""
 
 from __future__ import annotations
 
@@ -18,13 +18,19 @@ sys.path.insert(0, os.fspath(REPOSITORY / "scripts"))
 
 import check_release
 
-A_COMMIT = "a" * 40
 B_COMMIT = "b" * 40
 
 
 class FakeRun:
-    def __init__(self, *, dirty: bool = False, fail_gate: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        dirty: bool = False,
+        commit: str = B_COMMIT,
+        fail_gate: str | None = None,
+    ) -> None:
         self.dirty = dirty
+        self.commit = commit
         self.fail_gate = fail_gate
         self.calls: list[tuple[list[str], bool]] = []
 
@@ -44,13 +50,7 @@ class FakeRun:
             if arguments[1:3] == ["status", "--porcelain=v1"]:
                 output = " M tracked\n" if self.dirty else ""
             elif arguments[1:] == ["rev-parse", "--verify", "HEAD"]:
-                output = B_COMMIT + "\n"
-            elif arguments[1:] == [
-                "rev-parse",
-                "--verify",
-                A_COMMIT + "^{commit}",
-            ]:
-                output = A_COMMIT + "\n"
+                output = self.commit + "\n"
             elif arguments[1:3] == ["check-ignore", "--quiet"]:
                 if capture_output:
                     raise AssertionError(
@@ -63,12 +63,8 @@ class FakeRun:
         if capture_output or arguments[:1] == ["just"]:
             raise AssertionError(f"unexpected gate command {arguments}")
         for gate in check_release.GATES:
-            expanded = [
-                value.format(from_commit=A_COMMIT, to_commit=B_COMMIT)
-                for value in gate.command
-            ]
-            if arguments == expanded:
-                if self.fail_gate in gate.names:
+            if arguments == list(gate.command):
+                if self.fail_gate == gate.name:
                     raise subprocess.CalledProcessError(1, arguments)
                 return subprocess.CompletedProcess(arguments, 0, "", "")
         raise AssertionError(f"unknown gate command {arguments}")
@@ -92,7 +88,12 @@ class ReleaseCheckTest(unittest.TestCase):
         self.evidence_patch.start()
         self.addCleanup(self.evidence_patch.stop)
 
-    def test_runs_exact_direct_gate_and_writes_canonical_evidence(self) -> None:
+    def test_cli_takes_no_release_pair_arguments(self) -> None:
+        self.assertEqual(vars(check_release.parser().parse_args([])), {})
+        with self.assertRaises(SystemExit):
+            check_release.parser().parse_args([B_COMMIT])
+
+    def test_runs_exact_direct_gates_and_writes_canonical_evidence(self) -> None:
         fake = FakeRun()
         instants = iter(
             (
@@ -100,10 +101,9 @@ class ReleaseCheckTest(unittest.TestCase):
                 dt.datetime(2026, 8, 30, 10, 30, 0, tzinfo=dt.UTC),
             )
         )
-        result = check_release.check_release(A_COMMIT, fake, lambda: next(instants))
+        result = check_release.check_release(fake, lambda: next(instants))
         expected = {
-            "from_commit": A_COMMIT,
-            "to_commit": B_COMMIT,
+            "commit": B_COMMIT,
             "started_at": "2026-08-30T10:00:00.000Z",
             "finished_at": "2026-08-30T10:30:00.000Z",
             "gates": list(check_release.EVIDENCE_GATES),
@@ -113,47 +113,30 @@ class ReleaseCheckTest(unittest.TestCase):
         gates = [
             arguments for arguments, _capture in fake.calls if arguments[0] != "git"
         ]
-        self.assertEqual(
-            gates,
-            [
-                [
-                    value.format(from_commit=A_COMMIT, to_commit=B_COMMIT)
-                    for value in gate.command
-                ]
-                for gate in check_release.GATES
-            ],
-        )
+        self.assertEqual(gates, [list(gate.command) for gate in check_release.GATES])
         self.assertTrue(all(command[0] != "just" for command in gates))
-        candidate = self.evidence_root / f"{A_COMMIT}..{B_COMMIT}" / "candidate.json"
+        candidate = self.evidence_root / B_COMMIT / "candidate.json"
         self.assertEqual(candidate.read_bytes(), check_release.canonical_json(expected))
         self.assertEqual(stat.S_IMODE(candidate.stat().st_mode), 0o600)
         self.assertEqual(stat.S_IMODE(candidate.parent.stat().st_mode), 0o700)
         self.assertEqual(stat.S_IMODE(self.evidence_root.stat().st_mode), 0o700)
         self.assertEqual(json.loads(candidate.read_bytes()), expected)
 
-    def test_gate_failure_stops_without_evidence_or_success(self) -> None:
+    def test_gate_failure_stops_without_evidence(self) -> None:
         fake = FakeRun(fail_gate="moto-restic")
         with self.assertRaises(check_release.ReleaseCheckError):
-            check_release.check_release(A_COMMIT, fake)
+            check_release.check_release(fake)
         self.assertFalse(self.evidence_root.exists())
         gate_names = [
-            gate.names[0]
+            gate.name
             for gate in check_release.GATES
-            if any(
-                arguments
-                == [
-                    value.format(from_commit=A_COMMIT, to_commit=B_COMMIT)
-                    for value in gate.command
-                ]
-                for arguments, _capture in fake.calls
-            )
+            if any(arguments == list(gate.command) for arguments, _ in fake.calls)
         ]
         self.assertEqual(
             gate_names,
             [
                 "nix-flake-check",
                 "go-race",
-                "go-coverage",
                 "govulncheck",
                 "products",
                 "targetless-deployment",
@@ -161,21 +144,12 @@ class ReleaseCheckTest(unittest.TestCase):
             ],
         )
 
-    def test_dirty_equal_and_noncanonical_commits_reject_before_gates(self) -> None:
-        dirty = FakeRun(dirty=True)
-        with self.assertRaises(check_release.ReleaseCheckError):
-            check_release.check_release(A_COMMIT, dirty)
-        self.assertFalse(any(call[0][0] != "git" for call in dirty.calls))
-
-        equal = FakeRun()
-        with self.assertRaises(check_release.ReleaseCheckError):
-            check_release.check_release(B_COMMIT, equal)
-        self.assertFalse(any(call[0][0] != "git" for call in equal.calls))
-
-        untouched = FakeRun()
-        with self.assertRaises(check_release.ReleaseCheckError):
-            check_release.check_release("A" * 40, untouched)
-        self.assertEqual(untouched.calls, [])
+    def test_dirty_and_invalid_head_reject_before_gates(self) -> None:
+        for fake in (FakeRun(dirty=True), FakeRun(commit="not-a-commit")):
+            with self.subTest(fake=fake):
+                with self.assertRaises(check_release.ReleaseCheckError):
+                    check_release.check_release(fake)
+                self.assertFalse(any(call[0][0] != "git" for call in fake.calls))
 
     def test_gate_and_evidence_names_are_the_frozen_contract(self) -> None:
         self.assertEqual(
@@ -183,7 +157,6 @@ class ReleaseCheckTest(unittest.TestCase):
             (
                 "nix-flake-check",
                 "go-race",
-                "go-coverage",
                 "govulncheck",
                 "products",
                 "targetless-deployment",
@@ -192,8 +165,6 @@ class ReleaseCheckTest(unittest.TestCase):
                 "multitarget-threshold",
                 "dual-repository",
                 "initial-import",
-                "upgrade-accept",
-                "upgrade-rollback",
             ),
         )
 

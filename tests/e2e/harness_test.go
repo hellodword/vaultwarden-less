@@ -64,9 +64,7 @@ type e2eHarness struct {
 	dockerPath          string
 	dockerEnv           []string
 	productionCompose   string
-	upgradeCompose      string
 	testCompose         string
-	upgradeTestCompose  string
 	targets             []string
 	publicHTTP          string
 	publicTLS           string
@@ -84,15 +82,11 @@ type e2eHarness struct {
 }
 
 var (
-	runBackupE2E          = flag.Bool("run-backup-e2e", false, "run the real Vaultwarden backup/restore lifecycle")
-	runImportE2E          = flag.Bool("run-import-e2e", false, "run the real initial SQLite import lifecycle")
-	runUpgradeAcceptE2E   = flag.Bool("run-upgrade-accept-e2e", false, "run the real A/B accept lifecycle")
-	runUpgradeRollbackE2E = flag.Bool("run-upgrade-rollback-e2e", false, "run the real A/B deepest rollback lifecycle")
-	upgradeFromCommit     = flag.String("upgrade-from-commit", "", "full clean A commit for the upgrade lifecycle")
-	upgradeToCommit       = flag.String("upgrade-to-commit", "", "full clean B commit for the upgrade lifecycle")
-	proxyPort             = flag.Int("proxy-host-port", 0, "fixed proxy host port; zero asks Docker for an ephemeral port")
-	drillPort             = flag.Int("drill-host-port", 0, "fixed drill host port; zero asks Docker for an ephemeral port")
-	preloadedImages       = flag.Bool("preloaded-images", false, "use already loaded local test images")
+	runBackupE2E    = flag.Bool("run-backup-e2e", false, "run the real Vaultwarden backup/restore lifecycle")
+	runImportE2E    = flag.Bool("run-import-e2e", false, "run the real initial SQLite import lifecycle")
+	proxyPort       = flag.Int("proxy-host-port", 0, "fixed proxy host port; zero asks Docker for an ephemeral port")
+	drillPort       = flag.Int("drill-host-port", 0, "fixed drill host port; zero asks Docker for an ephemeral port")
+	preloadedImages = flag.Bool("preloaded-images", false, "use already loaded local test images")
 )
 
 func newE2EHarness(t *testing.T, ctx context.Context, targets ...string) *e2eHarness {
@@ -150,9 +144,7 @@ func newE2EHarnessForTargets(t *testing.T, ctx context.Context, prepareImages bo
 		targets:       slices.Clone(targets),
 	}
 	harness.productionCompose = filepath.Join(repository, "compose.yml")
-	harness.upgradeCompose = filepath.Join(repository, "compose.upgrade.yml")
 	harness.testCompose = filepath.Join(repository, "tests", "e2e", "compose.override.yml")
-	harness.upgradeTestCompose = filepath.Join(repository, "tests", "e2e", "compose.upgrade.override.yml")
 	t.Cleanup(harness.cleanup)
 	if output, err := harness.docker("info"); err != nil {
 		t.Fatalf("Docker daemon is required: %v: %s", err, truncateDiagnostic(output, 2000))
@@ -1071,4 +1063,29 @@ func harnessDiagnostics(value string) string {
 		"BW_SESSION",
 		"AWS_SECRET_ACCESS_KEY",
 	)
+}
+
+func exactCommandErrorCode(t *testing.T, output string) string {
+	t.Helper()
+	type envelope struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	codes := []string{}
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "{") {
+			continue
+		}
+		var document envelope
+		if decodeExactJSON(line, &document) == nil && document.Error.Code != "" && document.Error.Message != "" {
+			codes = append(codes, document.Error.Code)
+		}
+	}
+	if len(codes) != 1 {
+		t.Fatalf("failure did not contain exactly one strict command error: %s", harnessDiagnostics(output))
+	}
+	return codes[0]
 }

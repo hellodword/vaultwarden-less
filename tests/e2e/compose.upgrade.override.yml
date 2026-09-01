@@ -1,6 +1,0 @@
-services:
-  upgrade-vaultwarden-b:
-    networks:
-      source-ingress: {}
-    ports:
-      - "127.0.0.1:${E2E_SOURCE_PORT-}:80"

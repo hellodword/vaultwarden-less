@@ -731,40 +731,50 @@ RELEASE.<committer timestamp UTC YYYY-MM-DDTHH-MM-SSZ>-g<first-12-commit-hex>
 The timestamp is the commit's integer committer time rendered in UTC, not wall
 clock time. A clean tree means `git status --porcelain=v1
 --untracked-files=all` is empty; ignored private/runtime files do not affect
-identity. The three production images each have a local and immutable tag:
+identity. Development/E2E image derivations use the local tags:
 
 ```text
 vaultwarden-less-backup:local
-vaultwarden-less-backup:<immutable-release>
 vaultwarden-less-proxy:local
-vaultwarden-less-proxy:<immutable-release>
 vaultwarden-less-vaultwarden:local
+```
+
+The release derivation instead emits one archive for each immutable tag:
+
+```text
+vaultwarden-less-backup:<immutable-release>
+vaultwarden-less-proxy:<immutable-release>
 vaultwarden-less-vaultwarden:<immutable-release>
 ```
 
 For each image, `org.opencontainers.image.revision` is the full commit,
 `org.opencontainers.image.version` is the immutable release, and
 `org.opencontainers.image.created` is that commit time in UTC RFC 3339 seconds.
-Local and immutable tags for one product point to the same image ID. Dirty
-images report development identity and cannot serve or persist.
+Both variants use the same image definition and content. A deployment operator
+creates each `local` alias from the verified immutable image after loading the
+release. Dirty images report development identity and cannot serve or persist.
 
 A release directory is created in a same-parent temporary directory and
 atomically renamed to a previously absent requested output. It contains only:
 
 ```text
-images.tar.gz
 SHA256SUMS
+backup.tar.gz
+proxy.tar.gz
+vaultwarden.tar.gz
 ```
 
-The archive loads directly with standard `docker image load`, contains exactly
-the six production references, and excludes Moto. Gzip has an empty original
-filename and timestamp zero. `SHA256SUMS` is exactly one lowercase SHA-256,
-two spaces, `images.tar.gz`, and LF. Failure removes the temporary output and
-never overwrites an existing path. Two builds from the same clean commit and
-inputs must make both files byte-identical.
+Each archive loads directly with standard `docker image load`, contains exactly
+one immutable production reference, and excludes Moto and `local` aliases.
+`SHA256SUMS` contains exactly three lines in backup, proxy, Vaultwarden order;
+each is one lowercase SHA-256, two spaces, its archive name, and LF. The pure
+Nix derivation owns the archive bytes. The thin exporter validates the exact
+file set and checksums, removes a failed task-owned temporary output, and never
+overwrites an existing path.
 
 The flake has one locked `nixos-unstable` input; treefmt follows it. Public
-outputs are the existing packages, formatter, one
+outputs are the product packages including `packages.<system>.release`, the
+formatter, one
 `devShells.<system>.default`, and checks. It exposes no `apps`. `checks.unit`
 executes `go test ./... -count=1` as a validation derivation distinct from a
 product package. Ordinary Go and Python tests, vet, GolangCI-Lint, Ruff,
@@ -793,8 +803,8 @@ recipe dependencies. `just --list` exposes exactly:
 
 ```text
 check
-check-release <A-full-commit>
-release <A-full-commit> <output-directory>
+check-release
+release <output-directory>
 ```
 
 `just` is invoked directly, never through `nix develop`. `check` is one
@@ -805,40 +815,40 @@ fixed tools and never invokes Just. `release` similarly runs the tested
 maintenance use documented raw Compose commands. All retired recipes,
 including `soak`, have no alias or compatibility fallback.
 
-`check-release A` requires a full clean A distinct from clean HEAD B and, in
-order, runs: `nix flake check`; full-tree race; full-tree coverage;
-`govulncheck`; every binary and production/Moto image build; targetless
+`check-release` requires clean HEAD B and, in order, runs: `nix flake check`;
+full-tree race; `govulncheck`; every binary, production/Moto image, and release
+bundle build; targetless
 deployment E2E; Moto/Restic integration; expanded backup/restore/drill E2E;
 accelerated fake-clock
 multi-target threshold integration; short production-image dual-repository
-failure isolation/catch-up E2E; initial import E2E; A/B accept E2E; and A/B
-rollback E2E. It then revalidates A, B, and the unchanged worktree.
+failure isolation/catch-up E2E; and initial import E2E. It then revalidates B
+and the unchanged worktree. A/B compatibility is not a release gate.
 
 On success it atomically creates
-`tmp/release-evidence/<A>..<B>/candidate.json`. The directory is ignored and
-`0700`; the canonical `0600` JSON contains exact A/B, UTC millisecond start and
+`tmp/release-evidence/<B>/candidate.json`. The directory is ignored and
+`0700`; the canonical `0600` JSON contains exact B, UTC millisecond start and
 finish instants, the ordered passed gate names, and `"status":"passed"`. It
 contains no version field, secret, or raw stderr. Evidence has no wall-clock
 expiry; any mismatched commit or byte content invalidates it.
 
 ```json
-{"from_commit":"<A-full-commit>","to_commit":"<B-full-commit>","started_at":"2026-08-30T10:00:00.000Z","finished_at":"2026-08-30T10:30:00.000Z","gates":["nix-flake-check","go-race","go-coverage","govulncheck","products","targetless-deployment","moto-restic","backup-restore-drill","multitarget-threshold","dual-repository","initial-import","upgrade-accept","upgrade-rollback"],"status":"passed"}
+{"commit":"<B-full-commit>","started_at":"2026-08-30T10:00:00.000Z","finished_at":"2026-08-30T10:30:00.000Z","gates":["nix-flake-check","go-race","govulncheck","products","targetless-deployment","moto-restic","backup-restore-drill","multitarget-threshold","dual-repository","initial-import"],"status":"passed"}
 ```
 
-`release A output-directory` requires an absent output, an existing real
-parent, a clean B, and byte-valid candidate evidence for that exact A/B. If the
-output is inside the Git tree it must be ignored. Two independent temporary
-builds must produce byte-identical `images.tar.gz` and `SHA256SUMS`. Standard
-image loading must prove exactly six references, three distinct image IDs,
-matching local/immutable pairs, OCI identity, entrypoints, expected upstream
-version, and absence of Moto. Before the final no-replace rename, canonical
-`artifact.json` is atomically written beside candidate evidence with its hash,
-A/B, immutable release, both output hashes, UTC millisecond completion, and
-`"status":"verified"`. It attests verification, not external publication.
-Failure removes only task-owned temporary paths and never replaces output.
+`release output-directory` requires an absent output, an existing real parent,
+a clean B, and byte-valid candidate evidence for B. If the output is inside the
+Git tree it must be ignored. It builds `packages.<system>.release` once, accepts
+exactly the four files above, validates all three checksum lines, copies them
+into a same-parent private temporary directory, and publishes with a no-replace
+rename. It never contacts Docker. Before publication, canonical `artifact.json`
+is atomically written beside candidate evidence with its hash, B identity,
+immutable release, all four output hashes, UTC millisecond completion, and
+`"status":"verified"`. It attests byte verification, not external publication
+or A/B compatibility. Failure removes only task-owned temporary paths and never
+replaces output.
 
 ```json
-{"candidate_sha256":"sha256:<64-lowercase-hex>","from_commit":"<A-full-commit>","to_commit":"<B-full-commit>","release":"<B-immutable-release>","files":{"SHA256SUMS":"sha256:<64-lowercase-hex>","images.tar.gz":"sha256:<64-lowercase-hex>"},"verified_at":"2026-08-30T10:40:00.000Z","status":"verified"}
+{"candidate_sha256":"sha256:<64-lowercase-hex>","commit":"<B-full-commit>","release":"<B-immutable-release>","files":{"SHA256SUMS":"sha256:<64-lowercase-hex>","backup.tar.gz":"sha256:<64-lowercase-hex>","proxy.tar.gz":"sha256:<64-lowercase-hex>","vaultwarden.tar.gz":"sha256:<64-lowercase-hex>"},"verified_at":"2026-08-30T10:40:00.000Z","status":"verified"}
 ```
 
 ## Upgrade and explicit rollback
@@ -1233,14 +1243,14 @@ Their exact command surfaces are:
 
 ```text
 capture_vaultwarden_schema.py --database <sqlite-file> [--upstreams UPSTREAMS.toml] [--output internal/upstream/vaultwarden-schema.json]
-check_release.py <A-full-commit>
-release.py <A-full-commit> <output-directory>
+check_release.py
+release.py <output-directory>
 upstream_diff.py <vaultwarden|bitwarden-cli|restic|moto|go> <candidate-tag> [--upstreams UPSTREAMS.toml]
 verify_go_test.py --require <package>:<test> [--require ...] -- <JSON-event-producing test command>
 ```
 
-`check_release.py` requires the exact clean pair and gate order defined by the
-public Just contract, stops on the first failure, and rechecks the pair before
+`check_release.py` requires clean B and the gate order defined by the public
+Just contract, stops on the first failure, and rechecks B before
 atomically writing candidate evidence. It never emits raw child stderr into
 evidence and does not invoke Just.
 
@@ -1261,13 +1271,13 @@ uses UTF-8, two-space indent, LF, and a deterministic framed fingerprint. An
 unchanged database produces identical bytes even through a path containing
 spaces, tabs, newlines, backslashes, or non-ASCII characters.
 
-Release validates exact candidate evidence, independently builds twice, loads
-and verifies each production image set, assigns exactly six production
-references, validates labels and image-ID pairs, and writes deterministic gzip
-and checksum output in task-owned same-parent temporary directories. It
-refuses an existing final directory. Standard checksum and image-load tools,
-not a script subcommand, perform external re-verification. A subprocess or
-inspection failure cleans only task-owned temporary output.
+Release validates exact B candidate evidence, builds the pure Nix release
+bundle once, validates its exact four regular files and checksum content, and
+copies it through a task-owned same-parent temporary directory. It refuses an
+existing final directory and never contacts Docker. Standard checksum and
+image-load tools perform external re-verification; OCI identity and `local`
+alias creation belong to the deployment runbook. A subprocess or filesystem
+failure cleans only task-owned temporary output.
 
 Upstream diff resolves both tags to full commits in an ignored cache with an
 exact expected origin. Changed paths come only from `git diff --name-status -z

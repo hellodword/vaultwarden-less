@@ -6,16 +6,16 @@ successful writes and logins into backup demand. The worker creates a verified
 SQLite recovery point, includes only database-referenced attachments and file
 Sends, and writes it to one or more Restic repositories.
 
-Compatibility and support claims apply only to the exact clean project commit,
+Build and runtime claims apply only to the exact clean project commit,
 immutable release, and upstream component set locked and audited by this
 repository. Substituting or independently upgrading Vaultwarden, Restic,
-Bitwarden CLI, or another audited component is outside that scope. Two project
-releases with the same actual Vaultwarden version can fully verify the upgrade
-orchestrator without leaving a cross-version support gap. See the normative
-[supported component set](docs/contracts.md#supported-component-set).
+Bitwarden CLI, or another audited component is outside that scope. Compatibility
+between a deployed A and a candidate B is an operator-owned acceptance decision,
+not a property of the B release gate. See the normative [supported component
+set](docs/contracts.md#supported-component-set).
 
 The deployment host needs only Git, Docker Engine, the Docker Compose plugin,
-gzip/checksum tools, and a release directory containing `images.tar.gz` and
+checksum tools, and a release directory containing three image archives plus
 `SHA256SUMS`. It does not need Python, Nix, Just, Go, Restic, or a registry.
 
 ## Ten-minute local start
@@ -69,11 +69,22 @@ Edit the private copies. In particular:
 See [Configuration](docs/configuration.md) and [provider recipes](docs/providers.md)
 before inserting cloud credentials.
 
-Verify and load the exact two-file release with ordinary host tools:
+Verify and load the exact release with ordinary host tools, then create the
+mutable aliases used by the normal Compose model:
 
 ```sh
 (cd <release-directory> && sha256sum --check SHA256SUMS)
-gzip --decompress --stdout <release-directory>/images.tar.gz | docker image load
+docker image load --input <release-directory>/backup.tar.gz
+docker image load --input <release-directory>/proxy.tar.gz
+docker image load --input <release-directory>/vaultwarden.tar.gz
+vwless_commit='<full-clean-commit>'
+vwless_release='<immutable-release>'
+for vwless_product in backup proxy vaultwarden; do
+  vwless_immutable="vaultwarden-less-$vwless_product:$vwless_release"
+  test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$vwless_immutable")" = "$vwless_commit"
+  test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$vwless_immutable")" = "$vwless_release"
+  docker image tag "$vwless_immutable" "vaultwarden-less-$vwless_product:local"
+done
 ```
 
 Validate both isolated credential roles before any repository or application
@@ -115,21 +126,19 @@ environment. Do not install project tools globally.
 ```sh
 just --list
 just check
-just check-release <A-full-commit>
-just release <A-full-commit> <previously-absent-ignored-output-directory>
+just check-release
+just release <previously-absent-ignored-output-directory>
 ```
 
 `check` is the daily flake gate for formatting, ordinary tests, vet, lint,
-scripts, contracts, and pinned toolchain wiring. `check-release` requires a
-distinct clean A commit and clean HEAD B, then runs full-tree race and coverage,
-vulnerability and product checks, the targetless deployment, real Moto/Restic
-and recovery lifecycles, the accelerated worker threshold, two repositories,
-initial import, and the two A/B terminal paths. It writes exact private
-candidate evidence. `release`
-requires that evidence, independently builds the three images twice, verifies
-their bytes, labels, entrypoints, references, and upstream versions through a
-standard image load, and creates a previously absent two-file output. Cold-host
-and real-provider acceptance remain separately recorded operational evidence.
+scripts, contracts, and pinned toolchain wiring. `check-release` requires clean
+HEAD B, then runs full-tree race, vulnerability and Nix product checks, the
+targetless deployment, real Moto/Restic and recovery lifecycles, the accelerated
+worker threshold, two repositories, and initial import. It writes exact private
+B candidate evidence. `release` requires that evidence and atomically exports
+the pure Nix `.#release` bundle into a previously absent four-file directory;
+it does not invoke Docker. Cold-host, real-provider, and A/B compatibility
+acceptance remain separately recorded operator evidence.
 
 ## Documentation map
 
