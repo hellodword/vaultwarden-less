@@ -1,11 +1,10 @@
-"""Contract tests for the B-only release gate and candidate evidence."""
+"""Contract tests for the stateless optional release checks."""
 
 from __future__ import annotations
 
-import datetime as dt
-import json
+import contextlib
+import io
 import os
-import stat
 import subprocess
 import sys
 import tempfile
@@ -51,12 +50,6 @@ class FakeRun:
                 output = " M tracked\n" if self.dirty else ""
             elif arguments[1:] == ["rev-parse", "--verify", "HEAD"]:
                 output = self.commit + "\n"
-            elif arguments[1:3] == ["check-ignore", "--quiet"]:
-                if capture_output:
-                    raise AssertionError(
-                        "ignore validation unexpectedly captured output"
-                    )
-                output = ""
             else:
                 raise AssertionError(f"unexpected Git command {arguments}")
             return subprocess.CompletedProcess(arguments, 0, output, "")
@@ -71,62 +64,32 @@ class FakeRun:
 
 
 class ReleaseCheckTest(unittest.TestCase):
-    def setUp(self) -> None:
-        temporary = tempfile.TemporaryDirectory(prefix="check-release-test-")
-        self.addCleanup(temporary.cleanup)
-        self.repository = Path(temporary.name) / "repository"
-        (self.repository / "tmp").mkdir(parents=True)
-        self.evidence_root = self.repository / "tmp" / "release-evidence"
-        self.repository_patch = mock.patch.object(
-            check_release, "REPOSITORY", self.repository
-        )
-        self.repository_patch.start()
-        self.addCleanup(self.repository_patch.stop)
-        self.evidence_patch = mock.patch.object(
-            check_release, "EVIDENCE_ROOT", self.evidence_root
-        )
-        self.evidence_patch.start()
-        self.addCleanup(self.evidence_patch.stop)
-
-    def test_cli_takes_no_release_pair_arguments(self) -> None:
+    def test_cli_takes_no_arguments(self) -> None:
         self.assertEqual(vars(check_release.parser().parse_args([])), {})
         with self.assertRaises(SystemExit):
             check_release.parser().parse_args([B_COMMIT])
 
-    def test_runs_exact_direct_gates_and_writes_canonical_evidence(self) -> None:
+    def test_runs_exact_direct_gates_without_writing_state(self) -> None:
+        temporary = tempfile.TemporaryDirectory(prefix="check-release-test-")
+        self.addCleanup(temporary.cleanup)
+        repository = Path(temporary.name)
         fake = FakeRun()
-        instants = iter(
-            (
-                dt.datetime(2026, 8, 30, 10, 0, 0, tzinfo=dt.UTC),
-                dt.datetime(2026, 8, 30, 10, 30, 0, tzinfo=dt.UTC),
-            )
-        )
-        result = check_release.check_release(fake, lambda: next(instants))
-        expected = {
-            "commit": B_COMMIT,
-            "started_at": "2026-08-30T10:00:00.000Z",
-            "finished_at": "2026-08-30T10:30:00.000Z",
-            "gates": list(check_release.EVIDENCE_GATES),
-            "status": "passed",
-        }
-        self.assertEqual(result, expected)
+        with mock.patch.object(check_release, "REPOSITORY", repository):
+            self.assertEqual(check_release.check_release(fake), B_COMMIT)
         gates = [
             arguments for arguments, _capture in fake.calls if arguments[0] != "git"
         ]
         self.assertEqual(gates, [list(gate.command) for gate in check_release.GATES])
         self.assertTrue(all(command[0] != "just" for command in gates))
-        candidate = self.evidence_root / B_COMMIT / "candidate.json"
-        self.assertEqual(candidate.read_bytes(), check_release.canonical_json(expected))
-        self.assertEqual(stat.S_IMODE(candidate.stat().st_mode), 0o600)
-        self.assertEqual(stat.S_IMODE(candidate.parent.stat().st_mode), 0o700)
-        self.assertEqual(stat.S_IMODE(self.evidence_root.stat().st_mode), 0o700)
-        self.assertEqual(json.loads(candidate.read_bytes()), expected)
+        self.assertEqual(list(repository.iterdir()), [])
 
-    def test_gate_failure_stops_without_evidence(self) -> None:
+    def test_gate_failure_names_gate_and_stops(self) -> None:
         fake = FakeRun(fail_gate="moto-restic")
-        with self.assertRaises(check_release.ReleaseCheckError):
+        with self.assertRaisesRegex(
+            check_release.ReleaseCheckError,
+            "gate moto-restic exited with status 1",
+        ):
             check_release.check_release(fake)
-        self.assertFalse(self.evidence_root.exists())
         gate_names = [
             gate.name
             for gate in check_release.GATES
@@ -151,9 +114,27 @@ class ReleaseCheckTest(unittest.TestCase):
                     check_release.check_release(fake)
                 self.assertFalse(any(call[0][0] != "git" for call in fake.calls))
 
-    def test_gate_and_evidence_names_are_the_frozen_contract(self) -> None:
+    def test_cli_reports_commit_and_actionable_failure(self) -> None:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            self.assertEqual(check_release.main([], FakeRun()), 0)
+        self.assertEqual(stdout.getvalue(), f"release checks passed: {B_COMMIT}\n")
+        self.assertEqual(stderr.getvalue(), "")
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            self.assertEqual(check_release.main([], FakeRun(fail_gate="products")), 1)
+        self.assertEqual(stdout.getvalue(), "")
         self.assertEqual(
-            check_release.EVIDENCE_GATES,
+            stderr.getvalue(),
+            "check-release failed: gate products exited with status 1\n",
+        )
+
+    def test_gate_names_are_the_full_optional_contract(self) -> None:
+        self.assertEqual(
+            check_release.GATE_NAMES,
             (
                 "nix-flake-check",
                 "go-race",

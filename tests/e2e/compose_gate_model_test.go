@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -41,14 +42,20 @@ func TestComposeStartupGateModel(t *testing.T) {
 		}
 	}
 	deploymentEnvironment := fmt.Sprintf(
-		"DEPLOYMENT_ROOT=%s\nRUNTIME_UID=%d\nRUNTIME_GID=%d\nLISTEN_PORT=18080\nDRILL_PORT=18081\n",
+		"DEPLOYMENT_ROOT=%s\nVWLESS_IMAGE_TAG=local\nRUNTIME_UID=%d\nRUNTIME_GID=%d\nLISTEN_PORT=18080\nDRILL_PORT=18081\n",
 		root, os.Geteuid(), os.Getegid(),
 	)
 	writePrivateFile(t, filepath.Join(root, ".env"), deploymentEnvironment)
 	writePrivateFile(t, filepath.Join(root, "config", "vaultwarden.env"), "DOMAIN=https://vaultwarden.example.test\n")
 
 	base := renderComposeModel(t, root, filepath.Join(root, ".env"),
-		filepath.Join(repository, "compose.yml"), "--profile", "deployment", "--profile", "drill", "--profile", "import")
+		filepath.Join(repository, "compose.yml"),
+		"--profile", "maintenance",
+		"--profile", "deployment",
+		"--profile", "restore",
+		"--profile", "drill",
+		"--profile", "import",
+	)
 	assertGateCommand(t, base["vaultwarden"], "normal")
 	assertGateDeploymentEnvironment(t, base["vaultwarden"], root)
 	assertGateMount(t, base["vaultwarden"], filepath.Join(root, "state"), "/state", true)
@@ -100,7 +107,8 @@ func TestComposeStartupGateModel(t *testing.T) {
 	assertGateMount(t, testModel["drill-vaultwarden"], drillSource, "/recovery", true)
 
 	upgradeEnvironment := filepath.Join(root, "compose.env")
-	writePrivateFile(t, upgradeEnvironment, deploymentEnvironment+
+	writePrivateFile(t, upgradeEnvironment, strings.Replace(deploymentEnvironment,
+		"VWLESS_IMAGE_TAG=local", "VWLESS_IMAGE_TAG=RELEASE.2026-08-28T13-00-00Z-gbbbbbbbbbbbb", 1)+
 		"A_RELEASE=RELEASE.2026-08-28T12-00-00Z-gaaaaaaaaaaaa\n"+
 		"B_RELEASE=RELEASE.2026-08-28T13-00-00Z-gbbbbbbbbbbbb\n")
 	upgradeModel := renderComposeModel(
@@ -109,6 +117,8 @@ func TestComposeStartupGateModel(t *testing.T) {
 		upgradeEnvironment,
 		filepath.Join(repository, "compose.yml"),
 		"--file", filepath.Join(repository, "compose.upgrade.yml"),
+		"--profile", "maintenance",
+		"--profile", "drill",
 		"--profile", "upgrade",
 		"--profile", "rollback",
 	)

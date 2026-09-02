@@ -51,7 +51,7 @@ x-cache-mount: &cache-mount
 services:
   vaultwarden:
     <<: *service-defaults
-    image: vaultwarden-less-vaultwarden:local
+    image: "vaultwarden-less-vaultwarden:${VWLESS_IMAGE_TAG:?VWLESS_IMAGE_TAG is required}"
     pull_policy: never
     hostname: vaultwarden
     command: [normal]
@@ -82,7 +82,7 @@ services:
 
   backup:
     <<: *service-defaults
-    image: vaultwarden-less-backup:local
+    image: "vaultwarden-less-backup:${VWLESS_IMAGE_TAG:?VWLESS_IMAGE_TAG is required}"
     pull_policy: never
     hostname: backup
     entrypoint: [/bin/vaultwarden-less-backup]
@@ -132,7 +132,7 @@ services:
 
   proxy:
     <<: *service-defaults
-    image: vaultwarden-less-proxy:local
+    image: "vaultwarden-less-proxy:${VWLESS_IMAGE_TAG:?VWLESS_IMAGE_TAG is required}"
     pull_policy: never
     hostname: proxy
     entrypoint: [/bin/vaultwarden-less-proxy]
@@ -164,7 +164,7 @@ services:
 
   config-check-backup:
     <<: *service-defaults
-    image: vaultwarden-less-backup:local
+    image: "vaultwarden-less-backup:${VWLESS_IMAGE_TAG:?VWLESS_IMAGE_TAG is required}"
     pull_policy: never
     profiles: [maintenance]
     restart: "no"
@@ -224,7 +224,7 @@ services:
 
   config-check-maintenance:
     <<: *service-defaults
-    image: vaultwarden-less-backup:local
+    image: "vaultwarden-less-backup:${VWLESS_IMAGE_TAG:?VWLESS_IMAGE_TAG is required}"
     pull_policy: never
     profiles: [maintenance]
     restart: "no"
@@ -278,7 +278,7 @@ services:
 
   maintenance:
     <<: *service-defaults
-    image: vaultwarden-less-backup:local
+    image: "vaultwarden-less-backup:${VWLESS_IMAGE_TAG:?VWLESS_IMAGE_TAG is required}"
     pull_policy: never
     profiles: [maintenance]
     restart: "no"
@@ -321,7 +321,7 @@ services:
 
   deployment-admin:
     <<: *service-defaults
-    image: vaultwarden-less-backup:local
+    image: "vaultwarden-less-backup:${VWLESS_IMAGE_TAG:?VWLESS_IMAGE_TAG is required}"
     pull_policy: never
     profiles: [deployment]
     restart: "no"
@@ -349,7 +349,7 @@ services:
 
   import-vaultwarden:
     <<: *service-defaults
-    image: vaultwarden-less-vaultwarden:local
+    image: "vaultwarden-less-vaultwarden:${VWLESS_IMAGE_TAG:?VWLESS_IMAGE_TAG is required}"
     pull_policy: never
     profiles: [import]
     restart: "no"
@@ -402,7 +402,7 @@ services:
 
   restore:
     <<: *service-defaults
-    image: vaultwarden-less-backup:local
+    image: "vaultwarden-less-backup:${VWLESS_IMAGE_TAG:?VWLESS_IMAGE_TAG is required}"
     pull_policy: never
     profiles: [restore]
     restart: "no"
@@ -434,7 +434,7 @@ services:
 
   drill-copy:
     <<: *service-defaults
-    image: vaultwarden-less-vaultwarden:local
+    image: "vaultwarden-less-vaultwarden:${VWLESS_IMAGE_TAG:?VWLESS_IMAGE_TAG is required}"
     pull_policy: never
     profiles: [drill]
     restart: "no"
@@ -457,7 +457,7 @@ services:
 
   drill-vaultwarden:
     <<: *service-defaults
-    image: vaultwarden-less-vaultwarden:local
+    image: "vaultwarden-less-vaultwarden:${VWLESS_IMAGE_TAG:?VWLESS_IMAGE_TAG is required}"
     pull_policy: never
     profiles: [drill]
     restart: "no"

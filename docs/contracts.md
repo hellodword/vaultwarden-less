@@ -37,21 +37,24 @@ releases intentionally contain different actual Vaultwarden versions,
 cross-version compatibility may be claimed only for that exact pair after the
 complete upgrade scenario passes.
 
-## Source checkout and deployment root
+## Release bundle and deployment root
 
-The source checkout contains tracked Compose files, public templates, and
-documentation. Its ignored `.env` selects a separate private deployment root;
-the checkout is not the owner or default location of credentials, state, or
-application data. Existing checkout-relative ignored paths remain protected by
-`.gitignore` only to prevent private material from entering Git. Product
-code and tests never read them as fixtures.
+The source checkout is a build/development input. A deployment uses the
+checksummed public Compose files, templates, and documentation from one
+immutable release directory and a separate private deployment root. The
+operator copies `.env.example` to `<DEPLOYMENT_ROOT>/.env`; neither the release
+directory nor the checkout owns credentials, state, or application data.
+Existing checkout-relative private paths remain protected by `.gitignore` only
+to prevent accidental Git inclusion during development. Product code and tests
+never read them as fixtures.
 
-The deployment `.env` is parsed by the locked Docker Compose implementation.
-The project does not implement a second dotenv grammar. After Compose
-interpolation these five values are required:
+The deployment `.env` is parsed by Docker Compose. The project does not
+implement a second dotenv grammar. After Compose interpolation these six values
+are required:
 
 ```dotenv
 DEPLOYMENT_ROOT=/srv/vaultwarden-less
+VWLESS_IMAGE_TAG=RELEASE.2026-09-02T05-43-20Z-g0123456789ab
 RUNTIME_UID=1000
 RUNTIME_GID=1000
 LISTEN_PORT=8080
@@ -59,6 +62,10 @@ DRILL_PORT=8081
 ```
 
 `DEPLOYMENT_ROOT` resolves to an existing absolute directory and is not `/`.
+For a production deployment, `VWLESS_IMAGE_TAG` is the immutable release in
+the active deployment identity. The tracked source-tree example uses `local`
+only for development and E2E. The release bundle substitutes its exact
+immutable release before publication.
 Runtime IDs are canonical decimal `1..4294967294`; ports are canonical decimal
 `1024..65535` and differ. The Compose-resolved values, not a product-owned
 reparse of `.env`, are the inputs to configuration checks. The example uses
@@ -69,6 +76,7 @@ The private layout is exactly rooted below `DEPLOYMENT_ROOT`:
 
 ```text
 <DEPLOYMENT_ROOT>/
+  .env
   config/
     backup.yaml
     vaultwarden.env
@@ -95,11 +103,12 @@ permitted only when the operator has independently confirmed the whole root is
 ignored.
 
 `compose.yml` defines production, maintenance, restore, drill, and import
-profiles. `compose.upgrade.yml` is only an upgrade/rollback overlay. Every
-private bind uses `${DEPLOYMENT_ROOT}/...` long syntax with
-`bind.create_host_path: false`; rendered Compose contains no
-checkout-relative private bind. Both files use only local production aliases,
-contain no `build:` key, set `pull_policy: never`, publish only intended
+profiles. It selects each production image with `VWLESS_IMAGE_TAG`.
+`compose.upgrade.yml` is only an upgrade/rollback overlay and selects immutable
+A/B references from its generated environment. Every private bind uses
+`${DEPLOYMENT_ROOT}/...` long syntax with `bind.create_host_path: false`;
+rendered Compose contains no checkout-relative private bind. Both files contain
+no `build:` key, set `pull_policy: never`, publish only intended
 loopback/public endpoints, mount no container-engine socket, and pull no
 registry image. Resident services use the configured non-root identity,
 read-only roots, `no-new-privileges`, and no capabilities.
@@ -108,9 +117,9 @@ Before production start, both role configuration checks validate the resolved
 deployment values, actual binds, private paths, target/password key sets,
 role separation, notifier credentials, UID/GID, and ports without contacting a
 repository. An empty deployment is initialized only after those checks.
-Production operator procedures use Git, Docker Engine, Docker Compose, gzip,
-and checksum tools; they do not require Python, Go, Nix, or Just. No product
-command may overwrite live `data`.
+Production operator procedures use the complete release bundle, Docker Engine,
+Docker Compose, and checksum tools; they do not require Git, Python, Go, Nix,
+Just, or a source checkout. No product command may overwrite live `data`.
 
 ## Active release identity and startup gates
 
@@ -729,9 +738,15 @@ RELEASE.<committer timestamp UTC YYYY-MM-DDTHH-MM-SSZ>-g<first-12-commit-hex>
 ```
 
 The timestamp is the commit's integer committer time rendered in UTC, not wall
-clock time. A clean tree means `git status --porcelain=v1
---untracked-files=all` is empty; ignored private/runtime files do not affect
-identity. Development/E2E image derivations use the local tags:
+clock time. The Git-backed flake exposes `self.rev` only for a committed
+revision without tracked changes, and building `packages.release` rejects an
+input without it before producing a bundle. Git flake source filtering excludes
+untracked and ignored paths; therefore no private, generated, or ignored path
+can become an implicit release input. The optional `check-release` command is
+deliberately stricter and requires `git status --porcelain=v1
+--untracked-files=all` to remain empty.
+
+Development and E2E image derivations use the local tags:
 
 ```text
 vaultwarden-less-backup:local
@@ -750,27 +765,57 @@ vaultwarden-less-vaultwarden:<immutable-release>
 For each image, `org.opencontainers.image.revision` is the full commit,
 `org.opencontainers.image.version` is the immutable release, and
 `org.opencontainers.image.created` is that commit time in UTC RFC 3339 seconds.
-Both variants use the same image definition and content. A deployment operator
-creates each `local` alias from the verified immutable image after loading the
-release. Dirty images report development identity and cannot serve or persist.
+Both variants use the same image definition and content. Source-tree Compose
+selects `local`; the release-provided `.env.example` selects the exact immutable
+release. Production never needs a mutable alias. Dirty development images
+report development identity and cannot serve or persist.
 
-A release directory is created in a same-parent temporary directory and
-atomically renamed to a previously absent requested output. It contains only:
+`packages.<system>.release` is one immutable Nix store directory. It is a
+self-contained public deployment bundle with this shape:
 
 ```text
+.env.example
+LICENSE
+NOTICE.md
+RELEASE.md
 SHA256SUMS
-backup.tar.gz
-proxy.tar.gz
-vaultwarden.tar.gz
+UPSTREAMS.toml
+compose.yml
+compose.upgrade.yml
+release.json
+config/
+  backup.example.yaml
+  vaultwarden.example.env
+credentials/
+  backup.example.yaml
+  maintenance.example.yaml
+  notifiers.example.yaml
+  restic/primary.example
+docs/
+examples/targetless/
+  config/backup.yaml
+  credentials/{backup,maintenance,notifiers}.yaml
+images/{backup,proxy,vaultwarden}.tar.gz
+internal/upstream/{recovery-projection,vaultwarden-schema}.json
 ```
 
 Each archive loads directly with standard `docker image load`, contains exactly
 one immutable production reference, and excludes Moto and `local` aliases.
-`SHA256SUMS` contains exactly three lines in backup, proxy, Vaultwarden order;
-each is one lowercase SHA-256, two spaces, its archive name, and LF. The pure
-Nix derivation owns the archive bytes. The thin exporter validates the exact
-file set and checksums, removes a failed task-owned temporary output, and never
-overwrites an existing path.
+`docs/` is the complete tracked operator documentation tree. All files are
+public and non-executable; the Nix store owns their final read-only mode. Private
+configuration, credentials, runtime state, deployment data, source, tests, and
+build tools are absent. `SHA256SUMS` contains one standard lowercase SHA-256
+line for every other regular file, sorted by its relative path. The pure Nix
+derivation owns the complete bundle and checksum bytes.
+
+`release.json` is one LF-terminated JSON object with exactly `format` 1, the
+full `commit`, immutable `release`, build `system`, and the three ordered image
+archive/reference pairs. It is deterministic build metadata, not a signature,
+attestation, test claim, or publication record.
+
+```json
+{"commit":"<full-commit>","format":1,"images":[{"archive":"images/backup.tar.gz","reference":"vaultwarden-less-backup:<immutable-release>"},{"archive":"images/proxy.tar.gz","reference":"vaultwarden-less-proxy:<immutable-release>"},{"archive":"images/vaultwarden.tar.gz","reference":"vaultwarden-less-vaultwarden:<immutable-release>"}],"release":"<immutable-release>","system":"x86_64-linux"}
+```
 
 The flake has one locked `nixos-unstable` input; treefmt follows it. Public
 outputs are the product packages including `packages.<system>.release`, the
@@ -790,11 +835,14 @@ repeat image digests, vendor hashes, release archive hashes, or tool source
 hashes already owned by nixpkgs and `flake.lock`. Checks compare actual package
 versions and readable source revisions to the audit record.
 
-There is no Restic patch or custom derivation, Trivy, Syft, CycloneDX, bundle
-JSON, source archive, license archive, generated license index, or tracked
-third-party license copy. The project remains MIT under `LICENSE`; `NOTICE.md`
-accurately notes Vaultwarden's AGPL obligations. The project does not claim a
-complete SBOM or license/source archive.
+There is no Restic patch or custom derivation, Trivy, Syft, CycloneDX, source
+archive, license archive, generated license index, or tracked third-party
+license copy. The project remains MIT under `LICENSE`; `NOTICE.md` accurately
+notes Vaultwarden's AGPL obligations. The bundle is not a complete SBOM or
+corresponding-source archive. The operator owns access control, transport,
+signing if desired, retained validation logs, placement in a new destination,
+and retention of any copied bundle after its source store path is garbage
+collected.
 
 ### Public Just interface
 
@@ -804,52 +852,32 @@ recipe dependencies. `just --list` exposes exactly:
 ```text
 check
 check-release
-release <output-directory>
+release
 ```
 
-`just` is invoked directly, never through `nix develop`. `check` is one
-`nix flake check` invocation. `check-release` enters the default development
-shell once to run `scripts/check_release.py`; that script directly invokes its
-fixed tools and never invokes Just. `release` similarly runs the tested
-`scripts/release.py` build-machine workflow. Production operation and
-maintenance use documented raw Compose commands. All retired recipes,
-including `soak`, have no alias or compatibility fallback.
+`check` is exactly one `nix flake check` invocation. `check-release` enters the
+default development shell once to run `scripts/check_release.py`; that script
+directly invokes its fixed tools and never invokes Just. `release` is exactly
+`nix build --no-link --print-out-paths .#release`: it has no arguments, recipe
+dependency, development shell, Python exporter, result symlink, ignored output,
+or mutable repository state. Its sole standard output is the Nix store path;
+the operator copies that path to a new durable destination before garbage
+collection. Production operation and maintenance use documented raw Compose
+commands. All retired recipes, including `soak`, have no alias or compatibility
+fallback.
 
-`check-release` requires clean HEAD B and, in order, runs: `nix flake check`;
+`check-release` is optional and does not gate `release`. It requires clean HEAD
+B and, in order, runs: `nix flake check`;
 full-tree race; `govulncheck`; every binary, production/Moto image, and release
 bundle build; targetless
 deployment E2E; Moto/Restic integration; expanded backup/restore/drill E2E;
 accelerated fake-clock
 multi-target threshold integration; short production-image dual-repository
 failure isolation/catch-up E2E; and initial import E2E. It then revalidates B
-and the unchanged worktree. A/B compatibility is not a release gate.
-
-On success it atomically creates
-`tmp/release-evidence/<B>/candidate.json`. The directory is ignored and
-`0700`; the canonical `0600` JSON contains exact B, UTC millisecond start and
-finish instants, the ordered passed gate names, and `"status":"passed"`. It
-contains no version field, secret, or raw stderr. Evidence has no wall-clock
-expiry; any mismatched commit or byte content invalidates it.
-
-```json
-{"commit":"<B-full-commit>","started_at":"2026-08-30T10:00:00.000Z","finished_at":"2026-08-30T10:30:00.000Z","gates":["nix-flake-check","go-race","govulncheck","products","targetless-deployment","moto-restic","backup-restore-drill","multitarget-threshold","dual-repository","initial-import"],"status":"passed"}
-```
-
-`release output-directory` requires an absent output, an existing real parent,
-a clean B, and byte-valid candidate evidence for B. If the output is inside the
-Git tree it must be ignored. It builds `packages.<system>.release` once, accepts
-exactly the four files above, validates all three checksum lines, copies them
-into a same-parent private temporary directory, and publishes with a no-replace
-rename. It never contacts Docker. Before publication, canonical `artifact.json`
-is atomically written beside candidate evidence with its hash, B identity,
-immutable release, all four output hashes, UTC millisecond completion, and
-`"status":"verified"`. It attests byte verification, not external publication
-or A/B compatibility. Failure removes only task-owned temporary paths and never
-replaces output.
-
-```json
-{"candidate_sha256":"sha256:<64-lowercase-hex>","commit":"<B-full-commit>","release":"<B-immutable-release>","files":{"SHA256SUMS":"sha256:<64-lowercase-hex>","backup.tar.gz":"sha256:<64-lowercase-hex>","proxy.tar.gz":"sha256:<64-lowercase-hex>","vaultwarden.tar.gz":"sha256:<64-lowercase-hex>"},"verified_at":"2026-08-30T10:40:00.000Z","status":"verified"}
-```
+and the unchanged worktree. On success it prints exactly
+`release checks passed: <B-full-commit>` and LF. It writes no evidence,
+timestamp, candidate, artifact, or cache. A/B compatibility and external
+provider acceptance remain operator-owned and are not release gates.
 
 ## Upgrade and explicit rollback
 
@@ -899,7 +927,7 @@ configuration. With an empty target set it returns `not_ready` before creating
 or opening upgrade state; a recoverable upgrade requires at least one backup
 target.
 
-`compose.env` contains exactly these seven unique, unquoted assignments in
+`compose.env` contains exactly these eight unique, unquoted assignments in
 this order and no other content:
 
 ```dotenv
@@ -908,12 +936,18 @@ RUNTIME_UID=<decimal>
 RUNTIME_GID=<decimal>
 LISTEN_PORT=<decimal>
 DRILL_PORT=<decimal>
+VWLESS_IMAGE_TAG=<B-immutable-release>
 A_RELEASE=<A-immutable-release>
 B_RELEASE=<B-immutable-release>
 ```
 
-It is passed explicitly to the tracked upgrade overlay. Both release values
-are validated immutable tags and exactly match `prepare.json`.
+It is passed explicitly to the tracked base Compose file and upgrade overlay.
+`VWLESS_IMAGE_TAG` and `B_RELEASE` are the same validated B tag; both release
+values exactly match `prepare.json`. The generated file drives only the current
+upgrade. It never edits the ordinary deployment `.env`; after accept, the
+operator atomically changes that file's one `VWLESS_IMAGE_TAG` assignment from
+A to B before starting the normal services. Before accept or after rollback,
+the ordinary assignment remains A.
 
 `rollback-ticket.json` is created once by freeze and is then immutable:
 
@@ -1000,16 +1034,20 @@ The required production sequence is:
    snapshots on configured verification targets, really restores them, makes
    and validates the same-filesystem rollback tree, and writes the immutable
    ticket.
-4. B is loaded; local aliases move to B while every A immutable tag remains.
+4. B's immutable images are loaded while every A immutable tag remains; no
+   mutable alias is created or moved.
 5. Only B Vaultwarden starts and migrates active data. Proxy and normal backup
    remain stopped.
 6. B checks exact schema/migration, snapshots only verification targets,
    restores each through Restic, and starts an isolated B drill.
 7. `upgrade accept` is explicit. It validates the healthy B drill, atomically
    creates the accept decision, and then idempotently changes active identity
-   from A to B. An interruption after the decision can only resume accept and
-   does not repeat the pre-decision drill authorization.
-8. The documented raw Compose sequence starts B's three normal services,
+   from A to B. The operator atomically changes the ordinary deployment
+   environment's single image tag from A to B. An interruption after the
+   decision can only resume accept and the same tag switch; it does not repeat
+   the pre-decision drill authorization.
+8. The documented raw Compose sequence uses that ordinary environment to start
+   B's three normal services,
    waits for health, proves every container image ID matches its immutable B
    tag and OCI identity, removes only the verified drill resources, and then
    invokes `upgrade finalize`. Finalize validates the immutable decision,
@@ -1049,13 +1087,14 @@ capabilities are dropped, `no-new-privileges` is set, and no engine socket is
 mounted.
 
 The documented raw Compose rollback sequence stops B and drill services,
-invokes that resumable A command, verifies and retags only A's three immutable
-images as local, starts and verifies the three ordinary A services, removes
-only the verified drill resources, and invokes A `upgrade finalize`. Until
-then current retains the decision, candidate, and exchanged B tree. Finalize
-moves that complete directory to `quarantine/<upgrade-id>`. Any interruption
-can repeat only the same recorded decision; neither data tree is deleted and
-the opposite decision remains impossible.
+invokes that resumable A command, verifies A's three immutable images, confirms
+that the ordinary deployment environment still selects A, starts and verifies
+the three ordinary A services, removes only the verified drill resources, and
+invokes A `upgrade finalize`. Until then current retains the decision,
+candidate, and exchanged B tree. Finalize moves that complete directory to
+`quarantine/<upgrade-id>`. Any interruption can repeat only the same recorded
+decision; neither data tree is deleted and the opposite decision remains
+impossible.
 
 Migration, repository verification, and drill failures are induced in tests by
 real read-only permissions, an invalid disposable target, and corrupted
@@ -1231,28 +1270,25 @@ state conflicts use `conflict`.
 ## Development scripts
 
 The only durable Python scripts are `capture_vaultwarden_schema.py`,
-`check_release.py`, `release.py`, `upstream_diff.py`, and
-`verify_go_test.py`; each uses only the standard library and has a focused
-contract test. `test_justfile.py` owns the three-recipe allowlist and their
-final dry-run argv. Production terminal workflows are documented Compose and
-product-CLI steps, not a host Python interface. Schema capture, release, and
-upstream diff may print one result path followed by LF. The release checker and
-Go verifier print one strict result.
+`check_release.py`, `upstream_diff.py`, and `verify_go_test.py`; each uses only
+the standard library and has a focused contract test. `test_justfile.py` owns
+the three-recipe allowlist and their final dry-run argv. Production terminal
+workflows are documented Compose and product-CLI steps, not a host Python
+interface. Schema capture and upstream diff may print one result path followed
+by LF. The release checker and Go verifier print one strict result.
 
 Their exact command surfaces are:
 
 ```text
 capture_vaultwarden_schema.py --database <sqlite-file> [--upstreams UPSTREAMS.toml] [--output internal/upstream/vaultwarden-schema.json]
 check_release.py
-release.py <output-directory>
 upstream_diff.py <vaultwarden|bitwarden-cli|restic|moto|go> <candidate-tag> [--upstreams UPSTREAMS.toml]
 verify_go_test.py --require <package>:<test> [--require ...] -- <JSON-event-producing test command>
 ```
 
 `check_release.py` requires clean B and the gate order defined by the public
-Just contract, stops on the first failure, and rechecks B before
-atomically writing candidate evidence. It never emits raw child stderr into
-evidence and does not invoke Just.
+Just contract, stops on the first failure, and rechecks B before returning. It
+creates no evidence or other repository state and does not invoke Just.
 
 `verify_go_test.py` validates the child stream rather than requiring a literal
 `-json` token in child argv. Every line must still be a valid Go test JSON
@@ -1270,14 +1306,6 @@ half-file. Object order is `(type,name)`, SQL is trimmed only at both ends, JSON
 uses UTF-8, two-space indent, LF, and a deterministic framed fingerprint. An
 unchanged database produces identical bytes even through a path containing
 spaces, tabs, newlines, backslashes, or non-ASCII characters.
-
-Release validates exact B candidate evidence, builds the pure Nix release
-bundle once, validates its exact four regular files and checksum content, and
-copies it through a task-owned same-parent temporary directory. It refuses an
-existing final directory and never contacts Docker. Standard checksum and
-image-load tools perform external re-verification; OCI identity and `local`
-alias creation belong to the deployment runbook. A subprocess or filesystem
-failure cleans only task-owned temporary output.
 
 Upstream diff resolves both tags to full commits in an ignored cache with an
 exact expected origin. Changed paths come only from `git diff --name-status -z

@@ -6,26 +6,26 @@ endpoints and permissions are in [Storage providers](providers.md).
 
 ## Private layout and ownership
 
-The Git clone contains tracked Compose files and public `*.example*` templates.
-Its ignored `.env` points at an existing absolute `DEPLOYMENT_ROOT`; private
-counterparts and runtime directories live under that separate root. Never put
-real credentials in an example and never run `git clean -x` or `git clean -X`
-in a deployment clone.
+The Nix release bundle contains checksummed Compose files and public
+`*.example*` templates. Keep that versioned directory read-only. Its private
+`.env`, private counterparts, and runtime directories all live under a separate
+absolute `DEPLOYMENT_ROOT`. Never put real credentials in a release or example.
 
 Create the layout as the account whose identity will run the containers:
 
 ```sh
 vwless_root=/srv/vaultwarden-less
+vwless_release_dir=/opt/vaultwarden-less/releases/<immutable-release>
 install -d -m 0700 "$vwless_root"
 install -d -m 0700 "$vwless_root/config" "$vwless_root/credentials" "$vwless_root/credentials/restic"
 install -d -m 0700 "$vwless_root/data" "$vwless_root/import" "$vwless_root/staging" "$vwless_root/cache" "$vwless_root/restore" "$vwless_root/state"
-install -m 0600 .env.example .env
-install -m 0600 config/backup.example.yaml "$vwless_root/config/backup.yaml"
-install -m 0600 config/vaultwarden.example.env "$vwless_root/config/vaultwarden.env"
-install -m 0600 credentials/backup.example.yaml "$vwless_root/credentials/backup.yaml"
-install -m 0600 credentials/maintenance.example.yaml "$vwless_root/credentials/maintenance.yaml"
-install -m 0600 credentials/notifiers.example.yaml "$vwless_root/credentials/notifiers.yaml"
-install -m 0600 credentials/restic/primary.example "$vwless_root/credentials/restic/primary"
+install -m 0600 "$vwless_release_dir/.env.example" "$vwless_root/.env"
+install -m 0600 "$vwless_release_dir/config/backup.example.yaml" "$vwless_root/config/backup.yaml"
+install -m 0600 "$vwless_release_dir/config/vaultwarden.example.env" "$vwless_root/config/vaultwarden.env"
+install -m 0600 "$vwless_release_dir/credentials/backup.example.yaml" "$vwless_root/credentials/backup.yaml"
+install -m 0600 "$vwless_release_dir/credentials/maintenance.example.yaml" "$vwless_root/credentials/maintenance.yaml"
+install -m 0600 "$vwless_release_dir/credentials/notifiers.example.yaml" "$vwless_root/credentials/notifiers.yaml"
+install -m 0600 "$vwless_release_dir/credentials/restic/primary.example" "$vwless_root/credentials/restic/primary"
 ```
 
 Every private directory must be a real, non-symlink directory with mode
@@ -41,12 +41,14 @@ path.
 
 ## Deployment environment
 
-The tracked `.env.example` shows five canonical unquoted assignments. Docker
+The release `.env.example` shows six canonical unquoted assignments. Docker
 Compose owns actual `.env` quoting, escaping, and interpolation; the product
-validates only the five resolved values passed to its containers:
+validates the five deployment values passed to its containers, while Compose
+uses `VWLESS_IMAGE_TAG` to select the images:
 
 ```dotenv
 DEPLOYMENT_ROOT=/srv/vaultwarden-less
+VWLESS_IMAGE_TAG=RELEASE.2026-09-02T05-43-20Z-g8d8b03e2264d
 RUNTIME_UID=1000
 RUNTIME_GID=1000
 LISTEN_PORT=8080
@@ -54,6 +56,8 @@ DRILL_PORT=8081
 ```
 
 - `DEPLOYMENT_ROOT` resolves to an existing absolute directory other than `/`.
+- `VWLESS_IMAGE_TAG` is `local` only in the source-tree development example;
+  every release bundle substitutes its exact immutable release tag.
 - IDs are canonical decimal `1..4294967294` and must match private-path
   ownership.
 - ports are canonical decimal `1024..65535`, must differ, and are published
@@ -181,7 +185,10 @@ targets: {}
 
 The private `credentials/restic` directory must still be a real, owned mode-
 `0700` directory, but it is empty. Do not copy the tracked primary password
-example into that private directory.
+example into that private directory. A release bundle provides the complete
+public set under `examples/targetless/`; install those four files directly as
+shown in the targetless bootstrap runbook instead of editing targetful examples
+down by hand.
 
 ## Notifiers
 

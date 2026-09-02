@@ -2,10 +2,10 @@
 check:
     nix flake check
 
-# Validate clean HEAD B, then write exact candidate evidence.
+# Run the full optional release checks for one unchanged clean commit.
 check-release:
-    nix develop --command python3 scripts/check_release.py
+    nix develop --command python3 -B scripts/check_release.py
 
-# Export the exact Nix-built HEAD B release after candidate validation.
-release output_directory:
-    nix develop --command python3 scripts/release.py "{{ output_directory }}"
+# Build the immutable deployment bundle and print its Nix store path.
+release:
+    @nix build --no-link --print-out-paths .#release

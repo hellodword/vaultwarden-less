@@ -14,23 +14,22 @@ between a deployed A and a candidate B is an operator-owned acceptance decision,
 not a property of the B release gate. See the normative [supported component
 set](docs/contracts.md#supported-component-set).
 
-The deployment host needs only Git, Docker Engine, the Docker Compose plugin,
-checksum tools, and a release directory containing three image archives plus
-`SHA256SUMS`. It does not need Python, Nix, Just, Go, Restic, or a registry.
+The deployment host needs only Docker Engine, the Docker Compose plugin,
+checksum tools, and one complete release bundle. It does not need the project
+source tree, Git, Python, Nix, Just, Go, Restic, or a registry.
 
 ## Ten-minute local start
 
-Start from the exact clean Git commit named by the release producer. Do not
-mix a release archive with another commit, and never run `git clean -x` or
-`git clean -X` in a deployment clone: the ignored `.env` is deployment input.
-All real credentials and Vaultwarden state live under a separate explicit
-`DEPLOYMENT_ROOT`, not in the source checkout.
+Copy the exact Nix-built release bundle into a new versioned directory, verify
+all of its files, and keep it read-only. All real credentials and Vaultwarden
+state live under a separate explicit `DEPLOYMENT_ROOT`, not in the release.
 
 ```sh
-git clone <repository-url> vaultwarden-less
-cd vaultwarden-less
-git checkout --detach <full-clean-commit>
-test -z "$(git status --porcelain=v1 --untracked-files=all)"
+vwless_release_dir=/opt/vaultwarden-less/releases/<immutable-release>
+(cd "$vwless_release_dir" && sha256sum --check SHA256SUMS)
+docker image load --input "$vwless_release_dir/images/backup.tar.gz"
+docker image load --input "$vwless_release_dir/images/proxy.tar.gz"
+docker image load --input "$vwless_release_dir/images/vaultwarden.tar.gz"
 ```
 
 Create private deployment inputs. Run these commands as the account whose UID
@@ -42,21 +41,21 @@ vwless_root=/srv/vaultwarden-less
 install -d -m 0700 "$vwless_root"
 install -d -m 0700 "$vwless_root/config" "$vwless_root/credentials" "$vwless_root/credentials/restic"
 install -d -m 0700 "$vwless_root/data" "$vwless_root/import" "$vwless_root/staging" "$vwless_root/cache" "$vwless_root/restore" "$vwless_root/state"
-install -m 0600 .env.example .env
-install -m 0600 config/backup.example.yaml "$vwless_root/config/backup.yaml"
-install -m 0600 config/vaultwarden.example.env "$vwless_root/config/vaultwarden.env"
-install -m 0600 credentials/backup.example.yaml "$vwless_root/credentials/backup.yaml"
-install -m 0600 credentials/maintenance.example.yaml "$vwless_root/credentials/maintenance.yaml"
-install -m 0600 credentials/notifiers.example.yaml "$vwless_root/credentials/notifiers.yaml"
-install -m 0600 credentials/restic/primary.example "$vwless_root/credentials/restic/primary"
+install -m 0600 "$vwless_release_dir/.env.example" "$vwless_root/.env"
+install -m 0600 "$vwless_release_dir/config/backup.example.yaml" "$vwless_root/config/backup.yaml"
+install -m 0600 "$vwless_release_dir/config/vaultwarden.example.env" "$vwless_root/config/vaultwarden.env"
+install -m 0600 "$vwless_release_dir/credentials/backup.example.yaml" "$vwless_root/credentials/backup.yaml"
+install -m 0600 "$vwless_release_dir/credentials/maintenance.example.yaml" "$vwless_root/credentials/maintenance.yaml"
+install -m 0600 "$vwless_release_dir/credentials/notifiers.example.yaml" "$vwless_root/credentials/notifiers.yaml"
+install -m 0600 "$vwless_release_dir/credentials/restic/primary.example" "$vwless_root/credentials/restic/primary"
 ```
 
 Edit the private copies. In particular:
 
-- `.env` must contain exactly the five documented assignments. Set
-  `DEPLOYMENT_ROOT` to the absolute root created above, set `RUNTIME_UID` and
-  `RUNTIME_GID` to the owner of every private path, and choose two different
-  unprivileged loopback ports.
+- `.env` must contain exactly the six documented assignments. Keep the
+  release-provided immutable `VWLESS_IMAGE_TAG`, set `DEPLOYMENT_ROOT` to the
+  absolute root created above, set `RUNTIME_UID` and `RUNTIME_GID` to the owner
+  of every private path, and choose two different unprivileged loopback ports.
 - Set `DOMAIN` in `$vwless_root/config/vaultwarden.env` to the public HTTPS origin. Review
   every security-sensitive Vaultwarden setting rather than enabling examples
   blindly.
@@ -69,21 +68,16 @@ Edit the private copies. In particular:
 See [Configuration](docs/configuration.md) and [provider recipes](docs/providers.md)
 before inserting cloud credentials.
 
-Verify and load the exact release with ordinary host tools, then create the
-mutable aliases used by the normal Compose model:
+Verify the loaded images against `release.json`. Production Compose uses their
+immutable tag directly; it never requires a mutable `local` alias:
 
 ```sh
-(cd <release-directory> && sha256sum --check SHA256SUMS)
-docker image load --input <release-directory>/backup.tar.gz
-docker image load --input <release-directory>/proxy.tar.gz
-docker image load --input <release-directory>/vaultwarden.tar.gz
 vwless_commit='<full-clean-commit>'
 vwless_release='<immutable-release>'
 for vwless_product in backup proxy vaultwarden; do
   vwless_immutable="vaultwarden-less-$vwless_product:$vwless_release"
   test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$vwless_immutable")" = "$vwless_commit"
   test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$vwless_immutable")" = "$vwless_release"
-  docker image tag "$vwless_immutable" "vaultwarden-less-$vwless_product:local"
 done
 ```
 
@@ -91,18 +85,18 @@ Validate both isolated credential roles before any repository or application
 operation:
 
 ```sh
-docker compose --env-file .env --file compose.yml --profile maintenance run --rm --no-deps config-check-backup
-docker compose --env-file .env --file compose.yml --profile maintenance run --rm --no-deps config-check-maintenance
-docker compose --env-file .env --file compose.yml --profile deployment run --rm --no-deps deployment-admin deployment init
+docker compose --env-file "$vwless_root/.env" --file "$vwless_release_dir/compose.yml" --profile maintenance run --rm --no-deps config-check-backup
+docker compose --env-file "$vwless_root/.env" --file "$vwless_release_dir/compose.yml" --profile maintenance run --rm --no-deps config-check-maintenance
+docker compose --env-file "$vwless_root/.env" --file "$vwless_release_dir/compose.yml" --profile deployment run --rm --no-deps deployment-admin deployment init
 ```
 
 Initialize each new repository once, then start the three production services:
 
 ```sh
-docker compose --env-file .env --file compose.yml --profile maintenance run --rm --no-deps maintenance repo init --target primary
-docker compose --env-file .env --file compose.yml up --detach vaultwarden backup proxy
-docker compose --env-file .env --file compose.yml ps
-docker compose --env-file .env --file compose.yml exec --no-TTY backup /bin/vaultwarden-less-backup status
+docker compose --env-file "$vwless_root/.env" --file "$vwless_release_dir/compose.yml" --profile maintenance run --rm --no-deps maintenance repo init --target primary
+docker compose --env-file "$vwless_root/.env" --file "$vwless_release_dir/compose.yml" up --detach vaultwarden backup proxy
+docker compose --env-file "$vwless_root/.env" --file "$vwless_release_dir/compose.yml" ps
+docker compose --env-file "$vwless_root/.env" --file "$vwless_release_dir/compose.yml" exec --no-TTY backup /bin/vaultwarden-less-backup status
 ```
 
 Only the proxy is published, and only on loopback. Put a trusted TLS edge in
@@ -127,18 +121,18 @@ environment. Do not install project tools globally.
 just --list
 just check
 just check-release
-just release <previously-absent-ignored-output-directory>
+just release
 ```
 
 `check` is the daily flake gate for formatting, ordinary tests, vet, lint,
 scripts, contracts, and pinned toolchain wiring. `check-release` requires clean
 HEAD B, then runs full-tree race, vulnerability and Nix product checks, the
 targetless deployment, real Moto/Restic and recovery lifecycles, the accelerated
-worker threshold, two repositories, and initial import. It writes exact private
-B candidate evidence. `release` requires that evidence and atomically exports
-the pure Nix `.#release` bundle into a previously absent four-file directory;
-it does not invoke Docker. Cold-host, real-provider, and A/B compatibility
-acceptance remain separately recorded operator evidence.
+worker threshold, two repositories, and initial import. It is optional and
+stateless: success is not consumed by `release`. `release` directly builds the
+pure Nix `.#release` package and prints its store path without creating a result
+link. Test-log retention, artifact signing, transfer, and A/B compatibility
+acceptance remain operator responsibilities.
 
 ## Documentation map
 

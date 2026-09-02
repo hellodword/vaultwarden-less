@@ -1,15 +1,23 @@
 # Operations and recovery
 
-These procedures run on an ordinary Linux/amd64 deployment host with Git,
-Docker Engine, the Docker Compose plugin, gzip, checksum tools, and GNU
-coreutils. Python, Go, Nix, and Just are not production dependencies. Nix is
-used only on a build or verification host. Run commands from the exact clean
-deployment checkout; its ignored `.env` selects `DEPLOYMENT_ROOT`, and every
-private bind resolves beneath that separate root.
+These procedures run on an ordinary Linux/amd64 deployment host with Docker
+Engine, the Docker Compose plugin, checksum tools, rsync, and GNU coreutils.
+Git, Python, Go, Nix, and Just are not production dependencies. Nix is used
+only on a build or verification host. Run Compose from an exact checksummed
+release directory; every private bind and the private Compose environment live
+beneath a separate `DEPLOYMENT_ROOT`.
 
-Never run `git clean -x` or `git clean -X` in a deployment clone. Do not delete
-or overwrite `data`, `restore`, `state`, credentials, or a repository merely to
-make a command pass.
+The examples use these reviewed absolute paths throughout:
+
+```sh
+vwless_release_dir=/opt/vaultwarden-less/releases/<immutable-release>
+vwless_root=/srv/vaultwarden-less
+vwless_env="$vwless_root/.env"
+vwless_compose="$vwless_release_dir/compose.yml"
+```
+
+Do not edit the release directory. Do not delete or overwrite `data`,
+`restore`, `state`, credentials, or a repository merely to make a command pass.
 
 ## Operator command surface
 
@@ -23,11 +31,11 @@ There are deliberately no `down`, `ps`, `logs`, `drill-status`, or detailed
 `repo-*` recipes. Use the documented raw commands, for example:
 
 ```sh
-docker compose --env-file .env --file compose.yml down
-docker compose --env-file .env --file compose.yml ps
-docker compose --env-file .env --file compose.yml logs --tail 200 vaultwarden backup proxy
-docker compose --project-name vaultwarden-less-drill --env-file .env --file compose.yml --profile drill ps
-docker compose --env-file .env --file compose.yml --profile maintenance run --rm --no-deps maintenance repo check --target primary
+docker compose --env-file "$vwless_env" --file "$vwless_compose" down
+docker compose --env-file "$vwless_env" --file "$vwless_compose" ps
+docker compose --env-file "$vwless_env" --file "$vwless_compose" logs --tail 200 vaultwarden backup proxy
+docker compose --project-name vaultwarden-less-drill --env-file "$vwless_env" --file "$vwless_compose" --profile drill ps
+docker compose --env-file "$vwless_env" --file "$vwless_compose" --profile maintenance run --rm --no-deps maintenance repo check --target primary
 ```
 
 Repository format migration is not an operator command: initialization always
@@ -36,120 +44,65 @@ separately authorized maintenance event outside this interface.
 
 ## Release transfer and startup
 
-Use one of these three source-transfer models. In every model, the deployment
-checkout is a clean detached checkout of the release's full commit, and the
-release files arrive in a previously absent directory.
-
-1. If the deployment host can reach the Git remote, connect with ordinary SSH,
-   clone or fetch there, and detach to the full release commit. Transfer only
-   the two release files with the `rsync` command below.
-2. For a first `rsync` followed by Git updates, create a dedicated clean clone
-   with no private files, and synchronize the checkout root, including `.git`,
-   to the host with `rsync --archive --checksum`. For each later update on the
-   host, switch back to its tracking branch, run `git pull --ff-only`, and then
-   detach to the reviewed full release commit. Do not use a working deployment
-   checkout as the rsync source.
-3. For an always-rsync host, synchronize each release into a new checkout
-   directory that did not previously exist. Never overlay a prior checkout,
-   never use `--delete` against a directory that contains `.env`, and retain
-   the old checkout until the new deployment is accepted.
-
-Generic commands use placeholders only. For the remote-Git model:
+On the build host, `just release` performs only the pure Nix build and prints
+one store path. It creates no `result` link and consumes no prior test evidence.
+Because that path is not a persistent garbage-collection root, copy it before
+allowing Nix store collection:
 
 ```sh
-ssh -p <ssh-port> <user>@<host>
-git clone -- <git-url> <new-checkout-directory>
-git -C <new-checkout-directory> fetch --prune --tags origin
-git -C <new-checkout-directory> switch --detach <full-release-commit>
-```
-
-For the initial-rsync/later-Git model, prepare and verify a dedicated clone,
-then copy its complete checkout including `.git`:
-
-```sh
-git clone -- <git-url> <dedicated-clean-clone>
-test -z "$(git -C <dedicated-clean-clone> status --porcelain=v1 --untracked-files=all)"
+release_path="$(just release)"
+test -d "$release_path"
+ssh -p <ssh-port> <user>@<host> 'test ! -e <new-release-directory>'
 rsync --archive --checksum -- \
-  <dedicated-clean-clone>/ <user>@<host>:<new-checkout-directory>/
-```
-
-On later releases, update the remote clone only through its tracking branch
-before detaching to the reviewed commit:
-
-```sh
-git -C <remote-checkout-directory> switch <tracking-branch>
-git -C <remote-checkout-directory> pull --ff-only
-git -C <remote-checkout-directory> switch --detach <full-release-commit>
-```
-
-For the always-rsync model, verify the destination is absent and copy from a
-dedicated clean checkout without `--delete`:
-
-```sh
-ssh -p <ssh-port> <user>@<host> 'test ! -e <new-checkout-directory>'
-rsync --archive --checksum -- \
-  <dedicated-clean-release-checkout>/ <user>@<host>:<new-checkout-directory>/
-```
-
-For every model, transfer the release artifact in exactly this shape:
-
-```sh
-rsync --archive --checksum -- \
-  <release>/SHA256SUMS \
-  <release>/backup.tar.gz \
-  <release>/proxy.tar.gz \
-  <release>/vaultwarden.tar.gz \
+  "$release_path/" \
   <user>@<host>:<new-release-directory>/
 ```
 
-On the deployment host, require the exact commit and a clean checkout before
-using the artifact:
+Never overlay an existing release directory and never use `--delete` against
+`DEPLOYMENT_ROOT`. On the deployment host, verify every shipped regular file,
+load the three images, and compare their immutable identities with
+`release.json` before changing the running stack:
 
 ```sh
-cd <new-checkout-directory>
-test "$(git rev-parse --verify HEAD)" = '<full-clean-commit>'
-test -z "$(git status --porcelain=v1 --untracked-files=all)"
-```
-
-A release directory must contain exactly `SHA256SUMS`, `backup.tar.gz`,
-`proxy.tar.gz`, and `vaultwarden.tar.gz` from one clean commit. Verify and load
-it, validate the immutable identities, and create the normal Compose aliases
-before changing the running stack:
-
-```sh
-(cd <release-directory> && sha256sum --check SHA256SUMS)
-docker image load --input <release-directory>/backup.tar.gz
-docker image load --input <release-directory>/proxy.tar.gz
-docker image load --input <release-directory>/vaultwarden.tar.gz
+(cd "$vwless_release_dir" && sha256sum --check SHA256SUMS)
+docker image load --input "$vwless_release_dir/images/backup.tar.gz"
+docker image load --input "$vwless_release_dir/images/proxy.tar.gz"
+docker image load --input "$vwless_release_dir/images/vaultwarden.tar.gz"
 vwless_commit='<full-clean-commit>'
 vwless_release='<immutable-release>'
 for vwless_product in backup proxy vaultwarden; do
   vwless_immutable="vaultwarden-less-$vwless_product:$vwless_release"
-  vwless_local="vaultwarden-less-$vwless_product:local"
   test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$vwless_immutable")" = "$vwless_commit"
   test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$vwless_immutable")" = "$vwless_release"
-  docker image tag "$vwless_immutable" "$vwless_local"
-  test "$(docker image inspect --format '{{.Id}}' "$vwless_local")" = "$(docker image inspect --format '{{.Id}}' "$vwless_immutable")"
 done
 ```
 
 Each archive contains one immutable production reference and no test image.
-The explicit tags create only the three local aliases used by `compose.yml`.
+Production Compose selects that immutable release through
+`VWLESS_IMAGE_TAG`; `local` remains a source-tree development and E2E value.
 A successful load proves transferred image bytes and labels, not configuration
-or repository access.
+or repository access. `SHA256SUMS` detects changed transfer/storage bytes but
+is not a signature; artifact authentication belongs to the transfer or signing
+policy chosen by the operator.
+
+Create the private layout and install public templates from the immutable
+release as described in [Configuration](configuration.md). In particular,
+`$vwless_env` is a mode-`0600` copy of the release `.env.example`, edited only
+for the private root, runtime identity, and ports while retaining the exact
+release-provided image tag.
 
 Validate both isolated roles:
 
 ```sh
-docker compose --env-file .env --file compose.yml --profile maintenance run --rm --no-deps config-check-backup
-docker compose --env-file .env --file compose.yml --profile maintenance run --rm --no-deps config-check-maintenance
+docker compose --env-file "$vwless_env" --file "$vwless_compose" --profile maintenance run --rm --no-deps config-check-backup
+docker compose --env-file "$vwless_env" --file "$vwless_compose" --profile maintenance run --rm --no-deps config-check-maintenance
 ```
 
 For one new deployment only, while `data` is completely empty and no import
 or upgrade is current, bind it to the exact loaded immutable release:
 
 ```sh
-docker compose --env-file .env --file compose.yml --profile deployment run --rm --no-deps deployment-admin deployment init
+docker compose --env-file "$vwless_env" --file "$vwless_compose" --profile deployment run --rm --no-deps deployment-admin deployment init
 ```
 
 The result is `initialized` or, for the exact same already-recorded identity,
@@ -159,15 +112,15 @@ is a hard stop; do not synthesize or edit `state/deployment/active.json`.
 Initialize only a known-empty, dedicated repository target, once:
 
 ```sh
-docker compose --env-file .env --file compose.yml --profile maintenance run --rm --no-deps maintenance repo init --target primary
+docker compose --env-file "$vwless_env" --file "$vwless_compose" --profile maintenance run --rm --no-deps maintenance repo init --target primary
 ```
 
 Start the exact production services after both checks succeed:
 
 ```sh
-docker compose --env-file .env --file compose.yml up --detach vaultwarden backup proxy
-docker compose --env-file .env --file compose.yml ps
-docker compose --env-file .env --file compose.yml logs --tail 200 vaultwarden backup proxy
+docker compose --env-file "$vwless_env" --file "$vwless_compose" up --detach vaultwarden backup proxy
+docker compose --env-file "$vwless_env" --file "$vwless_compose" ps
+docker compose --env-file "$vwless_env" --file "$vwless_compose" logs --tail 200 vaultwarden backup proxy
 ```
 
 Only the proxy is bound to loopback. A trusted TLS edge must present the
@@ -185,7 +138,7 @@ already protect the proxy before registration is enabled; this project does
 not terminate TLS.
 
 Create a dedicated private root as the runtime account, separate from the
-checkout:
+release directory, and install the release-provided targetless examples:
 
 ```sh
 vwless_root=/srv/vaultwarden-less
@@ -193,13 +146,17 @@ umask 077
 install -d -m 0700 "$vwless_root"
 install -d -m 0700 "$vwless_root/config" "$vwless_root/credentials" "$vwless_root/credentials/restic"
 install -d -m 0700 "$vwless_root/data" "$vwless_root/import" "$vwless_root/staging" "$vwless_root/cache" "$vwless_root/restore" "$vwless_root/state"
-install -m 0600 .env.example .env
-install -m 0600 config/vaultwarden.example.env "$vwless_root/config/vaultwarden.env"
+install -m 0600 "$vwless_release_dir/.env.example" "$vwless_env"
+install -m 0600 "$vwless_release_dir/config/vaultwarden.example.env" "$vwless_root/config/vaultwarden.env"
+install -m 0600 "$vwless_release_dir/examples/targetless/config/backup.yaml" "$vwless_root/config/backup.yaml"
+install -m 0600 "$vwless_release_dir/examples/targetless/credentials/backup.yaml" "$vwless_root/credentials/backup.yaml"
+install -m 0600 "$vwless_release_dir/examples/targetless/credentials/maintenance.yaml" "$vwless_root/credentials/maintenance.yaml"
+install -m 0600 "$vwless_release_dir/examples/targetless/credentials/notifiers.yaml" "$vwless_root/credentials/notifiers.yaml"
 ```
 
-Set the five `.env` values and the public HTTPS `DOMAIN` as described in
-[Configuration](configuration.md). Write these three private YAML documents
-exactly:
+Set the six `.env` values and the public HTTPS `DOMAIN` as described in
+[Configuration](configuration.md). The installed YAML documents have exactly
+these contents:
 
 ```yaml
 # config/backup.yaml
@@ -218,7 +175,7 @@ targets: {}
 notifiers: {}
 ```
 
-All three files are owned by the runtime UID/GID and mode `0600`; the private
+All four files are owned by the runtime UID/GID and mode `0600`; the private
 Restic password directory is mode `0700` and completely empty. Set
 `SIGNUPS_ALLOWED=true` in the private Vaultwarden environment only for the
 first-account window. Then validate both roles and initialize the deployment
@@ -226,21 +183,21 @@ identity. Both validation results must contain `"targets":[]` and no
 `warnings` field:
 
 ```sh
-docker compose --env-file .env --file compose.yml --profile maintenance run --rm --no-deps config-check-backup
-docker compose --env-file .env --file compose.yml --profile maintenance run --rm --no-deps config-check-maintenance
-docker compose --env-file .env --file compose.yml --profile deployment run --rm --no-deps deployment-admin deployment init
+docker compose --env-file "$vwless_env" --file "$vwless_compose" --profile maintenance run --rm --no-deps config-check-backup
+docker compose --env-file "$vwless_env" --file "$vwless_compose" --profile maintenance run --rm --no-deps config-check-maintenance
+docker compose --env-file "$vwless_env" --file "$vwless_compose" --profile deployment run --rm --no-deps deployment-admin deployment init
 ```
 
 Do not run `repo init`. Start the three production services and prove the
 targetless boundary:
 
 ```sh
-docker compose --env-file .env --file compose.yml up --detach vaultwarden backup proxy
-docker compose --env-file .env --file compose.yml ps vaultwarden backup proxy
-docker compose --env-file .env --file compose.yml logs --tail 200 backup
-docker compose --env-file .env --file compose.yml exec --no-TTY backup /bin/vaultwarden-less-backup status
+docker compose --env-file "$vwless_env" --file "$vwless_compose" up --detach vaultwarden backup proxy
+docker compose --env-file "$vwless_env" --file "$vwless_compose" ps vaultwarden backup proxy
+docker compose --env-file "$vwless_env" --file "$vwless_compose" logs --tail 200 backup
+docker compose --env-file "$vwless_env" --file "$vwless_compose" exec --no-TTY backup /bin/vaultwarden-less-backup status
 test ! -e "$vwless_root/staging/point"
-if docker compose --env-file .env --file compose.yml exec --no-TTY backup /bin/vaultwarden-less-backup request-backup; then
+if docker compose --env-file "$vwless_env" --file "$vwless_compose" exec --no-TTY backup /bin/vaultwarden-less-backup request-backup; then
   exit 1
 fi
 ```
@@ -261,19 +218,19 @@ Immediately close registration with a same-directory atomic replacement. Run
 this as the owner of the private environment file:
 
 ```sh
-vwless_env="$vwless_root/config/vaultwarden.env"
-test "$(grep -c '^SIGNUPS_ALLOWED=true$' "$vwless_env")" = 1
-test "$(grep -c '^SIGNUPS_ALLOWED=false$' "$vwless_env" || true)" = 0
-vwless_env_tmp="$(mktemp "$vwless_root/config/.vaultwarden.env.XXXXXX")"
-trap 'rm -f -- "$vwless_env_tmp"' EXIT HUP INT TERM
-chmod 0600 "$vwless_env_tmp"
-sed 's/^SIGNUPS_ALLOWED=true$/SIGNUPS_ALLOWED=false/' "$vwless_env" > "$vwless_env_tmp"
-test "$(grep -c '^SIGNUPS_ALLOWED=false$' "$vwless_env_tmp")" = 1
-sync "$vwless_env_tmp"
-mv -T -- "$vwless_env_tmp" "$vwless_env"
+vwless_vaultwarden_env="$vwless_root/config/vaultwarden.env"
+test "$(grep -c '^SIGNUPS_ALLOWED=true$' "$vwless_vaultwarden_env")" = 1
+test "$(grep -c '^SIGNUPS_ALLOWED=false$' "$vwless_vaultwarden_env" || true)" = 0
+vwless_vaultwarden_env_tmp="$(mktemp "$vwless_root/config/.vaultwarden.env.XXXXXX")"
+trap 'rm -f -- "$vwless_vaultwarden_env_tmp"' EXIT HUP INT TERM
+chmod 0600 "$vwless_vaultwarden_env_tmp"
+sed 's/^SIGNUPS_ALLOWED=true$/SIGNUPS_ALLOWED=false/' "$vwless_vaultwarden_env" > "$vwless_vaultwarden_env_tmp"
+test "$(grep -c '^SIGNUPS_ALLOWED=false$' "$vwless_vaultwarden_env_tmp")" = 1
+sync "$vwless_vaultwarden_env_tmp"
+mv -T -- "$vwless_vaultwarden_env_tmp" "$vwless_vaultwarden_env"
 sync -f "$vwless_root/config"
 trap - EXIT HUP INT TERM
-docker compose --env-file .env --file compose.yml up --detach --force-recreate vaultwarden
+docker compose --env-file "$vwless_env" --file "$vwless_compose" up --detach --force-recreate vaultwarden
 ```
 
 `restart` is insufficient because it does not reload `env_file`; the
@@ -288,7 +245,7 @@ claiming data protection or attempting an upgrade.
 private inputs remain:
 
 ```sh
-docker compose --env-file .env --file compose.yml down
+docker compose --env-file "$vwless_env" --file "$vwless_compose" down
 ```
 
 ## One-time external SQLite import
@@ -310,7 +267,7 @@ With normal services stopped, `data` empty, no active identity, and no current
 upgrade, prepare the candidate:
 
 ```sh
-docker compose --env-file .env --file compose.yml --profile deployment run --rm --no-deps deployment-admin deployment import prepare
+docker compose --env-file "$vwless_env" --file "$vwless_compose" --profile deployment run --rm --no-deps deployment-admin deployment import prepare
 ```
 
 Record the returned tree IDs. A repeated exact command resumes preparation;
@@ -321,7 +278,7 @@ publishes a private candidate without the old RSA identity or SQLite sidecars.
 Start only the candidate:
 
 ```sh
-docker compose --env-file .env --file compose.yml --profile import up --detach --wait --wait-timeout 180 import-vaultwarden
+docker compose --env-file "$vwless_env" --file "$vwless_compose" --profile import up --detach --wait --wait-timeout 180 import-vaultwarden
 ```
 
 Temporarily route the existing trusted HTTPS edge to loopback `DRILL_PORT`.
@@ -331,8 +288,8 @@ HTTP, database inspection, or an old session as client-login confirmation.
 Then stop the candidate and record verification:
 
 ```sh
-docker compose --env-file .env --file compose.yml --profile import stop import-vaultwarden
-docker compose --env-file .env --file compose.yml --profile deployment run --rm --no-deps deployment-admin deployment import verify --confirm-client-login
+docker compose --env-file "$vwless_env" --file "$vwless_compose" --profile import stop import-vaultwarden
+docker compose --env-file "$vwless_env" --file "$vwless_compose" --profile deployment run --rm --no-deps deployment-admin deployment import verify --confirm-client-login
 ```
 
 Supply `--confirm-client-login` only after that real HTTPS login succeeds.
@@ -343,15 +300,15 @@ database/attachment/Send snapshot closure. Without verification, accept fails.
 Accept and finish with the following raw, resumable sequence:
 
 ```sh
-docker compose --env-file .env --file compose.yml --profile import stop import-vaultwarden
-docker compose --env-file .env --file compose.yml --profile import rm --force --stop import-vaultwarden
-docker compose --env-file .env --file compose.yml --profile deployment run --rm --no-deps deployment-admin deployment import accept
-docker compose --env-file .env --file compose.yml up --detach --wait --wait-timeout 180 vaultwarden backup proxy
-docker compose --env-file .env --file compose.yml ps vaultwarden backup proxy
-docker compose --env-file .env --file compose.yml exec --no-TTY backup /bin/vaultwarden-less-backup version
-docker compose --env-file .env --file compose.yml exec --no-TTY proxy /bin/vaultwarden-less-proxy version
-docker image inspect --format '{{json .Config.Labels}}' vaultwarden-less-vaultwarden:local
-docker compose --env-file .env --file compose.yml --profile deployment run --rm --no-deps deployment-admin deployment import finalize
+docker compose --env-file "$vwless_env" --file "$vwless_compose" --profile import stop import-vaultwarden
+docker compose --env-file "$vwless_env" --file "$vwless_compose" --profile import rm --force --stop import-vaultwarden
+docker compose --env-file "$vwless_env" --file "$vwless_compose" --profile deployment run --rm --no-deps deployment-admin deployment import accept
+docker compose --env-file "$vwless_env" --file "$vwless_compose" up --detach --wait --wait-timeout 180 vaultwarden backup proxy
+docker compose --env-file "$vwless_env" --file "$vwless_compose" ps vaultwarden backup proxy
+docker compose --env-file "$vwless_env" --file "$vwless_compose" exec --no-TTY backup /bin/vaultwarden-less-backup version
+docker compose --env-file "$vwless_env" --file "$vwless_compose" exec --no-TTY proxy /bin/vaultwarden-less-proxy version
+docker image inspect --format '{{json .Config.Labels}}' "vaultwarden-less-vaultwarden:$vwless_release"
+docker compose --env-file "$vwless_env" --file "$vwless_compose" --profile deployment run --rm --no-deps deployment-admin deployment import finalize
 ```
 
 The Go accept command records the immutable decision before exchanging the
@@ -369,7 +326,7 @@ backups have been independently accepted.
 Before any accept decision, cancellation is explicit:
 
 ```sh
-docker compose --env-file .env --file compose.yml --profile deployment run --rm --no-deps deployment-admin deployment import cancel
+docker compose --env-file "$vwless_env" --file "$vwless_compose" --profile deployment run --rm --no-deps deployment-admin deployment import cancel
 ```
 
 Cancel removes only disposable candidate/current state and never source or
@@ -382,13 +339,13 @@ directories manually, or replace a missing active document.
 Read resident process status:
 
 ```sh
-docker compose --env-file .env --file compose.yml exec --no-TTY backup /bin/vaultwarden-less-backup status
+docker compose --env-file "$vwless_env" --file "$vwless_compose" exec --no-TTY backup /bin/vaultwarden-less-backup status
 ```
 
 Request one debounced check:
 
 ```sh
-docker compose --env-file .env --file compose.yml exec --no-TTY backup /bin/vaultwarden-less-backup request-backup
+docker compose --env-file "$vwless_env" --file "$vwless_compose" exec --no-TTY backup /bin/vaultwarden-less-backup request-backup
 ```
 
 The acknowledgement means only that demand was accepted. A check can wait for
@@ -407,7 +364,7 @@ Status and notification queues reset on worker restart. Repository snapshots
 are the durable fact. Confirm them independently:
 
 ```sh
-docker compose --env-file .env --file compose.yml --profile maintenance run --rm --no-deps maintenance repo snapshots --target primary --limit 100
+docker compose --env-file "$vwless_env" --file "$vwless_compose" --profile maintenance run --rm --no-deps maintenance repo snapshots --target primary --limit 100
 ```
 
 Use the full 64-character snapshot ID returned here for an explicit earlier
@@ -422,29 +379,29 @@ networks.
 List snapshots and check repository metadata:
 
 ```sh
-docker compose --env-file .env --file compose.yml --profile maintenance run --rm --no-deps maintenance repo snapshots --target primary --limit 100
-docker compose --env-file .env --file compose.yml --profile maintenance run --rm --no-deps maintenance repo check --target primary
+docker compose --env-file "$vwless_env" --file "$vwless_compose" --profile maintenance run --rm --no-deps maintenance repo snapshots --target primary --limit 100
+docker compose --env-file "$vwless_env" --file "$vwless_compose" --profile maintenance run --rm --no-deps maintenance repo check --target primary
 ```
 
 Unlock is for a confirmed stale Restic lock after proving no backup, restore,
 prune, or other client is active:
 
 ```sh
-docker compose --env-file .env --file compose.yml --profile maintenance run --rm --no-deps maintenance repo unlock --target primary
+docker compose --env-file "$vwless_env" --file "$vwless_compose" --profile maintenance run --rm --no-deps maintenance repo unlock --target primary
 ```
 
 Prune always begins with a preview:
 
 ```sh
-docker compose --env-file .env --file compose.yml --profile maintenance run --rm --no-deps maintenance repo prune --target primary
+docker compose --env-file "$vwless_env" --file "$vwless_compose" --profile maintenance run --rm --no-deps maintenance repo prune --target primary
 ```
 
 Review every retained and removed full snapshot ID. Only then apply the exact
 fixed policy:
 
 ```sh
-docker compose --env-file .env --file compose.yml --profile maintenance run --rm --no-deps maintenance repo prune --target primary --apply
-docker compose --env-file .env --file compose.yml --profile maintenance run --rm --no-deps maintenance repo check --target primary
+docker compose --env-file "$vwless_env" --file "$vwless_compose" --profile maintenance run --rm --no-deps maintenance repo prune --target primary --apply
+docker compose --env-file "$vwless_env" --file "$vwless_compose" --profile maintenance run --rm --no-deps maintenance repo check --target primary
 ```
 
 The fixed retention is within 24 hours, 48 hourly, 14 daily, 8 weekly, 12
@@ -458,13 +415,13 @@ lock may make unlock or prune fail; see [Storage providers](providers.md).
 Restore latest to one previously absent output name:
 
 ```sh
-docker compose --env-file .env --file compose.yml --profile restore run --rm --no-deps restore restore --target primary --snapshot latest --output drill
+docker compose --env-file "$vwless_env" --file "$vwless_compose" --profile restore run --rm --no-deps restore restore --target primary --snapshot latest --output drill
 ```
 
 Restore an explicit earlier full snapshot ID to a different absent name:
 
 ```sh
-docker compose --env-file .env --file compose.yml --profile restore run --rm --no-deps restore restore --target primary --snapshot <full-64-character-id> --output earlier
+docker compose --env-file "$vwless_env" --file "$vwless_compose" --profile restore run --rm --no-deps restore restore --target primary --snapshot <full-64-character-id> --output earlier
 ```
 
 The output name resolves beneath `restore/`. Restore downloads into a private
@@ -510,7 +467,7 @@ test -e "$vwless_root/state/incidents" || mkdir -m 0700 -- "$vwless_root/state/i
 mkdir -m 0700 -- "$vwless_incident"
 test "$(stat -c '%a:%u:%g' "$vwless_root/state/incidents")" = "700:$(id -u):$(id -g)"
 test "$(stat -c '%a:%u:%g' "$vwless_incident")" = "700:$(id -u):$(id -g)"
-docker compose --env-file .env --file compose.yml exec --no-TTY backup /bin/vaultwarden-less-backup version > "$vwless_incident/active-version.json"
+docker compose --env-file "$vwless_env" --file "$vwless_compose" exec --no-TTY backup /bin/vaultwarden-less-backup version > "$vwless_incident/active-version.json"
 cp --update=none-fail --preserve=mode,timestamps -- "$vwless_restore/manifest.json" "$vwless_incident/reviewed-manifest.json"
 ```
 
@@ -519,10 +476,10 @@ commit before continuing. Then stop writers in order and confirm that no
 container or host process holds `db.sqlite3`:
 
 ```sh
-docker compose --env-file .env --file compose.yml stop proxy
-docker compose --env-file .env --file compose.yml stop backup
-docker compose --env-file .env --file compose.yml stop vaultwarden
-test -z "$(docker compose --env-file .env --file compose.yml ps --status running --quiet vaultwarden backup proxy)"
+docker compose --env-file "$vwless_env" --file "$vwless_compose" stop proxy
+docker compose --env-file "$vwless_env" --file "$vwless_compose" stop backup
+docker compose --env-file "$vwless_env" --file "$vwless_compose" stop vaultwarden
+test -z "$(docker compose --env-file "$vwless_env" --file "$vwless_compose" ps --status running --quiet vaultwarden backup proxy)"
 ```
 
 While stopped, move the manifest into the incident record and perform only
@@ -547,7 +504,7 @@ services stopped and reverse only with no-overwrite renames:
 ```sh
 mv --update=none-fail --no-copy -T -- "$vwless_root/data" "$vwless_incident/failed-restored-data"
 mv --update=none-fail --no-copy -T -- "$vwless_incident/pre-restore-data" "$vwless_root/data"
-docker compose --env-file .env --file compose.yml up --detach --wait --wait-timeout 180 vaultwarden backup proxy
+docker compose --env-file "$vwless_env" --file "$vwless_compose" up --detach --wait --wait-timeout 180 vaultwarden backup proxy
 ```
 
 If failure occurred before the restored tree reached `data`, leave that tree
@@ -561,8 +518,8 @@ The drill profile consumes exactly `restore/drill`, so create that verified
 output first. Start the separate project and wait for health:
 
 ```sh
-docker compose --project-name vaultwarden-less-drill --env-file .env --file compose.yml --profile drill up --detach --wait --wait-timeout 180 drill-vaultwarden
-docker compose --project-name vaultwarden-less-drill --env-file .env --file compose.yml --profile drill ps
+docker compose --project-name vaultwarden-less-drill --env-file "$vwless_env" --file "$vwless_compose" --profile drill up --detach --wait --wait-timeout 180 drill-vaultwarden
+docker compose --project-name vaultwarden-less-drill --env-file "$vwless_env" --file "$vwless_compose" --profile drill ps
 ```
 
 Configure a normal Bitwarden client for the drill's loopback origin. Use fresh
@@ -583,7 +540,7 @@ are expected to be invalid.
 Remove only the disposable drill project and volume:
 
 ```sh
-docker compose --project-name vaultwarden-less-drill --env-file .env --file compose.yml --profile drill down --volumes
+docker compose --project-name vaultwarden-less-drill --env-file "$vwless_env" --file "$vwless_compose" --profile drill down --volumes
 ```
 
 The verified `restore/drill` tree remains. The production stack is a different
@@ -595,11 +552,11 @@ After the first successful point and after material deployment changes, prove
 that durable repository state survives a complete service restart:
 
 ```sh
-docker compose --env-file .env --file compose.yml stop proxy backup vaultwarden
-docker compose --env-file .env --file compose.yml up --detach vaultwarden backup proxy
-docker compose --env-file .env --file compose.yml exec --no-TTY backup /bin/vaultwarden-less-backup request-backup
-docker compose --env-file .env --file compose.yml --profile maintenance run --rm --no-deps maintenance repo snapshots --target primary --limit 100
-docker compose --env-file .env --file compose.yml --profile maintenance run --rm --no-deps maintenance repo check --target primary
+docker compose --env-file "$vwless_env" --file "$vwless_compose" stop proxy backup vaultwarden
+docker compose --env-file "$vwless_env" --file "$vwless_compose" up --detach vaultwarden backup proxy
+docker compose --env-file "$vwless_env" --file "$vwless_compose" exec --no-TTY backup /bin/vaultwarden-less-backup request-backup
+docker compose --env-file "$vwless_env" --file "$vwless_compose" --profile maintenance run --rm --no-deps maintenance repo snapshots --target primary --limit 100
+docker compose --env-file "$vwless_env" --file "$vwless_compose" --profile maintenance run --rm --no-deps maintenance repo check --target primary
 ```
 
 Wait for a completed worker check before interpreting the snapshot list.
@@ -637,12 +594,13 @@ missed intermediate state.
 ## Cold deployment acceptance
 
 Before relying on a new deployment, use an ordinary isolated Linux/amd64 host
-with only Git, Docker Engine, and Compose for deployment operations:
+with only Docker Engine, Compose, checksum tools, and rsync for deployment
+operations:
 
-1. clone the exact clean commit and verify the working tree;
-2. create private copies and modes exactly as in the README;
+1. copy the exact release bundle into a new directory and verify every checksum;
+2. create private copies beneath `DEPLOYMENT_ROOT` exactly as documented;
 3. checksum and standard-load all three immutable image archives, validate
-   their labels, and create the local aliases;
+   their labels, and render Compose with the same immutable tag;
 4. run both configuration checks, initialize the empty deployment identity,
    and initialize two real repositories;
 5. start production, create real Vaultwarden data through a normal client, and

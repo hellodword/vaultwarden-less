@@ -230,6 +230,7 @@ func composeEnvironment(deployment config.Deployment, prepare Prepare) []byte {
 		"RUNTIME_GID=" + strconv.FormatUint(uint64(deployment.RuntimeGID), 10),
 		"LISTEN_PORT=" + strconv.FormatUint(uint64(deployment.ListenPort), 10),
 		"DRILL_PORT=" + strconv.FormatUint(uint64(deployment.DrillPort), 10),
+		"VWLESS_IMAGE_TAG=" + prepare.ToRelease,
 		"A_RELEASE=" + prepare.FromRelease,
 		"B_RELEASE=" + prepare.ToRelease,
 	}, "\n") + "\n")

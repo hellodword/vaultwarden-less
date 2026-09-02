@@ -14,7 +14,7 @@ available:
 just --list
 just check
 just check-release
-just release <previously-absent-ignored-output-directory>
+just release
 ```
 
 `just --list` exposes exactly `check`, `check-release`, and `release`.
@@ -40,14 +40,16 @@ Docker, image, port, or network work unless their explicit test-only flag is
 present. A green ordinary gate therefore does not claim any real container
 scenario, full-tree race run, vulnerability scan, or cloud-provider behavior.
 
-## Exact release-candidate gate
+## Optional full release check
 
 ```sh
 just check-release
 ```
 
-HEAD B must be a full clean commit, and the whole worktree including untracked
-files must remain unchanged. The fixed gate order is:
+This command is not a prerequisite for `just release` and writes no reusable
+evidence. HEAD B must nevertheless be a full clean commit, and the whole
+worktree including untracked files must remain unchanged while it runs. The
+fixed gate order is:
 
 1. `nix flake check`;
 2. full-tree `go test -race ./... -count=1`;
@@ -61,13 +63,11 @@ files must remain unchanged. The fixed gate order is:
 9. the two-repository failure/catch-up lifecycle;
 10. the initial external-data import lifecycle.
 
-The check stops at the first failure, revalidates unchanged clean B, and
-atomically writes canonical mode-`0600` evidence to
-`tmp/release-evidence/<B>/candidate.json`. That ignored document binds B,
-timestamps, the ordered gate allowlist, and the passed result. Its
-normative fields and gate names are in [Product contracts](contracts.md).
-Any gate-array or evidence-shape change invalidates earlier evidence and
-requires the complete gate to run again.
+The check stops at the first failure and revalidates unchanged clean B. Success
+prints the checked full commit; failure identifies the gate. It creates no
+candidate, artifact, timestamp, cache, or other repository state. Operators who
+need durable logs, signatures, or organizational approval records retain those
+outside this project.
 
 ### Required-test proof
 
@@ -185,42 +185,53 @@ consumed by the product and cannot be claimed from a successful B release.
 
 ## Deterministic release
 
-After the candidate gate passes:
+From a committed Git revision without tracked changes:
 
 ```sh
-just release <previously-absent-ignored-output-directory>
+release_path="$(just release)"
 ```
 
-Release creation revalidates the exact private candidate evidence and clean
-HEAD B, builds the pure `packages.release` derivation once, validates its exact
-file set and checksums, and atomically exports it. The Nix bundle contains:
+`just release` is only
+`nix build --no-link --print-out-paths .#release`. The pure release build fails
+before producing a bundle when the Git flake has no clean `self.rev`, prints one
+immutable Nix store path on success, creates no `result` symlink or repository
+output, and neither runs nor consumes `check-release` evidence. Git-flake source
+filtering excludes ignored and untracked paths, so the derivation has no
+implicit dependency on private or generated repository files.
+
+The Nix bundle contains:
 
 - exactly one immutable archive for each production image;
-- no local alias, Moto image, source bundle, deployment tree, registry
-  reference, SBOM, or license archive;
-- exactly `SHA256SUMS`, `backup.tar.gz`, `proxy.tar.gz`, and
-  `vaultwarden.tar.gz` in the new output;
-- checksum success, no replacement of an existing output, and task-only cleanup
-  on failure.
+- production Compose and upgrade files plus an immutable-tag `.env.example`;
+- public configuration and credential templates, including a complete
+  targetless example;
+- complete operator documentation, release metadata, upstream audit metadata,
+  `LICENSE`, and `NOTICE.md`;
+- no mutable image alias, Moto image, private deployment tree, source/tests,
+  registry publication, SBOM, signature, attestation, or corresponding-source
+  archive;
+- a `SHA256SUMS` entry for every other regular file in the bundle.
 
-Canonical `artifact.json` is atomically written beside candidate evidence and
-binds its hash, B commit/release, and the hashes of all four output files. It
-attests the verified export bytes, not publication or deployment acceptance.
-The exporter does not require or contact a Docker daemon.
+`release.json` names the exact commit, immutable release, system, image archive
+paths, and image references. It states build facts only; it does not claim that
+optional checks, provider validation, transfer, deployment, or client
+acceptance ran. Copy the store directory to a previously absent durable
+destination before Nix garbage collection. Destination selection,
+no-overwrite policy, access control, transport, signing, log retention, and
+store-path retention are operator responsibilities.
 
 External verification uses ordinary tools:
 
 ```sh
-(cd <output-directory> && sha256sum --check SHA256SUMS)
-docker image load --input <output-directory>/backup.tar.gz
-docker image load --input <output-directory>/proxy.tar.gz
-docker image load --input <output-directory>/vaultwarden.tar.gz
-find <output-directory> -mindepth 1 -maxdepth 1 -printf '%f\n' | sort
+(cd "$release_path" && sha256sum --check SHA256SUMS)
+docker image load --input "$release_path/images/backup.tar.gz"
+docker image load --input "$release_path/images/proxy.tar.gz"
+docker image load --input "$release_path/images/vaultwarden.tar.gz"
 ```
 
-The final command must list only `SHA256SUMS`, `backup.tar.gz`, `proxy.tar.gz`,
-and `vaultwarden.tar.gz`. The operator validates immutable OCI identity and
-creates `local` aliases as documented in [Operations](operations.md).
+The operator validates immutable OCI identity and deploys with the bundle's
+exact `VWLESS_IMAGE_TAG` as documented in [Operations](operations.md). Loading
+does not require or create mutable aliases.
 
 ## Conditional operational evidence
 
@@ -241,8 +252,8 @@ Before final acceptance:
   profile, command, flag, and output against the tree;
 - render all Compose profiles and the upgrade overlay with ignored synthetic
   private fixtures;
-- prove `scripts/` contains the five durable Python tools and
-  `tests/scripts/` their five matching tests plus `test_justfile.py`;
+- prove `scripts/` contains the four durable Python tools and
+  `tests/scripts/` their four matching tests plus `test_justfile.py`;
 - prove the Just allowlist is exactly three recipes and their final argv matches;
 - search for retired project-version markers, command names, checkout-relative
   private paths, host orchestration, hidden generated deployment trees, and

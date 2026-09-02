@@ -12,16 +12,11 @@ RECIPES = {
     "check": ([], ["nix flake check"]),
     "check-release": (
         [],
-        ["nix develop --command python3 scripts/check_release.py"],
+        ["nix develop --command python3 -B scripts/check_release.py"],
     ),
     "release": (
-        ["/tmp/vaultwarden-less-release"],
-        [
-            (
-                "nix develop --command python3 scripts/release.py "
-                '"/tmp/vaultwarden-less-release"'
-            )
-        ],
+        [],
+        ["nix build --no-link --print-out-paths .#release"],
     ),
 }
 

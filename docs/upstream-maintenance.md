@@ -88,13 +88,15 @@ as one reviewed unit. Then update every exact test expectation and image input
 that is genuinely owned by that change. Do not add a parallel schema or fallback
 unless a separately authorized durable contract requires it.
 
-Acceptance requires the complete local gate, release reproducibility, real
-backup/restore/drill lifecycle, two-target degradation/catch-up, and the A/B
-upgrade suite with the prior actual Vaultwarden version as A and the candidate
-actual version as B. If those versions do not differ, the result is only
-framework evidence for that exact managed release pair; it is complete for
-that claim and does not create a pending cross-version obligation. If they do
-differ, a passing suite supports only that exact managed pair.
+The strongest project-owned acceptance runs the complete optional local check,
+release reproducibility, real backup/restore/drill lifecycle, two-target
+degradation/catch-up, and the A/B upgrade suite with the prior actual
+Vaultwarden version as A and the candidate actual version as B. An operator may
+choose a narrower policy but must not claim an unrun boundary. If those versions
+do not differ, the result is only framework evidence for that exact managed
+release pair; it is complete for that claim and does not create a pending
+cross-version obligation. If they do differ, a passing suite supports only that
+exact managed pair.
 
 ## Bitwarden CLI checklist
 
@@ -212,10 +214,10 @@ several components. Before applying it:
 Lockfile churn, download volume, or a successful evaluation is not proof that
 the selected product set is unchanged.
 
-## Required acceptance
+## Acceptance options
 
-Run focused tests first, then the complete release-candidate gate from clean
-HEAD B:
+Run focused tests first. When the change warrants full local acceptance, run
+the optional complete release check from clean HEAD B:
 
 ```sh
 just check-release
@@ -232,17 +234,19 @@ the production clock has no test override. The gate intentionally excludes
 cold-host, real-provider, and exact A/B acceptance.
 
 When Nix image composition, entrypoints, labels, or release logic changes,
-generate B's release into one previously absent ignored root:
+build B's release and capture its immutable Nix store path:
 
 ```sh
-just release <previously-absent-ignored-output-root>
+release_path="$(just release)"
 ```
 
-The release command builds the pure Nix bundle once and atomically exports it.
-Require successful checksums and standard `docker image load` for all three
-archives, exact immutable OCI labels and entrypoints, no Moto or local reference,
-the actual expected upstream versions, exact B candidate binding, canonical
-artifact evidence, and only the documented four files in the output.
+The release command is a direct pure Nix build. It writes no evidence or
+repository output and does not depend on the optional check. Require successful
+checksums and standard `docker image load` for all three archives, exact
+immutable OCI labels and entrypoints, no Moto or local reference, the actual
+expected upstream versions, and the documented self-contained public bundle.
+Copy the store path to a durable, previously absent destination before garbage
+collection when it will be retained or deployed.
 Repeat the archive-only cold deployment acceptance in
 [Operations](operations.md) when Compose, image entrypoints, permissions, bind
 paths, directory exchange, or deployment orchestration changes. Record a

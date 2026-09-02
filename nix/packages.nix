@@ -162,15 +162,83 @@ let
     vaultwarden = vaultwardenImage identity.release;
   };
 
-  releaseBundle = pkgs.runCommand "vaultwarden-less-release-${identity.release}" { } ''
-    mkdir -p "$out"
-    install -m 0644 ${releaseImages.backup} "$out/backup.tar.gz"
-    install -m 0644 ${releaseImages.proxy} "$out/proxy.tar.gz"
-    install -m 0644 ${releaseImages.vaultwarden} "$out/vaultwarden.tar.gz"
-    cd "$out"
-    sha256sum backup.tar.gz proxy.tar.gz vaultwarden.tar.gz > SHA256SUMS
-    chmod 0644 SHA256SUMS
-  '';
+  releaseManifest = pkgs.writeText "vaultwarden-less-release.json" (
+    builtins.toJSON {
+      format = 1;
+      commit = identity.projectCommit;
+      release = identity.release;
+      system = pkgs.stdenv.hostPlatform.system;
+      images = [
+        {
+          archive = "images/backup.tar.gz";
+          reference = "vaultwarden-less-backup:${identity.release}";
+        }
+        {
+          archive = "images/proxy.tar.gz";
+          reference = "vaultwarden-less-proxy:${identity.release}";
+        }
+        {
+          archive = "images/vaultwarden.tar.gz";
+          reference = "vaultwarden-less-vaultwarden:${identity.release}";
+        }
+      ];
+    }
+    + "\n"
+  );
+
+  releaseBundle =
+    if identity.clean then
+      pkgs.runCommand "vaultwarden-less-release-${identity.release}" { } ''
+        mkdir -p \
+          "$out/images" \
+          "$out/config" \
+          "$out/credentials/restic" \
+          "$out/examples/targetless/config" \
+          "$out/examples/targetless/credentials" \
+          "$out/internal/upstream"
+
+        install -m 0644 ${releaseImages.backup} "$out/images/backup.tar.gz"
+        install -m 0644 ${releaseImages.proxy} "$out/images/proxy.tar.gz"
+        install -m 0644 ${releaseImages.vaultwarden} "$out/images/vaultwarden.tar.gz"
+        install -m 0644 ${releaseManifest} "$out/release.json"
+        install -m 0644 ${source}/RELEASE.md "$out/RELEASE.md"
+        install -m 0644 ${source}/compose.yml "$out/compose.yml"
+        install -m 0644 ${source}/compose.upgrade.yml "$out/compose.upgrade.yml"
+        substitute ${source}/.env.example "$out/.env.example" \
+          --replace-fail 'VWLESS_IMAGE_TAG=local' 'VWLESS_IMAGE_TAG=${identity.release}'
+
+        install -m 0644 ${source}/config/backup.example.yaml "$out/config/backup.example.yaml"
+        install -m 0644 ${source}/config/vaultwarden.example.env "$out/config/vaultwarden.example.env"
+        install -m 0644 ${source}/credentials/backup.example.yaml "$out/credentials/backup.example.yaml"
+        install -m 0644 ${source}/credentials/maintenance.example.yaml "$out/credentials/maintenance.example.yaml"
+        install -m 0644 ${source}/credentials/notifiers.example.yaml "$out/credentials/notifiers.example.yaml"
+        install -m 0644 ${source}/credentials/restic/primary.example "$out/credentials/restic/primary.example"
+
+        install -m 0644 ${source}/examples/targetless/config/backup.yaml "$out/examples/targetless/config/backup.yaml"
+        install -m 0644 ${source}/examples/targetless/credentials/backup.yaml "$out/examples/targetless/credentials/backup.yaml"
+        install -m 0644 ${source}/examples/targetless/credentials/maintenance.yaml "$out/examples/targetless/credentials/maintenance.yaml"
+        install -m 0644 ${source}/examples/targetless/credentials/notifiers.yaml "$out/examples/targetless/credentials/notifiers.yaml"
+
+        cp -R --no-preserve=mode ${source}/docs "$out/docs"
+        install -m 0644 ${source}/UPSTREAMS.toml "$out/UPSTREAMS.toml"
+        install -m 0644 ${source}/internal/upstream/vaultwarden-schema.json "$out/internal/upstream/vaultwarden-schema.json"
+        install -m 0644 ${source}/internal/upstream/recovery-projection.json "$out/internal/upstream/recovery-projection.json"
+        install -m 0644 ${source}/LICENSE "$out/LICENSE"
+        install -m 0644 ${source}/NOTICE.md "$out/NOTICE.md"
+
+        find "$out" -type d -exec chmod 0755 {} +
+        find "$out" -type f -exec chmod 0644 {} +
+        cd "$out"
+        find . -type f ! -path './SHA256SUMS' -printf '%P\0' \
+          | LC_ALL=C sort -z \
+          | xargs -0 sha256sum -- > SHA256SUMS
+        chmod 0644 SHA256SUMS
+      ''
+    else
+      pkgs.runCommand "vaultwarden-less-release-requires-clean-git" { } ''
+        echo "packages.release requires a clean Git revision" >&2
+        exit 1
+      '';
 
   motoPython = pkgs.python3.withPackages (
     pythonPackages: [ pythonPackages.moto ] ++ pythonPackages.moto.optional-dependencies.server

@@ -377,6 +377,7 @@ func TestPrepareWritesExactComposeEnvironment(t *testing.T) {
 		"RUNTIME_GID=" + strconv.Itoa(os.Getegid()) + "\n" +
 		"LISTEN_PORT=8080\n" +
 		"DRILL_PORT=8081\n" +
+		"VWLESS_IMAGE_TAG=" + testBRelease + "\n" +
 		"A_RELEASE=" + testARelease + "\n" +
 		"B_RELEASE=" + testBRelease + "\n"
 	got, err := os.ReadFile(paths(fixture.state).compose)

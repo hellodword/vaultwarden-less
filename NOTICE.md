@@ -5,7 +5,7 @@ authoritative project and Go dependency versions are recorded in `go.mod`,
 `go.sum`, `UPSTREAMS.toml`, and `flake.lock`. Nix builds the project binaries
 and assembles the runtime images from the closures selected by that lock.
 
-This project does not claim that its two-file image release is a complete
+This project does not claim that its deployment bundle is a complete
 software bill of materials, license archive, or source archive. Every linked
 or included component remains subject to its own license. Review those
 licenses and the locked dependency graph before redistributing an image
@@ -32,9 +32,9 @@ project, source, and license are available at:
 The Vaultwarden production image is assembled from `pkgs.vaultwarden` at the
 audited tag and commit recorded in `UPSTREAMS.toml`. Vaultwarden is licensed
 under AGPL-3.0-only. Anyone distributing the resulting Vaultwarden image must
-satisfy the AGPL's corresponding-source and notice obligations; the two-file
-vaultwarden-less release does not itself contain that source. The audited
-upstream source and license are available at:
+satisfy the AGPL's corresponding-source and notice obligations; the
+vaultwarden-less deployment bundle does not itself contain that source. The
+audited upstream source and license are available at:
 
 - https://github.com/dani-garcia/vaultwarden
 - https://github.com/dani-garcia/vaultwarden/blob/main/LICENSE.txt

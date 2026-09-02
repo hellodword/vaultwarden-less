@@ -24,8 +24,8 @@ Before `prepare`:
 - At least one backup target is configured. Targetless deployments must add and
   verify a target before `upgrade prepare`; the command otherwise returns
   `not_ready` before creating upgrade state.
-- B is an exact clean managed commit with a separately generated and checked
-  four-file Nix release bundle.
+- B is an exact clean managed commit with a separately generated, checksummed
+  Nix release bundle.
 - A and B immutable image references are available locally or their release
   archives are available for standard loading.
 - `.env`, private configuration, credentials, directories, ownership, and
@@ -51,13 +51,21 @@ successful B release.
 ## Production command surface
 
 The production interface is the raw Docker Compose and product-CLI sequence
-below. The host needs no Python, Nix, Just, or Go. Run every command from the
-exact clean B checkout, and set this shell value from the reviewed absolute
-deployment root without sourcing `.env`:
+below. The host needs no Git, Python, Nix, Just, Go, or source checkout. Copy B's
+complete release bundle to an immutable absolute directory, keep mutable and
+private files below the separate deployment root, and set these shell values
+without sourcing `.env`:
 
 ```sh
-vwless_upgrade_env='<exact DEPLOYMENT_ROOT>/state/upgrade/current/compose.env'
-test -f "$vwless_upgrade_env"
+vwless_b_release_dir='<absolute B release directory>'
+vwless_root='<exact DEPLOYMENT_ROOT>'
+vwless_env="$vwless_root/.env"
+vwless_compose="$vwless_b_release_dir/compose.yml"
+vwless_upgrade_compose="$vwless_b_release_dir/compose.upgrade.yml"
+vwless_upgrade_env="$vwless_root/state/upgrade/current/compose.env"
+test -f "$vwless_env"
+test -f "$vwless_compose"
+test -f "$vwless_upgrade_compose"
 ```
 
 Every pre-terminal phase is retried only by repeating that same product
@@ -76,9 +84,10 @@ B_COMMIT='<B-full-commit>'
 B_RELEASE='<B-immutable-release>'
 test -n "$B_COMMIT"
 test -n "$B_RELEASE"
-docker compose --env-file .env --file compose.yml --profile maintenance run --rm --no-deps config-check-backup
-docker compose --env-file .env --file compose.yml --profile maintenance run --rm --no-deps config-check-maintenance
-docker compose --env-file .env --file compose.yml --profile maintenance run --rm --no-deps maintenance upgrade prepare --to-commit "$B_COMMIT" --to-release "$B_RELEASE"
+docker compose --env-file "$vwless_env" --file "$vwless_compose" --profile maintenance run --rm --no-deps config-check-backup
+docker compose --env-file "$vwless_env" --file "$vwless_compose" --profile maintenance run --rm --no-deps config-check-maintenance
+docker compose --env-file "$vwless_env" --file "$vwless_compose" --profile maintenance run --rm --no-deps maintenance upgrade prepare --to-commit "$B_COMMIT" --to-release "$B_RELEASE"
+test -f "$vwless_upgrade_env"
 ```
 
 Prepare binds the current full A commit/release, requested B commit/release,
@@ -91,10 +100,10 @@ tags.
 Now verify and standard-load B's exact release:
 
 ```sh
-(cd <B-release-directory> && sha256sum --check SHA256SUMS)
-docker image load --input <B-release-directory>/backup.tar.gz
-docker image load --input <B-release-directory>/proxy.tar.gz
-docker image load --input <B-release-directory>/vaultwarden.tar.gz
+(cd "$vwless_b_release_dir" && sha256sum --check SHA256SUMS)
+docker image load --input "$vwless_b_release_dir/images/backup.tar.gz"
+docker image load --input "$vwless_b_release_dir/images/proxy.tar.gz"
+docker image load --input "$vwless_b_release_dir/images/vaultwarden.tar.gz"
 for vwless_product in backup proxy vaultwarden; do
   vwless_image="vaultwarden-less-$vwless_product:$B_RELEASE"
   test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$vwless_image")" = "$B_COMMIT"
@@ -102,8 +111,8 @@ for vwless_product in backup proxy vaultwarden; do
 done
 ```
 
-Do not create B's `local` aliases or continue if its OCI revision/version labels
-do not match the requested full commit and immutable release.
+Do not create mutable aliases or continue if B's OCI revision/version labels do
+not match the requested full commit and immutable release.
 
 ## 2. Freeze A
 
@@ -111,9 +120,9 @@ Freeze stops new ingress first, then the worker and Vaultwarden, and finally
 runs the freeze command from A's immutable backup image:
 
 ```sh
-docker compose --env-file .env --file compose.yml stop proxy
-docker compose --env-file .env --file compose.yml stop backup vaultwarden
-docker compose --env-file "$vwless_upgrade_env" --file compose.yml --file compose.upgrade.yml --profile upgrade run --rm --no-deps upgrade-a upgrade freeze
+docker compose --env-file "$vwless_env" --file "$vwless_compose" stop proxy
+docker compose --env-file "$vwless_env" --file "$vwless_compose" stop backup vaultwarden
+docker compose --env-file "$vwless_upgrade_env" --file "$vwless_compose" --file "$vwless_upgrade_compose" --profile upgrade run --rm --no-deps upgrade-a upgrade freeze
 ```
 
 Freeze verifies that writes are stopped, creates A-owned repository evidence,
@@ -128,10 +137,10 @@ Validate B with both roles before starting it. Then start only B's Vaultwarden
 and wait for health:
 
 ```sh
-docker compose --env-file "$vwless_upgrade_env" --file compose.yml --file compose.upgrade.yml --profile maintenance run --rm --no-deps config-check-backup
-docker compose --env-file "$vwless_upgrade_env" --file compose.yml --file compose.upgrade.yml --profile maintenance run --rm --no-deps config-check-maintenance
-docker compose --env-file "$vwless_upgrade_env" --file compose.yml --file compose.upgrade.yml --profile upgrade up --detach --no-deps --wait --wait-timeout 180 upgrade-vaultwarden-b
-docker compose --env-file "$vwless_upgrade_env" --file compose.yml --file compose.upgrade.yml --profile upgrade run --rm --no-deps upgrade-b upgrade migrate-check
+docker compose --env-file "$vwless_upgrade_env" --file "$vwless_compose" --file "$vwless_upgrade_compose" --profile maintenance run --rm --no-deps config-check-backup
+docker compose --env-file "$vwless_upgrade_env" --file "$vwless_compose" --file "$vwless_upgrade_compose" --profile maintenance run --rm --no-deps config-check-maintenance
+docker compose --env-file "$vwless_upgrade_env" --file "$vwless_compose" --file "$vwless_upgrade_compose" --profile upgrade up --detach --no-deps --wait --wait-timeout 180 upgrade-vaultwarden-b
+docker compose --env-file "$vwless_upgrade_env" --file "$vwless_compose" --file "$vwless_upgrade_compose" --profile upgrade run --rm --no-deps upgrade-b upgrade migrate-check
 ```
 
 B migrates the stopped tree. `migrate-check` captures and compares the exact
@@ -144,9 +153,9 @@ Stop active B, ask immutable B to create/restore its evidence, and start only
 the isolated B drill:
 
 ```sh
-docker compose --env-file "$vwless_upgrade_env" --file compose.yml --file compose.upgrade.yml --profile upgrade stop proxy backup vaultwarden upgrade-vaultwarden-b
-docker compose --env-file "$vwless_upgrade_env" --file compose.yml --file compose.upgrade.yml --profile upgrade run --rm --no-deps upgrade-b upgrade verify
-docker compose --env-file "$vwless_upgrade_env" --file compose.yml --file compose.upgrade.yml --profile drill up --detach --wait --wait-timeout 180 drill-vaultwarden
+docker compose --env-file "$vwless_upgrade_env" --file "$vwless_compose" --file "$vwless_upgrade_compose" --profile upgrade stop proxy backup vaultwarden upgrade-vaultwarden-b
+docker compose --env-file "$vwless_upgrade_env" --file "$vwless_compose" --file "$vwless_upgrade_compose" --profile upgrade run --rm --no-deps upgrade-b upgrade verify
+docker compose --env-file "$vwless_upgrade_env" --file "$vwless_compose" --file "$vwless_upgrade_compose" --profile drill up --detach --wait --wait-timeout 180 drill-vaultwarden
 ```
 
 Verification must succeed on every configured upgrade target. B creates a
@@ -168,24 +177,43 @@ the reviewed prepare document and release archive, then run this resumable
 sequence:
 
 ```sh
+vwless_a_release='<A-immutable-release>'
 vwless_b_commit='<B-full-commit>'
 vwless_b_release='<B-immutable-release>'
-docker compose --env-file "$vwless_upgrade_env" --file compose.yml --file compose.upgrade.yml --profile upgrade --profile drill run --rm --no-deps upgrade-b upgrade accept
-docker compose --env-file "$vwless_upgrade_env" --file compose.yml --file compose.upgrade.yml up --detach --wait --wait-timeout 180 vaultwarden backup proxy
-docker compose --env-file "$vwless_upgrade_env" --file compose.yml --file compose.upgrade.yml ps vaultwarden backup proxy
-docker compose --env-file "$vwless_upgrade_env" --file compose.yml --file compose.upgrade.yml exec --no-TTY backup /bin/vaultwarden-less-backup version
-docker compose --env-file "$vwless_upgrade_env" --file compose.yml --file compose.upgrade.yml exec --no-TTY proxy /bin/vaultwarden-less-proxy version
-docker compose --env-file "$vwless_upgrade_env" --file compose.yml --file compose.upgrade.yml exec --no-TTY vaultwarden /bin/vaultwarden --version
+docker compose --env-file "$vwless_upgrade_env" --file "$vwless_compose" --file "$vwless_upgrade_compose" --profile upgrade --profile drill run --rm --no-deps upgrade-b upgrade accept
+
+test "$(grep -c '^VWLESS_IMAGE_TAG=' "$vwless_env")" -eq 1
+vwless_current_tag="$(sed -n 's/^VWLESS_IMAGE_TAG=//p' "$vwless_env")"
+case "$vwless_current_tag" in
+  "$vwless_a_release")
+    umask 077
+    vwless_env_tmp="$(mktemp "$vwless_root/.env.XXXXXX")"
+    trap 'rm -f -- "$vwless_env_tmp"' EXIT HUP INT TERM
+    sed "s/^VWLESS_IMAGE_TAG=.*/VWLESS_IMAGE_TAG=$vwless_b_release/" "$vwless_env" > "$vwless_env_tmp"
+    chown --reference="$vwless_env" "$vwless_env_tmp"
+    chmod 0600 "$vwless_env_tmp"
+    sync "$vwless_env_tmp"
+    mv -T -- "$vwless_env_tmp" "$vwless_env"
+    sync -f "$vwless_root"
+    trap - EXIT HUP INT TERM
+    ;;
+  "$vwless_b_release") ;;
+  *) false ;;
+esac
+grep -Fx "VWLESS_IMAGE_TAG=$vwless_b_release" "$vwless_env"
+
+docker compose --env-file "$vwless_env" --file "$vwless_compose" up --detach --wait --wait-timeout 180 vaultwarden backup proxy
+docker compose --env-file "$vwless_env" --file "$vwless_compose" ps vaultwarden backup proxy
+docker compose --env-file "$vwless_env" --file "$vwless_compose" exec --no-TTY backup /bin/vaultwarden-less-backup version
+docker compose --env-file "$vwless_env" --file "$vwless_compose" exec --no-TTY proxy /bin/vaultwarden-less-proxy version
+docker compose --env-file "$vwless_env" --file "$vwless_compose" exec --no-TTY vaultwarden /bin/vaultwarden --version
 for vwless_product in backup proxy vaultwarden; do
   vwless_image="vaultwarden-less-$vwless_product:$vwless_b_release"
-  vwless_local="vaultwarden-less-$vwless_product:local"
   test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$vwless_image")" = "$vwless_b_commit"
   test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$vwless_image")" = "$vwless_b_release"
-  docker image tag "$vwless_image" "$vwless_local"
-  test "$(docker image inspect --format '{{.Id}}' "$vwless_local")" = "$(docker image inspect --format '{{.Id}}' "$vwless_image")"
 done
-docker compose --env-file "$vwless_upgrade_env" --file compose.yml --file compose.upgrade.yml --profile drill stop drill-vaultwarden
-docker compose --env-file "$vwless_upgrade_env" --file compose.yml --file compose.upgrade.yml --profile drill rm --force --stop drill-vaultwarden drill-copy
+docker compose --env-file "$vwless_upgrade_env" --file "$vwless_compose" --file "$vwless_upgrade_compose" --profile drill stop drill-vaultwarden
+docker compose --env-file "$vwless_upgrade_env" --file "$vwless_compose" --file "$vwless_upgrade_compose" --profile drill rm --force --stop drill-vaultwarden drill-copy
 vwless_drill_volume="$(docker volume ls --quiet --filter label=com.docker.compose.project=vaultwarden-less --filter label=com.docker.compose.volume=drill-data)"
 test -z "$vwless_drill_volume" || test "$vwless_drill_volume" = vaultwarden-less_drill-data
 if test -n "$vwless_drill_volume"; then
@@ -193,23 +221,31 @@ if test -n "$vwless_drill_volume"; then
   test "$(docker volume inspect --format '{{index .Labels "com.docker.compose.volume"}}' "$vwless_drill_volume")" = drill-data
   docker volume rm -- "$vwless_drill_volume"
 fi
-docker compose --env-file "$vwless_upgrade_env" --file compose.yml --file compose.upgrade.yml --profile upgrade --profile drill run --rm --no-deps upgrade-b upgrade cleanup-drill
-docker compose --env-file "$vwless_upgrade_env" --file compose.yml --file compose.upgrade.yml --profile upgrade --profile drill run --rm --no-deps upgrade-b upgrade finalize
+docker compose --env-file "$vwless_upgrade_env" --file "$vwless_compose" --file "$vwless_upgrade_compose" --profile upgrade --profile drill run --rm --no-deps upgrade-b upgrade cleanup-drill
+docker compose --env-file "$vwless_upgrade_env" --file "$vwless_compose" --file "$vwless_upgrade_compose" --profile upgrade --profile drill run --rm --no-deps upgrade-b upgrade finalize
 ```
 
 The first command creates or resumes the immutable accept decision and active B
-identity. Before cleanup, require all three `ps` entries to be healthy, require
-the three in-container versions and immutable OCI labels to name the reviewed B
-release, create and verify B's normal `local` aliases, and complete a normal
-HTTPS client check. If interrupted before
-finalize, repeat the sequence from its first line: the Go command can continue
-only accept and cannot exchange or decide twice. Finalize validates only
-durable decision, active, frozen-data, and cleanup evidence before archiving
-current state to history; it does not infer runtime health. After finalize the
-current `compose.env` is intentionally gone, so there is no host-level
+identity. The operator-owned edit then atomically changes the ordinary
+deployment environment from A's immutable tag to B's. It accepts only the
+reviewed A or already-selected B value, preserves the rest of `.env`, and is
+idempotent across an interruption. Run it as the owner of the private
+deployment files. Before cleanup, require all three `ps` entries to be healthy,
+require the three in-container versions and immutable OCI labels to name the
+reviewed B release, and complete a normal HTTPS client check. If interrupted
+before finalize, repeat the sequence from its first line: the Go command can
+continue only accept and cannot exchange or decide twice. Finalize validates
+only durable decision, active, frozen-data, and cleanup evidence before
+archiving current state to history; it does not infer runtime health. After
+finalize the current `compose.env` is intentionally gone, so there is no host-level
 `already_complete` command. Once accept is decided, rollback is permanently
 rejected. Returning to an older product requires a new audited forward upgrade;
 never rewrite history or exchange data manually.
+
+If the host fails after `upgrade accept` but before the `.env` replacement,
+ordinary A startup fails closed because active identity already names B. Repeat
+the accept sequence; it resumes the recorded decision and completes the same
+A-to-B environment change.
 
 Immediately check B status, repository snapshots, and representative client
 operations. Retain A's immutable images and accepted evidence according to
@@ -220,8 +256,9 @@ local incident policy; removing them is not part of acceptance.
 Rollback is never automatic. It is owned by immutable A and may run only before
 accept. Set the expected A identity from the reviewed prepare document, then
 stop transient B/drill services, create or resume the rollback decision and
-tree-ID-driven exchange, verify and retag only A's three immutable images,
-start ordinary A, clean the exact drill resources, and finalize:
+tree-ID-driven exchange, verify A's three immutable images, confirm the ordinary
+deployment environment still selects A, start ordinary A, clean the exact drill
+resources, and finalize:
 The one-shot A role is networkless, non-root, capability-free, and uses one
 deployment-root bind so both exchange directories remain beneath the same
 mount; split `data`/`state` binds would make Linux reject the atomic exchange.
@@ -229,22 +266,21 @@ mount; split `data`/`state` binds would make Linux reject the atomic exchange.
 ```sh
 vwless_a_commit='<A-full-commit>'
 vwless_a_release='<A-immutable-release>'
-docker compose --env-file "$vwless_upgrade_env" --file compose.yml --file compose.upgrade.yml --profile upgrade --profile drill stop proxy backup vaultwarden upgrade-vaultwarden-b drill-vaultwarden
-docker compose --env-file "$vwless_upgrade_env" --file compose.yml --file compose.upgrade.yml --profile upgrade --profile drill rm --force --stop proxy backup vaultwarden upgrade-vaultwarden-b drill-vaultwarden drill-copy
-docker compose --env-file "$vwless_upgrade_env" --file compose.yml --file compose.upgrade.yml --profile upgrade --profile drill run --rm --no-deps rollback-a rollback apply
+docker compose --env-file "$vwless_upgrade_env" --file "$vwless_compose" --file "$vwless_upgrade_compose" --profile upgrade --profile drill stop proxy backup vaultwarden upgrade-vaultwarden-b drill-vaultwarden
+docker compose --env-file "$vwless_upgrade_env" --file "$vwless_compose" --file "$vwless_upgrade_compose" --profile upgrade --profile drill rm --force --stop proxy backup vaultwarden upgrade-vaultwarden-b drill-vaultwarden drill-copy
+docker compose --env-file "$vwless_upgrade_env" --file "$vwless_compose" --file "$vwless_upgrade_compose" --profile upgrade --profile drill run --rm --no-deps rollback-a rollback apply
 for vwless_product in backup proxy vaultwarden; do
   vwless_immutable="vaultwarden-less-$vwless_product:$vwless_a_release"
-  vwless_local="vaultwarden-less-$vwless_product:local"
   test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$vwless_immutable")" = "$vwless_a_commit"
   test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$vwless_immutable")" = "$vwless_a_release"
-  docker image tag "$vwless_immutable" "$vwless_local"
-  test "$(docker image inspect --format '{{.Id}}' "$vwless_local")" = "$(docker image inspect --format '{{.Id}}' "$vwless_immutable")"
 done
-docker compose --env-file .env --file compose.yml up --detach --wait --wait-timeout 180 vaultwarden backup proxy
-docker compose --env-file .env --file compose.yml ps vaultwarden backup proxy
-docker compose --env-file .env --file compose.yml exec --no-TTY backup /bin/vaultwarden-less-backup version
-docker compose --env-file .env --file compose.yml exec --no-TTY proxy /bin/vaultwarden-less-proxy version
-docker compose --env-file .env --file compose.yml exec --no-TTY vaultwarden /bin/vaultwarden --version
+test "$(grep -c '^VWLESS_IMAGE_TAG=' "$vwless_env")" -eq 1
+grep -Fx "VWLESS_IMAGE_TAG=$vwless_a_release" "$vwless_env"
+docker compose --env-file "$vwless_env" --file "$vwless_compose" up --detach --wait --wait-timeout 180 vaultwarden backup proxy
+docker compose --env-file "$vwless_env" --file "$vwless_compose" ps vaultwarden backup proxy
+docker compose --env-file "$vwless_env" --file "$vwless_compose" exec --no-TTY backup /bin/vaultwarden-less-backup version
+docker compose --env-file "$vwless_env" --file "$vwless_compose" exec --no-TTY proxy /bin/vaultwarden-less-proxy version
+docker compose --env-file "$vwless_env" --file "$vwless_compose" exec --no-TTY vaultwarden /bin/vaultwarden --version
 vwless_drill_volume="$(docker volume ls --quiet --filter label=com.docker.compose.project=vaultwarden-less --filter label=com.docker.compose.volume=drill-data)"
 test -z "$vwless_drill_volume" || test "$vwless_drill_volume" = vaultwarden-less_drill-data
 if test -n "$vwless_drill_volume"; then
@@ -252,8 +288,8 @@ if test -n "$vwless_drill_volume"; then
   test "$(docker volume inspect --format '{{index .Labels "com.docker.compose.volume"}}' "$vwless_drill_volume")" = drill-data
   docker volume rm -- "$vwless_drill_volume"
 fi
-docker compose --env-file "$vwless_upgrade_env" --file compose.yml --file compose.upgrade.yml --profile upgrade --profile drill run --rm --no-deps rollback-a upgrade cleanup-drill
-docker compose --env-file "$vwless_upgrade_env" --file compose.yml --file compose.upgrade.yml --profile upgrade --profile drill run --rm --no-deps rollback-a upgrade finalize
+docker compose --env-file "$vwless_upgrade_env" --file "$vwless_compose" --file "$vwless_upgrade_compose" --profile upgrade --profile drill run --rm --no-deps rollback-a upgrade cleanup-drill
+docker compose --env-file "$vwless_upgrade_env" --file "$vwless_compose" --file "$vwless_upgrade_compose" --profile upgrade --profile drill run --rm --no-deps rollback-a upgrade finalize
 ```
 
 After rollback, verify A through the ordinary proxy, read worker status, list

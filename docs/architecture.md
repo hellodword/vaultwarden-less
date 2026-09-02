@@ -70,26 +70,31 @@ verification remains deliberately serial.
 | `import-ingress` | initial-import Vaultwarden candidate | Separate loopback publication for trusted HTTPS client verification. |
 
 No production container receives the container-engine socket. Normal Compose
-uses only local image aliases and `pull_policy: never`; it cannot build or pull
-an image. Only the proxy, drill, and initial-import candidate endpoints are
-published, all on loopback and never simultaneously as ordinary serving paths.
+uses one explicit immutable image tag and `pull_policy: never`; it cannot build,
+pull, or retag an image. Only the proxy, drill, and initial-import candidate
+endpoints are published, all on loopback and never simultaneously as ordinary
+serving paths.
 
 ## Filesystem and identity boundaries
 
-The source checkout and deployment root are separate ownership boundaries. The
-checkout contains tracked code, public templates, Compose files, documentation,
-and one ignored `.env` selector:
+The immutable release bundle and mutable deployment root are separate ownership
+boundaries. A source checkout exists only on a build host. The deployment host
+receives checksummed public files and keeps its private selector, credentials,
+state, and data outside that release directory:
 
 ```text
-<checkout>/
-  .env                       five Compose-owned deployment values
+<RELEASE_DIRECTORY>/
+  .env.example               six Compose-owned deployment values
   compose.yml
   compose.upgrade.yml
-  config/*.example*
-  credentials/*.example*
+  release.json
+  SHA256SUMS
+  images/
+  config/ and credentials/   public templates only
   docs/
 
 <DEPLOYMENT_ROOT>/
+  .env                       private deployment selector
   config/                    private product and Vaultwarden configuration
   credentials/               isolated role/notifier/password inputs
   data/                      live Vaultwarden data
@@ -178,26 +183,30 @@ the drill project and volume cannot remove the verified restore.
 
 ## Release and deployment split
 
-Nix owns builds, tests, and release creation. A clean commit produces three
-development images tagged `local` and three release archives tagged only with
-one deterministic immutable release name. Both variants come from the same
-image definitions; OCI revision, version, and creation labels derive from the
-commit.
+Nix owns builds, tests, and release creation. A clean committed Git flake can
+produce three development images tagged `local` and a self-contained release
+bundle whose three production archives carry only one deterministic immutable
+release name. Both variants come from the same image definitions; OCI revision,
+version, and creation labels derive from the commit. Untracked and ignored
+paths are excluded from the Git flake input.
 
-The release directory contains only:
+The release directory contains public deployment inputs:
 
 ```text
-SHA256SUMS
-backup.tar.gz
-proxy.tar.gz
-vaultwarden.tar.gz
+images/{backup,proxy,vaultwarden}.tar.gz
+compose.yml and compose.upgrade.yml
+immutable-tag .env.example
+configuration and targetless templates
+complete operator documentation
+release.json, SHA256SUMS, audit metadata, LICENSE, and NOTICE.md
 ```
 
 Each archive loads directly through standard `docker image load` and contains
 one immutable production reference; the bundle excludes the test-only Moto
-image. The ordinary deployment host verifies and loads these bytes, validates
-their identity, and explicitly creates the `local` aliases. It does not
-compile, contact a registry, or need Nix.
+image, source, tests, private state, and credentials. The ordinary deployment
+host verifies and loads these bytes, validates their identity, and selects the
+immutable tag in its private `.env`. It does not compile, retag, contact a
+registry, need a checkout, or need Nix.
 
 ## Upgrade ownership
 
@@ -217,7 +226,9 @@ binds it to immutable release identities. B must migrate, create and restore
 evidence, verify configured repositories, and pass an isolated drill before an
 operator can accept. On any pre-accept failure the operator invokes explicit A
 rollback; there is no automatic data exchange. Accept archives the complete
-current record to history only after healthy B services and drill cleanup.
+current record to history only after the operator atomically changes the
+ordinary deployment image tag from A to B, verifies healthy B services, and
+cleans up the drill.
 Rollback uses the frozen tree ID to resume a single same-filesystem exchange,
 starts ordinary A services, and then archives the complete current record with
 exchanged B data to quarantine. See [Upgrades](upgrades.md).
