@@ -33,14 +33,16 @@ services:
 
 | Service | Responsibility | Mounts | Networks |
 | --- | --- | --- | --- |
-| `vaultwarden` | Run the selected upstream Vaultwarden directly | writable `data`; `vaultwarden.env` | `backend` |
-| `backup` | Resident worker and internal HTTP API | backup configuration and credentials; Restic passwords; read-only `data`; writable `staging` and `cache` | `backend`, `egress` |
-| `proxy` | Transparently forward traffic and asynchronously report writes | none | `backend`; loopback port only |
-| `maintenance` | One-shot config, repository, and restore commands | maintenance credentials; Restic passwords; writable `cache` and `restore` | `egress`; profile-gated |
+| `vaultwarden` | Run the selected upstream Vaultwarden directly | writable `data`; `vaultwarden.env` | project `default` |
+| `backup` | Resident worker and internal HTTP API | backup configuration and credentials; Restic passwords; read-only `data`; writable `staging` and `cache` | project `default` |
+| `proxy` | Transparently forward traffic and asynchronously report writes | none | project `default`; loopback port only |
+| `maintenance` | One-shot config, repository, and restore commands | maintenance credentials; Restic passwords; writable `cache` and `restore` | project `default`; profile-gated |
 
-`backend` is `internal: true`. Only `backup` and `maintenance` join `egress`.
-There are no named data volumes, secondary Compose files, dedicated config
-checker, or special-purpose drill or data-adoption networks.
+Every active service joins only the one project-scoped `default` bridge that
+Compose creates implicitly. The network is not internal and is not a security
+boundary between these four trusted services. There are no custom networks,
+named data volumes, secondary Compose files, dedicated config checker, or
+special-purpose drill or data-adoption networks.
 
 Every service has an explicit non-root UID/GID, a read-only root filesystem,
 `tmpfs` at `/tmp`, `no-new-privileges`, all capabilities dropped, bounded log
@@ -282,7 +284,8 @@ and errors use semantic JSON. Errors use the envelope
 added only where documented. JSON field order, help prose, command registration
 order, and encoder byte choices are not contracts.
 
-The resident worker listens only on the private backend network and provides:
+The resident worker has no host-published port. On the shared project network it
+provides:
 
 - `GET /healthz`, which reports process health;
 - `GET /status`, which returns the current typed state;
@@ -455,6 +458,37 @@ but repositories, role credentials, and passwords are intentionally empty and
 must fail validation until configured. An operator choosing targetless mode
 must explicitly write both empty arrays, both empty role maps, and an actually
 empty password directory.
+
+## Formal release validation
+
+The complete release-level acceptance command is:
+
+```sh
+nix build --no-link -L .#release-test
+```
+
+`just check-release` is exactly a convenience wrapper for that command. The
+`release-test` package requires a clean `x86_64-linux` Git flake and KVM. It is
+not part of `nix flake check`, the default package, or the release bundle.
+
+Host-side Nix builds the current commit's release bundle, the test-only Moto
+image, and the Go E2E executable. A disposable NixOS guest runs Docker and the
+official Bitwarden CLI, loads the three production archives directly from that
+release bundle, proves that the test process and Docker daemon share bind
+paths, and runs exactly these scenarios:
+
+```text
+TestTargetlessDeploymentAndFullDataAdoption
+TestTwoTargetBackupRestore
+```
+
+The scenarios retain their targetless, write-proxy, complete-data adoption,
+registration closure, multi-target failure, repository check, restore,
+fresh-login, and cleanup assertions. They use only synthetic temporary data.
+A successful build is the formal VM acceptance result. A host without KVM must
+report that missing capability and cannot substitute emulation, a remote Docker
+daemon, or an ad hoc VM exercise. Distribution-specific Debian deployment and
+SSH validation are outside this formal gate.
 
 ## Source documentation
 
