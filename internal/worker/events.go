@@ -6,10 +6,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
-	"time"
 	"unicode/utf8"
-
-	"github.com/hellodword/vaultwarden-less/internal/config"
 )
 
 const (
@@ -87,12 +84,12 @@ func Handler(worker *Worker) http.Handler {
 
 func NewHTTPServer(worker *Worker) *http.Server {
 	return &http.Server{
-		Addr:              config.ListenAddress,
+		Addr:              ListenAddress,
 		Handler:           Handler(worker),
-		ReadHeaderTimeout: 5 * time.Second,
-		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      10 * time.Second,
-		IdleTimeout:       30 * time.Second,
+		ReadHeaderTimeout: httpReadHeaderTimeout,
+		ReadTimeout:       httpReadTimeout,
+		WriteTimeout:      httpWriteTimeout,
+		IdleTimeout:       httpIdleTimeout,
 		MaxHeaderBytes:    16 << 10,
 	}
 }
@@ -104,10 +101,10 @@ func decodeEventRequest(writer http.ResponseWriter, request *http.Request) *requ
 			message: "Content-Type must be exactly application/json",
 		}
 	}
-	if request.ContentLength > config.EventMaxBytes {
+	if request.ContentLength > eventMaxBytes {
 		return &requestFailure{status: http.StatusBadRequest, code: "usage_error", message: "Request body is too large"}
 	}
-	request.Body = http.MaxBytesReader(writer, request.Body, config.EventMaxBytes)
+	request.Body = http.MaxBytesReader(writer, request.Body, eventMaxBytes)
 	data, err := io.ReadAll(request.Body)
 	if err != nil {
 		var tooLarge *http.MaxBytesError

@@ -11,7 +11,6 @@ import (
 	"slices"
 	"strings"
 	"testing"
-	"time"
 )
 
 const minimalBackupYAML = `targets:
@@ -278,16 +277,6 @@ func TestYAMLErrorsAndPrivateFileBoundary(t *testing.T) {
 	}
 	if _, err := LoadBackup(path); err == nil {
 		t.Fatal("public config file was accepted")
-	}
-}
-
-func TestFixedRuntimePolicy(t *testing.T) {
-	t.Parallel()
-	if QuietWindow != 30*time.Second || MaximumQuietWindow != 2*time.Minute || MinimumCheckInterval != 5*time.Minute ||
-		FallbackCheckInterval != 12*time.Hour || ConsistencyRetry != 30*time.Second || FailureRetry != 5*time.Minute ||
-		DegradedAfter != 30*time.Minute || EventRetry != 30*time.Second || TargetTimeout != 2*time.Hour ||
-		MaintenanceTimeout != 24*time.Hour || NotifierTimeout != 10*time.Second || ShutdownTimeout != 2*time.Minute {
-		t.Fatal("fixed runtime policy changed")
 	}
 }
 

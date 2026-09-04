@@ -65,15 +65,9 @@ func testRunner(t *testing.T, execute executeFunc) (Runner, config.Target, *[]re
 		},
 	}
 	calls := []recordedCall{}
-	runner := Runner{
-		Binary:       "/usr/local/bin/restic",
-		CacheDir:     cache,
-		PasswordRoot: credentialsDir,
-		Credentials:  credentials,
-		recoveryPath: config.RecoveryPointPath,
-	}
+	runner := NewRunner("/usr/local/bin/restic", cache, credentialsDir, config.RecoveryPointPath, credentials, nil)
 	runner.execute = func(ctx context.Context, binary string, arguments, environment []string, directory string) ([]byte, error) {
-		if binary != runner.Binary {
+		if binary != runner.binary {
 			t.Fatalf("binary = %s", binary)
 		}
 		calls = append(calls, recordedCall{slices.Clone(arguments), slices.Clone(environment), directory})
@@ -194,8 +188,8 @@ func TestEnsureBacksUpDifferentContentOnceWithFixedIdentity(t *testing.T) {
 	}
 	wantArguments := []string{
 		"--repo", target.Repository,
-		"--password-file", filepath.Join(runner.PasswordRoot, target.Name),
-		"--cache-dir", filepath.Join(runner.CacheDir, target.Name),
+		"--password-file", filepath.Join(runner.passwordRoot, target.Name),
+		"--cache-dir", filepath.Join(runner.cacheDir, target.Name),
 		"--option", "s3.region=ap-singapore",
 		"--option", "s3.bucket-lookup=path",
 		"backup", "--json",
@@ -322,7 +316,7 @@ func TestResolveSnapshotUsesLatestOrOneExactFullID(t *testing.T) {
 			}
 		})
 	}
-	if _, err := (Runner{}).ResolveSnapshot(context.Background(), config.Target{}, "short"); err == nil {
+	if _, err := NewRunner("", "", "", "", nil, nil).ResolveSnapshot(context.Background(), config.Target{}, "short"); err == nil {
 		t.Fatal("short snapshot ID was accepted")
 	}
 }
@@ -413,8 +407,8 @@ func TestInitUsesExactRepositoryVersionTwoArguments(t *testing.T) {
 	}
 	want := []string{
 		"--repo", target.Repository,
-		"--password-file", filepath.Join(runner.PasswordRoot, target.Name),
-		"--cache-dir", filepath.Join(runner.CacheDir, target.Name),
+		"--password-file", filepath.Join(runner.passwordRoot, target.Name),
+		"--cache-dir", filepath.Join(runner.cacheDir, target.Name),
 		"--option", "s3.region=ap-singapore",
 		"--option", "s3.bucket-lookup=path",
 		"init", "--repository-version", "2", "--json",
@@ -449,7 +443,7 @@ func TestStructuredResticLogsExcludeArgumentsAndCredentials(t *testing.T) {
 		return []byte(`{"message_type":"initialized","id":"` + firstSnapshotID + `","repository":"redacted"}` + "\n"), nil
 	})
 	var output bytes.Buffer
-	runner.Logger = slog.New(slog.NewJSONHandler(&output, nil))
+	runner.logger = slog.New(slog.NewJSONHandler(&output, nil))
 	if err := runner.Init(context.Background(), target); err != nil {
 		t.Fatal(err)
 	}
@@ -528,7 +522,7 @@ func TestSummaryParsersRejectIncompleteOrErrorResults(t *testing.T) {
 }
 
 func TestSubprocessBoundsStderrTimeoutCancellationAndRedaction(t *testing.T) {
-	runner := Runner{}
+	runner := NewRunner("", "", "", "", nil, nil)
 	runHelper := func(ctx context.Context, mode string) ([]byte, error) {
 		return runner.run(ctx, os.Args[0], []string{"-test.run=TestResticHelperProcess", "--", mode}, []string{"GO_WANT_RESTIC_HELPER=1"}, "")
 	}

@@ -70,7 +70,7 @@ func newBarkSender(cfg config.Notifier) (Sender, error) {
 	return &barkSender{
 		name: cfg.Name, endpoint: apnsProductionEndpoint, deviceToken: deviceToken,
 		keyID: cfg.KeyID, teamID: cfg.TeamID, topic: cfg.Topic, sound: sound, key: key,
-		client: strictClient(config.NotifierTimeout),
+		client: strictClient(notifierTimeout),
 	}, nil
 }
 

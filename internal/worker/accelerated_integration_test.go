@@ -144,7 +144,7 @@ func TestWorkerAcceleratedTargetDegradationIntegration(t *testing.T) {
 		!strings.Contains(message, "failed=[secondary]") {
 		t.Fatalf("initial adapter notification = %q", message)
 	}
-	clock.Advance(config.DegradedAfter - time.Millisecond)
+	clock.Advance(degradedAfter - time.Millisecond)
 	runCheck("partial")
 	assertNoWorkerNotification(t, messages)
 	if status := worker.Status(); status.State != "partial" || status.Targets[1].State != "retrying" {
@@ -159,14 +159,14 @@ func TestWorkerAcceleratedTargetDegradationIntegration(t *testing.T) {
 	if status := worker.Status(); status.State != "degraded" || status.Targets[1].State != "degraded" {
 		t.Fatalf("status at 30:00.000 = %#v", status)
 	}
-	clock.Advance(config.FailureRetry)
+	clock.Advance(failureRetry)
 	runCheck("partial")
 	assertNoWorkerNotification(t, messages)
 
 	if err := runner.Init(ctx, targets[1]); err != nil {
 		t.Fatalf("initialize recovered secondary Restic repository: %v", err)
 	}
-	clock.Advance(config.FailureRetry)
+	clock.Advance(failureRetry)
 	runCheck("created")
 	if message := waitWorkerNotification(t, messages); !strings.Contains(message, "target secondary has recovered") {
 		t.Fatalf("recovery adapter notification = %q", message)

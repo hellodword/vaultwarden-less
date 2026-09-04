@@ -49,10 +49,10 @@ func TestSchedulerDemandDuringCheckIsRetained(t *testing.T) {
 	base := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
 	state := schedule{}
 	state.demand(base)
-	state.begin(base.Add(config.QuietWindow))
-	state.demand(base.Add(config.QuietWindow + time.Second))
-	state.complete(base.Add(config.QuietWindow+2*time.Second), false)
-	assertSchedule(t, &state, base.Add(config.QuietWindow+config.MinimumCheckInterval), triggerDemand)
+	state.begin(base.Add(quietWindow))
+	state.demand(base.Add(quietWindow + time.Second))
+	state.complete(base.Add(quietWindow+2*time.Second), false)
+	assertSchedule(t, &state, base.Add(quietWindow+minimumCheckInterval), triggerDemand)
 }
 
 func TestWaitingPreservesPartialAndDegradedStatus(t *testing.T) {
@@ -286,16 +286,16 @@ func TestSchedulerRunRetainsDemandArrivingDuringCheck(t *testing.T) {
 	done := make(chan struct{})
 	go func() { defer close(done); worker.Run(ctx) }()
 
-	if got := <-clock.created; got != config.QuietWindow {
+	if got := <-clock.created; got != quietWindow {
 		t.Fatalf("startup delay = %s", got)
 	}
-	clock.Advance(config.QuietWindow)
+	clock.Advance(quietWindow)
 	<-repository.started
 	worker.Request()
 	worker.Request()
 	close(repository.release)
-	if got := <-clock.created; got != config.MinimumCheckInterval {
-		t.Fatalf("retained demand delay = %s, want %s", got, config.MinimumCheckInterval)
+	if got := <-clock.created; got != minimumCheckInterval {
+		t.Fatalf("retained demand delay = %s, want %s", got, minimumCheckInterval)
 	}
 	status := worker.Status()
 	if status.State != "debouncing" || status.LastCheck == nil || status.LastCheck.Result != "created" {
@@ -316,11 +316,11 @@ func TestWorkerConsistencyFailureRetriesEveryThirtySeconds(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go func() { done <- worker.check(ctx) }()
-	if got := <-clock.created; got != config.ConsistencyRetry {
+	if got := <-clock.created; got != consistencyRetry {
 		t.Fatalf("consistency retry = %s", got)
 	}
 	source.err = nil
-	clock.Advance(config.ConsistencyRetry)
+	clock.Advance(consistencyRetry)
 	outcome := <-done
 	if outcome.result != "unchanged" || outcome.retry || source.calls != 2 {
 		t.Fatalf("outcome/calls = %#v/%d", outcome, source.calls)
@@ -503,14 +503,14 @@ func TestWorkerDegradedTransitionsOccurOnceAndRecoverOnce(t *testing.T) {
 	source, repository := &fixedSource{}, &orderedRepository{}
 	worker := New(workerConfig("primary"), source.Build, repository.Ensure, collector.Enqueue, discardLogger())
 	worker.targetFailed(0, base, "backup_failed")
-	worker.targetFailed(0, base.Add(config.DegradedAfter-time.Millisecond), "backup_failed")
+	worker.targetFailed(0, base.Add(degradedAfter-time.Millisecond), "backup_failed")
 	if got := len(collector.snapshot()); got != 0 {
 		t.Fatalf("events before degraded threshold = %d", got)
 	}
-	worker.targetFailed(0, base.Add(config.DegradedAfter), "backup_failed")
-	worker.targetFailed(0, base.Add(config.DegradedAfter+time.Minute), "backup_failed")
-	worker.targetSucceeded(0, base.Add(config.DegradedAfter+2*time.Minute), syncResult('a', strings.Repeat("b", 71), false))
-	worker.targetSucceeded(0, base.Add(config.DegradedAfter+3*time.Minute), syncResult('a', strings.Repeat("b", 71), false))
+	worker.targetFailed(0, base.Add(degradedAfter), "backup_failed")
+	worker.targetFailed(0, base.Add(degradedAfter+time.Minute), "backup_failed")
+	worker.targetSucceeded(0, base.Add(degradedAfter+2*time.Minute), syncResult('a', strings.Repeat("b", 71), false))
+	worker.targetSucceeded(0, base.Add(degradedAfter+3*time.Minute), syncResult('a', strings.Repeat("b", 71), false))
 	events := collector.snapshot()
 	if len(events) != 2 || events[0].Type != "target_degraded" || events[1].Type != "target_recovered" {
 		t.Fatalf("transition events = %#v", events)
@@ -527,6 +527,26 @@ func TestWorkerInitialStatusHasNullHistoryAndArrayTargets(t *testing.T) {
 	}
 	if status.Targets[0].State != "unknown" || status.Targets[0].LastAttemptAt != nil || status.Targets[0].SnapshotID != nil {
 		t.Fatalf("initial target = %#v", status.Targets[0])
+	}
+}
+
+func TestWorkerCopiesTargetsAndOptionsAtConstruction(t *testing.T) {
+	t.Parallel()
+	cfg := &config.Backup{Targets: []config.Target{{
+		Name: "primary", Repository: "original", Options: []config.Option{{Name: "region", Value: "original"}},
+	}}}
+	worker := New(cfg, nil, nil, nil, discardLogger())
+	cfg.Targets[0].Name = "mutated"
+	cfg.Targets[0].Repository = "mutated"
+	cfg.Targets[0].Options[0].Value = "mutated"
+	cfg.Targets = append(cfg.Targets, config.Target{Name: "extra"})
+
+	if len(worker.targets) != 1 || worker.targets[0].Name != "primary" || worker.targets[0].Repository != "original" ||
+		len(worker.targets[0].Options) != 1 || worker.targets[0].Options[0].Value != "original" {
+		t.Fatalf("worker retained mutable config data: %#v", worker.targets)
+	}
+	if status := worker.Status(); len(status.Targets) != 1 || status.Targets[0].Name != "primary" {
+		t.Fatalf("worker status changed through config mutation: %#v", status)
 	}
 }
 
@@ -597,8 +617,8 @@ func TestWorkerHTTPContract(t *testing.T) {
 	assertHTTP(t, handler, http.MethodPost, EventsPath, "application/json", `null`, http.StatusBadRequest, "")
 	assertHTTP(t, handler, http.MethodPost, EventsPath, "", `{}`, http.StatusBadRequest, "")
 	assertHTTP(t, handler, http.MethodPost, EventsPath, "application/json; charset=utf-8", `{}`, http.StatusBadRequest, "")
-	assertHTTP(t, handler, http.MethodPost, EventsPath, "application/json", strings.Repeat(" ", config.EventMaxBytes+1), http.StatusBadRequest, "")
-	assertHTTP(t, handler, http.MethodPost, EventsPath, "application/json", `{}`+strings.Repeat(" ", config.EventMaxBytes), http.StatusBadRequest, "")
+	assertHTTP(t, handler, http.MethodPost, EventsPath, "application/json", strings.Repeat(" ", eventMaxBytes+1), http.StatusBadRequest, "")
+	assertHTTP(t, handler, http.MethodPost, EventsPath, "application/json", `{}`+strings.Repeat(" ", eventMaxBytes), http.StatusBadRequest, "")
 	assertHTTP(t, handler, http.MethodGet, HealthPath, "", "unexpected", http.StatusBadRequest, "")
 	assertHTTP(t, handler, http.MethodGet, StatusPath, "", "unexpected", http.StatusBadRequest, "")
 	assertHTTP(t, handler, http.MethodGet, EventsPath, "", "", http.StatusMethodNotAllowed, "")

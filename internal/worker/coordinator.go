@@ -44,13 +44,41 @@ type Status struct {
 	Targets     []TargetStatus `json:"targets"`
 }
 
+type lastCheckState struct {
+	StartedAt  time.Time
+	FinishedAt time.Time
+	Result     string
+	ContentID  *string
+	ArchiveID  *string
+	ErrorCode  *string
+}
+
+type targetStatusState struct {
+	Name          string
+	State         string
+	LastAttemptAt *time.Time
+	LastSuccessAt *time.Time
+	SnapshotID    *string
+	ContentID     *string
+	ArchiveID     *string
+	ErrorCode     *string
+}
+
+type statusState struct {
+	State       string
+	StartedAt   time.Time
+	NextCheckAt *time.Time
+	LastCheck   *lastCheckState
+	Targets     []targetStatusState
+}
+
 type failureState struct {
 	since    time.Time
 	degraded bool
 }
 
 type Worker struct {
-	config  *config.Backup
+	targets []config.Target
 	build   func(context.Context) (snapshot.Manifest, error)
 	ensure  func(context.Context, config.Target, snapshot.Manifest) (restic.SyncResult, error)
 	enqueue func(notify.Event)
@@ -59,7 +87,7 @@ type Worker struct {
 	demand  chan struct{}
 
 	mu             sync.RWMutex
-	status         Status
+	status         statusState
 	sourceFailure  failureState
 	targetFailures []failureState
 }
@@ -86,20 +114,33 @@ func newWithClock(
 		enqueue = func(notify.Event) {}
 	}
 	started := currentClock.Now().UTC()
-	targets := make([]TargetStatus, 0, len(cfg.Targets))
-	for _, target := range cfg.Targets {
-		targets = append(targets, TargetStatus{Name: target.Name, State: "unknown"})
+	targets := copyTargets(cfg)
+	targetStatuses := make([]targetStatusState, 0, len(targets))
+	for _, target := range targets {
+		targetStatuses = append(targetStatuses, targetStatusState{Name: target.Name, State: "unknown"})
 	}
 	return &Worker{
-		config: cfg, build: build, ensure: ensure, enqueue: enqueue, logger: logger, clock: currentClock,
+		targets: targets, build: build, ensure: ensure, enqueue: enqueue, logger: logger, clock: currentClock,
 		demand: make(chan struct{}, 1),
-		status: Status{
+		status: statusState{
 			State:     "idle",
-			StartedAt: formatTime(started),
-			Targets:   targets,
+			StartedAt: started,
+			Targets:   targetStatuses,
 		},
-		targetFailures: make([]failureState, len(cfg.Targets)),
+		targetFailures: make([]failureState, len(targets)),
 	}
+}
+
+func copyTargets(cfg *config.Backup) []config.Target {
+	if cfg == nil || len(cfg.Targets) == 0 {
+		return []config.Target{}
+	}
+	targets := make([]config.Target, len(cfg.Targets))
+	for index, target := range cfg.Targets {
+		target.Options = append([]config.Option(nil), target.Options...)
+		targets[index] = target
+	}
+	return targets
 }
 
 // Request coalesces all outstanding demand into one in-memory signal.
@@ -114,33 +155,51 @@ func (worker *Worker) Request() {
 }
 
 func (worker *Worker) targetless() bool {
-	return len(worker.config.Targets) == 0
+	return len(worker.targets) == 0
 }
 
 func (worker *Worker) Status() Status {
 	worker.mu.RLock()
 	defer worker.mu.RUnlock()
-	result := worker.status
-	result.NextCheckAt = cloneString(worker.status.NextCheckAt)
+	result := Status{
+		State:     worker.status.State,
+		StartedAt: formatTime(worker.status.StartedAt),
+		Targets:   make([]TargetStatus, len(worker.status.Targets)),
+	}
+	if worker.status.NextCheckAt != nil {
+		value := formatTime(*worker.status.NextCheckAt)
+		result.NextCheckAt = &value
+	}
 	if worker.status.LastCheck != nil {
-		last := *worker.status.LastCheck
-		last.ContentID = cloneString(last.ContentID)
-		last.ArchiveID = cloneString(last.ArchiveID)
-		last.ErrorCode = cloneString(last.ErrorCode)
-		result.LastCheck = &last
+		state := worker.status.LastCheck
+		last := &LastCheck{
+			StartedAt:  formatTime(state.StartedAt),
+			FinishedAt: formatTime(state.FinishedAt),
+			Result:     state.Result,
+			ContentID:  cloneString(state.ContentID),
+			ArchiveID:  cloneString(state.ArchiveID),
+			ErrorCode:  cloneString(state.ErrorCode),
+		}
+		result.LastCheck = last
 	}
-	result.Targets = make([]TargetStatus, len(worker.status.Targets))
-	for index, target := range worker.status.Targets {
-		target.LastAttemptAt = cloneString(target.LastAttemptAt)
-		target.LastSuccessAt = cloneString(target.LastSuccessAt)
-		target.SnapshotID = cloneString(target.SnapshotID)
-		target.ContentID = cloneString(target.ContentID)
-		target.ArchiveID = cloneString(target.ArchiveID)
-		target.ErrorCode = cloneString(target.ErrorCode)
+	for index, state := range worker.status.Targets {
+		target := TargetStatus{
+			Name:       state.Name,
+			State:      state.State,
+			SnapshotID: cloneString(state.SnapshotID),
+			ContentID:  cloneString(state.ContentID),
+			ArchiveID:  cloneString(state.ArchiveID),
+			ErrorCode:  cloneString(state.ErrorCode),
+		}
+		if state.LastAttemptAt != nil {
+			value := formatTime(*state.LastAttemptAt)
+			target.LastAttemptAt = &value
+		}
+		if state.LastSuccessAt != nil {
+			value := formatTime(*state.LastSuccessAt)
+			target.LastSuccessAt = &value
+		}
 		result.Targets[index] = target
-	}
-	if result.Targets == nil {
-		result.Targets = []TargetStatus{}
 	}
 	return result
 }
@@ -243,7 +302,7 @@ func (worker *Worker) check(ctx context.Context) checkOutcome {
 		now := worker.clock.Now()
 		worker.sourceFailed(now, "source_inconsistent")
 		worker.logFailure("source recovery point is not yet consistent", "source_inconsistent", "")
-		timer := worker.clock.NewTimer(config.ConsistencyRetry)
+		timer := worker.clock.NewTimer(consistencyRetry)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
@@ -256,11 +315,11 @@ func (worker *Worker) check(ctx context.Context) checkOutcome {
 	if !completed {
 		return checkOutcome{cancelled: true}
 	}
-	targetNotifications := make([]notify.TargetStatus, len(worker.config.Targets))
+	targetNotifications := make([]notify.TargetStatus, len(worker.targets))
 	created := 0
 	succeeded := 0
 	failed := 0
-	for index, target := range worker.config.Targets {
+	for index, target := range worker.targets {
 		attempt := attempts[index]
 		result, err := attempt.result, attempt.err
 		if err == nil && !validSyncResult(result, built) {
@@ -285,9 +344,7 @@ func (worker *Worker) check(ctx context.Context) checkOutcome {
 	}
 
 	if created > 0 {
-		worker.enqueue(notify.Event{
-			Type: "recovery_point_created", ContentID: built.ContentID, Targets: targetNotifications,
-		})
+		worker.enqueue(notify.RecoveryPointCreated(built.ContentID, targetNotifications))
 	}
 	if failed == 0 {
 		result := "unchanged"
@@ -303,10 +360,10 @@ func (worker *Worker) check(ctx context.Context) checkOutcome {
 }
 
 func (worker *Worker) synchronizeTargets(ctx context.Context, built snapshot.Manifest) ([]targetAttempt, bool) {
-	attempts := make([]targetAttempt, len(worker.config.Targets))
+	attempts := make([]targetAttempt, len(worker.targets))
 	semaphore := make(chan struct{}, targetConcurrency)
 	var wait sync.WaitGroup
-	for index, target := range worker.config.Targets {
+	for index, target := range worker.targets {
 		select {
 		case semaphore <- struct{}{}:
 		case <-ctx.Done():
@@ -316,7 +373,7 @@ func (worker *Worker) synchronizeTargets(ctx context.Context, built snapshot.Man
 		worker.recordTargetAttempt(index, worker.clock.Now())
 		wait.Go(func() {
 			defer func() { <-semaphore }()
-			targetContext, cancel := context.WithTimeout(ctx, config.TargetTimeout)
+			targetContext, cancel := context.WithTimeout(ctx, targetTimeout)
 			result, err := worker.ensure(targetContext, target, built)
 			cancel()
 			attempts[index] = targetAttempt{result: result, err: err, finishedAt: worker.clock.Now()}
@@ -330,15 +387,15 @@ func (worker *Worker) sourceFailed(now time.Time, code string) {
 	if worker.sourceFailure.since.IsZero() {
 		worker.sourceFailure.since = now
 	}
-	if !worker.sourceFailure.degraded && !now.Before(worker.sourceFailure.since.Add(config.DegradedAfter)) {
+	if !worker.sourceFailure.degraded && !now.Before(worker.sourceFailure.since.Add(degradedAfter)) {
 		worker.sourceFailure.degraded = true
-		worker.enqueue(notify.Event{Type: "source_degraded", ErrorCode: code})
+		worker.enqueue(notify.SourceDegraded(code))
 	}
 }
 
 func (worker *Worker) sourceSucceeded() {
 	if worker.sourceFailure.degraded {
-		worker.enqueue(notify.Event{Type: "source_recovered"})
+		worker.enqueue(notify.SourceRecovered())
 	}
 	worker.sourceFailure = failureState{}
 }
@@ -349,14 +406,9 @@ func (worker *Worker) targetFailed(index int, now time.Time, code string) {
 		failure.since = now
 	}
 	state := "retrying"
-	if !failure.degraded && !now.Before(failure.since.Add(config.DegradedAfter)) {
+	if !failure.degraded && !now.Before(failure.since.Add(degradedAfter)) {
 		failure.degraded = true
-		worker.enqueue(notify.Event{
-			Type: "target_degraded",
-			Targets: []notify.TargetStatus{{
-				Name: worker.config.Targets[index].Name, State: "degraded", ErrorCode: code,
-			}},
-		})
+		worker.enqueue(notify.TargetDegraded(worker.targets[index].Name, code))
 	}
 	if failure.degraded {
 		state = "degraded"
@@ -370,15 +422,10 @@ func (worker *Worker) targetFailed(index int, now time.Time, code string) {
 func (worker *Worker) targetSucceeded(index int, now time.Time, result restic.SyncResult) {
 	failure := worker.targetFailures[index]
 	if failure.degraded {
-		worker.enqueue(notify.Event{
-			Type: "target_recovered",
-			Targets: []notify.TargetStatus{{
-				Name: worker.config.Targets[index].Name, State: "healthy",
-			}},
-		})
+		worker.enqueue(notify.TargetRecovered(worker.targets[index].Name))
 	}
 	worker.targetFailures[index] = failureState{}
-	when := formatTime(now)
+	when := now.UTC()
 	worker.mu.Lock()
 	target := &worker.status.Targets[index]
 	target.State = "healthy"
@@ -395,7 +442,7 @@ func (worker *Worker) targetSucceeded(index int, now time.Time, result restic.Sy
 }
 
 func (worker *Worker) recordTargetAttempt(index int, now time.Time) {
-	when := formatTime(now)
+	when := now.UTC()
 	worker.mu.Lock()
 	worker.status.Targets[index].LastAttemptAt = &when
 	worker.mu.Unlock()
@@ -410,7 +457,7 @@ func (worker *Worker) setWaiting(state string, next *time.Time) {
 	if next == nil {
 		worker.status.NextCheckAt = nil
 	} else {
-		value := formatTime(*next)
+		value := next.UTC()
 		worker.status.NextCheckAt = &value
 	}
 	worker.mu.Unlock()
@@ -424,9 +471,9 @@ func (worker *Worker) setChecking() {
 }
 
 func (worker *Worker) finishCheck(started, finished time.Time, outcome checkOutcome) {
-	last := &LastCheck{
-		StartedAt:  formatTime(started),
-		FinishedAt: formatTime(finished),
+	last := &lastCheckState{
+		StartedAt:  started.UTC(),
+		FinishedAt: finished.UTC(),
 		Result:     outcome.result,
 	}
 	if outcome.contentID != "" {

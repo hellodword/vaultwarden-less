@@ -964,6 +964,98 @@ func TestSpacePreflightRejectsImpossibleRequirement(t *testing.T) {
 	}
 }
 
+func TestTransientBuildCleanupRemovesOnlyOwnedProcessDirectories(t *testing.T) {
+	t.Parallel()
+	staging := t.TempDir()
+	if err := os.Chmod(staging, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	build, err := os.MkdirTemp(staging, ".build-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(build, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(build, "partial"), []byte("partial"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := cleanupTransientBuilds(staging); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(build); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("transient build still exists: %v", err)
+	}
+}
+
+func TestTransientBuildCleanupRejectsUnsafePrefixObjects(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name  string
+		setup func(*testing.T, string)
+	}{
+		{
+			name: "unexpected name",
+			setup: func(t *testing.T, path string) {
+				t.Helper()
+				if err := os.Mkdir(path, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "regular file",
+			setup: func(t *testing.T, path string) {
+				t.Helper()
+				if err := os.WriteFile(path, []byte("do not delete"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "symbolic link",
+			setup: func(t *testing.T, path string) {
+				t.Helper()
+				target := filepath.Join(filepath.Dir(path), "keep")
+				if err := os.Mkdir(target, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(target, path); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "permissive directory",
+			setup: func(t *testing.T, path string) {
+				t.Helper()
+				if err := os.Mkdir(path, 0o755); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			staging := t.TempDir()
+			if err := os.Chmod(staging, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			name := ".build-123456789"
+			if test.name == "unexpected name" {
+				name = ".build-not-from-mkdirtemp"
+			}
+			path := filepath.Join(staging, name)
+			test.setup(t, path)
+			if err := cleanupTransientBuilds(staging); err == nil {
+				t.Fatal("unsafe build-prefix object was accepted")
+			}
+			if _, err := os.Lstat(path); err != nil {
+				t.Fatalf("unsafe object was removed: %v", err)
+			}
+		})
+	}
+}
+
 func TestAtomicPublicationFailurePreservesPreviousPoint(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()

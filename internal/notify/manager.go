@@ -60,7 +60,7 @@ func (manager *Manager) Enqueue(event Event) {
 	for index := range manager.workers {
 		worker := &manager.workers[index]
 		select {
-		case worker.queue <- event:
+		case worker.queue <- event.clone():
 		default:
 			manager.logError("notification_queue_full", worker.sender.Name())
 		}

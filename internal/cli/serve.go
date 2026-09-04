@@ -9,7 +9,6 @@ import (
 	"sync"
 
 	"github.com/hellodword/vaultwarden-less/internal/buildinfo"
-	"github.com/hellodword/vaultwarden-less/internal/config"
 	"github.com/hellodword/vaultwarden-less/internal/notify"
 	"github.com/hellodword/vaultwarden-less/internal/snapshot"
 	"github.com/hellodword/vaultwarden-less/internal/worker"
@@ -83,7 +82,7 @@ func serveCommand(configPath *string, environment commandEnvironment) *cobra.Com
 			}
 
 			cancel()
-			shutdownContext, shutdownCancel := context.WithTimeout(context.WithoutCancel(cmd.Context()), config.ShutdownTimeout)
+			shutdownContext, shutdownCancel := context.WithTimeout(context.WithoutCancel(cmd.Context()), shutdownTimeout)
 			defer shutdownCancel()
 			if err := server.Shutdown(shutdownContext); err != nil && result == nil {
 				result = fmt.Errorf("internal HTTP server shutdown failed")

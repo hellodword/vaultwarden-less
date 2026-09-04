@@ -224,15 +224,40 @@ func cleanupTransientBuilds(stagingDir string) error {
 	if err != nil {
 		return err
 	}
+	builds := make([]string, 0)
 	for _, entry := range entries {
 		if !strings.HasPrefix(entry.Name(), ".build-") {
 			continue
 		}
-		if err := os.RemoveAll(filepath.Join(stagingDir, entry.Name())); err != nil {
+		path := filepath.Join(stagingDir, entry.Name())
+		if !validTransientBuildName(entry.Name()) {
+			return fmt.Errorf("unsafe transient recovery build %q", entry.Name())
+		}
+		if err := validateOwnedDirectory(path); err != nil {
+			return fmt.Errorf("unsafe transient recovery build %q: %w", entry.Name(), err)
+		}
+		builds = append(builds, path)
+	}
+	for _, path := range builds {
+		if err := os.RemoveAll(path); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func validTransientBuildName(name string) bool {
+	suffix := strings.TrimPrefix(name, ".build-")
+	// os.MkdirTemp appends the decimal representation of a random uint32.
+	if len(suffix) < 1 || len(suffix) > 10 {
+		return false
+	}
+	for _, character := range suffix {
+		if character < '0' || character > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func validateOwnedDirectory(path string) error {

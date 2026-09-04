@@ -2,8 +2,6 @@ package worker
 
 import (
 	"time"
-
-	"github.com/hellodword/vaultwarden-less/internal/config"
 )
 
 type timer interface {
@@ -63,13 +61,13 @@ func (state *schedule) next() (time.Time, triggerKind, bool) {
 		}
 	}
 	if state.demandFirst != nil {
-		demandDue := state.demandLast.Add(config.QuietWindow)
-		maximum := state.demandFirst.Add(config.MaximumQuietWindow)
+		demandDue := state.demandLast.Add(quietWindow)
+		maximum := state.demandFirst.Add(maximumQuietWindow)
 		if maximum.Before(demandDue) {
 			demandDue = maximum
 		}
 		if state.lastStarted != nil {
-			minimum := state.lastStarted.Add(config.MinimumCheckInterval)
+			minimum := state.lastStarted.Add(minimumCheckInterval)
 			if minimum.After(demandDue) {
 				demandDue = minimum
 			}
@@ -99,9 +97,9 @@ func (state *schedule) complete(now time.Time, retry bool) {
 	state.retryAt = nil
 	state.fallbackAt = nil
 	if retry {
-		due := now.Add(config.FailureRetry)
+		due := now.Add(failureRetry)
 		if state.lastStarted != nil {
-			minimum := state.lastStarted.Add(config.MinimumCheckInterval)
+			minimum := state.lastStarted.Add(minimumCheckInterval)
 			if minimum.After(due) {
 				due = minimum
 			}
@@ -109,6 +107,6 @@ func (state *schedule) complete(now time.Time, retry bool) {
 		state.retryAt = &due
 		return
 	}
-	due := now.Add(config.FallbackCheckInterval)
+	due := now.Add(fallbackCheckInterval)
 	state.fallbackAt = &due
 }

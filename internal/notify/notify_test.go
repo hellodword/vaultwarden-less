@@ -20,32 +20,54 @@ import (
 )
 
 func recoveryEvent() Event {
-	return Event{
-		Type:      "recovery_point_created",
-		ContentID: "sha256:" + strings.Repeat("a", 64),
-		Targets: []TargetStatus{
+	return RecoveryPointCreated(
+		"sha256:"+strings.Repeat("a", 64),
+		[]TargetStatus{
 			{Name: "primary", State: "created"},
 			{Name: "cold", State: "failed", ErrorCode: "command_failed"},
 		},
-	}
+	)
 }
 
 func TestRecoveryMessageListsEveryTargetOutcome(t *testing.T) {
 	t.Parallel()
-	event := Event{
-		Type:      "recovery_point_created",
-		ContentID: "sha256:" + strings.Repeat("a", 64),
-		Targets: []TargetStatus{
+	event := RecoveryPointCreated(
+		"sha256:"+strings.Repeat("a", 64),
+		[]TargetStatus{
 			{Name: "primary", State: "created"},
 			{Name: "archive", State: "synced"},
 			{Name: "cold", State: "failed", ErrorCode: "command_failed"},
 		},
-	}
+	)
 	message := event.Message()
 	for _, expected := range []string{"created=[primary]", "synced=[archive]", "failed=[cold]"} {
 		if !strings.Contains(message, expected) {
 			t.Fatalf("recovery message %q does not contain %q", message, expected)
 		}
+	}
+}
+
+func TestMalformedTargetEventHasSafeFallbackMessage(t *testing.T) {
+	t.Parallel()
+	for _, event := range []Event{
+		{Type: "target_degraded"},
+		{Type: "target_recovered", Targets: []TargetStatus{{}, {}}},
+	} {
+		if message := event.Message(); message != "Vaultwarden backup status changed" {
+			t.Fatalf("malformed event message = %q", message)
+		}
+	}
+}
+
+func TestManagerEnqueueCopiesEventData(t *testing.T) {
+	t.Parallel()
+	manager := newManagerWithSenders([]Sender{&countingSender{name: "operations"}}, nil, []time.Duration{0})
+	event := recoveryEvent()
+	manager.Enqueue(event)
+	event.Targets[0].Name = "mutated"
+	queued := <-manager.workers[0].queue
+	if queued.Targets[0].Name != "primary" {
+		t.Fatalf("queued event changed through caller slice: %#v", queued)
 	}
 }
 

@@ -13,7 +13,10 @@ import (
 	"github.com/hellodword/vaultwarden-less/internal/config"
 )
 
-const maxResponseBytes = 64 << 10
+const (
+	maxResponseBytes = 64 << 10
+	notifierTimeout  = 10 * time.Second
+)
 
 type Sender interface {
 	Name() string
@@ -31,7 +34,7 @@ func newWechatSender(cfg config.Notifier) (Sender, error) {
 	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.Fragment != "" {
 		return nil, fmt.Errorf("WeChat webhook URL is invalid")
 	}
-	return &wechatSender{name: cfg.Name, url: cfg.WebhookURL, client: strictClient(config.NotifierTimeout)}, nil
+	return &wechatSender{name: cfg.Name, url: cfg.WebhookURL, client: strictClient(notifierTimeout)}, nil
 }
 
 func (s *wechatSender) Name() string { return s.name }

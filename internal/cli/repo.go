@@ -60,7 +60,7 @@ func repoCommand(configPath *string, environment commandEnvironment) *cobra.Comm
 				if err != nil {
 					return commandFailure(codeInvalidCredentials, "Maintenance credentials are invalid", err)
 				}
-				ctx, cancel := context.WithTimeout(cmd.Context(), config.MaintenanceTimeout)
+				ctx, cancel := context.WithTimeout(cmd.Context(), maintenanceTimeout)
 				defer cancel()
 				if err := repository.VerifyVersion(ctx); err != nil {
 					return commandFailure(codeRepositoryFailure, "Restic version verification failed", err)

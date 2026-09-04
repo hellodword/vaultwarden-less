@@ -33,6 +33,12 @@ type repository interface {
 
 type restoreFunc func(context.Context, restoretool.Repository, restoretool.Request) (restoretool.Result, error)
 
+const (
+	maintenanceTimeout  = 24 * time.Hour
+	shutdownTimeout     = 2 * time.Minute
+	workerClientTimeout = 5 * time.Second
+)
+
 type commandEnvironment struct {
 	loadBackup        func(string) (*config.Backup, error)
 	loadCredentials   func(string, *config.Backup) (*config.RoleCredentials, error)
@@ -63,7 +69,7 @@ func defaultEnvironment(stderr io.Writer) commandEnvironment {
 		validateDirectory: privatefs.ValidatePrivateDirectory,
 		restore:           restoretool.Run,
 		httpClient: &http.Client{
-			Timeout: 5 * time.Second,
+			Timeout: workerClientTimeout,
 			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
 				return http.ErrUseLastResponse
 			},
