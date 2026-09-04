@@ -10,8 +10,6 @@ pkgs.mkShell {
     pkgs.docker
     pkgs.docker-compose
     formatter.config.build.wrapper
-    pkgs.golangci-lint
-    pkgs.govulncheck
     pkgs.ruff
     pkgs.python3
     pkgs.bitwarden-cli

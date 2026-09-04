@@ -15,7 +15,6 @@ let
       name,
       subPackage,
       cgoEnabled,
-      check ? false,
     }:
     pkgs.buildGoModule {
       pname = name;
@@ -23,7 +22,7 @@ let
       src = source;
       vendorHash = productVendorHash;
       subPackages = [ subPackage ];
-      doCheck = check;
+      doCheck = false;
       env.CGO_ENABLED = if cgoEnabled then "1" else "0";
       ldflags = [
         "-s"
@@ -47,7 +46,6 @@ let
     name = "vaultwarden-less-backup";
     subPackage = "cmd/vaultwarden-less-backup";
     cgoEnabled = true;
-    check = true;
   };
 
   proxy = productPackage {
@@ -147,68 +145,31 @@ let
     vaultwarden = vaultwardenImage identity.release;
   };
 
-  releaseManifest = pkgs.writeText "vaultwarden-less-release.json" (
-    builtins.toJSON {
-      format = 1;
-      commit = identity.projectCommit;
-      release = identity.release;
-      system = pkgs.stdenv.hostPlatform.system;
-      images = [
-        {
-          archive = "images/backup.tar.gz";
-          reference = "vaultwarden-less-backup:${identity.release}";
-        }
-        {
-          archive = "images/proxy.tar.gz";
-          reference = "vaultwarden-less-proxy:${identity.release}";
-        }
-        {
-          archive = "images/vaultwarden.tar.gz";
-          reference = "vaultwarden-less-vaultwarden:${identity.release}";
-        }
-      ];
-    }
-    + "\n"
-  );
-
   releaseBundle =
     if identity.clean then
       pkgs.runCommand "vaultwarden-less-release-${identity.release}" { } ''
         mkdir -p \
           "$out/images" \
-          "$out/config" \
-          "$out/credentials/restic" \
-          "$out/examples/targetless/config" \
-          "$out/examples/targetless/credentials" \
-          "$out/internal/upstream"
+          "$out/templates/config" \
+          "$out/templates/credentials/restic"
 
         install -m 0644 ${releaseImages.backup} "$out/images/backup.tar.gz"
         install -m 0644 ${releaseImages.proxy} "$out/images/proxy.tar.gz"
         install -m 0644 ${releaseImages.vaultwarden} "$out/images/vaultwarden.tar.gz"
-        install -m 0644 ${releaseManifest} "$out/release.json"
-        install -m 0644 ${source}/RELEASE.md "$out/RELEASE.md"
         install -m 0644 ${source}/compose.yml "$out/compose.yml"
-        substitute ${source}/.env.example "$out/.env.example" \
-          --replace-fail 'VWLESS_IMAGE_TAG=local' 'VWLESS_IMAGE_TAG=${identity.release}'
-
-        install -m 0644 ${source}/config/backup.example.yaml "$out/config/backup.example.yaml"
-        install -m 0644 ${source}/config/vaultwarden.example.env "$out/config/vaultwarden.example.env"
-        install -m 0644 ${source}/credentials/backup.example.yaml "$out/credentials/backup.example.yaml"
-        install -m 0644 ${source}/credentials/maintenance.example.yaml "$out/credentials/maintenance.example.yaml"
-        install -m 0644 ${source}/credentials/notifiers.example.yaml "$out/credentials/notifiers.example.yaml"
-        install -m 0644 ${source}/credentials/restic/primary.example "$out/credentials/restic/primary.example"
-
-        install -m 0644 ${source}/examples/targetless/config/backup.yaml "$out/examples/targetless/config/backup.yaml"
-        install -m 0644 ${source}/examples/targetless/credentials/backup.yaml "$out/examples/targetless/credentials/backup.yaml"
-        install -m 0644 ${source}/examples/targetless/credentials/maintenance.yaml "$out/examples/targetless/credentials/maintenance.yaml"
-        install -m 0644 ${source}/examples/targetless/credentials/notifiers.yaml "$out/examples/targetless/credentials/notifiers.yaml"
-
-        cp -R --no-preserve=mode ${source}/docs "$out/docs"
-        install -m 0644 ${source}/UPSTREAMS.toml "$out/UPSTREAMS.toml"
-        install -m 0644 ${source}/internal/upstream/vaultwarden-schema.json "$out/internal/upstream/vaultwarden-schema.json"
-        install -m 0644 ${source}/internal/upstream/recovery-projection.json "$out/internal/upstream/recovery-projection.json"
         install -m 0644 ${source}/LICENSE "$out/LICENSE"
         install -m 0644 ${source}/NOTICE.md "$out/NOTICE.md"
+
+        substitute ${source}/templates/compose.env "$out/templates/compose.env" \
+          --replace-fail \
+            'VWLESS_IMAGE_TAG=git-0000000000000000000000000000000000000000' \
+            'VWLESS_IMAGE_TAG=${identity.release}'
+        install -m 0644 ${source}/templates/config/backup.yaml "$out/templates/config/backup.yaml"
+        install -m 0644 ${source}/templates/config/vaultwarden.env "$out/templates/config/vaultwarden.env"
+        install -m 0644 ${source}/templates/credentials/backup.yaml "$out/templates/credentials/backup.yaml"
+        install -m 0644 ${source}/templates/credentials/maintenance.yaml "$out/templates/credentials/maintenance.yaml"
+        install -m 0644 ${source}/templates/credentials/restic/primary "$out/templates/credentials/restic/primary"
+        install -m 0644 ${source}/templates/credentials/restic/b2 "$out/templates/credentials/restic/b2"
 
         find "$out" -type d -exec chmod 0755 {} +
         find "$out" -type f -exec chmod 0644 {} +

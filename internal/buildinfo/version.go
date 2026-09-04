@@ -7,7 +7,7 @@ import (
 	"strings"
 )
 
-var releasePattern = regexp.MustCompile(`^RELEASE\.[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}-[0-9]{2}-[0-9]{2}Z-g([0-9a-f]{12})$`)
+var releasePattern = regexp.MustCompile(`^git-([0-9a-f]{40})$`)
 
 var (
 	// ProjectCommit is a full clean Git commit or the empty string for a dirty
@@ -30,5 +30,5 @@ func Ready() bool {
 		return false
 	}
 	match := releasePattern.FindStringSubmatch(Release)
-	return len(match) == 2 && match[1] == ProjectCommit[:12]
+	return len(match) == 2 && match[1] == ProjectCommit
 }

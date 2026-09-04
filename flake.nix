@@ -23,13 +23,6 @@
       clean = self ? rev;
       projectCommit = if clean then self.rev else "";
       compactDate = self.lastModifiedDate;
-      releaseDate =
-        "${builtins.substring 0 4 compactDate}-${builtins.substring 4 2 compactDate}-${
-          builtins.substring 6 2 compactDate
-        }"
-        + "T${builtins.substring 8 2 compactDate}-${builtins.substring 10 2 compactDate}-${
-          builtins.substring 12 2 compactDate
-        }Z";
       created =
         if clean then
           "${builtins.substring 0 4 compactDate}-${builtins.substring 4 2 compactDate}-${
@@ -40,8 +33,7 @@
           }Z"
         else
           "1970-01-01T00:00:01Z";
-      release =
-        if clean then "RELEASE.${releaseDate}-g${builtins.substring 0 12 projectCommit}" else "development";
+      release = if clean then "git-${projectCommit}" else "development";
       identity = {
         inherit
           clean
