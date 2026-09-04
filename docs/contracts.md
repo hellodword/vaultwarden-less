@@ -1,259 +1,206 @@
 # Product contracts
 
-This document is the normative machine contract for the product. Tracked
-examples, Compose files, binaries, tests, and operator prose must agree with it;
-none can silently redefine it. It does not authorize deployment, publication,
-deletion, or mutation of real data.
+This document is the sole normative product contract. The Compose file,
+configuration, binaries, tests, release bundle, and operator documentation must
+agree with it. It does not authorize publication, deployment to a real service,
+or mutation of real data.
 
-All instants are UTC RFC 3339 with exactly three fractional digits, for example
-`2026-08-27T12:34:56.789Z`. A full commit is 40 lowercase hexadecimal
-characters. A digest is `sha256:` followed by 64 lowercase hexadecimal
-characters. The only allowed version markers are externally owned: Restic
-repository format 2, OCI and Docker media types, Docker authentication URL
-`/v1/`, Git porcelain v1, upstream versions, and Vaultwarden migrations.
+This is a direct breaking redesign of an early project. The former CLI,
+configuration, Compose layout, and state documents have no compatibility layer
+or project-supplied migrator. The recovery manifest, Restic tags, content and
+archive identities, and Restic repository format remain compatible.
 
-## Supported component set
+## Product boundary
 
-Compatibility and support claims are scoped to one exact clean project commit
-and its immutable release. The supported component set is exactly the project
-binaries, images, Compose files, and audited upstream packages selected by that
-commit's `flake.nix`, tool-generated `flake.lock`, and `UPSTREAMS.toml`. This
-includes the selected Vaultwarden and unmodified Restic packages and, for
-development and acceptance, the selected Bitwarden CLI, Moto, and Go toolchain.
+The project is responsible only for:
 
-Replacing, rebuilding, relabelling, or independently upgrading any of those
-components is outside the contract, even if its name, CLI, protocol, schema, or
-version appears compatible. A candidate upstream version enters the supported
-set only through a reviewed project commit, project-produced immutable release,
-and the acceptance required by this contract. The project makes no support or
-compatibility promise for arbitrary Vaultwarden, Restic, Bitwarden CLI, Moto,
-Go, image, or wrapper versions outside that managed set.
+- running Vaultwarden, a resident backup worker, and a write-aware proxy;
+- constructing a consistent recovery point from a running SQLite Vaultwarden;
+- synchronizing that point to zero or more Restic targets; and
+- repository maintenance, status, manual backup requests, and verified restore
+  commands.
 
-Support evidence is exact-set and exact-pair evidence, not a general upstream
-compatibility matrix. Two managed project releases that contain the same actual
-Vaultwarden version can completely verify the A/B orchestration contract
-without creating an unverified cross-version obligation. If two managed
-releases intentionally contain different actual Vaultwarden versions,
-cross-version compatibility may be claimed only for that exact pair after the
-complete upgrade scenario passes.
+The project does not initialize or activate deployments, run a stateful import,
+coordinate release transitions or rollback, replace production `data`, provide
+TLS or public access control, manage provider IAM or object lifecycles, publish
+artifacts, sign releases, produce an SBOM, or discharge redistribution
+obligations for an operator.
 
-## Release bundle and deployment root
+## Runtime and Compose
 
-The source checkout is a build/development input. A deployment uses the
-checksummed public Compose files, templates, and documentation from one
-immutable release directory and a separate private deployment root. The
-operator copies `.env.example` to `<DEPLOYMENT_ROOT>/.env`; neither the release
-directory nor the checkout owns credentials, state, or application data.
-Existing checkout-relative private paths remain protected by `.gitignore` only
-to prevent accidental Git inclusion during development. Product code and tests
-never read them as fixtures.
+One `compose.yml` is the complete runtime definition. It contains exactly these
+services:
 
-The deployment `.env` is parsed by Docker Compose. The project does not
-implement a second dotenv grammar. After Compose interpolation these six values
-are required:
+| Service | Responsibility | Mounts | Networks |
+| --- | --- | --- | --- |
+| `vaultwarden` | Run the selected upstream Vaultwarden directly | writable `data`; `vaultwarden.env` | `backend` |
+| `backup` | Resident worker and internal HTTP API | backup configuration and credentials; Restic passwords; read-only `data`; writable `staging` and `cache` | `backend`, `egress` |
+| `proxy` | Transparently forward traffic and asynchronously report writes | none | `backend`; loopback port only |
+| `maintenance` | One-shot config, repository, and restore commands | maintenance credentials; Restic passwords; writable `cache` and `restore` | `egress`; profile-gated |
+
+`backend` is `internal: true`. Only `backup` and `maintenance` join `egress`.
+There are no named data volumes, secondary Compose files, dedicated config
+checker, or special-purpose drill or data-adoption networks.
+
+Every service has an explicit non-root UID/GID, a read-only root filesystem,
+`tmpfs` at `/tmp`, `no-new-privileges`, all capabilities dropped, bounded log
+rotation, and a health check. Every bind uses long syntax with
+`bind.create_host_path: false`. No service mounts a container-engine socket.
+
+Compose reads exactly these operator variables:
 
 ```dotenv
 DEPLOYMENT_ROOT=/srv/vaultwarden-less
-VWLESS_IMAGE_TAG=RELEASE.2026-09-02T05-43-20Z-g0123456789ab
+VWLESS_IMAGE_TAG=git-0123456789abcdef0123456789abcdef01234567
 RUNTIME_UID=1000
 RUNTIME_GID=1000
 LISTEN_PORT=8080
-DRILL_PORT=8081
 ```
 
-`DEPLOYMENT_ROOT` resolves to an existing absolute directory and is not `/`.
-For a production deployment, `VWLESS_IMAGE_TAG` is the immutable release in
-the active deployment identity. The tracked source-tree example uses `local`
-only for development and E2E. The release bundle substitutes its exact
-immutable release before publication.
-Runtime IDs are canonical decimal `1..4294967294`; ports are canonical decimal
-`1024..65535` and differ. The Compose-resolved values, not a product-owned
-reparse of `.env`, are the inputs to configuration checks. The example uses
-plain canonical assignments; quoting, escaping, comments, interpolation, and
-precedence follow Docker Compose's official `.env` rules.
+The image tag is `git-` followed by one complete 40-character lowercase Git
+commit. Runtime IDs are canonical decimal values from 1 through 4294967294.
+`LISTEN_PORT` is a canonical decimal value from 1024 through 65535. Compose,
+not project code, owns dotenv parsing and interpolation.
 
-The private layout is exactly rooted below `DEPLOYMENT_ROOT`:
+The deployment root has exactly this project-managed shape:
 
 ```text
-<DEPLOYMENT_ROOT>/
-  .env
+DEPLOYMENT_ROOT/
+  compose.env
   config/
     backup.yaml
     vaultwarden.env
   credentials/
     backup.yaml
     maintenance.yaml
-    notifiers.yaml
-    restic/<target>
+    restic/
+      <target-name>
   data/
-  import/
   staging/
   cache/
   restore/
-  state/
 ```
 
-The root and every private directory are existing, real, non-symlink
-directories owned by the runtime UID/GID with mode `0700`. Every private file
-is a real, single-link, non-symlink regular file owned by that identity with
-mode `0600`; every ancestor is inspected without following symlinks. Checks
-report a stable error and never repair ownership or mode with `chmod` or
-`chown`. The recommended root is outside the checkout. A root inside it is
-permitted only when the operator has independently confirmed the whole root is
-ignored.
+The root and each private directory are real, non-symlink directories owned by
+the configured runtime UID/GID with mode `0700`. Each private file is a real,
+non-symlink regular file owned by that identity with mode `0600`. Validation
+fails without repairing permissions or ownership. Project code never discovers
+or replaces production `data` implicitly.
 
-`compose.yml` defines production, maintenance, restore, drill, and import
-profiles. It selects each production image with `VWLESS_IMAGE_TAG`.
-`compose.upgrade.yml` is only an upgrade/rollback overlay and selects immutable
-A/B references from its generated environment. Every private bind uses
-`${DEPLOYMENT_ROOT}/...` long syntax with `bind.create_host_path: false`;
-rendered Compose contains no checkout-relative private bind. Both files contain
-no `build:` key, set `pull_policy: never`, publish only intended
-loopback/public endpoints, mount no container-engine socket, and pull no
-registry image. Resident services use the configured non-root identity,
-read-only roots, `no-new-privileges`, and no capabilities.
+## Vaultwarden
 
-Before production start, both role configuration checks validate the resolved
-deployment values, actual binds, private paths, target/password key sets,
-role separation, notifier credentials, UID/GID, and ports without contacting a
-repository. An empty deployment is initialized only after those checks.
-Production operator procedures use the complete release bundle, Docker Engine,
-Docker Compose, and checksum tools; they do not require Git, Python, Go, Nix,
-Just, or a source checkout. No product command may overwrite live `data`.
+The Vaultwarden image runs `/bin/vaultwarden` directly. The image or Compose
+fixes these values:
 
-## Active release identity and startup gates
-
-`state/deployment` is a real `0700` directory owned by the runtime UID/GID.
-Its sole durable document is a non-symlink, single-link `0600` regular file no
-larger than 1 MiB, owned by that same identity:
-
-```json
-{"project_commit":"0123456789abcdef0123456789abcdef01234567","release":"RELEASE.2026-08-28T12-34-56Z-g0123456789ab","activated_at":"2026-08-28T12:34:56.789Z"}
+```dotenv
+ROCKET_ADDRESS=0.0.0.0
+ROCKET_PORT=80
+DATA_FOLDER=/data
+DATABASE_URL=sqlite:///data/db.sqlite3
+RSA_KEY_FILENAME=/data/rsa_key
+ATTACHMENTS_FOLDER=/data/attachments
+SENDS_FOLDER=/data/sends
+WEB_VAULT_ENABLED=false
+DISABLE_ICON_DOWNLOAD=true
+ICON_CACHE_TTL=0
 ```
 
-The file is canonical one-line JSON followed by LF. Unknown or duplicate
-fields, trailing values, wrong JSON types, a
-non-lowercase/full commit, a release that does not contain the matching first
-12 commit characters, and a non-UTC millisecond timestamp are invalid.
-For a terminal workflow, immutable `decided_at` is chosen strictly after the
-prior active instant. The resulting `activated_at` is also the publication
-boundary for the completed data transition and must not predate that decision.
+The supplied runtime template contains only:
 
-`deployment init` requires one clean immutable build, an existing empty
-`data` directory, no active document, and no `state/upgrade/current` or
-`state/import/current`. It atomically creates the active document without
-replacement. Repeating the exact same identity returns `already_initialized`
-without changing `activated_at`, including after Vaultwarden has populated
-`data`; a different identity returns `conflict`. Missing, damaged, unsafe, or
-mismatched active state is never reconstructed from data, image tags, or the
-invoking binary.
-
-The Vaultwarden image contains a CGO-free entry gate and invokes it with
-exactly one Compose-owned mode: `normal`, `upgrade-candidate`, `rollback`,
-`drill`, or `import`. The gate validates the clean build identity before
-executing `/bin/vaultwarden`:
-
-- `normal` requires active commit and release to match the image. It permits A
-  during prepare before freeze; afterwards current must contain an immutable
-  terminal decision for that same identity. Rollback proves live `data` has
-  A's frozen tree ID before publishing the terminal active instant and before
-  any normal process opens it;
-- `upgrade-candidate` requires immutable B, active A, and a frozen current
-  upgrade with valid rollback evidence and no terminal decision;
-- `rollback` requires the immutable rollback decision and active A;
-- `drill` requires the private recovery manifest commit to match the image;
-  while an upgrade is current, its content and archive identities must also
-  match B's verification evidence;
-- `import` requires no active document and exact current import preparation
-  for the image and candidate.
-
-An unavailable or incomplete mode fails closed. Normal backup and proxy serve
-paths independently require the exact active commit and release before they
-open data or accept traffic. The data-opening Vaultwarden and backup roles also
-validate the live data filesystem against accepted upgrade evidence. Proxy has
-no data mount: its state-only gate still validates import state, the complete
-upgrade decision/activation, verified candidate, and frozen rollback device and
-tree identity. `version`, `healthcheck`, `config validate`, and the explicit
-initialization workflow retain their narrower pre-active modes.
-
-### Stable state-file ownership
-
-`internal/statefile` is the only package that owns durable private JSON file
-I/O. Its interface is:
-
-```go
-ReadJSON(path string, limit int64, destination any) error
-WriteNewJSON(path string, limit int64, value any) error
-ReplaceJSON(path string, limit int64, value any) error
-IsOwnedTemporary(targetName string, candidateName string) bool
-ValidateOwnedTemporary(directory string, candidateName string, limit int64, targetNames ...string) (bool, error)
-CleanupOwnedTemporaries(directory string, limit int64, targetNames ...string) error
+```dotenv
+SIGNUPS_ALLOWED=false
+INVITATIONS_ALLOWED=false
 ```
 
-It enforces the private single-link `0600` file and UID/GID contract, rejects
-symlinks and file substitution by comparing the opened object before and after
-I/O, applies the explicit size limit, writes canonical JSON plus one LF, uses a
-same-directory owned temporary file, fsyncs the file and parent, and implements
-no-replace or replace exactly as selected. Cleanup recognizes only temporary
-names owned by the target. Deployment, import, and upgrade retain ownership of
-their fields, phases, identities, validation, and stable domain error codes.
-Injected failure at any write boundary leaves either the complete prior file or
-the complete new file, never a partial durable document.
+The project neither sets nor validates a public domain. Operators may add other
+upstream Vaultwarden environment settings; the project does not translate or
+validate them. Web Vault assets are absent. End users access the service with an
+official Bitwarden desktop, browser-extension, or mobile client.
 
-## YAML configuration and credentials
+The proxy publishes only `127.0.0.1:${LISTEN_PORT}`. A trusted external HTTPS
+reverse proxy is a deployment prerequisite and remains operator-owned.
 
-Each YAML file is at most 1 MiB, contains exactly one document, and is
-decoded without implicit type conversion. Unknown fields, duplicate mapping
-keys at any depth, merge keys, anchors, aliases, tags, and trailing documents
-are rejected. Mapping order is not semantic. Target and notifier list order is
-semantic and is preserved in output and execution.
+## Backup configuration
 
-### Backup configuration
-
-`config/backup.yaml` has exactly this shape:
+`config/backup.yaml` is a strict YAML document of at most 1 MiB. Its only
+top-level fields are the required arrays `targets` and `notifiers`:
 
 ```yaml
-upgrade_verification_targets:
-  - primary
 targets:
   - name: primary
-    repository: s3:https://objects.example.test/bucket/vaultwarden
+    repository: s3:s3.eu-central-1.amazonaws.com/example/vaultwarden
+    options: []
+  - name: b2
+    repository: s3:https://s3.eu-central-003.backblazeb2.com/example/vaultwarden
     options:
       - name: s3.bucket-lookup
         value: path
 notifiers:
   - name: operations
     type: wechat
+    webhook_url: https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=replace-me
 ```
 
-`targets` must be present and contain 0 to 32 entries. A target name matches
-`[a-z][a-z0-9-]{0,62}` and is unique. `repository` is a string of 1 to 4096
-bytes with no NUL, CR, or LF and is passed to Restic as one argument; the
-product does not parse or branch on a provider. `options` is required and is an
-array of at most 64 objects with exactly `name` and `value`. An option name is
-1 to 256 bytes, unique within the target, and contains no NUL, CR, LF, or `=`.
-Its value is a string of at most 4096 bytes with no NUL, CR, or LF. Each option
-becomes the two arguments `--option` and `name=value`, in configured order.
-Within the project-managed Restic package, Restic decides whether the
-repository and options are supported. This delegation does not extend project
-support to another Restic build or version.
+Unknown fields, duplicate keys at any depth, multiple documents, implicit YAML
+types, merge keys, anchors, aliases, and tags are rejected. Mapping order is not
+semantic. Target and notifier array order is semantic and is preserved.
 
-When `targets` is nonempty, `upgrade_verification_targets` contains 1 to 32
-unique target names, preserves order, and is a subset (including the possible
-full set) of `targets`. When `targets` is the explicit empty array,
-`upgrade_verification_targets` must also be present as the explicit empty
-array. A missing or null value at either boundary is invalid.
-Resident target synchronization uses at most two operations concurrently.
-Targets are dispatched and all results and notifications are published in
-configuration order; one failure does not cancel another target. Upgrade
-verification targets remain serial. There are 0 to 16 notifiers;
-notifier names use the target-name pattern and are unique. The only notifier
-types are `wechat` and `bark`. This file never contains a secret.
+`targets` contains 0 through 32 entries. Each unique target name matches
+`[a-z][a-z0-9-]{0,62}`. `repository` is a nonempty string of at most 4096 bytes
+without NUL, CR, or LF and is passed to Restic as one structured argument.
+`options` is always explicit and contains at most 64 `{name, value}` objects.
+Option names are unique within one target, 1 through 256 bytes, and contain no
+NUL, CR, LF, or `=`. Values are strings of at most 4096 bytes without NUL, CR,
+or LF. Each option becomes the two arguments `--option` and `name=value` in
+configuration order.
 
-### Role credentials and passwords
+`notifiers` contains 0 through 16 entries with unique names using the target
+name syntax. A WeChat notifier has exactly these fields:
 
-`credentials/backup.yaml` and `credentials/maintenance.yaml` have the same
-strict shape but are separate files and security roles:
+```yaml
+- name: operations
+  type: wechat
+  webhook_url: https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=replace-me
+```
+
+The URL is absolute HTTPS, at most 4096 bytes, has a host and nonempty path, and
+has no user info, fragment, NUL, CR, or LF. A Bark notifier has exactly these
+fields, except that `sound` is optional:
+
+```yaml
+- name: operations
+  type: bark
+  device_token: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  auth_key: |
+    -----BEGIN PRIVATE KEY-----
+    replace-me
+    -----END PRIVATE KEY-----
+  key_id: KEY123
+  team_id: TEAM123
+  topic: me.example.app
+  sound: "1107"
+```
+
+The device token is 64 lowercase hexadecimal characters. `auth_key` is one
+PKCS#8 P-256 private key in PEM form, at most 16 KiB, with no NUL or trailing
+non-whitespace data. Key ID, team ID, topic, and sound are at most 255 bytes and
+contain no NUL, CR, or LF; required values are at least two bytes. An omitted or
+empty sound uses `1107`. Each notifier type rejects fields belonging to the
+other type. Errors and logs never disclose notifier values.
+
+An explicit targetless configuration is:
+
+```yaml
+targets: []
+notifiers: []
+```
+
+Missing or null arrays are invalid.
+
+## Role credentials and Restic passwords
+
+`credentials/backup.yaml` and `credentials/maintenance.yaml` are separate
+strict documents with the same shape:
 
 ```yaml
 targets:
@@ -261,97 +208,143 @@ targets:
     environment:
       AWS_ACCESS_KEY_ID: replace-me
       AWS_SECRET_ACCESS_KEY: replace-me
+  b2:
+    environment:
+      AWS_ACCESS_KEY_ID: replace-me
+      AWS_SECRET_ACCESS_KEY: replace-me
 ```
 
-The target key set equals the backup configuration target set exactly. Each
-`environment` mapping contains at most 128 entries. A name matches
-`[A-Z_][A-Z0-9_]{0,127}`. A value is a nonempty string of at most 65536 bytes
-with no NUL. Names beginning `RESTIC_`, and the exact names `PATH`, `HOME`,
-`TMPDIR`, `TMP`, `TEMP`, `LD_PRELOAD`, `LD_LIBRARY_PATH`, and `GODEBUG`, are
-forbidden. The backup role is available only to the resident worker. The
-maintenance role is available only to one-shot repository, restore, and
-upgrade commands. Neither role falls back to the other.
+The target key set in each role file exactly equals the configured target set.
+Each environment mapping has at most 128 entries. Names match
+`[A-Z_][A-Z0-9_]{0,127}`. Values are nonempty strings of at most 65536 bytes
+without NUL. Names beginning with `RESTIC_`, plus `PATH`, `HOME`, `TMPDIR`,
+`TMP`, `TEMP`, `LD_PRELOAD`, `LD_LIBRARY_PATH`, and `GODEBUG`, are forbidden.
+One role never falls back to the other.
 
-For an empty target set, both role files contain `targets: {}`. The private
-Restic password directory is present and empty. Notifier credentials likewise
-use `notifiers: {}` when no notifiers are configured.
+`credentials/restic` contains exactly one ordinary private file for each target
+and no other entry. A password is 1 through 65536 bytes, contains neither NUL
+nor CR, and represents one nonempty line; one terminal LF is accepted. No
+filename suffix is ignored.
 
-Each target has exactly one `credentials/restic/<target>` password file. It is
-1 to 65536 bytes, contains no NUL or CR, and represents one nonempty line. One
-terminal LF is allowed; no other LF is allowed. The password file set equals
-the configured target set exactly; examples do not count as passwords.
-
-Restic is invoked by its fixed image path `/bin/restic` with a structured argv,
-`--repo <repository>`, `--password-file
-/run/credentials/restic/<target>`, a target-specific cache directory beneath
-`/cache`, and a product-owned temporary directory. It receives no ambient
-environment. Its environment consists only of the selected role target map
-plus immutable product-controlled home, temporary-directory, and trust-store
-values required by the image. User configuration cannot override those fixed
-values. Repository locators, password material, target environment values,
-notifier values, and raw subprocess stderr are never logged or returned.
-
-`repo init` always invokes Restic with `init --repository-version 2`. The real
-integration must read repository config and observe integer version 2. No
-product command exposes or invokes `restic migrate`; changing repository
-format is an explicit, separately authorized maintenance event, never a
-software-upgrade side effect.
-
-Every Restic invocation owns a fresh parser and process context. JSON output is
-read as command-specific frames with an 8 MiB maximum frame, 64 MiB maximum
-stdout, 100,000-frame maximum, and 64 KiB captured-stderr maximum. A truncated
-frame, invalid UTF-8 or JSON, wrong consumed-field type, duplicate required
-semantic record, missing final summary, unexpected summary order, nonzero exit,
-or output after the final summary fails the command. Fields actually consumed
-for snapshot identity, prune decisions, or success are strict. Unknown fields
-within a recognized record and unrecognized progress records are ignored for
-forward compatibility. Parsers are not shared between commands. Timeout or
-context cancellation terminates the process group, drains bounded pipes,
-waits for exit, and returns `timeout` or the caller's stable error without
-including raw diagnostics.
-
-### Notifier credentials
-
-`credentials/notifiers.yaml` has exactly:
+For targetless operation, both role files contain exactly:
 
 ```yaml
-notifiers:
-  operations:
-    webhook_url: https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=replace-me
+targets: {}
 ```
 
-The notifier key set equals the configured notifier set exactly. A `wechat`
-entry has only `webhook_url`: an absolute HTTPS URL of at most 4096 bytes, with
-a host and nonempty path, and without user info, fragment, NUL, CR, or LF. A
-`bark` entry has exactly `device_token`, `auth_key`, `key_id`, `team_id`,
-`topic`, and optional `sound`. The token is 64 lowercase hexadecimal
-characters. `auth_key` is one PKCS#8 P-256 private key in PEM form, at most 16
-KiB, with no NUL or trailing non-whitespace data. Key ID, team ID, and topic are
-2 to 255 bytes and contain no NUL, CR, or LF. Sound is 0 to 255 bytes with the
-same exclusions; empty selects `1107`. Notification requests refuse redirects,
-are bounded to 10 seconds, and never block or change backup success.
+and `credentials/restic` is genuinely empty.
 
-After a check that creates at least one target snapshot, notifications list
-every configured target in configuration order as `created`, `synced`, or
-`failed`. A catch-up can therefore notify again for an existing content ID.
-Source and target degraded events are emitted once per continuous degraded
-interval and once on recovery. A notifier has a bounded queue of 16; a full
-queue drops only that notification and writes a safe error code. Delivery is
-attempted immediately, after 1 minute, and after 4 additional minutes, then is
-dropped. Messages contain only notifier name, safe target names, stable error
-codes, and the first 12 digest hexadecimal characters; never repository,
-credential, endpoint, password, raw stderr, or record data.
+Restic receives no ambient environment. It receives only the selected role's
+target environment plus immutable project-controlled home, temporary, cache,
+password, and trust-store values. Repository locators, credentials, passwords,
+notifier values, and raw subprocess diagnostics are never logged or returned.
 
-### Fixed scheduling and retention
+## Configuration validation
 
-The quiet window is 30 seconds, maximum quiet is 2 minutes, minimum check
-interval is 5 minutes, fallback is 12 hours, consistency retry is 30 seconds,
-ordinary failure retry is 5 minutes, continuous failure becomes degraded at 30
-minutes, event retry is 30 seconds, one target is bounded to 2 hours, one
-maintenance command to 24 hours, one notification to 10 seconds, and shutdown
-to 2 minutes. These are constants and have no configuration override.
+Validation uses the actual service mounts and never contacts a Restic
+repository or constructs a repository runner:
 
-Prune uses exactly:
+```sh
+docker compose --env-file "$DEPLOYMENT_ROOT/compose.env" -f RELEASE/compose.yml \
+  run --rm --no-deps backup config validate --role backup
+
+docker compose --env-file "$DEPLOYMENT_ROOT/compose.env" -f RELEASE/compose.yml \
+  --profile maintenance run --rm --no-deps maintenance \
+  config validate --role maintenance
+```
+
+The backup role validates the mounted backup configuration, backup credentials,
+password directory, `data`, `staging`, and `cache`. The maintenance role
+validates the mounted configuration, maintenance credentials, password
+directory, `cache`, and `restore`. Validation does not mount or compare a whole
+deployment root. Success returns semantic JSON containing `valid`, `role`, and
+target names in configuration order.
+
+## CLI and internal HTTP
+
+The backup executable exposes only this command tree:
+
+```text
+config validate --role backup|maintenance
+healthcheck
+repo init|snapshots|check|unlock|prune
+request-backup
+restore
+serve
+status
+version
+```
+
+`repo` and `restore` select one configured target by name. Restore accepts
+`latest` or a complete 64-character lowercase snapshot ID. Successful results
+and errors use semantic JSON. Errors use the envelope
+`{"error":{"code":"stable_code","message":"Safe message"}}`; fields may be
+added only where documented. JSON field order, help prose, command registration
+order, and encoder byte choices are not contracts.
+
+The resident worker listens only on the private backend network and provides:
+
+- `GET /healthz`, which reports process health;
+- `GET /status`, which returns the current typed state;
+- `POST /events`, which accepts a bounded write event and returns 204 when
+  accepted or deliberately ignored; and
+- `POST /checks`, which requests a backup and returns 202 when accepted.
+
+Clients bound responses and verify status, content type, and JSON structure.
+They do not revalidate every field produced by the same-version worker.
+
+When `targets` is empty, a backup process emits exactly one WARN per process
+startup with `warning_code=no_backup_targets`. It does not start scheduling,
+create a staging point, construct a repository runner, or execute Restic. Its
+status is semantically:
+
+```json
+{
+  "state": "idle",
+  "targets": [],
+  "last_check": null,
+  "next_check_at": null
+}
+```
+
+`POST /events` returns 204. `POST /checks` returns 503 with `not_ready`.
+`request-backup` exits nonzero and preserves that same error code.
+
+## Proxy event boundary
+
+The proxy transparently supports HTTP and WebSocket traffic. It emits an event
+only for a Vaultwarden write route whose upstream response succeeds, and only
+after the successful response body has been completely read. Event delivery is
+asynchronous and can never change the response observed by the client. A
+pending startup event and bounded failure retry remain supported.
+
+The write-route set is maintained in code comments. An upstream version string,
+test reason field, or a particular internal route-table representation is not a
+contract.
+
+## Snapshot and recovery format
+
+Live SQLite snapshots use the SQLite Online Backup API; a plain database-file
+copy under WAL is invalid. The recovery point contains `manifest.json`,
+`db.sqlite3`, every database-referenced attachment, and every database-referenced
+file Send. It excludes unreferenced files and the Vaultwarden RSA key.
+
+The existing manifest schema and meanings of `project_commit`, `content_id`,
+and `archive_id` remain unchanged. Canonical logical identity, archive identity,
+projection validation, attachment/Send closure, deterministic ordering, and
+golden encodings remain unchanged. SQLite schema and projection validation,
+concurrent WAL consistency, available-space checks, and atomic publication are
+required.
+
+Recovery-point construction uses a process-owned `.build-*` directory with
+mode `0700`. Cleanup may remove only a real directory whose name and ownership
+prove it belongs to that convention. An unsafe same-prefix file, symlink,
+special object, wrong mode, or wrong owner makes the build fail without removal.
+
+Each Restic snapshot retains the three existing required identity tags. Each
+required tag is present exactly once with a valid value. Additional unrelated
+tags are accepted for forward compatibility. `repo prune` validates this rule
+before applying the fixed retention policy:
 
 ```text
 --keep-within 24h
@@ -362,961 +355,119 @@ Prune uses exactly:
 --keep-yearly 3
 ```
 
-## Product CLI and JSON
+Repository format remains Restic format 2. `repo init` requests version 2;
+there is no project command for a repository-format migration.
 
-The backup executable has exactly these commands:
+The Restic adapter uses structured arguments, a cleaned environment, bounded
+stdout/stderr and JSON frames, forward-compatible parsing of unknown fields and
+progress records, and process-group cancellation. Timeouts or cancellation stop
+the whole subprocess group and wait for exit. One runner constructor owns
+process execution, command formation, parsing, and repository behavior.
+
+## Restore boundary
+
+`restore` may select only a configured target and either `latest` or one full
+snapshot ID. Its output is a valid, single path component below `/restore` that
+does not already exist. It restores into an owned temporary directory, validates
+the complete recovery point, and publishes atomically without replacement.
+After any failure, the requested final path remains absent. It never writes to
+or replaces production `data`.
+
+Because Restic recovery points exclude RSA material, an operator who promotes a
+restored tree lets Vaultwarden create a new RSA key. Existing sessions may no
+longer authenticate; acceptance uses a fresh official-client login.
+
+## Operator-controlled existing-data adoption
+
+Adopting an existing instance is a documented offline file operation, not a
+product command. Only SQLite Vaultwarden data is supported. The operator stops
+the source instance, verifies that the destination `data` is absent or empty,
+and copies the complete tree, including the database and WAL/SHM files, RSA
+material, attachments, Sends, and `config.json`. Symlinks and special files are
+rejected. The source tree is never modified. Vaultwarden performs its own
+database migration at startup. Acceptance preserves the RSA digest and uses a
+fresh official-client login; continuity of an old session is not required.
+
+## Operator-controlled release transition and rollback
+
+A release transition is an offline working-copy procedure, not product state or
+a hard release gate:
+
+1. Stop the current release A.
+2. Atomically rename `data` to a previously absent
+   `data.pre-<full-B-commit>` path.
+3. Completely copy that unmigrated A tree to a new working `data`.
+4. Allow only B Vaultwarden to open and migrate the working copy.
+5. Retain A's release and original data directory.
+6. To roll back, rename failed B data to a new `data.failed-*` name and rename
+   the original A directory back to `data`, never replacing an existing path.
+
+An isolated B exercise, repository check, or restore exercise is optional
+evidence, not a transition or release prerequisite. Targetless operation does
+not block the procedure and produces the documented warning.
+
+## Release identity and bundle
+
+The production identity is exactly `git-<40-lowercase-hex-commit>`. That same
+value is used for all three production image tags, generated
+`templates/compose.env`, the Go `version`, and the OCI version label. The OCI
+revision label is the same full commit without `git-`.
+
+`just release` is exactly:
+
+```make
+release:
+    nix build .#release
+```
+
+The release builds only from a clean Git flake, creates the standard `result`
+symlink, neither runs tests nor reads external evidence, and gives every
+production derivation `doCheck = false`. It never reads `tmp/`, `dist/`,
+`result`, or another ignored path.
+
+The release directory contains exactly:
 
 ```text
-serve
-request-backup
-status
-config validate --role backup|maintenance
-repo init --target <name>
-repo snapshots --target <name> [--limit <1..1000>]
-repo check --target <name>
-repo unlock --target <name>
-repo prune --target <name> [--apply]
-restore --target <name> [--snapshot latest|<64-lowercase-hex>] --output <name>
-deployment init
-deployment import prepare
-deployment import verify --confirm-client-login
-deployment import accept
-deployment import cancel
-deployment import finalize
-upgrade prepare --to-commit <full-commit> --to-release <immutable-release>
-upgrade freeze
-upgrade migrate-check
-upgrade verify
-upgrade accept
-upgrade cleanup-drill
-upgrade finalize
-rollback apply
-healthcheck
-version
-```
-
-`--config <path>` is the only global option and defaults to
-`/config/backup.yaml`. There are no environment-variable overrides. Snapshot
-limit defaults to 100. Restore snapshot defaults to `latest`; output name
-matches `[a-z][a-z0-9-]{0,62}` and resolves to `/restore/<name>`. Unknown
-commands, flags, positional arguments, or omitted required flags are usage
-errors. The proxy executable has only `serve`, `healthcheck`, and `version`.
-Explicit `--help` at any valid command may write text and exit 0.
-
-For every non-streaming command, success writes exactly one JSON document and
-one LF to stdout, writes nothing to stderr, and exits 0. A runtime or validation
-failure writes no stdout, exactly one JSON error document and LF to stderr, and
-exits 1. A usage failure has the same stream rule and exits 2. `serve` writes
-no stdout and writes bounded structured JSON Lines logs to stderr. Logs never
-contain secrets or record data.
-
-Every error uses this strict envelope:
-
-```json
-{"error":{"code":"invalid_config","message":"Safe message"}}
-```
-
-The exhaustive stable codes are `usage_error`, `invalid_config`,
-`invalid_credentials`, `unsafe_path`, `not_ready`, `conflict`,
-`source_inconsistent`, `repository_failure`,
-`verification_failure`, `timeout`, `upgrade_state_invalid`,
-`import_state_invalid`, `deployment_state_invalid`, and
-`internal_error`. The message is safe human context and is not a stable parsing
-surface. No error has extra fields.
-
-A dirty or non-Git build reports development identity. Only `version`,
-`healthcheck`, `config validate`, and help may run in that state. Both `serve`
-commands and every command that reads or changes runtime, repository, restore,
-or upgrade state fail `not_ready` before side effects.
-
-The complete success documents are:
-
-```json
-{"project_commit":"0123456789abcdef0123456789abcdef01234567","release":"RELEASE.2026-08-27T12-34-56Z-g0123456789ab","clean":true}
-{"project_commit":null,"release":"development","clean":false}
-{"healthy":true}
-{"accepted":true}
-{"valid":true,"role":"backup","targets":["primary"]}
-{"valid":true,"role":"backup","targets":[]}
-{"valid":true,"role":"maintenance","targets":[]}
-{"status":"initialized","project_commit":"0123456789abcdef0123456789abcdef01234567","release":"RELEASE.2026-08-27T12-34-56Z-g0123456789ab"}
-{"status":"already_initialized","project_commit":"0123456789abcdef0123456789abcdef01234567","release":"RELEASE.2026-08-27T12-34-56Z-g0123456789ab"}
-{"operation":"init","target":"primary","success":true}
-```
-
-`repo init`, `repo check`, and `repo unlock` use the last shape with their own
-operation string. Config target order is configuration order. Configuration
-validation has no `warnings` field.
-
-Snapshots are newest first, and matching snapshots with equal timestamps are
-ordered by ID descending:
-
-```json
-{
-  "target": "primary",
-  "limit": 100,
-  "truncated": false,
-  "snapshots": [{
-    "id": "<64-lowercase-hex>",
-    "time": "2026-08-27T12:34:56.789Z",
-    "project_commit": "<full-commit>",
-    "content_id": "sha256:<64-lowercase-hex>",
-    "archive_id": "sha256:<64-lowercase-hex>"
-  }]
-}
-```
-
-Prune is a preview unless `--apply` is present. Group and ID order is Restic's
-stable JSON order after validation:
-
-```json
-{
-  "operation": "prune",
-  "target": "primary",
-  "applied": false,
-  "groups": [{
-    "host": "vaultwarden-less",
-    "paths": ["/staging/point"],
-    "keep_snapshot_ids": [],
-    "remove_snapshot_ids": []
-  }]
-}
-```
-
-Restore returns:
-
-```json
-{"target":"primary","snapshot_id":"<64-lowercase-hex>","project_commit":"<full-commit>","content_id":"sha256:<64-lowercase-hex>","archive_id":"sha256:<64-lowercase-hex>","output":"/restore/drill"}
-```
-
-Upgrade and rollback commands use one common result. `targets` is present only
-for `frozen` and `verified` and otherwise is an empty array:
-
-```json
-{
-  "upgrade_id": "<A-full-commit>..<B-full-commit>",
-  "phase": "verified",
-  "from_commit": "<A-full-commit>",
-  "to_commit": "<B-full-commit>",
-  "targets": [{
-    "target": "primary",
-    "snapshot_id": "<64-lowercase-hex>",
-    "content_id": "sha256:<64-lowercase-hex>",
-    "archive_id": "sha256:<64-lowercase-hex>"
-  }]
-}
-```
-
-The phase is `prepared`, `frozen`, `migrated`, `verified`, `accepted`, or
-`rolled_back`, matching the command that completed.
-
-Status arrays are never null; unavailable instants and identifiers are JSON
-null:
-
-```json
-{
-  "state": "idle",
-  "started_at": "2026-08-27T12:00:00.000Z",
-  "next_check_at": null,
-  "last_check": {
-    "started_at": "2026-08-27T12:00:30.000Z",
-    "finished_at": "2026-08-27T12:00:40.000Z",
-    "result": "unchanged",
-    "content_id": "sha256:<64-lowercase-hex>",
-    "archive_id": "sha256:<64-lowercase-hex>",
-    "error_code": null
-  },
-  "targets": [{
-    "name": "primary",
-    "state": "healthy",
-    "last_attempt_at": "2026-08-27T12:00:35.000Z",
-    "last_success_at": "2026-08-27T12:00:39.000Z",
-    "snapshot_id": "<64-lowercase-hex>",
-    "content_id": "sha256:<64-lowercase-hex>",
-    "archive_id": "sha256:<64-lowercase-hex>",
-    "error_code": null
-  }]
-}
-```
-
-Worker state is `idle`, `debouncing`, `checking`, `partial`, or `degraded`.
-Target state is `unknown`, `healthy`, `retrying`, or `degraded`. Check result is
-`unchanged`, `created`, `partial`, or `failed`. `last_check.archive_id` is the
-source archive observed during that check even when unchanged logical content
-causes no upload.
-
-With an explicit empty target set, the worker starts healthy and writes one
-WARN per process start with `warning_code=no_backup_targets` and the message
-`Vaultwarden data is not being backed up because no backup targets are
-configured`. It does not start a scheduler, create a staging point, or
-instantiate or call repository operations. Its status remains `idle` with
-`targets: []`, `last_check: null`, and `next_check_at: null`.
-
-## Internal HTTP and proxy events
-
-The private backup HTTP interface is:
-
-- `GET /healthz` accepts no query or body and returns 204 with an empty body.
-- `GET /status` accepts no query or body and returns the CLI status JSON.
-- `POST /events` accepts the strict empty request and returns 204, including
-  when no targets are configured.
-- `POST /checks` accepts the same request. With configured targets it returns
-  202 plus the `request-backup` JSON. With no targets it returns 503 and the
-  ordinary `not_ready` envelope stating that no backup targets are configured.
-
-The only request object is `{}`. JSON whitespace is allowed, but the object
-must be empty and no second JSON value may follow. Body size is at most 1024 bytes.
-Content-Type is exactly `application/json` with no parameters. A query string,
-wrong method, duplicate or unknown key, redirect, or extra document is
-rejected. JSON HTTP errors use the CLI error envelope. Invalid input is 400,
-wrong method is 405, conflict is 409, unsafe path is 422, not-ready is 503,
-timeout is 504, repository failure is 502, and other runtime failures are 500.
-
-The proxy publishes `/.vaultwarden-less/healthz`; every other request and
-response is transparently forwarded. A completed upstream response with a
-2xx status triggers one event after `POST`, `PUT`, `PATCH`, or `DELETE`.
-`POST /identity/connect/token` is explicitly included because login can change
-KDF state. Failed writes, reads, health probes, and incomplete responses do not
-trigger. Event delivery retries every 30 seconds and does not alter the client
-response. Whether a triggered check uploads is decided only by `content_id`.
-
-## Recovery identity and manifest
-
-The recovery identity is the full clean project commit that created the
-snapshot. That commit uniquely selects `flake.lock`; the manifest does not
-repeat software versions, image digests, source hashes, or the lock hash.
-
-`manifest.json` is strict JSON:
-
-```json
-{
-  "project_commit": "<40-lowercase-hex>",
-  "content_id": "sha256:<64-lowercase-hex>",
-  "archive_id": "sha256:<64-lowercase-hex>",
-  "files": [
-    {"path":"db.sqlite3","size":123,"sha256":"sha256:<64-lowercase-hex>"}
-  ]
-}
-```
-
-The JSON rejects duplicate or unknown fields, invalid UTF-8, trailing values,
-more than 1,000,000 entries, or more than 64 MiB. `files` is nonempty, contains
-`db.sqlite3`, excludes the manifest, is unique, and is sorted by raw UTF-8 path
-bytes. Size is `0..9223372036854775807`. Every digest includes its `sha256:`
-prefix.
-
-Allowed paths are `db.sqlite3`,
-`attachments/<cipher-uuid>/<attachment-id>`, and
-`sends/<send-uuid>/<file-id>`. UUIDs use lowercase canonical hexadecimal with
-hyphens, attachment IDs are 20 lowercase hexadecimal characters, and Send file
-IDs are 64 lowercase hexadecimal characters. Attachment paths and sizes come
-from `(cipher_uuid,id,file_size)` in `attachments`. File Send paths come from
-the strict schema of `sends.data` for `atype=1`. Any invalid reference,
-duplicate path, missing file, symlink, special file, path escape, orphan file,
-size mismatch, or file change during copying fails the build without
-publishing a partial point.
-
-The staged database is made with the SQLite Online Backup API. Its journal is
-normalized without copying WAL, SHM, journal, Vaultwarden-created backups, RSA
-keys, icons, or cache files. Before publication it must return exactly `ok`
-from `PRAGMA integrity_check`, no row from `PRAGMA foreign_key_check`, match the
-complete tracked SQLite schema and audited latest Diesel migration, and match
-the complete projection contract. An unknown table, column, schema object,
-missing object, missing column, or projection mismatch fails closed.
-
-### Projection contract
-
-`internal/upstream/recovery-projection.json` is the human-reviewed projection.
-It lists every known table, every schema-ordinal column, and the canonical row
-key. Table disposition is `included`, `excluded`, or `validate_only`.
-`excluded_columns` applies only to an included table. The fully excluded tables
-are `auth_requests`, `devices`, `event`, `sso_auth`, `twofactor_duo_ctx`, and
-`twofactor_incomplete`. `__diesel_schema_migrations` is validation-only.
-`users` excludes `updated_at`, `last_verifying_at`, `login_verify_count`, and
-`stamp_exception`; `twofactor` excludes `last_used`. Every other known column
-is included. Primary-key order is the default row key;
-`collections_groups` uses `(collections_uuid,groups_uuid)` and `groups_users`
-uses `(groups_uuid,users_organizations_uuid)`.
-
-The projection JSON is tracked because the running binary consumes it and a
-change is a recovery-identity contract review. It is never generated from the
-schema automatically. The schema JSON is generated deterministically from the
-audited Vaultwarden migration and is tracked because offline build and runtime
-validation consume it. Either change requires generator verification, a real
-consumer test, a second generation with no diff, and the real lifecycle gates.
-
-### Canonical logical stream
-
-`content_id` is SHA-256 over this exact byte stream:
-
-1. Raw magic `vaultwarden-less-logical\0`.
-2. One length frame containing the 40-byte ASCII project commit.
-3. A big-endian uint64 count of included tables.
-4. For each included table by raw UTF-8 table-name bytes: a name frame, a
-   big-endian uint64 included-column count, one name frame per included column
-   in schema ordinal order, a big-endian uint64 row count, then every row.
-5. A big-endian uint64 referenced-file count, then for every manifest file
-   except `db.sqlite3`, in raw UTF-8 path order: path frame, big-endian uint64
-   size, and the 32 raw SHA-256 bytes.
-
-A length frame is an unsigned big-endian uint64 byte length followed by exactly
-that many bytes. Rows are sorted by the declared row-key columns using SQLite
-ascending storage-class order and `BINARY` collation for text. A row key must
-be unique. Values follow schema ordinal and use: NULL tag byte 0; INTEGER tag 1
-and big-endian two's-complement int64; REAL tag 2 and big-endian IEEE-754
-binary64 bits; TEXT tag 3 and a length frame of the exact SQLite text bytes;
-BLOB tag 4 and a length frame of the exact bytes. Other storage classes or a
-value outside the fixed representation fail. No Unicode, case, whitespace,
-timestamp, filename, or path normalization occurs.
-
-`archive_id` is SHA-256 over raw magic
-`vaultwarden-less-archive\0`, a big-endian uint64 manifest-file count, and,
-for every manifest file in raw UTF-8 path order, a path frame followed by a
-length frame containing the exact staged file bytes. It therefore changes when
-the online-backup bytes change even if the logical projection does not.
-
-### Restic identity, deduplication, and restore
-
-Every recovery snapshot repeats these tags:
-
-```text
-project_commit=<full-commit>
-content_id=sha256:<64-lowercase-hex>
-archive_id=sha256:<64-lowercase-hex>
-```
-
-The fixed Restic host is `vaultwarden-less` and fixed path is
-`/staging/point`. Selection and prune require the host, path, and all three
-identity tags. Each required identity tag must occur exactly once and contain a
-valid value. Other tags do not participate in identity and are ignored.
-Explicit snapshot IDs are full 64-character IDs.
-
-For each target, the newest matching snapshot's `content_id` decides upload.
-Equal content skips that target even when the observed `archive_id` differs.
-Targets that missed content are retried and catch up without a new source
-mutation. A source consistency failure publishes no target. Partial target
-success is retained and reported; it is not rolled back.
-
-Restore uses a temporary real directory beneath the output parent, refuses an
-existing output and every symlink ancestor, and verifies the strict manifest,
-listed file set, file modes, sizes and hashes, SQLite integrity and foreign
-keys, exact schema and migration, projection, database references, both IDs,
-and snapshot tags. It then atomically renames without replacement to the
-previously absent `/restore/<name>`. Failure removes only the task-owned
-temporary tree and never exposes a partial output. RSA material is not in the
-manifest, so first startup generates a new key and invalidates all prior
-access, refresh, invitation, and session state.
-
-### Production restore boundary
-
-Production restore is an operator runbook, not an automatic promotion command.
-The selected restore must pass full verification and a drill, and its
-`project_commit` must equal the current active identity. After exact
-incident-specific authorization, the operator stops proxy, backup, and
-Vaultwarden in that order and confirms no process holds the database.
-
-On the same deployment-root filesystem the operator creates a unique
-`state/incidents/<incident-id>/`, saves the selected manifest, renames existing
-`data` without replacement to `pre-restore-data`, removes the manifest from the
-verified restore tree, and renames that tree without replacement to `data`.
-Every failure preserves both available trees. Rollback while stopped moves a
-failed restore without replacement to `failed-restored-data` and restores the
-original tree without replacement. Active identity is unchanged. A snapshot
-from another commit or whose manifest fails the current contract is rejected.
-
-Because the recovery tree excludes RSA material, old sessions must fail and a
-fresh login, backup, restore, and drill must all succeed. Incident material is
-not deleted without separate authorization. Product commands never perform
-these promotion renames or infer permission from a successful backup.
-
-## Release, images, and Nix
-
-There is no `VERSION` contract. For a clean commit, immutable release is:
-
-```text
-RELEASE.<committer timestamp UTC YYYY-MM-DDTHH-MM-SSZ>-g<first-12-commit-hex>
-```
-
-The timestamp is the commit's integer committer time rendered in UTC, not wall
-clock time. The Git-backed flake exposes `self.rev` only for a committed
-revision without tracked changes, and building `packages.release` rejects an
-input without it before producing a bundle. Git flake source filtering excludes
-untracked and ignored paths; therefore no private, generated, or ignored path
-can become an implicit release input. The optional `check-release` command is
-deliberately stricter and requires `git status --porcelain=v1
---untracked-files=all` to remain empty.
-
-Development and E2E image derivations use the local tags:
-
-```text
-vaultwarden-less-backup:local
-vaultwarden-less-proxy:local
-vaultwarden-less-vaultwarden:local
-```
-
-The release derivation instead emits one archive for each immutable tag:
-
-```text
-vaultwarden-less-backup:<immutable-release>
-vaultwarden-less-proxy:<immutable-release>
-vaultwarden-less-vaultwarden:<immutable-release>
-```
-
-For each image, `org.opencontainers.image.revision` is the full commit,
-`org.opencontainers.image.version` is the immutable release, and
-`org.opencontainers.image.created` is that commit time in UTC RFC 3339 seconds.
-Both variants use the same image definition and content. Source-tree Compose
-selects `local`; the release-provided `.env.example` selects the exact immutable
-release. Production never needs a mutable alias. Dirty development images
-report development identity and cannot serve or persist.
-
-`packages.<system>.release` is one immutable Nix store directory. It is a
-self-contained public deployment bundle with this shape:
-
-```text
-.env.example
+SHA256SUMS
 LICENSE
 NOTICE.md
-RELEASE.md
-SHA256SUMS
-UPSTREAMS.toml
 compose.yml
-compose.upgrade.yml
-release.json
-config/
-  backup.example.yaml
-  vaultwarden.example.env
-credentials/
-  backup.example.yaml
-  maintenance.example.yaml
-  notifiers.example.yaml
-  restic/primary.example
-docs/
-examples/targetless/
-  config/backup.yaml
-  credentials/{backup,maintenance,notifiers}.yaml
-images/{backup,proxy,vaultwarden}.tar.gz
-internal/upstream/{recovery-projection,vaultwarden-schema}.json
+images/backup.tar.gz
+images/proxy.tar.gz
+images/vaultwarden.tar.gz
+templates/compose.env
+templates/config/backup.yaml
+templates/config/vaultwarden.env
+templates/credentials/backup.yaml
+templates/credentials/maintenance.yaml
+templates/credentials/restic/primary
+templates/credentials/restic/b2
 ```
 
-Each archive loads directly with standard `docker image load`, contains exactly
-one immutable production reference, and excludes Moto and `local` aliases.
-`docs/` is the complete tracked operator documentation tree. All files are
-public and non-executable; the Nix store owns their final read-only mode. Private
-configuration, credentials, runtime state, deployment data, source, tests, and
-build tools are absent. `SHA256SUMS` contains one standard lowercase SHA-256
-line for every other regular file, sorted by its relative path. The pure Nix
-derivation owns the complete bundle and checksum bytes.
+`SHA256SUMS` covers every other file and no absent file. The bundle contains no
+source, tests, schemas, scripts, documentation beyond `NOTICE.md`, repository
+service emulator, state, private configuration, release manifest, SBOM, or
+signature. `NOTICE.md` states the operator's corresponding-source obligations
+for the included AGPL Vaultwarden image.
 
-`release.json` is one LF-terminated JSON object with exactly `format` 1, the
-full `commit`, immutable `release`, build `system`, and the three ordered image
-archive/reference pairs. It is deterministic build metadata, not a signature,
-attestation, test claim, or publication record.
+The default template contains AWS S3 `primary` and Backblaze B2 `b2` targets,
+but repositories, role credentials, and passwords are intentionally empty and
+must fail validation until configured. An operator choosing targetless mode
+must explicitly write both empty arrays, both empty role maps, and an actually
+empty password directory.
 
-```json
-{"commit":"<full-commit>","format":1,"images":[{"archive":"images/backup.tar.gz","reference":"vaultwarden-less-backup:<immutable-release>"},{"archive":"images/proxy.tar.gz","reference":"vaultwarden-less-proxy:<immutable-release>"},{"archive":"images/vaultwarden.tar.gz","reference":"vaultwarden-less-vaultwarden:<immutable-release>"}],"release":"<immutable-release>","system":"x86_64-linux"}
-```
+## Source documentation
 
-The flake has one locked `nixos-unstable` input; treefmt follows it. Public
-outputs are the product packages including `packages.<system>.release`, the
-formatter, one
-`devShells.<system>.default`, and checks. It exposes no `apps`. `checks.unit`
-executes `go test ./... -count=1` as a validation derivation distinct from a
-product package. Ordinary Go and Python tests, vet, GolangCI-Lint, Ruff,
-formatting, contracts, and toolchain checks all participate in
-`nix flake check`. Vaultwarden is `pkgs.vaultwarden`; Restic is unmodified
-`pkgs.restic`; Go, Bitwarden CLI, and Moto come from the same locked package
-set. Nixpkgs `knownVulnerabilities` remains effective. Project vulnerability
-checking is `govulncheck ./...`.
-
-`UPSTREAMS.toml` contains only human-audited repository, tag, commit, audit
-paths, Vaultwarden migration, schema path, and projection path. It does not
-repeat image digests, vendor hashes, release archive hashes, or tool source
-hashes already owned by nixpkgs and `flake.lock`. Checks compare actual package
-versions and readable source revisions to the audit record.
-
-There is no Restic patch or custom derivation, Trivy, Syft, CycloneDX, source
-archive, license archive, generated license index, or tracked third-party
-license copy. The project remains MIT under `LICENSE`; `NOTICE.md` accurately
-notes Vaultwarden's AGPL obligations. The bundle is not a complete SBOM or
-corresponding-source archive. The operator owns access control, transport,
-signing if desired, retained validation logs, placement in a new destination,
-and retention of any copied bundle after its source store path is garbage
-collected.
-
-### Public Just interface
-
-The single root `Justfile` has no modules, groups, aliases, private helpers, or
-recipe dependencies. `just --list` exposes exactly:
+The complete source documentation set is:
 
 ```text
-check
-check-release
-release
+README.md
+docs/configuration.md
+docs/operations.md
+docs/contracts.md
+docs/maintenance.md
 ```
 
-`check` is exactly one `nix flake check` invocation. `check-release` enters the
-default development shell once to run `scripts/check_release.py`; that script
-directly invokes its fixed tools and never invokes Just. `release` is exactly
-`nix build --no-link --print-out-paths .#release`: it has no arguments, recipe
-dependency, development shell, Python exporter, result symlink, ignored output,
-or mutable repository state. Its sole standard output is the Nix store path;
-the operator copies that path to a new durable destination before garbage
-collection. Production operation and maintenance use documented raw Compose
-commands. All retired recipes, including `soak`, have no alias or compatibility
-fallback.
-
-`check-release` is optional and does not gate `release`. It requires clean HEAD
-B and, in order, runs: `nix flake check`;
-full-tree race; `govulncheck`; every binary, production/Moto image, and release
-bundle build; targetless
-deployment E2E; Moto/Restic integration; expanded backup/restore/drill E2E;
-accelerated fake-clock
-multi-target threshold integration; short production-image dual-repository
-failure isolation/catch-up E2E; and initial import E2E. It then revalidates B
-and the unchanged worktree. On success it prints exactly
-`release checks passed: <B-full-commit>` and LF. It writes no evidence,
-timestamp, candidate, artifact, or cache. A/B compatibility and external
-provider acceptance remain operator-owned and are not release gates.
-
-## Upgrade and explicit rollback
-
-Upgrade applies only between two different clean commits that both implement
-this contract. The upgrade ID is `<A-full-commit>..<B-full-commit>`.
-A owns `upgrade prepare`, `upgrade freeze`, and `rollback apply`. B owns
-`upgrade migrate-check`, `upgrade verify`, and `upgrade accept`. A never opens,
-decodes, hashes, or makes a decision from `candidate.json`; moving that fixed
-path as opaque evidence is allowed.
-
-State is under:
-
-```text
-state/upgrade/current/
-  prepare.json
-  rollback-ticket.json
-  candidate.json
-  decision.json
-  compose.env
-  rollback-data/
-state/upgrade/history/<upgrade-id>/
-state/upgrade/quarantine/<upgrade-id>/
-```
-
-Every state directory is real, owned, and `0700`. Every JSON or env file is a
-real `0600` file, written and fsynced in a same-directory temporary file and
-atomically renamed without following symlinks. JSON rejects duplicate/unknown
-fields and trailing values. An upgrade state file is at most 1 MiB. Recovery
-data follows the normal private tree rules.
-
-`prepare.json` is immutable after successful creation:
-
-```json
-{
-  "upgrade_id": "<A>..<B>",
-  "phase": "prepared",
-  "from_commit": "<A>",
-  "from_release": "<A-immutable-release>",
-  "to_commit": "<B>",
-  "to_release": "<B-immutable-release>",
-  "prepared_at": "2026-08-27T12:34:56.789Z"
-}
-```
-
-After validating its arguments, `upgrade prepare` loads the backup
-configuration. With an empty target set it returns `not_ready` before creating
-or opening upgrade state; a recoverable upgrade requires at least one backup
-target.
-
-`compose.env` contains exactly these eight unique, unquoted assignments in
-this order and no other content:
-
-```dotenv
-DEPLOYMENT_ROOT=<absolute-directory>
-RUNTIME_UID=<decimal>
-RUNTIME_GID=<decimal>
-LISTEN_PORT=<decimal>
-DRILL_PORT=<decimal>
-VWLESS_IMAGE_TAG=<B-immutable-release>
-A_RELEASE=<A-immutable-release>
-B_RELEASE=<B-immutable-release>
-```
-
-It is passed explicitly to the tracked base Compose file and upgrade overlay.
-`VWLESS_IMAGE_TAG` and `B_RELEASE` are the same validated B tag; both release
-values exactly match `prepare.json`. The generated file drives only the current
-upgrade. It never edits the ordinary deployment `.env`; after accept, the
-operator atomically changes that file's one `VWLESS_IMAGE_TAG` assignment from
-A to B before starting the normal services. Before accept or after rollback,
-the ordinary assignment remains A.
-
-`rollback-ticket.json` is created once by freeze and is then immutable:
-
-```json
-{
-  "upgrade_id": "<A>..<B>",
-  "phase": "frozen",
-  "from_commit": "<A>",
-  "from_release": "<A-immutable-release>",
-  "to_commit": "<B>",
-  "to_release": "<B-immutable-release>",
-  "active_path": "data",
-  "rollback_path": "state/upgrade/current/rollback-data",
-  "active_device": 1,
-  "rollback_device": 1,
-  "rollback_tree_id": "sha256:<64-lowercase-hex>",
-  "frozen_at": "2026-08-27T12:34:56.789Z",
-  "targets": [{
-    "target": "primary",
-    "snapshot_id": "<64-lowercase-hex>",
-    "content_id": "sha256:<64-lowercase-hex>",
-    "archive_id": "sha256:<64-lowercase-hex>"
-  }]
-}
-```
-
-Device values are unsigned filesystem device IDs read after both paths exist;
-they must be equal at freeze and again at rollback. Paths are the exact
-relative literals shown. `rollback_tree_id` hashes raw magic
-`vaultwarden-less-rollback\0`, an entry count, and every non-symlink regular
-file by UTF-8 relative path: a path frame, big-endian uint64 mode, and a content
-frame. Directories must be owned `0700`; files must be owned `0600`; special
-files, hard-link aliases, and unexpected symlinks fail. The frozen database is
-closed and has no live sidecar before this copy is accepted.
-
-`candidate.json` is B-owned and atomically replaced at B phase transitions:
-
-```json
-{
-  "upgrade_id": "<A>..<B>",
-  "phase": "verified",
-  "from_commit": "<A>",
-  "to_commit": "<B>",
-  "database_migration": "<audited-B-migration>",
-  "database_schema_fingerprint": "sha256:<64-lowercase-hex>",
-  "updated_at": "2026-08-27T12:34:56.789Z",
-  "targets": [{
-    "target": "primary",
-    "snapshot_id": "<64-lowercase-hex>",
-    "content_id": "sha256:<64-lowercase-hex>",
-    "archive_id": "sha256:<64-lowercase-hex>"
-  }]
-}
-```
-
-Phase is only `migrated` or `verified`. `targets` is empty while migrated and
-equals the configured verification-target order after verify. Acceptance never
-rewrites this evidence document and the old `accepted`/`accepted_at` shape is
-invalid state.
-
-`decision.json` is created once and is immutable. It has exactly:
-
-```json
-{
-  "upgrade_id": "<A>..<B>",
-  "decision": "accept",
-  "active_project_commit": "<B>",
-  "active_release": "<B-immutable-release>",
-  "decided_at": "2026-08-27T12:34:56.789Z"
-}
-```
-
-`decision` is `accept` with B's exact identity or `rollback` with A's exact
-identity. A conflicting decision can never replace it. Once it exists, only
-the matching terminal command may continue.
-
-The required production sequence is:
-
-1. B migrates a disposable A restore, creates a B snapshot, restores it through
-   real Restic, and starts an isolated B drill.
-2. Production proxy stops first; then backup and Vaultwarden stop. No new write
-   is admitted.
-3. Before loading B, immutable A rechecks source consistency, creates final
-   snapshots on configured verification targets, really restores them, makes
-   and validates the same-filesystem rollback tree, and writes the immutable
-   ticket.
-4. B's immutable images are loaded while every A immutable tag remains; no
-   mutable alias is created or moved.
-5. Only B Vaultwarden starts and migrates active data. Proxy and normal backup
-   remain stopped.
-6. B checks exact schema/migration, snapshots only verification targets,
-   restores each through Restic, and starts an isolated B drill.
-7. `upgrade accept` is explicit. It validates the healthy B drill, atomically
-   creates the accept decision, and then idempotently changes active identity
-   from A to B. The operator atomically changes the ordinary deployment
-   environment's single image tag from A to B. An interruption after the
-   decision can only resume accept and the same tag switch; it does not repeat
-   the pre-decision drill authorization.
-8. The documented raw Compose sequence uses that ordinary environment to start
-   B's three normal services,
-   waits for health, proves every container image ID matches its immutable B
-   tag and OCI identity, removes only the verified drill resources, and then
-   invokes `upgrade finalize`. Finalize validates the immutable decision,
-   active identity, data evidence, and recorded cleanup before moving current
-   to `history/<upgrade-id>`; it does not infer container health. The rollback
-   copy remains in history, while ordinary rollback is permanently rejected
-   once accept is decided.
-
-Evidence can be reused only when A snapshot ID, content ID, archive ID, project
-commit, B commit, configured target order, and state-file bytes all match.
-Prepare is idempotent only for the exact same identity. Freeze is idempotent
-only after revalidating the immutable ticket and rollback tree. Every other
-repeat, illegal phase, corrupt or missing state, commit mismatch, target
-mismatch, cross-filesystem layout, or changed evidence returns `conflict` or
-`upgrade_state_invalid` before side effects.
-
-No pre-accept failure automatically rolls back. Proxy remains stopped. The
-operator invokes immutable A `rollback apply`. A validates only its prepare,
-ticket, exact active/rollback paths, device IDs, and frozen A tree; it treats a
-safe `candidate.json` as opaque. It first atomically creates the rollback
-decision, then uses Linux `renameat2(RENAME_EXCHANGE)` only when the tree IDs
-show A is still in `rollback-data`. If `data` already has A's tree ID, a rerun
-does not exchange again. The command finally idempotently confirms active A;
-after verifying the exchange it refreshes A's `activated_at` no earlier than
-the rollback decision. That refresh is the startup marker which lets all three
-ordinary A services open the now-mutable tree without repeatedly hashing it;
-an interruption before the refresh leaves every service gate closed. A rerun
-preserves the refreshed instant. The command does not rewrite A data or remove
-RSA state.
-
-`rollback-a` is the immutable-A, networkless, non-root administrative role. It
-has one writable deployment-root bind at `/deployment-root` because Linux
-returns `EXDEV` when `data` and `rollback-data` are exposed as separate mount
-points. The command derives only `.env`, `data`, `restore`, and `state` paths
-under that fixed root; its container root filesystem is read-only, all
-capabilities are dropped, `no-new-privileges` is set, and no engine socket is
-mounted.
-
-The documented raw Compose rollback sequence stops B and drill services,
-invokes that resumable A command, verifies A's three immutable images, confirms
-that the ordinary deployment environment still selects A, starts and verifies
-the three ordinary A services, removes only the verified drill resources, and
-invokes A `upgrade finalize`. Until then current retains the decision,
-candidate, and exchanged B tree. Finalize moves that complete directory to
-`quarantine/<upgrade-id>`. Any interruption can repeat only the same recorded
-decision; neither data tree is deleted and the opposite decision remains
-impossible.
-
-Migration, repository verification, and drill failures are induced in tests by
-real read-only permissions, an invalid disposable target, and corrupted
-disposable restore data. Product binaries have no failure test hook. Kill and
-restart after every phase must yield either a valid idempotent continuation or
-a stable refusal, never an inferred transition.
-
-Framework verification requires different A/B clean commits and immutable
-tags and covers that exact managed release pair. When both releases contain the
-same actual Vaultwarden version, this is complete framework evidence and not an
-unverified compatibility obligation. Exact-pair cross-version verification is
-an additional claim available only after the same scenario runs with two
-managed releases whose actual Vaultwarden versions differ. Neither
-result promises compatibility for an upstream version or build that the
-project does not manage.
-
-## One-time external SQLite import
-
-Import is available only before the first active identity exists. It accepts a
-complete copy of a fully stopped external Vaultwarden data directory; it is not
-an online copy, merge, repeat import, or restore-promotion interface. The
-operator retains the original tree outside the deployment clone and copies it
-into `import/source`. The external original is never mounted into a project
-container. Project code treats `import/source` as immutable and never writes or
-deletes it.
-
-The fixed layout is:
-
-```text
-import/source/
-import/candidate/
-state/import/current/
-  prepare.json
-  verification.json
-  decision.json
-state/import/history/initial/
-```
-
-The deployment root, `data`, `import`, `import/source`, `state`, and all import
-state directories are real, owned `0700` directories. Every source directory
-is owned `0700`; every source file is an owned, single-link `0600` regular
-file. Symlinks, hard-link aliases, sockets, devices, FIFOs, path escape,
-cross-device entries, invalid UTF-8 paths, or a changing entry fail before a
-candidate is published. `data`, `import/source`, and `import/candidate` must be
-on the same nonzero filesystem device. Import state JSON follows the canonical,
-single-value, duplicate/unknown-field-rejecting, 1 MiB, owned `0600` rules used
-by active and upgrade state.
-
-`deployment import prepare` requires no active identity, completely empty
-`data`, no current upgrade/import, a root `db.sqlite3`, and a root
-`rsa_key.pem`. It hashes the complete stopped source, copies ordinary files
-into a private temporary candidate, and excludes the source database,
-SQLite sidecars, and all three RSA files. It first stable-copies the source
-database plus any `-wal`, `-shm`, or `-journal` sidecar into candidate-private
-scratch, then uses the SQLite Online Backup API against that scratch to create
-one closed `candidate/db.sqlite3`. Thus committed WAL content is absorbed
-without opening or changing `import/source`; the candidate retains no SQLite
-sidecar and no old RSA identity. Directories and files are normalized to
-`0700`/`0600`. Before publishing state, prepare exchanges two disposable
-sibling directories with Linux `renameat2(RENAME_EXCHANGE)` and rejects a
-filesystem that cannot perform the required atomic promotion.
-
-`source_tree_id` and `candidate_tree_id` use
-`vaultwarden-less-import-tree\0`, a big-endian entry count, then sorted
-UTF-8 slash-relative entries. Each entry contributes a length-framed path, a
-`d` or `f` byte, and a big-endian uint64 permission mode; each file then
-contributes its big-endian uint64 size and exact bytes. `source_rsa_key_id`
-uses the same size-plus-bytes file digest. All IDs are lowercase SHA-256 with
-the `sha256:` prefix.
-
-Immutable `prepare.json` has exactly:
-
-```json
-{
-  "import_id": "initial",
-  "phase": "prepared",
-  "project_commit": "<B-full-commit>",
-  "release": "<B-immutable-release>",
-  "source_path": "import/source",
-  "candidate_path": "import/candidate",
-  "data_path": "data",
-  "filesystem_device": 1,
-  "source_tree_id": "sha256:<64-lowercase-hex>",
-  "candidate_tree_id": "sha256:<64-lowercase-hex>",
-  "source_rsa_key_id": "sha256:<64-lowercase-hex>",
-  "prepared_at": "2026-08-28T12:34:56.789Z"
-}
-```
-
-Repeating prepare resumes only that exact immutable state and source. It may
-recover a matching private temporary candidate or deterministically rebuild
-one whose tree ID equals the preparation. A changed source, identity, device,
-candidate, active document, or unrelated candidate path is a hard failure.
-
-`import-vaultwarden` is the current production Vaultwarden image in the
-explicit `import` gate mode. It mounts only `import/candidate` as writable
-`/data`, mounts `import/source` and state read-only, disables registration,
-push, icons, and the Web Vault, and publishes container port 80 only on
-loopback `DRILL_PORT`. The operator routes the existing trusted HTTPS edge to
-that loopback endpoint and logs in with a real Bitwarden client. Direct
-plaintext HTTP probing is not client-login evidence. Vaultwarden owns its
-upstream migration and generates a new RSA identity in the candidate.
-
-After the candidate is stopped, `deployment import verify
---confirm-client-login` rehashes the unchanged source, normalizes the candidate,
-requires its `rsa_key.pem` digest to differ from the source, closes/removes
-SQLite sidecars, runs `integrity_check`, `foreign_key_check`, the exact audited
-migration and schema fingerprint checks, and the ordinary snapshot closure for
-database rows, attachments, and file Sends. The flag is mandatory usage input;
-without a real successful HTTPS client login the operator must not supply it.
-Immutable `verification.json` has exactly:
-
-```json
-{
-  "import_id": "initial",
-  "phase": "verified",
-  "project_commit": "<B-full-commit>",
-  "release": "<B-immutable-release>",
-  "source_tree_id": "sha256:<64-lowercase-hex>",
-  "candidate_tree_id": "sha256:<64-lowercase-hex>",
-  "database_migration": "<audited-B-migration>",
-  "database_schema_fingerprint": "sha256:<64-lowercase-hex>",
-  "content_id": "sha256:<64-lowercase-hex>",
-  "archive_id": "sha256:<64-lowercase-hex>",
-  "client_login_confirmed": true,
-  "verified_at": "2026-08-28T13:34:56.789Z"
-}
-```
-
-`deployment import accept` first revalidates source, candidate, empty data,
-device, verification, and absent active identity, then atomically creates:
-
-```json
-{
-  "import_id": "initial",
-  "decision": "accept",
-  "active_project_commit": "<B-full-commit>",
-  "active_release": "<B-immutable-release>",
-  "decided_at": "2026-08-28T14:34:56.789Z"
-}
-```
-
-After that immutable boundary, cancel is permanently rejected. Accept uses the
-verified candidate tree ID and exact empty-tree state to decide whether
-`RENAME_EXCHANGE(data, import/candidate)` has not happened or already happened;
-it never blindly exchanges twice. It then verifies live `data`, verifies that
-the exchanged candidate is exactly empty, and publishes the first active B
-identity no earlier than `decided_at`. An interruption after decision can only
-repeat accept.
-
-The documented raw Compose accept sequence stops and removes the candidate
-service, resumes the Go accept operation, starts and verifies the three normal
-B services, and invokes `deployment import finalize`. Finalize accepts only
-the exact active/decision ordering, verified data identity, and an empty
-exchanged candidate, removes that exact empty directory, and atomically
-archives current as `state/import/history/initial`. It records durable-state
-consistency only; adjacent Compose `ps`, container `version`/health checks, and
-image inspection own runtime proof. Repeating the terminal sequence can only
-continue the same recorded decision. `deployment import cancel` is available
-only before a decision and removes only the exact disposable candidate,
-matching candidate temporaries, and current state; it never removes source or
-data.
-
-Every import command returns the ordinary one-line success/error contract.
-The import success document has `import_id`, `phase`, exact project identity,
-source/candidate tree IDs, and
-`client_login_confirmed`. Phases exposed by those commands are `prepared`,
-`verified`, `accepted`, `cancelled`, and `finalized`. Unsafe or malformed state
-uses `import_state_invalid`; changed/unsafe source uses `source_inconsistent`;
-tree, RSA, database, or closure failure uses `verification_failure`; durable
-state conflicts use `conflict`.
-
-## Development scripts
-
-The only durable Python scripts are `capture_vaultwarden_schema.py`,
-`check_release.py`, `upstream_diff.py`, and `verify_go_test.py`; each uses only
-the standard library and has a focused contract test. `test_justfile.py` owns
-the three-recipe allowlist and their final dry-run argv. Production terminal
-workflows are documented Compose and product-CLI steps, not a host Python
-interface. Schema capture and upstream diff may print one result path followed
-by LF. The release checker and Go verifier print one strict result.
-
-Their exact command surfaces are:
-
-```text
-capture_vaultwarden_schema.py --database <sqlite-file> [--upstreams UPSTREAMS.toml] [--output internal/upstream/vaultwarden-schema.json]
-check_release.py
-upstream_diff.py <vaultwarden|bitwarden-cli|restic|moto|go> <candidate-tag> [--upstreams UPSTREAMS.toml]
-verify_go_test.py --require <package>:<test> [--require ...] -- <JSON-event-producing test command>
-```
-
-`check_release.py` requires clean B and the gate order defined by the public
-Just contract, stops on the first failure, and rechecks B before returning. It
-creates no evidence or other repository state and does not invoke Just.
-
-`verify_go_test.py` validates the child stream rather than requiring a literal
-`-json` token in child argv. Every line must still be a valid Go test JSON
-event, and each required test must have ordered run, test PASS, later package
-PASS, no skip/fail event, and a zero child exit. Project recipes use
-`go test -json`; repository-external runners may equivalently feed the locked
-`go tool test2json` stream.
-
-Schema capture refuses a symlink database or output/parent, opens SQLite
-read-only with WAL-aware semantics, checks `quick_check`, exact audited latest
-migration, and nonempty complete schema objects, and atomically replaces only
-its explicit output after fsync. A corrupt database, changed migration, output
-failure, or interruption leaves the prior output byte-identical and no
-half-file. Object order is `(type,name)`, SQL is trimmed only at both ends, JSON
-uses UTF-8, two-space indent, LF, and a deterministic framed fingerprint. An
-unchanged database produces identical bytes even through a path containing
-spaces, tabs, newlines, backslashes, or non-ASCII characters.
-
-Upstream diff resolves both tags to full commits in an ignored cache with an
-exact expected origin. Changed paths come only from `git diff --name-status -z
---find-renames --find-copies`. It parses status and NUL fields as bytes before
-filesystem decoding. Rename/copy old and new paths are each matched against the
-audited globs. Every path and commit subject in Markdown is JSON-quoted with
-ASCII escapes, so tabs, LF, backslashes, Unicode, backticks, and Markdown
-control characters cannot alter report structure. The report is atomically
-written below the component's ignored audit directory and its path is printed.
-
-The verifier's required identity is `<package>:<test>`. It accepts a required
-test only after seeing, in that package, test run then PASS, later package PASS,
-and process exit 0. A skip, fail, missing package, wrong order, malformed JSON,
-or same test name in a different package fails verification.
+These files respectively provide the entry point, configuration reference,
+complete operator runbook, stable product contract, and upstream maintenance
+procedure. No document or generated bundle silently expands the support scope.
