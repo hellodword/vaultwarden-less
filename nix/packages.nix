@@ -210,12 +210,24 @@ let
       };
     };
   };
+
+  releaseTest = import ./release-test.nix {
+    inherit
+      identity
+      motoImage
+      pkgs
+      releaseBundle
+      source
+      ;
+    goModules = backup.goModules;
+  };
 in
 {
   inherit backup proxy;
   backup-image = backupImage "local";
   proxy-image = proxyImage "local";
   release = releaseBundle;
+  release-test = releaseTest;
   vaultwarden-image = vaultwardenImage "local";
   moto-image = motoImage;
 }

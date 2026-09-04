@@ -4,7 +4,7 @@ check:
 
 # Run the full optional release checks for one unchanged clean commit.
 check-release:
-    nix develop --command go test -v ./tests/e2e -run '^(TestTargetlessDeploymentAndFullDataAdoption|TestTwoTargetBackupRestore)$' -count=1 -timeout=60m -args -run-e2e
+    nix build --no-link -L .#release-test
 
 # Build the immutable deployment bundle.
 release:

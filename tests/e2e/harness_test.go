@@ -33,11 +33,20 @@ const (
 )
 
 var (
-	runE2E            = flag.Bool("run-e2e", false, "run the two release-level Docker E2E scenarios")
-	lowerHex64Pattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
-	lowerHex40Pattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
-	contentIDPattern  = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+	runE2E                = flag.Bool("run-e2e", false, "run the two release-level Docker E2E scenarios")
+	e2eImageDirectory     = flag.String("e2e-image-directory", "", "directory containing the four release-test image archives")
+	e2eProductImageTag    = flag.String("e2e-product-image-tag", "", "complete git-<commit> tag for the three production images")
+	lowerHex64Pattern     = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	lowerHex40Pattern     = regexp.MustCompile(`^[0-9a-f]{40}$`)
+	fullReleaseTagPattern = regexp.MustCompile(`^git-[0-9a-f]{40}$`)
+	contentIDPattern      = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 )
+
+type e2eImageSet struct {
+	directory  string
+	productTag string
+	archives   map[string]string
+}
 
 type e2eHarness struct {
 	t               *testing.T
@@ -52,6 +61,7 @@ type e2eHarness struct {
 	composeFile     string
 	overrideFile    string
 	environmentFile string
+	images          e2eImageSet
 
 	vaultwardenPort int
 	proxyPort       int
@@ -78,6 +88,10 @@ func newE2EHarness(t *testing.T, ctx context.Context, targets []string) *e2eHarn
 	dockerPath, err := exec.LookPath("docker")
 	if err != nil {
 		t.Fatalf("the Nix-provided Docker CLI is required: %v", err)
+	}
+	images, err := resolveE2EImages(*e2eImageDirectory, *e2eProductImageTag)
+	if err != nil {
+		t.Fatalf("invalid release E2E image inputs: %v", err)
 	}
 
 	testRoot := t.TempDir()
@@ -107,6 +121,7 @@ func newE2EHarness(t *testing.T, ctx context.Context, targets []string) *e2eHarn
 		dockerPath:      dockerPath,
 		dockerConfig:    dockerConfig,
 		dockerEnv:       isolatedDockerEnvironment(dockerConfig),
+		images:          images,
 		vaultwardenPort: unusedLoopbackPort(t),
 		proxyPort:       unusedLoopbackPort(t),
 		sourcePort:      unusedLoopbackPort(t),
@@ -122,10 +137,11 @@ func newE2EHarness(t *testing.T, ctx context.Context, targets []string) *e2eHarn
 		t.Fatalf("Docker daemon is required: %v: %s", err, harnessDiagnostics(output))
 	}
 	// Load only the test-tooling image needed to execute the canary. Prove the
-	// filesystem boundary before building or loading any production image.
-	harness.prepareImages("moto-image")
+	// filesystem boundary before loading any production image.
+	harness.loadImages("moto")
 	harness.requireSharedBindPath()
-	harness.prepareImages("backup-image", "proxy-image", "vaultwarden-image")
+	harness.loadImages("backup", "proxy", "vaultwarden")
+	harness.validateProductImages()
 	harness.startTLSProxy()
 	harness.prepareDeployment(targets)
 	harness.writeOverride()
@@ -153,19 +169,62 @@ func repositoryRoot(t *testing.T) string {
 	}
 }
 
-func (h *e2eHarness) prepareImages(attributes ...string) {
+func resolveE2EImages(directory, productTag string) (e2eImageSet, error) {
+	if !filepath.IsAbs(directory) || filepath.Clean(directory) != directory {
+		return e2eImageSet{}, fmt.Errorf("image directory must be a clean absolute path")
+	}
+	info, err := os.Stat(directory)
+	if err != nil {
+		return e2eImageSet{}, fmt.Errorf("stat image directory: %w", err)
+	}
+	if !info.IsDir() {
+		return e2eImageSet{}, fmt.Errorf("image directory is not a directory")
+	}
+	if !fullReleaseTagPattern.MatchString(productTag) {
+		return e2eImageSet{}, fmt.Errorf("product image tag must be git- followed by one complete lowercase commit")
+	}
+	images := e2eImageSet{
+		directory:  directory,
+		productTag: productTag,
+		archives:   make(map[string]string, 4),
+	}
+	for _, name := range []string{"moto", "backup", "proxy", "vaultwarden"} {
+		archive := filepath.Join(directory, name+".tar.gz")
+		archiveInfo, statErr := os.Stat(archive)
+		if statErr != nil {
+			return e2eImageSet{}, fmt.Errorf("stat %s image archive: %w", name, statErr)
+		}
+		if !archiveInfo.Mode().IsRegular() {
+			return e2eImageSet{}, fmt.Errorf("%s image archive is not a regular file", name)
+		}
+		images.archives[name] = archive
+	}
+	return images, nil
+}
+
+func (h *e2eHarness) loadImages(names ...string) {
 	h.t.Helper()
-	for _, attribute := range attributes {
-		output, err := runCommand(h.ctx, h.repository, nil, os.Environ(), "nix", "build", "--no-link", "--print-out-paths", ".#"+attribute)
-		if err != nil {
-			h.t.Fatalf("build Nix image %s: %v: %s", attribute, err, harnessDiagnostics(output))
+	for _, name := range names {
+		archive, exists := h.images.archives[name]
+		if !exists {
+			h.t.Fatalf("unknown E2E image %q", name)
 		}
-		paths := strings.Fields(output)
-		if len(paths) != 1 {
-			h.t.Fatalf("Nix returned invalid output for %s: %q", attribute, output)
+		if loaded, err := h.docker("image", "load", "--input", archive); err != nil {
+			h.t.Fatalf("load %s image archive: %v: %s", name, err, harnessDiagnostics(loaded))
 		}
-		if loaded, err := h.docker("image", "load", "--input", paths[0]); err != nil {
-			h.t.Fatalf("load Nix image %s: %v: %s", attribute, err, harnessDiagnostics(loaded))
+	}
+}
+
+func (h *e2eHarness) validateProductImages() {
+	h.t.Helper()
+	commit := strings.TrimPrefix(h.images.productTag, "git-")
+	for _, name := range []string{"backup", "proxy", "vaultwarden"} {
+		reference := "vaultwarden-less-" + name + ":" + h.images.productTag
+		format := `{{.Os}}/{{.Architecture}}|{{index .Config.Labels "org.opencontainers.image.version"}}|{{index .Config.Labels "org.opencontainers.image.revision"}}`
+		output, err := h.docker("image", "inspect", "--format", format, reference)
+		expected := "linux/amd64|" + h.images.productTag + "|" + commit
+		if err != nil || strings.TrimSpace(output) != expected {
+			h.t.Fatalf("inspect production image %s: got %q/%v, want %q", reference, harnessDiagnostics(output), err, expected)
 		}
 	}
 }
@@ -253,8 +312,8 @@ func (h *e2eHarness) prepareDeployment(targets []string) {
 		}
 	}
 	writePrivateFile(h.t, h.environmentFile, fmt.Sprintf(
-		"DEPLOYMENT_ROOT=%s\nVWLESS_IMAGE_TAG=local\nRUNTIME_UID=%d\nRUNTIME_GID=%d\nLISTEN_PORT=%d\n",
-		h.deploymentRoot, os.Geteuid(), os.Getegid(), h.proxyPort,
+		"DEPLOYMENT_ROOT=%s\nVWLESS_IMAGE_TAG=%s\nRUNTIME_UID=%d\nRUNTIME_GID=%d\nLISTEN_PORT=%d\n",
+		h.deploymentRoot, h.images.productTag, os.Geteuid(), os.Getegid(), h.proxyPort,
 	))
 	writePrivateFile(h.t, filepath.Join(h.deploymentRoot, "config", "vaultwarden.env"), "SIGNUPS_ALLOWED=true\nINVITATIONS_ALLOWED=false\n")
 	writePrivateFile(h.t, filepath.Join(h.deploymentRoot, "config", "backup.yaml"), backupConfiguration(h.t, targets))
@@ -318,7 +377,7 @@ func (h *e2eHarness) writeOverride() {
 	service := func(name, dataPath string, port int) string {
 		return fmt.Sprintf(`  %s:
     profiles: [e2e-vaultwarden]
-    image: vaultwarden-less-vaultwarden:local
+    image: vaultwarden-less-vaultwarden:%s
     pull_policy: never
     platform: linux/amd64
     user: "%d:%d"
@@ -353,7 +412,7 @@ func (h *e2eHarness) writeOverride() {
       interval: 2s
       timeout: 3s
       retries: 60
-`, name, uid, gid, port, strconv.Quote(dataPath))
+`, name, h.images.productTag, uid, gid, port, strconv.Quote(dataPath))
 	}
 	sourceService := service("source-vaultwarden", filepath.Join(h.testRoot, "source-data"), h.sourcePort)
 	sourceService = strings.Replace(sourceService, `SIGNUPS_ALLOWED: "false"`, `SIGNUPS_ALLOWED: "true"`, 1)
