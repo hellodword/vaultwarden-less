@@ -1,479 +1,387 @@
-# Operations and recovery
+# Operations
 
-These procedures run on an ordinary Linux/amd64 deployment host with Docker
-Engine, the Docker Compose plugin, checksum tools, rsync, and GNU coreutils.
-Git, Python, Go, Nix, and Just are not production dependencies. Nix is used
-only on a build or verification host. Run Compose from an exact checksummed
-release directory; every private bind and the private Compose environment live
-beneath a separate `DEPLOYMENT_ROOT`.
+These runbooks assume an ordinary Linux/amd64 host with Docker Engine, the
+Docker Compose plugin, GNU file utilities, and checksum/copy tools. Nix, Git,
+Go, Python, Just, and the source tree are build-host concerns, not deployment
+dependencies.
 
-The examples use these reviewed absolute paths throughout:
+Examples use task-specific variables:
 
 ```sh
-vwless_release_dir=/opt/vaultwarden-less/releases/<immutable-release>
+vwless_release_dir=/opt/vaultwarden-less/releases/git-<full-commit>
 vwless_root=/srv/vaultwarden-less
-vwless_env="$vwless_root/.env"
+vwless_env="$vwless_root/compose.env"
 vwless_compose="$vwless_release_dir/compose.yml"
 ```
 
-Do not edit the release directory. Do not delete or overwrite `data`,
-`restore`, `state`, credentials, or a repository merely to make a command pass.
+Never edit the release directory. Never delete, overwrite, or exchange real
+data merely to make a check pass. Any production recovery or release
+transition requires explicit authorization for the exact instance, verified
+recovery material, and a rehearsed reversal.
 
-## Operator command surface
+## Release build, transfer, and image load
 
-The exact Docker Compose commands below are the production interface. Any
-development-host Just recipes are conveniences only and do not own deployment
-state or terminal sequencing. State operations use the networkless
-`deployment-admin` service; repository operations use the separately
-credentialed maintenance service.
-
-There are deliberately no `down`, `ps`, `logs`, `drill-status`, or detailed
-`repo-*` recipes. Use the documented raw commands, for example:
+On a clean committed build checkout:
 
 ```sh
-docker compose --env-file "$vwless_env" --file "$vwless_compose" down
-docker compose --env-file "$vwless_env" --file "$vwless_compose" ps
-docker compose --env-file "$vwless_env" --file "$vwless_compose" logs --tail 200 vaultwarden backup proxy
-docker compose --project-name vaultwarden-less-drill --env-file "$vwless_env" --file "$vwless_compose" --profile drill ps
-docker compose --env-file "$vwless_env" --file "$vwless_compose" --profile maintenance run --rm --no-deps maintenance repo check --target primary
+just check
+just release
+test -L result
+test -d result
 ```
 
-Repository format migration is not an operator command: initialization always
-creates Restic format 2, and a future explicit `restic migrate` would be a
-separately authorized maintenance event outside this interface.
-
-## Release transfer and startup
-
-On the build host, `just release` performs only the pure Nix build and prints
-one store path. It creates no `result` link and consumes no prior test evidence.
-Because that path is not a persistent garbage-collection root, copy it before
-allowing Nix store collection:
+`just release` is exactly `nix build .#release`; it creates the standard
+`result` link and does not run or consume tests. Copy the bundle into a
+previously absent, immutable version directory. Never overlay an older release
+and never use a deletion option against the deployment root:
 
 ```sh
-release_path="$(just release)"
-test -d "$release_path"
-ssh -p <ssh-port> <user>@<host> 'test ! -e <new-release-directory>'
-rsync --archive --checksum -- \
-  "$release_path/" \
-  <user>@<host>:<new-release-directory>/
+test ! -e <new-release-directory>
+mkdir -m 0755 -- <new-release-directory>
+rsync --archive --checksum -- result/ <new-release-directory>/
 ```
 
-Never overlay an existing release directory and never use `--delete` against
-`DEPLOYMENT_ROOT`. On the deployment host, verify every shipped regular file,
-load the three images, and compare their immutable identities with
-`release.json` before changing the running stack:
+On the deployment host, verify the complete bundle before loading anything:
 
 ```sh
 (cd "$vwless_release_dir" && sha256sum --check SHA256SUMS)
+```
+
+The file set must be exactly the allowlist in
+[Product contracts](contracts.md#release-identity-and-bundle). Load all three
+archives with the standard Docker loader:
+
+```sh
 docker image load --input "$vwless_release_dir/images/backup.tar.gz"
 docker image load --input "$vwless_release_dir/images/proxy.tar.gz"
 docker image load --input "$vwless_release_dir/images/vaultwarden.tar.gz"
-vwless_commit='<full-clean-commit>'
-vwless_release='<immutable-release>'
+```
+
+Given the reviewed full commit, verify the tag and OCI labels:
+
+```sh
+vwless_commit=<40-lowercase-hex-commit>
+vwless_tag="git-$vwless_commit"
 for vwless_product in backup proxy vaultwarden; do
-  vwless_immutable="vaultwarden-less-$vwless_product:$vwless_release"
-  test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$vwless_immutable")" = "$vwless_commit"
-  test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$vwless_immutable")" = "$vwless_release"
+  vwless_image="vaultwarden-less-$vwless_product:$vwless_tag"
+  test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$vwless_image")" = "$vwless_commit"
+  test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$vwless_image")" = "$vwless_tag"
 done
 ```
 
-Each archive contains one immutable production reference and no test image.
-Production Compose selects that immutable release through
-`VWLESS_IMAGE_TAG`; `local` remains a source-tree development and E2E value.
-A successful load proves transferred image bytes and labels, not configuration
-or repository access. `SHA256SUMS` detects changed transfer/storage bytes but
-is not a signature; artifact authentication belongs to the transfer or signing
-policy chosen by the operator.
+Loading proves only transferred bytes and labels. `SHA256SUMS` is not an
+artifact signature, and the bundle is not an SBOM or corresponding-source
+archive. Transport authentication, publication, retention, and redistribution
+compliance remain operator policy.
 
-Create the private layout and install public templates from the immutable
-release as described in [Configuration](configuration.md). In particular,
-`$vwless_env` is a mode-`0600` copy of the release `.env.example`, edited only
-for the private root, runtime identity, and ports while retaining the exact
-release-provided image tag.
-
-Validate both isolated roles:
+Create the private tree and edit private copies as described in
+[Configuration](configuration.md). Render the final Compose model and validate
+both role mounts before starting services:
 
 ```sh
-docker compose --env-file "$vwless_env" --file "$vwless_compose" --profile maintenance run --rm --no-deps config-check-backup
-docker compose --env-file "$vwless_env" --file "$vwless_compose" --profile maintenance run --rm --no-deps config-check-maintenance
+docker compose --env-file "$vwless_env" --file "$vwless_compose" config --quiet
+
+docker compose --env-file "$vwless_env" --file "$vwless_compose" \
+  run --rm --no-deps backup config validate --role backup
+
+docker compose --env-file "$vwless_env" --file "$vwless_compose" \
+  --profile maintenance run --rm --no-deps maintenance \
+  config validate --role maintenance
 ```
 
-For one new deployment only, while `data` is completely empty and no import
-or upgrade is current, bind it to the exact loaded immutable release:
+## Targetless first start and first account
+
+Targetless operation is the only supported start without a repository. It is
+an explicit unprotected state, not a partial configuration. Before validation:
+
+1. write exactly `targets: []` and `notifiers: []` to
+   `config/backup.yaml`;
+2. write exactly `targets: {}` to both role credential files;
+3. leave `credentials/restic` genuinely empty; and
+4. set `SIGNUPS_ALLOWED=true` and `INVITATIONS_ALLOWED=false` in
+   `config/vaultwarden.env`.
+
+Run both validation commands above, then start the three production services:
 
 ```sh
-docker compose --env-file "$vwless_env" --file "$vwless_compose" --profile deployment run --rm --no-deps deployment-admin deployment init
+docker compose --env-file "$vwless_env" --file "$vwless_compose" \
+  up --detach vaultwarden backup proxy
+docker compose --env-file "$vwless_env" --file "$vwless_compose" \
+  ps vaultwarden backup proxy
 ```
 
-The result is `initialized` or, for the exact same already-recorded identity,
-`already_initialized`. Any other existing, damaged, or mismatched active state
-is a hard stop; do not synthesize or edit `state/deployment/active.json`.
-
-Initialize only a known-empty, dedicated repository target, once:
+Require all three health checks to become healthy. Confirm the backup process
+emits exactly one targetless warning for that startup:
 
 ```sh
-docker compose --env-file "$vwless_env" --file "$vwless_compose" --profile maintenance run --rm --no-deps maintenance repo init --target primary
+test "$(docker compose --env-file "$vwless_env" --file "$vwless_compose" \
+  logs backup | grep -c '"warning_code":"no_backup_targets"')" -eq 1
 ```
 
-Start the exact production services after both checks succeed:
+Status must be idle with an empty target array and null last/next checks, and no
+staging point may appear:
 
 ```sh
-docker compose --env-file "$vwless_env" --file "$vwless_compose" up --detach vaultwarden backup proxy
-docker compose --env-file "$vwless_env" --file "$vwless_compose" ps
-docker compose --env-file "$vwless_env" --file "$vwless_compose" logs --tail 200 vaultwarden backup proxy
-```
-
-Only the proxy is bound to loopback. A trusted TLS edge must present the
-configured public `DOMAIN`, remove untrusted forwarding headers, and send
-root-path HTTP and WebSocket traffic to the proxy. The worker API and direct
-Vaultwarden endpoint remain on internal networks.
-
-### Explicit targetless bootstrap and first account
-
-Use this procedure only when no Restic target is currently available. It
-starts Vaultwarden, backup, and proxy, but it deliberately creates no recovery
-point. Every byte written until a target is later configured and proven is
-unprotected. A trusted external HTTPS/TLS edge and operator-only access must
-already protect the proxy before registration is enabled; this project does
-not terminate TLS.
-
-Create a dedicated private root as the runtime account, separate from the
-release directory, and install the release-provided targetless examples:
-
-```sh
-vwless_root=/srv/vaultwarden-less
-umask 077
-install -d -m 0700 "$vwless_root"
-install -d -m 0700 "$vwless_root/config" "$vwless_root/credentials" "$vwless_root/credentials/restic"
-install -d -m 0700 "$vwless_root/data" "$vwless_root/import" "$vwless_root/staging" "$vwless_root/cache" "$vwless_root/restore" "$vwless_root/state"
-install -m 0600 "$vwless_release_dir/.env.example" "$vwless_env"
-install -m 0600 "$vwless_release_dir/config/vaultwarden.example.env" "$vwless_root/config/vaultwarden.env"
-install -m 0600 "$vwless_release_dir/examples/targetless/config/backup.yaml" "$vwless_root/config/backup.yaml"
-install -m 0600 "$vwless_release_dir/examples/targetless/credentials/backup.yaml" "$vwless_root/credentials/backup.yaml"
-install -m 0600 "$vwless_release_dir/examples/targetless/credentials/maintenance.yaml" "$vwless_root/credentials/maintenance.yaml"
-install -m 0600 "$vwless_release_dir/examples/targetless/credentials/notifiers.yaml" "$vwless_root/credentials/notifiers.yaml"
-```
-
-Set the six `.env` values and the public HTTPS `DOMAIN` as described in
-[Configuration](configuration.md). The installed YAML documents have exactly
-these contents:
-
-```yaml
-# config/backup.yaml
-upgrade_verification_targets: []
-targets: []
-notifiers: []
-```
-
-```yaml
-# credentials/backup.yaml and credentials/maintenance.yaml
-targets: {}
-```
-
-```yaml
-# credentials/notifiers.yaml
-notifiers: {}
-```
-
-All four files are owned by the runtime UID/GID and mode `0600`; the private
-Restic password directory is mode `0700` and completely empty. Set
-`SIGNUPS_ALLOWED=true` in the private Vaultwarden environment only for the
-first-account window. Then validate both roles and initialize the deployment
-identity. Both validation results must contain `"targets":[]` and no
-`warnings` field:
-
-```sh
-docker compose --env-file "$vwless_env" --file "$vwless_compose" --profile maintenance run --rm --no-deps config-check-backup
-docker compose --env-file "$vwless_env" --file "$vwless_compose" --profile maintenance run --rm --no-deps config-check-maintenance
-docker compose --env-file "$vwless_env" --file "$vwless_compose" --profile deployment run --rm --no-deps deployment-admin deployment init
-```
-
-Do not run `repo init`. Start the three production services and prove the
-targetless boundary:
-
-```sh
-docker compose --env-file "$vwless_env" --file "$vwless_compose" up --detach vaultwarden backup proxy
-docker compose --env-file "$vwless_env" --file "$vwless_compose" ps vaultwarden backup proxy
-docker compose --env-file "$vwless_env" --file "$vwless_compose" logs --tail 200 backup
-docker compose --env-file "$vwless_env" --file "$vwless_compose" exec --no-TTY backup /bin/vaultwarden-less-backup status
+docker compose --env-file "$vwless_env" --file "$vwless_compose" \
+  exec --no-TTY backup /bin/vaultwarden-less-backup status
 test ! -e "$vwless_root/staging/point"
-if docker compose --env-file "$vwless_env" --file "$vwless_compose" exec --no-TTY backup /bin/vaultwarden-less-backup request-backup; then
-  exit 1
-fi
 ```
 
-All three services must be healthy. Each backup-process start writes exactly
-one WARN with `warning_code=no_backup_targets` and an explicit statement that
-Vaultwarden data is not being backed up. Status remains `idle` with
-`targets: []`, `last_check: null`, and `next_check_at: null`. The manual request
-must fail nonzero with the ordinary `not_ready` error. Proxy events continue to
-return success and must not block Vaultwarden writes.
-
-Through the trusted public HTTPS origin, configure an official Bitwarden
-desktop or mobile client for this server, create the first account, log in,
-sync, and create then read a representative vault item. A health response or
-direct plaintext request is not account verification.
-
-Immediately close registration with a same-directory atomic replacement. Run
-this as the owner of the private environment file:
+The following command must exit nonzero with error code `not_ready`:
 
 ```sh
-vwless_vaultwarden_env="$vwless_root/config/vaultwarden.env"
-test "$(grep -c '^SIGNUPS_ALLOWED=true$' "$vwless_vaultwarden_env")" = 1
-test "$(grep -c '^SIGNUPS_ALLOWED=false$' "$vwless_vaultwarden_env" || true)" = 0
-vwless_vaultwarden_env_tmp="$(mktemp "$vwless_root/config/.vaultwarden.env.XXXXXX")"
-trap 'rm -f -- "$vwless_vaultwarden_env_tmp"' EXIT HUP INT TERM
-chmod 0600 "$vwless_vaultwarden_env_tmp"
-sed 's/^SIGNUPS_ALLOWED=true$/SIGNUPS_ALLOWED=false/' "$vwless_vaultwarden_env" > "$vwless_vaultwarden_env_tmp"
-test "$(grep -c '^SIGNUPS_ALLOWED=false$' "$vwless_vaultwarden_env_tmp")" = 1
-sync "$vwless_vaultwarden_env_tmp"
-mv -T -- "$vwless_vaultwarden_env_tmp" "$vwless_vaultwarden_env"
-sync -f "$vwless_root/config"
-trap - EXIT HUP INT TERM
-docker compose --env-file "$vwless_env" --file "$vwless_compose" up --detach --force-recreate vaultwarden
+docker compose --env-file "$vwless_env" --file "$vwless_compose" \
+  exec --no-TTY backup /bin/vaultwarden-less-backup request-backup
 ```
 
-`restart` is insufficient because it does not reload `env_file`; the
-`--force-recreate` command is required. After Vaultwarden is healthy again,
-use a fresh official-client login to read the existing item and confirm that a
-new account registration is rejected. Recheck the empty worker status and the
-startup warning. The account is usable, but it still has no recovery point;
-configure, initialize, back up, restore, and drill a real target before
-claiming data protection or attempting an upgrade.
+Do not expose the loopback port directly. Configure a trusted HTTPS reverse
+proxy first. In an official Bitwarden desktop, browser-extension, or mobile
+client, select the exact HTTPS server origin, create the first account, log in,
+sync, and create/read a representative item. Web Vault assets are not included.
 
-`down` stops and removes only the normal Compose project; bind-mounted data and
-private inputs remain:
+After successful client verification, atomically disable further signup. The
+following example accepts only the expected single source line and publishes a
+`0600` replacement in the same directory:
 
 ```sh
-docker compose --env-file "$vwless_env" --file "$vwless_compose" down
+vwless_signup_file="$vwless_root/config/vaultwarden.env"
+test "$(grep -c '^SIGNUPS_ALLOWED=true$' "$vwless_signup_file")" -eq 1
+test "$(grep -c '^SIGNUPS_ALLOWED=false$' "$vwless_signup_file")" -eq 0
+umask 077
+vwless_signup_tmp="$(mktemp --tmpdir="$vwless_root/config" .vaultwarden.env.XXXXXX)"
+sed 's/^SIGNUPS_ALLOWED=true$/SIGNUPS_ALLOWED=false/' "$vwless_signup_file" > "$vwless_signup_tmp"
+chmod 0600 -- "$vwless_signup_tmp"
+mv -T -- "$vwless_signup_tmp" "$vwless_signup_file"
 ```
 
-## One-time external SQLite import
-
-Use this workflow instead of `deployment init` when the first deployment takes
-ownership of an existing Vaultwarden data directory. It is unavailable after
-an active identity exists and never merges with nonempty `data`.
-
-First stop the external Vaultwarden completely. Keep that original directory
-outside this clone as the recovery copy. Create owned mode-`0700`
-`import/source`, then use an offline copy mechanism to copy the complete data
-tree into it, including `db.sqlite3`, any stopped WAL/SHM files, attachments,
-Sends, and RSA files. The copied source must contain only owned `0700`
-directories and owned, single-link `0600` regular files; do not repair a
-rejected symlink, hard link, special file, owner, or permission blindly.
-`data`, `import`, and `import/source` must be on the same filesystem.
-
-With normal services stopped, `data` empty, no active identity, and no current
-upgrade, prepare the candidate:
+Force-recreate only Vaultwarden and prove its container identity changed:
 
 ```sh
-docker compose --env-file "$vwless_env" --file "$vwless_compose" --profile deployment run --rm --no-deps deployment-admin deployment import prepare
+vwless_old_container="$(docker compose --env-file "$vwless_env" --file "$vwless_compose" ps --quiet vaultwarden)"
+docker compose --env-file "$vwless_env" --file "$vwless_compose" \
+  up --detach --force-recreate vaultwarden
+vwless_new_container="$(docker compose --env-file "$vwless_env" --file "$vwless_compose" ps --quiet vaultwarden)"
+test -n "$vwless_old_container"
+test -n "$vwless_new_container"
+test "$vwless_old_container" != "$vwless_new_container"
 ```
 
-Record the returned tree IDs. A repeated exact command resumes preparation;
-do not delete state to force another result. Preparation absorbs committed WAL
-through SQLite Online Backup, preserves `import/source` byte-for-byte, and
-publishes a private candidate without the old RSA identity or SQLite sidecars.
+Use a fresh official-client login to read the first account's item, and verify
+that creating another account is rejected. The data tree and RSA digest must be
+unchanged by recreation. Status must remain targetless and no staging point may
+be created. Configure and prove a real target promptly; until then, all
+Vaultwarden data has no repository recovery point.
 
-Start only the candidate:
+## Normal target-backed startup
+
+Fill every repository, both independent role files, and every Restic password,
+then run both configuration validations. Initialize each dedicated, known-empty
+repository once:
 
 ```sh
-docker compose --env-file "$vwless_env" --file "$vwless_compose" --profile import up --detach --wait --wait-timeout 180 import-vaultwarden
+docker compose --env-file "$vwless_env" --file "$vwless_compose" \
+  --profile maintenance run --rm --no-deps maintenance \
+  repo init --target primary
+
+docker compose --env-file "$vwless_env" --file "$vwless_compose" \
+  --profile maintenance run --rm --no-deps maintenance \
+  repo init --target b2
 ```
 
-Temporarily route the existing trusted HTTPS edge to loopback `DRILL_PORT`.
-Use the official Bitwarden client to log in again and verify representative
-logins, attachments, and file Sends. Do not treat `/alive`, direct plaintext
-HTTP, database inspection, or an old session as client-login confirmation.
-Then stop the candidate and record verification:
+Do not initialize an unknown or nonempty prefix. Start production and wait for
+all services to be healthy:
 
 ```sh
-docker compose --env-file "$vwless_env" --file "$vwless_compose" --profile import stop import-vaultwarden
-docker compose --env-file "$vwless_env" --file "$vwless_compose" --profile deployment run --rm --no-deps deployment-admin deployment import verify --confirm-client-login
+docker compose --env-file "$vwless_env" --file "$vwless_compose" \
+  up --detach vaultwarden backup proxy
+docker compose --env-file "$vwless_env" --file "$vwless_compose" \
+  ps vaultwarden backup proxy
 ```
 
-Supply `--confirm-client-login` only after that real HTTPS login succeeds.
-Verification checks the unchanged source, rotated RSA identity, exact audited
-schema/migration, SQLite integrity/foreign keys, and the complete
-database/attachment/Send snapshot closure. Without verification, accept fails.
+Create and read representative data through an official client, request a
+backup, and confirm each target independently before relying on it.
 
-Accept and finish with the following raw, resumable sequence:
+## Existing SQLite data adoption
+
+Existing-data adoption is an offline operator file operation. There is no
+project import command or state machine. Only a stopped SQLite Vaultwarden is
+supported.
+
+1. Stop the source Vaultwarden completely and retain the original directory as
+   the recovery copy.
+2. Confirm destination `data` is absent or empty. Never merge trees.
+3. Inventory the complete source, including `db.sqlite3`, any WAL/SHM files,
+   RSA files, attachments, Sends, and `config.json` when present.
+4. Reject every symlink and special file. Perform the copy as the configured
+   runtime identity so the original source remains untouched.
+
+A GNU-tooling preflight and copy for an already stopped source is:
 
 ```sh
-docker compose --env-file "$vwless_env" --file "$vwless_compose" --profile import stop import-vaultwarden
-docker compose --env-file "$vwless_env" --file "$vwless_compose" --profile import rm --force --stop import-vaultwarden
-docker compose --env-file "$vwless_env" --file "$vwless_compose" --profile deployment run --rm --no-deps deployment-admin deployment import accept
-docker compose --env-file "$vwless_env" --file "$vwless_compose" up --detach --wait --wait-timeout 180 vaultwarden backup proxy
-docker compose --env-file "$vwless_env" --file "$vwless_compose" ps vaultwarden backup proxy
-docker compose --env-file "$vwless_env" --file "$vwless_compose" exec --no-TTY backup /bin/vaultwarden-less-backup version
-docker compose --env-file "$vwless_env" --file "$vwless_compose" exec --no-TTY proxy /bin/vaultwarden-less-proxy version
-docker image inspect --format '{{json .Config.Labels}}' "vaultwarden-less-vaultwarden:$vwless_release"
-docker compose --env-file "$vwless_env" --file "$vwless_compose" --profile deployment run --rm --no-deps deployment-admin deployment import finalize
+vwless_source=/absolute/path/to/stopped-vaultwarden-data
+vwless_destination="$vwless_root/data"
+test "$vwless_source" != "$vwless_destination"
+test -d "$vwless_source"
+test -d "$vwless_destination"
+test -z "$(find -P "$vwless_destination" -mindepth 1 -print -quit)"
+test -z "$(find -P "$vwless_source" -mindepth 1 ! -type d ! -type f -print -quit)"
+test -z "$(find -P "$vwless_source" -type f -links +1 -print -quit)"
+
+vwless_source_rsa="$(sha256sum "$vwless_source/rsa_key.pem" | cut -d' ' -f1)"
+cp -R --preserve=timestamps --no-preserve=mode,ownership -- \
+  "$vwless_source/." "$vwless_destination/"
+find -P "$vwless_destination" -type d -exec chmod 0700 -- {} +
+find -P "$vwless_destination" -type f -exec chmod 0600 -- {} +
+test "$(sha256sum "$vwless_destination/rsa_key.pem" | cut -d' ' -f1)" = "$vwless_source_rsa"
 ```
 
-The Go accept command records the immutable decision before exchanging the
-verified candidate with empty `data` and publishing the active release. Before
-finalize, require all three `ps` entries to be healthy, require backup/proxy
-version output and the Vaultwarden image labels to name the same exact clean
-release, and verify the normal HTTPS path. Finalize only validates durable
-state and archives it; it does not infer container health. If interrupted after
-the decision, exchange, active write, service start, or before finalize, repeat
-the sequence from its first line. Each Go boundary is idempotent for the same
-recorded decision. The pre-import session must fail because RSA was rotated.
-Retain the external original and `import/source` until the deployment and
-backups have been independently accepted.
+Generate and compare a filename-safe, sorted SHA-256 inventory of both trees,
+including every regular file and the directory set. Keep that evidence outside
+the source and destination. Confirm the source inventory did not change.
 
-Before any accept decision, cancellation is explicit:
+Use the current release's `compose.env`, run both configuration validations,
+then start Vaultwarden. Vaultwarden itself performs any database migration.
+After all three services are healthy, use a fresh official-client login to read
+representative items, attachments, and file Sends. The RSA digest must remain
+the source digest. Continuity of an old session is not an acceptance
+requirement.
+
+## Status, backup demand, and target catch-up
+
+Read the resident process state and request one debounced check:
 
 ```sh
-docker compose --env-file "$vwless_env" --file "$vwless_compose" --profile deployment run --rm --no-deps deployment-admin deployment import cancel
+docker compose --env-file "$vwless_env" --file "$vwless_compose" \
+  exec --no-TTY backup /bin/vaultwarden-less-backup status
+
+docker compose --env-file "$vwless_env" --file "$vwless_compose" \
+  exec --no-TTY backup /bin/vaultwarden-less-backup request-backup
 ```
 
-Cancel removes only disposable candidate/current state and never source or
-data. Once `decision.json` exists, cancel is permanently invalid; continue the
-same raw accept/start/verify/finalize sequence. Never edit import JSON, exchange
-directories manually, or replace a missing active document.
+Acceptance means only that demand entered the in-memory queue. The worker uses
+a 30-second quiet window, a two-minute maximum quiet window, a five-minute
+minimum interval between check starts, a five-minute target retry, a 12-hour
+fallback check, and a 30-minute continuous-failure degradation threshold.
+Process status and notifications are not durable evidence; repository
+snapshots are.
 
-## Status and backup demand
-
-Read resident process status:
-
-```sh
-docker compose --env-file "$vwless_env" --file "$vwless_compose" exec --no-TTY backup /bin/vaultwarden-less-backup status
-```
-
-Request one debounced check:
-
-```sh
-docker compose --env-file "$vwless_env" --file "$vwless_compose" exec --no-TTY backup /bin/vaultwarden-less-backup request-backup
-```
-
-The acknowledgement means only that demand was accepted. A check can wait for
-the 30-second quiet period, extend quieting to two minutes, and wait for the
-five-minute minimum check-start interval. A source inconsistency retries after
-30 seconds; ordinary target failure retries after five minutes; 30 minutes of
-continuous target failure becomes degraded. A 12-hour fallback check protects
-against lost process-local events.
-
-Worker state is `idle`, `debouncing`, `checking`, `partial`, or `degraded`.
-Target state is `unknown`, `healthy`, `retrying`, or `degraded`. `partial`
-means at least one configured repository has the point and another does not;
-it must not be reported as complete success.
-
-Status and notification queues reset on worker restart. Repository snapshots
-are the durable fact. Confirm them independently:
-
-```sh
-docker compose --env-file "$vwless_env" --file "$vwless_compose" --profile maintenance run --rm --no-deps maintenance repo snapshots --target primary --limit 100
-```
-
-Use the full 64-character snapshot ID returned here for an explicit earlier
-restore. Do not parse log messages as a snapshot contract.
+With multiple targets, `partial` means at least one target succeeded and at
+least one failed. Repair only the failed endpoint or credential, make no new
+Vaultwarden write, request another check, and require the failed target to
+catch up to the same `content_id` without replacing an already valid snapshot
+on the healthy target. Run check and restore against each target separately.
 
 ## Repository maintenance
 
-Run maintenance only after both role validation commands pass. The one-shot
-maintenance container has repository egress but does not join application
-networks.
-
-List snapshots and check repository metadata:
+Use the maintenance profile and its separate credentials. List bounded newest
+snapshots and check repository metadata:
 
 ```sh
-docker compose --env-file "$vwless_env" --file "$vwless_compose" --profile maintenance run --rm --no-deps maintenance repo snapshots --target primary --limit 100
-docker compose --env-file "$vwless_env" --file "$vwless_compose" --profile maintenance run --rm --no-deps maintenance repo check --target primary
+docker compose --env-file "$vwless_env" --file "$vwless_compose" \
+  --profile maintenance run --rm --no-deps maintenance \
+  repo snapshots --target primary --limit 100
+
+docker compose --env-file "$vwless_env" --file "$vwless_compose" \
+  --profile maintenance run --rm --no-deps maintenance \
+  repo check --target primary
 ```
 
-Unlock is for a confirmed stale Restic lock after proving no backup, restore,
-prune, or other client is active:
+Unlock only after proving no backup, restore, prune, or other Restic process is
+active:
 
 ```sh
-docker compose --env-file "$vwless_env" --file "$vwless_compose" --profile maintenance run --rm --no-deps maintenance repo unlock --target primary
+docker compose --env-file "$vwless_env" --file "$vwless_compose" \
+  --profile maintenance run --rm --no-deps maintenance \
+  repo unlock --target primary
 ```
 
-Prune always begins with a preview:
+Prune defaults to a dry run. Review every full snapshot ID before explicitly
+applying the fixed retention policy, then check again:
 
 ```sh
-docker compose --env-file "$vwless_env" --file "$vwless_compose" --profile maintenance run --rm --no-deps maintenance repo prune --target primary
+docker compose --env-file "$vwless_env" --file "$vwless_compose" \
+  --profile maintenance run --rm --no-deps maintenance \
+  repo prune --target primary
+
+docker compose --env-file "$vwless_env" --file "$vwless_compose" \
+  --profile maintenance run --rm --no-deps maintenance \
+  repo prune --target primary --apply
+
+docker compose --env-file "$vwless_env" --file "$vwless_compose" \
+  --profile maintenance run --rm --no-deps maintenance \
+  repo check --target primary
 ```
 
-Review every retained and removed full snapshot ID. Only then apply the exact
-fixed policy:
-
-```sh
-docker compose --env-file "$vwless_env" --file "$vwless_compose" --profile maintenance run --rm --no-deps maintenance repo prune --target primary --apply
-docker compose --env-file "$vwless_env" --file "$vwless_compose" --profile maintenance run --rm --no-deps maintenance repo check --target primary
-```
-
-The fixed retention is within 24 hours, 48 hourly, 14 daily, 8 weekly, 12
-monthly, and 3 yearly snapshots. Selection is limited to this product's exact
-host, path, project commit, content identity, and archive identity. Provider
-lifecycle rules must not independently expire active Restic objects. Object
-lock may make unlock or prune fail; see [Storage providers](providers.md).
+Provider lifecycle rules must not expire live Restic objects independently.
+Object lock can make unlock or prune fail. Repository-format migration is not a
+project command.
 
 ## Verified restore
 
-Restore latest to one previously absent output name:
+Restore latest or one explicit full snapshot ID into a previously absent name
+under `restore/`:
 
 ```sh
-docker compose --env-file "$vwless_env" --file "$vwless_compose" --profile restore run --rm --no-deps restore restore --target primary --snapshot latest --output drill
+docker compose --env-file "$vwless_env" --file "$vwless_compose" \
+  --profile maintenance run --rm --no-deps maintenance \
+  restore --target primary --snapshot latest --output recovery-primary
+
+docker compose --env-file "$vwless_env" --file "$vwless_compose" \
+  --profile maintenance run --rm --no-deps maintenance \
+  restore --target primary --snapshot <64-lowercase-hex-id> --output recovery-earlier
 ```
 
-Restore an explicit earlier full snapshot ID to a different absent name:
+Restore verifies repository identity tags, the manifest, exact file closure,
+hashes, SQLite integrity and schema, database references, and content/archive
+identities before an atomic no-replace publication. It never falls back from a
+failed latest point or writes production `data`. After failure, the requested
+output remains absent; preserve the semantic error, run `repo check`, and use a
+different output name for any separately authorized attempt.
+
+## Isolated restore exercise
+
+Never let Vaultwarden modify the verified restore output used as evidence.
+Create a disposable deployment root with a different loopback port, copy the
+verified recovery tree into its empty `data`, and remove `manifest.json` only
+from that disposable copy. Populate the other inputs from the same release as
+an explicit targetless deployment and keep signup disabled.
+
+Use a unique Compose project and the one shipped `compose.yml`:
 
 ```sh
-docker compose --env-file "$vwless_env" --file "$vwless_compose" --profile restore run --rm --no-deps restore restore --target primary --snapshot <full-64-character-id> --output earlier
+vwless_drill_root=/srv/vaultwarden-less-drills/<unique-id>
+vwless_drill_env="$vwless_drill_root/compose.env"
+docker compose --project-name vaultwarden-less-drill-<unique-id> \
+  --env-file "$vwless_drill_env" --file "$vwless_compose" \
+  up --detach vaultwarden backup proxy
 ```
 
-The output name resolves beneath `restore/`. Restore downloads into a private
-temporary sibling, verifies exact tags, manifest, file set, sizes, hashes,
-SQLite integrity and foreign keys, complete audited schema, database
-references, canonical content identity, and archive identity, then atomically
-publishes the output without replacement. It never falls back from a corrupt
-latest point to an earlier point and never overwrites an existing output.
+Route a temporary trusted HTTPS origin to that drill's distinct loopback port.
+An old authenticated session should fail because recovery points exclude RSA.
+Use a fresh official-client login and verify representative folders, items,
+attachments, and file Sends. Record the newly generated RSA identity and
+service health.
 
-On failure, preserve the error JSON, run `repo check`, and select a known full
-earlier ID explicitly if incident policy authorizes it. Use a new output name;
-do not delete a verified restore merely to reuse its name.
-
-### Authorized production restore runbook
-
-This is a manual incident procedure, not a product command. Do not run it
-without incident-specific authorization for the exact deployment and selected
-restore. The verified restore must already have passed the complete drill. Its
-manifest `project_commit` must exactly equal the current healthy backup
-container's `version` project commit; a point from another A/B identity is
-ineligible. Record both JSON documents and stop on any
-mismatch.
-
-Set the following values explicitly from the reviewed incident record; do not
-source or reparse `.env` in shell code:
+Remove only the unique disposable project, then verify it has no remaining
+containers, networks, or volumes before deleting its exact root:
 
 ```sh
-vwless_root='<exact Compose-resolved DEPLOYMENT_ROOT>'
-vwless_restore_name='<verified-restore-output-name>'
-vwless_incident_id='<unique-lowercase-incident-id>'
-printf '%s\n' "$vwless_restore_name" | grep -Eq '^[a-z][a-z0-9-]{0,62}$'
-printf '%s\n' "$vwless_incident_id" | grep -Eq '^[a-z0-9][a-z0-9-]{0,62}$'
-vwless_restore="$vwless_root/restore/$vwless_restore_name"
-vwless_incident="$vwless_root/state/incidents/$vwless_incident_id"
-test "$vwless_root" != / && test -d "$vwless_root"
-test -d "$vwless_restore" && test -f "$vwless_restore/manifest.json"
-test "$(stat -c %d "$vwless_root/data")" = "$(stat -c %d "$vwless_restore")"
-LC_ALL=C mv --help | grep -q -- '--no-copy'
-LC_ALL=C mv --help | grep -q -- 'none-fail'
-LC_ALL=C cp --help | grep -q -- 'none-fail'
-umask 077
-test -e "$vwless_root/state/incidents" || mkdir -m 0700 -- "$vwless_root/state/incidents"
-mkdir -m 0700 -- "$vwless_incident"
-test "$(stat -c '%a:%u:%g' "$vwless_root/state/incidents")" = "700:$(id -u):$(id -g)"
-test "$(stat -c '%a:%u:%g' "$vwless_incident")" = "700:$(id -u):$(id -g)"
-docker compose --env-file "$vwless_env" --file "$vwless_compose" exec --no-TTY backup /bin/vaultwarden-less-backup version > "$vwless_incident/active-version.json"
-cp --update=none-fail --preserve=mode,timestamps -- "$vwless_restore/manifest.json" "$vwless_incident/reviewed-manifest.json"
+docker compose --project-name vaultwarden-less-drill-<unique-id> \
+  --env-file "$vwless_drill_env" --file "$vwless_compose" down
 ```
 
-Review those two saved JSON files and require the same exact full project
-commit before continuing. Then stop writers in order and confirm that no
-container or host process holds `db.sqlite3`:
+The original verified restore output remains unchanged.
+
+## Authorized production recovery
+
+This is a destructive real-data operation and is never implied by a restore
+command. Proceed only with authorization for the exact incident after the
+selected restore passed the isolated exercise and the current data tree has a
+separate verified recovery copy.
+
+1. Record the active image identities, selected snapshot/manifest identities,
+   current data inventory, and reversal paths in a protected incident record.
+2. Stop new writes, then the worker, then Vaultwarden:
 
 ```sh
 docker compose --env-file "$vwless_env" --file "$vwless_compose" stop proxy
@@ -482,148 +390,98 @@ docker compose --env-file "$vwless_env" --file "$vwless_compose" stop vaultwarde
 test -z "$(docker compose --env-file "$vwless_env" --file "$vwless_compose" ps --status running --quiet vaultwarden backup proxy)"
 ```
 
-While stopped, move the manifest into the incident record and perform only
-same-filesystem, no-copy, no-overwrite renames. Every destination below must be
-absent; `none-fail` turns an existing destination into a hard failure.
+3. On one filesystem, atomically rename current `data` to a previously absent
+   incident path. With GNU `mv --no-clobber`, verify both postconditions so a
+   racing destination cannot become a silent success:
 
 ```sh
-mv --update=none-fail --no-copy -T -- "$vwless_restore/manifest.json" "$vwless_incident/selected-manifest.json"
-mv --update=none-fail --no-copy -T -- "$vwless_root/data" "$vwless_incident/pre-restore-data"
-mv --update=none-fail --no-copy -T -- "$vwless_restore" "$vwless_root/data"
+vwless_previous="$vwless_root/data.pre-recovery-<unique-id>"
+test ! -e "$vwless_previous"
+test "$(stat -c %d "$vwless_root/data")" = "$(stat -c %d "$vwless_root")"
+mv --no-clobber -T -- "$vwless_root/data" "$vwless_previous"
+test ! -e "$vwless_root/data"
+test -d "$vwless_previous"
 ```
 
-The durable active identity does not change. Start the same current release,
-require all three health checks, reject every old session, and establish a
-fresh login. Then create a new backup, restore it to a new output, and complete
-another drill. Keep the entire incident directory and both retained data trees
-until separate deletion authorization is recorded.
+4. Create a new `0700` working `data`, copy the verified restore into it without
+   modifying the source, and remove only the copied `manifest.json`. Normalize
+   copied directories to `0700` and files to `0600` under the runtime identity.
+5. Start the same release. Require three healthy services, a newly generated
+   RSA identity, failure of old sessions, and fresh official-client reads.
+6. Immediately create, list, check, restore, and exercise a new recovery point
+   before accepting the incident result.
 
-If startup or validation fails after the restored tree reached `data`, keep
-services stopped and reverse only with no-overwrite renames:
+If startup or client verification fails, stop all three services, atomically
+rename failed working data to a new absent `data.failed-<unique-id>` path, then
+rename the untouched previous tree back to absent `data`. Verify both
+postconditions after each no-clobber rename. Never overwrite either tree and do
+not remove incident material as part of recovery.
+
+## Working-copy release transition and rollback
+
+A release transition is an operator-owned offline working-copy procedure, not
+project state and not a release gate. Retain both release directories, the
+complete original A data, A's `compose.env`, and a tested rollback path.
+
+Before stopping A:
+
+1. transfer, checksum, and load B;
+2. prepare a private B `compose.env` containing B's exact `git-<full-commit>`
+   tag and the same reviewed root, runtime IDs, and port;
+3. render B Compose and run both B configuration checks; and
+4. record A/B full identities and exact absent destination names outside the
+   deployment tree.
+
+Then:
 
 ```sh
-mv --update=none-fail --no-copy -T -- "$vwless_root/data" "$vwless_incident/failed-restored-data"
-mv --update=none-fail --no-copy -T -- "$vwless_incident/pre-restore-data" "$vwless_root/data"
-docker compose --env-file "$vwless_env" --file "$vwless_compose" up --detach --wait --wait-timeout 180 vaultwarden backup proxy
+# Stop A in writer-to-reader order.
+docker compose --env-file "$vwless_env" --file <A-release>/compose.yml stop proxy
+docker compose --env-file "$vwless_env" --file <A-release>/compose.yml stop backup
+docker compose --env-file "$vwless_env" --file <A-release>/compose.yml stop vaultwarden
+
+vwless_original="$vwless_root/data.pre-<full-B-commit>"
+test ! -e "$vwless_original"
+test "$(stat -c %d "$vwless_root/data")" = "$(stat -c %d "$vwless_root")"
+mv --no-clobber -T -- "$vwless_root/data" "$vwless_original"
+test ! -e "$vwless_root/data"
+test -d "$vwless_original"
+
+# Copy the unmigrated A tree into a new B working directory.
+install -d -m 0700 -- "$vwless_root/data"
+cp -R --preserve=timestamps --no-preserve=mode,ownership -- \
+  "$vwless_original/." "$vwless_root/data/"
+find -P "$vwless_root/data" -type d -exec chmod 0700 -- {} +
+find -P "$vwless_root/data" -type f -exec chmod 0600 -- {} +
 ```
 
-If failure occurred before the restored tree reached `data`, leave that tree
-where it is and restore only the missing original `data` with the second rename.
-Never overwrite either tree, change `active.json`, promote a cross-commit
-snapshot, or remove incident material as part of this runbook.
+Atomically install the already reviewed B `compose.env`. Start only B
+Vaultwarden first and wait for its health check; only that working copy may be
+opened or migrated by B. Then start B backup and proxy, route the trusted HTTPS
+edge normally, and use a fresh official-client login to inspect representative
+data. Targetless B is permitted but must emit its warning.
 
-## Isolated recovery drill
+Repository checks, a B restore exercise, and broader compatibility testing are
+useful evidence but are not automatic release prerequisites. Accept only after
+the operator's own A/B criteria pass. Keep A and `data.pre-<full-B-commit>`.
 
-The drill profile consumes exactly `restore/drill`, so create that verified
-output first. Start the separate project and wait for health:
+To roll back, stop B in the same order. Rename B working data to a previously
+absent `data.failed-<unique-id>` path, verify `data` is absent, then atomically
+rename the untouched A directory back to `data` without replacement. Restore
+A's recorded `compose.env` atomically and start only images from A's retained
+release. If any destination exists, stop and investigate; never delete it to
+continue.
+
+## Shutdown and incident boundary
+
+Normal shutdown removes only this Compose project's containers and networks;
+bind-mounted data and private inputs remain:
 
 ```sh
-docker compose --project-name vaultwarden-less-drill --env-file "$vwless_env" --file "$vwless_compose" --profile drill up --detach --wait --wait-timeout 180 drill-vaultwarden
-docker compose --project-name vaultwarden-less-drill --env-file "$vwless_env" --file "$vwless_compose" --profile drill ps
+docker compose --env-file "$vwless_env" --file "$vwless_compose" down
 ```
 
-Configure a normal Bitwarden client for the drill's loopback origin. Use fresh
-sessions and verify, at minimum:
-
-- both a personal and an organization item, including a value changed after an
-  earlier recovery point;
-- folders, organizations, collections, and membership;
-- attachment bytes and ordinary file-Send bytes;
-- the exhausted behavior of an access-limited Send when present;
-- a second user and data owned by that user.
-
-An authenticated session captured before recovery should fail against the
-drill. Login again and establish fresh sessions. RSA state is intentionally
-excluded, so prior access, refresh, invitation, attachment, and download tokens
-are expected to be invalid.
-
-Remove only the disposable drill project and volume:
-
-```sh
-docker compose --project-name vaultwarden-less-drill --env-file "$vwless_env" --file "$vwless_compose" --profile drill down --volumes
-```
-
-The verified `restore/drill` tree remains. The production stack is a different
-Compose project and is not changed by drill cleanup.
-
-## Restart durability check
-
-After the first successful point and after material deployment changes, prove
-that durable repository state survives a complete service restart:
-
-```sh
-docker compose --env-file "$vwless_env" --file "$vwless_compose" stop proxy backup vaultwarden
-docker compose --env-file "$vwless_env" --file "$vwless_compose" up --detach vaultwarden backup proxy
-docker compose --env-file "$vwless_env" --file "$vwless_compose" exec --no-TTY backup /bin/vaultwarden-less-backup request-backup
-docker compose --env-file "$vwless_env" --file "$vwless_compose" --profile maintenance run --rm --no-deps maintenance repo snapshots --target primary --limit 100
-docker compose --env-file "$vwless_env" --file "$vwless_compose" --profile maintenance run --rm --no-deps maintenance repo check --target primary
-```
-
-Wait for a completed worker check before interpreting the snapshot list.
-Unchanged logical content may reuse the existing point even if the fresh
-SQLite archive bytes differ. That is expected content-ID deduplication, not a
-missed backup.
-
-## Two-target degradation and catch-up
-
-Test this only with controlled acceptance targets. Do not create a provider
-outage or revoke production credentials without exact authorization.
-
-1. Configure two independent repositories, passwords, and role keys; validate
-   both roles and initialize both targets.
-2. Create changed Vaultwarden data and wait until both targets report the same
-   `content_id` with their own verified snapshots.
-3. Make only the secondary target unavailable through the controlled test
-   mechanism, create another change, and request a backup.
-4. Prove the primary succeeds while the secondary reports retrying and the
-   worker reports partial rather than complete success. Use the release gate's
-   exact-boundary fake-clock test and accelerated real-adapter test as the
-   degradation-threshold evidence; do not turn a wall-clock observation into a
-   stronger timing claim.
-5. Restore secondary access without changing source data. The worker must
-   catch that target up to the same latest `content_id`.
-6. Run `repo check`, latest restore, and drill from each target. Do not accept
-   equality based only on snapshot count or timestamp.
-
-The resident worker dispatches in configuration order with at most two target
-operations in flight, then publishes results and notifications in configuration
-order. A slow target occupies one slot but does not erase another target's
-result. Catch-up stores the newest verified point; it does not synthesize every
-missed intermediate state.
-
-## Cold deployment acceptance
-
-Before relying on a new deployment, use an ordinary isolated Linux/amd64 host
-with only Docker Engine, Compose, checksum tools, and rsync for deployment
-operations:
-
-1. copy the exact release bundle into a new directory and verify every checksum;
-2. create private copies beneath `DEPLOYMENT_ROOT` exactly as documented;
-3. checksum and standard-load all three immutable image archives, validate
-   their labels, and render Compose with the same immutable tag;
-4. run both configuration checks, initialize the empty deployment identity,
-   and initialize two real repositories;
-5. start production, create real Vaultwarden data through a normal client, and
-   obtain verified points on both targets;
-6. stop and restart all three services and prove repository continuity;
-7. restore latest and an earlier full ID, run a drill, verify data, and prove
-   old-session invalidation plus fresh login;
-8. run the controlled two-target degradation/catch-up sequence;
-9. remove only acceptance-created containers, networks, volumes, and temporary
-   directories, then prove no such resource remains.
-
-The operator should not need to read Go/Nix source or install project tools to
-perform those steps. A real provider must still be tested separately from the
-Moto-based automated boundary.
-
-## Incident boundary
-
-The product creates verified restore trees and disposable drills; it does not
-replace live `data`. Promotion of a restore into production is a destructive
-real-data decision and requires exact authorization plus a verified recovery
-copy of the current tree. Keep the failed source intact, record the selected
-snapshot and identities, complete the drill, plan rollback, and only then use
-a separately reviewed incident procedure.
-
-For an audited A/B product change, do not improvise image replacement or data
-promotion. Follow [Upgrades and explicit rollback](upgrades.md).
+The product creates verified restore directories but never promotes them into
+production. It does not administer provider data, delete old working copies,
+or decide when incident or transition evidence may be destroyed. Those are
+separate, explicitly authorized operator actions with their own recovery path.

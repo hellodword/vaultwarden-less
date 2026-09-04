@@ -1,280 +1,267 @@
 # Configuration
 
-This document shows how to create deployment inputs. Exact validators and
-limits are normative in [the product contracts](contracts.md). Storage-specific
-endpoints and permissions are in [Storage providers](providers.md).
+This reference describes private deployment inputs. Exact limits and rejection
+rules are normative in [Product contracts](contracts.md). The release templates
+are intentionally unusable until their empty repository, credential, and
+password placeholders are replaced, or until the operator explicitly selects
+targetless operation.
 
-## Private layout and ownership
+## Deployment tree and permissions
 
-The Nix release bundle contains checksummed Compose files and public
-`*.example*` templates. Keep that versioned directory read-only. Its private
-`.env`, private counterparts, and runtime directories all live under a separate
-absolute `DEPLOYMENT_ROOT`. Never put real credentials in a release or example.
-
-Create the layout as the account whose identity will run the containers:
+Keep the checksummed release directory read-only and separate from mutable
+state. Create the deployment tree as the exact UID/GID that will run the
+containers:
 
 ```sh
 vwless_root=/srv/vaultwarden-less
-vwless_release_dir=/opt/vaultwarden-less/releases/<immutable-release>
-install -d -m 0700 "$vwless_root"
-install -d -m 0700 "$vwless_root/config" "$vwless_root/credentials" "$vwless_root/credentials/restic"
-install -d -m 0700 "$vwless_root/data" "$vwless_root/import" "$vwless_root/staging" "$vwless_root/cache" "$vwless_root/restore" "$vwless_root/state"
-install -m 0600 "$vwless_release_dir/.env.example" "$vwless_root/.env"
-install -m 0600 "$vwless_release_dir/config/backup.example.yaml" "$vwless_root/config/backup.yaml"
-install -m 0600 "$vwless_release_dir/config/vaultwarden.example.env" "$vwless_root/config/vaultwarden.env"
-install -m 0600 "$vwless_release_dir/credentials/backup.example.yaml" "$vwless_root/credentials/backup.yaml"
-install -m 0600 "$vwless_release_dir/credentials/maintenance.example.yaml" "$vwless_root/credentials/maintenance.yaml"
-install -m 0600 "$vwless_release_dir/credentials/notifiers.example.yaml" "$vwless_root/credentials/notifiers.yaml"
-install -m 0600 "$vwless_release_dir/credentials/restic/primary.example" "$vwless_root/credentials/restic/primary"
+vwless_release_dir=/opt/vaultwarden-less/releases/git-<full-commit>
+
+install -d -m 0700 -- "$vwless_root"
+install -d -m 0700 -- \
+  "$vwless_root/config" \
+  "$vwless_root/credentials" \
+  "$vwless_root/credentials/restic" \
+  "$vwless_root/data" \
+  "$vwless_root/staging" \
+  "$vwless_root/cache" \
+  "$vwless_root/restore"
+
+install -m 0600 -- "$vwless_release_dir/templates/compose.env" "$vwless_root/compose.env"
+install -m 0600 -- "$vwless_release_dir/templates/config/backup.yaml" "$vwless_root/config/backup.yaml"
+install -m 0600 -- "$vwless_release_dir/templates/config/vaultwarden.env" "$vwless_root/config/vaultwarden.env"
+install -m 0600 -- "$vwless_release_dir/templates/credentials/backup.yaml" "$vwless_root/credentials/backup.yaml"
+install -m 0600 -- "$vwless_release_dir/templates/credentials/maintenance.yaml" "$vwless_root/credentials/maintenance.yaml"
+install -m 0600 -- "$vwless_release_dir/templates/credentials/restic/primary" "$vwless_root/credentials/restic/primary"
+install -m 0600 -- "$vwless_release_dir/templates/credentials/restic/b2" "$vwless_root/credentials/restic/b2"
 ```
 
-Every private directory must be a real, non-symlink directory with mode
-`0700`. Every private file must be a real, non-symlink regular file with mode
-`0600`. They and their required subdirectories must be owned by the exact
-runtime UID/GID. Validation walks ancestors without following symlinks and
-rejects group/world permissions rather than silently repairing them.
+The resulting project-managed shape is:
 
-If the runtime identity differs from the invoking account, create or chown only
-the explicit deployment paths with an administrative account. Do not apply a
-recursive ownership change to a parent directory or an existing machine-wide
-path.
+```text
+DEPLOYMENT_ROOT/
+  compose.env
+  config/
+    backup.yaml
+    vaultwarden.env
+  credentials/
+    backup.yaml
+    maintenance.yaml
+    restic/
+      <target-name>
+  data/
+  staging/
+  cache/
+  restore/
+```
 
-## Deployment environment
+Every directory is a real, non-symlink `0700` directory. Every private file is
+a real, non-symlink `0600` regular file. All are owned by the configured
+runtime identity. Validation reports a mismatch and never repairs it. If an
+administrator must establish ownership for a separate runtime account, scope
+that change to these exact newly created paths; never recursively change an
+unrelated parent or existing data tree.
 
-The release `.env.example` shows six canonical unquoted assignments. Docker
-Compose owns actual `.env` quoting, escaping, and interpolation; the product
-validates the five deployment values passed to its containers, while Compose
-uses `VWLESS_IMAGE_TAG` to select the images:
+## Compose environment
+
+`compose.env` contains exactly five unquoted assignments:
 
 ```dotenv
 DEPLOYMENT_ROOT=/srv/vaultwarden-less
-VWLESS_IMAGE_TAG=RELEASE.2026-09-02T05-43-20Z-g8d8b03e2264d
+VWLESS_IMAGE_TAG=git-0123456789abcdef0123456789abcdef01234567
 RUNTIME_UID=1000
 RUNTIME_GID=1000
 LISTEN_PORT=8080
-DRILL_PORT=8081
 ```
 
-- `DEPLOYMENT_ROOT` resolves to an existing absolute directory other than `/`.
-- `VWLESS_IMAGE_TAG` is `local` only in the source-tree development example;
-  every release bundle substitutes its exact immutable release tag.
-- IDs are canonical decimal `1..4294967294` and must match private-path
-  ownership.
-- ports are canonical decimal `1024..65535`, must differ, and are published
-  only on loopback by tracked Compose.
-- resolved IDs and ports reject leading zeros, signs, or whitespace. Private
-  roots, files, and directories reject symlinks.
+- `DEPLOYMENT_ROOT` is the clean absolute non-root path above.
+- `VWLESS_IMAGE_TAG` comes from the release template and remains the exact
+  `git-<40-lowercase-hex-commit>` identity loaded from that bundle.
+- `RUNTIME_UID` and `RUNTIME_GID` are canonical decimal values from 1 through
+  4294967294 and match private-path ownership.
+- `LISTEN_PORT` is a canonical decimal value from 1024 through 65535. Compose
+  publishes only `127.0.0.1:${LISTEN_PORT}`.
 
-The normal and drill ports may be chosen freely inside those bounds. Do not
-publish either port directly on an untrusted interface.
+Compose owns dotenv parsing. Do not source this file as shell code. A trusted
+HTTPS reverse proxy must forward root-path HTTP and WebSocket traffic to the
+loopback port and must apply the operator's public access and forwarding-header
+policy.
 
-## Backup configuration
+## Backup YAML
 
-`config/backup.yaml` defines ordered targets, the subset required during an
-upgrade, and optional notifiers:
-
-```yaml
-upgrade_verification_targets:
-  - primary
-targets:
-  - name: primary
-    repository: s3:https://objects.example.invalid/vaultwarden-primary
-    options:
-      - name: s3.bucket-lookup
-        value: path
-notifiers:
-  - name: operations
-    type: wechat
-```
-
-Target names use lowercase letters, digits, and hyphens and begin with a
-letter. Target order is semantic. Resident synchronization dispatches in that
-order with at most two targets in flight, then reports results and notifications
-in the same order; one target failure does not cancel another. Upgrade
-verification is serial. Each option is a separate name/value pair so arguments
-are passed to Restic without shell interpretation. Repository and option values
-are never logged.
-
-For two repositories, add the second target and its independent password and
-role credentials:
+`config/backup.yaml` has only two required top-level arrays: ordered `targets`
+and ordered `notifiers`. A two-target AWS S3 and Backblaze B2 configuration has
+this shape:
 
 ```yaml
-upgrade_verification_targets:
-  - primary
-  - secondary
 targets:
   - name: primary
-    repository: s3:https://objects-a.example.invalid/vaultwarden
-    options:
-      - name: s3.bucket-lookup
-        value: path
-  - name: secondary
-    repository: s3:https://objects-b.example.invalid/vaultwarden
+    repository: s3:s3.ap-southeast-1.amazonaws.com/example-bucket/vaultwarden
+    options: []
+  - name: b2
+    repository: s3:https://s3.us-west-004.backblazeb2.com/example-bucket/vaultwarden
     options:
       - name: s3.bucket-lookup
         value: path
 notifiers: []
 ```
 
-`upgrade_verification_targets` must contain configured target names and should
-include every repository that must be proven before accepting B. Normal backup
-still attempts every configured target regardless of this subset.
+Targets use unique names matching `[a-z][a-z0-9-]{0,62}`. `options` is always
+an explicit array, even when empty. Each option becomes the structured Restic
+arguments `--option` and `name=value`; no value is interpreted by a shell.
+Target order is preserved in status and notification results, while at most two
+target operations run concurrently.
 
-For a bootstrap with no repository, both arrays must be present and explicitly
-empty:
+For AWS S3, choose the endpoint, region, bucket, and prefix assigned to this
+deployment. For B2's S3-compatible API, use its HTTPS regional endpoint and
+path-style bucket lookup. Both are consumed by unmodified Restic. Provider IAM,
+object retention, object lock, lifecycle rules, cost, durability, and regional
+behavior are outside the product: create dedicated least-privilege identities,
+prevent lifecycle deletion of active Restic objects, and prove the actual
+account with init, backup, check, restore, and a client exercise.
+
+An intentional targetless configuration is exactly:
 
 ```yaml
-upgrade_verification_targets: []
 targets: []
 notifiers: []
 ```
 
-Omitting either field or writing a YAML null is invalid. `targets` contains
-0 to 32 entries. With one or more targets,
-`upgrade_verification_targets` still contains 1 to 32 unique configured names;
-with zero targets, it is exactly `[]`. Targetless mode keeps the services alive
-but deliberately performs no scheduled or manual backup and provides no
-recovery point. Follow the complete
-[targetless bootstrap runbook](operations.md#explicit-targetless-bootstrap-and-first-account)
-and treat all current data as unprotected.
+Missing arrays and YAML nulls are invalid. Targetless keeps the application
+available while explicitly providing no recovery point.
 
-## Isolated role credentials
+The parser rejects unknown or duplicate fields, multiple YAML documents,
+implicit scalar types, anchors, aliases, tags, and merge keys. Repository and
+option values are bounded and must not contain control-line separators. See
+[Product contracts](contracts.md#backup-configuration) for the complete
+limits.
 
-`credentials/backup.yaml` and `credentials/maintenance.yaml` have the same
-schema and must contain exactly the configured target keys:
+## Role credentials and Restic passwords
+
+`credentials/backup.yaml` is mounted only by the resident worker.
+`credentials/maintenance.yaml` is mounted only by the one-shot maintenance
+service. They have the same schema but should contain separate provider keys:
 
 ```yaml
 targets:
   primary:
     environment:
-      AWS_ACCESS_KEY_ID: replace-me
-      AWS_SECRET_ACCESS_KEY: replace-me
+      AWS_ACCESS_KEY_ID: replace-with-backup-key
+      AWS_SECRET_ACCESS_KEY: replace-with-backup-secret
+  b2:
+    environment:
+      AWS_ACCESS_KEY_ID: replace-with-b2-backup-key
+      AWS_SECRET_ACCESS_KEY: replace-with-b2-backup-secret
 ```
 
-Create separate provider keys for the two files. The backup key belongs only
-to the resident worker. The maintenance key belongs only to one-shot init,
-check, prune, restore, and upgrade commands. This separation limits a resident
-service compromise and permits independent rotation.
+The target key set in each role file exactly equals the configured target set.
+Environment names are uppercase identifiers. Ambient environment is not
+inherited; `RESTIC_*`, path/home/temp variables, loader injection, and runtime
+debug variables are reserved. Values must be explicit nonempty strings.
 
-Environment names match `[A-Z_][A-Z0-9_]{0,127}`. Empty values, NUL, and
-oversized values are rejected. `RESTIC_*`, `PATH`, `HOME`, temp-directory
-variables, loader variables, and debug/runtime injection variables are
-reserved. Ambient host environment is not inherited.
-
-Each target also has a separate password file at
-`credentials/restic/<target>`:
+Each target has one separate `0600` password file named exactly after the
+target:
 
 ```text
-replace-with-a-long-random-restic-password
+credentials/restic/primary
+credentials/restic/b2
 ```
 
-The password file is raw text with one optional final LF. Do not reuse a cloud
-secret, Vaultwarden password, or another target's Restic password. Losing this
-password makes the encrypted repository unrecoverable; store a protected copy
-outside the deployment and test it through a restore.
+Each contains one nonempty line, with one optional final LF. There are no
+ignored suffixes or extra entries. Use independent high-entropy passwords and
+retain protected recovery copies outside this deployment. Losing a password
+makes that encrypted repository unusable.
 
-The key sets in backup credentials, maintenance credentials, target passwords,
-and `config/backup.yaml` must agree exactly. Adding or removing a target is one
-coordinated configuration change.
-
-For targetless mode, both role files contain exactly:
+For targetless operation, both role files contain exactly:
 
 ```yaml
 targets: {}
 ```
 
-The private `credentials/restic` directory must still be a real, owned mode-
-`0700` directory, but it is empty. Do not copy the tracked primary password
-example into that private directory. A release bundle provides the complete
-public set under `examples/targetless/`; install those four files directly as
-shown in the targetless bootstrap runbook instead of editing targetful examples
-down by hand.
+and `credentials/restic` is actually empty. Remove the two empty release
+template copies from the private password directory; do not leave placeholder
+filenames behind.
 
-## Notifiers
+## Inline notifiers
 
-Supported notifier types are `wechat` and `bark`. For a configured WeCom/WeChat
-Work notifier, `credentials/notifiers.yaml` contains the matching key exactly:
+Notifier values live directly in private `config/backup.yaml`; there is no
+separate notifier credential file. WeChat uses:
 
 ```yaml
 notifiers:
-  operations:
+  - name: operations
+    type: wechat
     webhook_url: https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=replace-me
 ```
 
-To disable notifications, use both:
+Bark/APNs uses:
 
 ```yaml
-# config/backup.yaml
-notifiers: []
+notifiers:
+  - name: operations
+    type: bark
+    device_token: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    auth_key: |
+      -----BEGIN PRIVATE KEY-----
+      replace-with-one-P-256-PKCS8-key
+      -----END PRIVATE KEY-----
+    key_id: replace-me
+    team_id: replace-me
+    topic: me.example.app
+    sound: "1107"
 ```
 
-```yaml
-# credentials/notifiers.yaml
-notifiers: {}
-```
-
-A Bark notifier uses exactly `device_token`, a PKCS#8 P-256 `auth_key`,
-`key_id`, `team_id`, `topic`, and optional `sound`. Keep the multiline private
-key only in the private credential file; use the tracked example as the field
-shape and replace every placeholder. The configured notifier names and the
-credential keys must agree exactly.
-
-Notifier delivery is bounded and best effort. It reports safe target names,
-stable codes, and shortened digests; it is not durable backup evidence. Protect
-the webhook as a secret and rotate it through the provider if disclosed.
+`sound` may be omitted and defaults to `1107`. Each notifier rejects fields
+from the other type. Delivery is bounded and best effort; it is not durable
+backup evidence. Treat webhook URLs, device tokens, and private keys as
+secrets.
 
 ## Vaultwarden environment
 
-Start from `config/vaultwarden.example.env` and review every value. Required
-storage paths are fixed to the mounted recovery boundary:
+The supplied `config/vaultwarden.env` intentionally contains only:
 
 ```dotenv
-DATA_FOLDER=/data
-DATABASE_URL=sqlite:///data/db.sqlite3
-RSA_KEY_FILENAME=/data/rsa_key
-ATTACHMENTS_FOLDER=/data/attachments
-SENDS_FOLDER=/data/sends
+SIGNUPS_ALLOWED=false
+INVITATIONS_ALLOWED=false
 ```
 
-Set `DOMAIN` to the exact public HTTPS origin presented by the trusted edge.
-The tracked example disables signups, invitations, the web vault, outbound
-icon download, push, SMTP-like features, and non-global HTTP requests. These
-are security defaults, not a claim that every deployment should have identical
-business policy. Changes must be deliberate and reviewed against the pinned
-Vaultwarden release.
+Compose fixes the listen address, SQLite/data paths, RSA prefix, attachment and
+Send paths, disabled Web Vault, and disabled icon downloads. Do not duplicate
+or override those values. The project neither requires nor validates a public
+domain. Operators may add other settings supported by the pinned Vaultwarden
+release, but the project does not translate or validate them.
 
-The RSA key is deliberately excluded from recovery. A restored or drilled
-instance creates a new key and invalidates old token-bearing sessions. This is
-a recovery property, not a configuration defect.
+For a new empty deployment, temporarily set `SIGNUPS_ALLOWED=true`, create the
+first account through an official Bitwarden client over the trusted HTTPS edge,
+then atomically restore `false` and force-recreate only Vaultwarden. The exact
+procedure is in [Operations](operations.md#targetless-first-start-and-first-account).
 
 ## Validation
 
-Load the exact release images before validation. Then run both role checks:
+After loading the release images, validate each actual role mount without
+contacting a repository:
 
 ```sh
-docker compose --env-file .env --file compose.yml --profile maintenance run --rm --no-deps config-check-backup
-docker compose --env-file .env --file compose.yml --profile maintenance run --rm --no-deps config-check-maintenance
+docker compose --env-file "$vwless_root/compose.env" --file "$vwless_release_dir/compose.yml" \
+  run --rm --no-deps backup config validate --role backup
+
+docker compose --env-file "$vwless_root/compose.env" --file "$vwless_release_dir/compose.yml" \
+  --profile maintenance run --rm --no-deps maintenance \
+  config validate --role maintenance
 ```
 
-Each command must print one strict JSON success document and exit zero.
-Together they check the five resolved values, exact YAML, actual Compose bind
-identity, ownership, modes, symlink containment, target/password key sets,
-both role files, notifier credentials, and required runtime directories. They
-intentionally do not contact a repository.
+Each success document semantically contains `valid: true`, the selected role,
+and target names in configuration order. Validation checks YAML, role keys,
+password filenames and contents, private paths, ownership, modes, and symlink
+containment. It does not connect to Restic or construct a repository runner.
 
-In targetless mode the exact results are
-`{"valid":true,"role":"backup","targets":[]}` and
-`{"valid":true,"role":"maintenance","targets":[]}`. There is no
-`warnings` field; the runtime warning is emitted by each backup service start.
-
-After validation, initialize every newly created configured repository with the
-maintenance role. Skip this step when `targets: []`:
+After both checks pass, initialize each known-empty dedicated target exactly
+once. Skip initialization when targetless:
 
 ```sh
-docker compose --env-file .env --file compose.yml --profile maintenance run --rm --no-deps maintenance repo init --target primary
+docker compose --env-file "$vwless_root/compose.env" --file "$vwless_release_dir/compose.yml" \
+  --profile maintenance run --rm --no-deps maintenance \
+  repo init --target primary
 ```
 
-Do not run `repo init` on an unknown nonempty location. Confirm the bucket,
-prefix, account, region, role, and independent Restic password first. A real
-`repo check`, backup, restore, and drill are still required before accepting
-the deployment.
+Never run `repo init` against an unreviewed nonempty prefix. A successful
+configuration check is not evidence that provider access or recovery works.
