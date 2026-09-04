@@ -3,17 +3,15 @@
 /config/vaultwarden.env
 /credentials/backup.yaml
 /credentials/maintenance.yaml
-/credentials/notifiers.yaml
 /credentials/restic/*
-!/credentials/restic/*.example*
 /data/
-/import/
 /staging/
 /cache/
 /restore/
-/state/
 /dist/
 /tmp/
+/result
+/compose.env
 
 AGENTS.md
 .agents/

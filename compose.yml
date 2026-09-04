@@ -18,12 +18,6 @@ x-service-defaults: &service-defaults
       max-size: 20m
       max-file: "3"
 
-x-deployment-environment: &deployment-environment
-  DEPLOYMENT_ROOT: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}"
-  RUNTIME_UID: "${RUNTIME_UID:?RUNTIME_UID is required}"
-  RUNTIME_GID: "${RUNTIME_GID:?RUNTIME_GID is required}"
-  LISTEN_PORT: "${LISTEN_PORT:?LISTEN_PORT is required}"
-
 x-backup-config-mount: &backup-config-mount
   type: bind
   source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/config/backup.yaml"
@@ -32,7 +26,7 @@ x-backup-config-mount: &backup-config-mount
   bind:
     create_host_path: false
 
-x-restic-credentials-mount: &restic-credentials-mount
+x-restic-passwords-mount: &restic-passwords-mount
   type: bind
   source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/credentials/restic"
   target: /run/credentials/restic
@@ -53,7 +47,17 @@ services:
     image: "vaultwarden-less-vaultwarden:${VWLESS_IMAGE_TAG:?VWLESS_IMAGE_TAG is required}"
     pull_policy: never
     hostname: vaultwarden
-    environment: *deployment-environment
+    environment:
+      ROCKET_ADDRESS: "0.0.0.0"
+      ROCKET_PORT: "80"
+      DATA_FOLDER: /data
+      DATABASE_URL: sqlite:///data/db.sqlite3
+      RSA_KEY_FILENAME: /data/rsa_key
+      ATTACHMENTS_FOLDER: /data/attachments
+      SENDS_FOLDER: /data/sends
+      WEB_VAULT_ENABLED: "false"
+      DISABLE_ICON_DOWNLOAD: "true"
+      ICON_CACHE_TTL: "0"
     env_file:
       - "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/config/vaultwarden.env"
     volumes:
@@ -63,8 +67,7 @@ services:
         bind:
           create_host_path: false
     networks:
-      app:
-        aliases: [vaultwarden]
+      - backend
     healthcheck:
       test: [CMD, /healthcheck.sh]
       interval: 10s
@@ -79,10 +82,9 @@ services:
     hostname: backup
     entrypoint: [/bin/vaultwarden-less-backup]
     command: [serve]
-    environment: *deployment-environment
     volumes:
       - *backup-config-mount
-      - *restic-credentials-mount
+      - *restic-passwords-mount
       - *cache-mount
       - type: bind
         source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/data"
@@ -101,16 +103,9 @@ services:
         read_only: true
         bind:
           create_host_path: false
-      - type: bind
-        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/credentials/notifiers.yaml"
-        target: /run/credentials/notifiers.yaml
-        read_only: true
-        bind:
-          create_host_path: false
     networks:
-      events:
-        aliases: [backup]
-      backup-outbound: {}
+      - backend
+      - egress
     healthcheck:
       test: [CMD, /bin/vaultwarden-less-backup, healthcheck]
       interval: 10s
@@ -124,7 +119,6 @@ services:
     hostname: proxy
     entrypoint: [/bin/vaultwarden-less-proxy]
     command: [serve]
-    environment: *deployment-environment
     depends_on:
       vaultwarden:
         condition: service_healthy
@@ -133,118 +127,12 @@ services:
     ports:
       - "127.0.0.1:${LISTEN_PORT:?LISTEN_PORT is required}:8080"
     networks:
-      - app
-      - events
-      - proxy-ingress
+      - backend
     healthcheck:
       test: [CMD, /bin/vaultwarden-less-proxy, healthcheck]
       interval: 10s
       timeout: 3s
       retries: 6
-
-  config-check-backup:
-    <<: *service-defaults
-    image: "vaultwarden-less-backup:${VWLESS_IMAGE_TAG:?VWLESS_IMAGE_TAG is required}"
-    pull_policy: never
-    profiles: [maintenance]
-    restart: "no"
-    network_mode: none
-    entrypoint: [/bin/vaultwarden-less-backup]
-    command: [config, validate, --role, backup]
-    environment: *deployment-environment
-    volumes:
-      - *backup-config-mount
-      - *restic-credentials-mount
-      - *cache-mount
-      - type: bind
-        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}"
-        target: /deployment-root
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/config/vaultwarden.env"
-        target: /deployment/vaultwarden.env
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/data"
-        target: /data
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/staging"
-        target: /staging
-        bind:
-          create_host_path: false
-      - type: bind
-        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/restore"
-        target: /restore
-        bind:
-          create_host_path: false
-      - type: bind
-        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/credentials/backup.yaml"
-        target: /run/credentials/role.yaml
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/credentials/notifiers.yaml"
-        target: /run/credentials/notifiers.yaml
-        read_only: true
-        bind:
-          create_host_path: false
-
-  config-check-maintenance:
-    <<: *service-defaults
-    image: "vaultwarden-less-backup:${VWLESS_IMAGE_TAG:?VWLESS_IMAGE_TAG is required}"
-    pull_policy: never
-    profiles: [maintenance]
-    restart: "no"
-    network_mode: none
-    entrypoint: [/bin/vaultwarden-less-backup]
-    command: [config, validate, --role, maintenance]
-    environment: *deployment-environment
-    volumes:
-      - *backup-config-mount
-      - *restic-credentials-mount
-      - *cache-mount
-      - type: bind
-        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}"
-        target: /deployment-root
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/config/vaultwarden.env"
-        target: /deployment/vaultwarden.env
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/data"
-        target: /data
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/staging"
-        target: /staging
-        bind:
-          create_host_path: false
-      - type: bind
-        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/restore"
-        target: /restore
-        bind:
-          create_host_path: false
-      - type: bind
-        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/credentials/maintenance.yaml"
-        target: /run/credentials/role.yaml
-        read_only: true
-        bind:
-          create_host_path: false
 
   maintenance:
     <<: *service-defaults
@@ -254,48 +142,9 @@ services:
     restart: "no"
     entrypoint: [/bin/vaultwarden-less-backup]
     command: [--help]
-    environment: *deployment-environment
     volumes:
       - *backup-config-mount
-      - *restic-credentials-mount
-      - *cache-mount
-      - type: bind
-        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/data"
-        target: /data
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/staging"
-        target: /staging
-        bind:
-          create_host_path: false
-      - type: bind
-        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/restore"
-        target: /restore
-        bind:
-          create_host_path: false
-      - type: bind
-        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/credentials/maintenance.yaml"
-        target: /run/credentials/role.yaml
-        read_only: true
-        bind:
-          create_host_path: false
-    networks:
-      - maintenance-outbound
-
-  restore:
-    <<: *service-defaults
-    image: "vaultwarden-less-backup:${VWLESS_IMAGE_TAG:?VWLESS_IMAGE_TAG is required}"
-    pull_policy: never
-    profiles: [restore]
-    restart: "no"
-    entrypoint: [/bin/vaultwarden-less-backup]
-    command: [--help]
-    environment: *deployment-environment
-    volumes:
-      - *backup-config-mount
-      - *restic-credentials-mount
+      - *restic-passwords-mount
       - *cache-mount
       - type: bind
         source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/restore"
@@ -309,15 +158,14 @@ services:
         bind:
           create_host_path: false
     networks:
-      - maintenance-outbound
+      - egress
+    healthcheck:
+      test: [CMD, /bin/vaultwarden-less-backup, version]
+      interval: 10s
+      timeout: 3s
+      retries: 3
 
 networks:
-  app:
+  backend:
     internal: true
-  events:
-    internal: true
-  proxy-ingress:
-    driver_opts:
-      com.docker.network.bridge.enable_ip_masquerade: "false"
-  backup-outbound: {}
-  maintenance-outbound: {}
+  egress: {}
