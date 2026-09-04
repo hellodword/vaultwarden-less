@@ -26,15 +26,11 @@ func serveCommand(configPath *string, environment commandEnvironment) *cobra.Com
 			if err != nil {
 				return commandFailure(codeInvalidConfig, "The backup configuration is invalid", err)
 			}
-			notifiers, err := environment.notifiersFor(cfg)
-			if err != nil {
-				return commandFailure(codeInvalidCredentials, "Notifier credentials are invalid", err)
-			}
 			logger := environment.logger
 			if logger == nil {
 				logger = slog.New(slog.NewJSONHandler(cmd.ErrOrStderr(), nil))
 			}
-			notifications, err := notify.NewManager(notifiers, logger)
+			notifications, err := notify.NewManager(cfg.Notifiers, logger)
 			if err != nil {
 				return commandFailure(codeInvalidCredentials, "Notifier credentials are invalid", err)
 			}

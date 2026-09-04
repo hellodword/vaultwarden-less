@@ -14,24 +14,20 @@ import (
 	"time"
 )
 
-const minimalBackupYAML = `upgrade_verification_targets:
-  - primary
-targets:
+const minimalBackupYAML = `targets:
   - name: primary
     repository: rest:https://repository.example.test/vaultwarden
     options: []
 notifiers: []
 `
 
-const targetlessBackupYAML = `upgrade_verification_targets: []
-targets: []
+const targetlessBackupYAML = `targets: []
 notifiers: []
 `
 
-func TestBackupSchemaPreservesSemanticOrder(t *testing.T) {
+func TestBackupSchemaContainsOnlyTargetsAndInlineNotifiers(t *testing.T) {
 	t.Parallel()
-	document := `upgrade_verification_targets: [cold, primary]
-targets:
+	document := `targets:
   - name: cold
     repository: /srv/cold
     options:
@@ -42,7 +38,10 @@ targets:
   - name: primary
     repository: b2:bucket:path
     options: []
-notifiers: []
+notifiers:
+  - name: operations
+    type: wechat
+    webhook_url: https://example.test/hooks/send?key=placeholder
 `
 	cfg, err := DecodeBackup([]byte(document))
 	if err != nil {
@@ -51,38 +50,46 @@ notifiers: []
 	if names := []string{cfg.Targets[0].Name, cfg.Targets[1].Name}; !slices.Equal(names, []string{"cold", "primary"}) {
 		t.Fatalf("target order = %#v", names)
 	}
-	if !slices.Equal(cfg.UpgradeVerificationTargets, []string{"cold", "primary"}) {
-		t.Fatalf("verification order = %#v", cfg.UpgradeVerificationTargets)
-	}
 	if got := cfg.Targets[0].Options; len(got) != 2 || got[0].Name != "first" || got[1].Name != "second" {
 		t.Fatalf("option order = %#v", got)
 	}
+	if len(cfg.Notifiers) != 1 || cfg.Notifiers[0].Name != "operations" || cfg.Notifiers[0].WebhookURL == "" {
+		t.Fatalf("inline notifier = %#v", cfg.Notifiers)
+	}
+	for name, extra := range map[string]string{
+		"removed verification field": "upgrade_verification_targets: []\n",
+		"removed deployment field":   "deployment: {}\n",
+		"removed notifier alias":     "notifier_credentials: /run/credentials/notifiers.yaml\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if _, err := DecodeBackup([]byte(extra + targetlessBackupYAML)); err == nil {
+				t.Fatal("removed top-level field was accepted")
+			}
+		})
+	}
 }
 
-func TestBackupRejectsEveryStrictYAMLAndShapeViolation(t *testing.T) {
+func TestBackupRejectsStrictYAMLAndShapeViolations(t *testing.T) {
 	t.Parallel()
 	tests := map[string]string{
-		"implicit null targets":  strings.Replace(minimalBackupYAML, "  - name: primary\n    repository: rest:https://repository.example.test/vaultwarden\n    options: []\n", "", 1),
-		"missing targets":        strings.Replace(minimalBackupYAML, "targets:\n  - name: primary\n    repository: rest:https://repository.example.test/vaultwarden\n    options: []\n", "", 1),
-		"missing verification":   strings.Replace(minimalBackupYAML, "upgrade_verification_targets:\n  - primary\n", "", 1),
-		"empty verification":     strings.Replace(minimalBackupYAML, "upgrade_verification_targets:\n  - primary", "upgrade_verification_targets: []", 1),
-		"unknown verification":   strings.Replace(minimalBackupYAML, "  - primary\n", "  - missing\n", 1),
-		"missing options":        strings.Replace(minimalBackupYAML, "    options: []\n", "", 1),
-		"missing notifiers":      strings.Replace(minimalBackupYAML, "notifiers: []\n", "", 1),
-		"unknown field":          minimalBackupYAML + "state_dir: /elsewhere\n",
-		"duplicate key":          minimalBackupYAML + "notifiers: []\n",
-		"multiple documents":     minimalBackupYAML + "---\nnotifiers: []\n",
-		"boolean string":         strings.Replace(minimalBackupYAML, "repository: rest:", "repository: true # rest:", 1),
-		"numeric option value":   strings.Replace(minimalBackupYAML, "options: []", "options: [{name: connections, value: 3}]", 1),
-		"anchor":                 strings.Replace(minimalBackupYAML, "repository: rest:", "repository: &repository rest:", 1),
-		"alias":                  strings.Replace(minimalBackupYAML, "notifiers: []", "notifiers: *repository", 1),
-		"tag":                    strings.Replace(minimalBackupYAML, "repository: rest:", "repository: !!str rest:", 1),
-		"merge":                  minimalBackupYAML + "extra: &extra {name: x}\nmerge: {<<: *extra}\n",
-		"duplicate option":       strings.Replace(minimalBackupYAML, "options: []", "options: [{name: x, value: a}, {name: x, value: b}]", 1),
-		"option equals":          strings.Replace(minimalBackupYAML, "options: []", "options: [{name: x=y, value: a}]", 1),
-		"repository newline":     strings.Replace(minimalBackupYAML, "repository: rest:https://repository.example.test/vaultwarden", "repository: |\n      bad\n      value", 1),
-		"duplicate target":       strings.Replace(minimalBackupYAML, "notifiers: []", "  - name: primary\n    repository: other\n    options: []\nnotifiers: []", 1),
-		"duplicate verification": strings.Replace(minimalBackupYAML, "  - primary\n", "  - primary\n  - primary\n", 1),
+		"implicit null targets": strings.Replace(minimalBackupYAML, "  - name: primary\n    repository: rest:https://repository.example.test/vaultwarden\n    options: []\n", "", 1),
+		"missing targets":       strings.Replace(minimalBackupYAML, "targets:\n  - name: primary\n    repository: rest:https://repository.example.test/vaultwarden\n    options: []\n", "", 1),
+		"missing options":       strings.Replace(minimalBackupYAML, "    options: []\n", "", 1),
+		"missing notifiers":     strings.Replace(minimalBackupYAML, "notifiers: []\n", "", 1),
+		"unknown field":         minimalBackupYAML + "state_dir: /elsewhere\n",
+		"duplicate key":         minimalBackupYAML + "notifiers: []\n",
+		"multiple documents":    minimalBackupYAML + "---\nnotifiers: []\n",
+		"boolean string":        strings.Replace(minimalBackupYAML, "repository: rest:", "repository: true # rest:", 1),
+		"numeric option value":  strings.Replace(minimalBackupYAML, "options: []", "options: [{name: connections, value: 3}]", 1),
+		"anchor":                strings.Replace(minimalBackupYAML, "repository: rest:", "repository: &repository rest:", 1),
+		"alias":                 strings.Replace(minimalBackupYAML, "notifiers: []", "notifiers: *repository", 1),
+		"tag":                   strings.Replace(minimalBackupYAML, "repository: rest:", "repository: !!str rest:", 1),
+		"merge":                 minimalBackupYAML + "extra: &extra {name: x}\nmerge: {<<: *extra}\n",
+		"duplicate option":      strings.Replace(minimalBackupYAML, "options: []", "options: [{name: x, value: a}, {name: x, value: b}]", 1),
+		"option equals":         strings.Replace(minimalBackupYAML, "options: []", "options: [{name: x=y, value: a}]", 1),
+		"repository newline":    strings.Replace(minimalBackupYAML, "repository: rest:https://repository.example.test/vaultwarden", "repository: |\n      bad\n      value", 1),
+		"duplicate target":      strings.Replace(minimalBackupYAML, "notifiers: []", "  - name: primary\n    repository: other\n    options: []\nnotifiers: []", 1),
 	}
 	for name, document := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -94,31 +101,27 @@ func TestBackupRejectsEveryStrictYAMLAndShapeViolation(t *testing.T) {
 	}
 }
 
-func TestTargetlessBackupRequiresExplicitEmptyPrivateMaterial(t *testing.T) {
+func TestTargetlessRequiresExplicitEmptyMaterial(t *testing.T) {
 	t.Parallel()
 	cfg, err := DecodeBackup([]byte(targetlessBackupYAML))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Targets == nil || len(cfg.Targets) != 0 || cfg.UpgradeVerificationTargets == nil || len(cfg.UpgradeVerificationTargets) != 0 {
+	if cfg.Targets == nil || len(cfg.Targets) != 0 || cfg.Notifiers == nil || len(cfg.Notifiers) != 0 {
 		t.Fatalf("targetless config = %#v", cfg)
 	}
 	credentials, err := LoadRoleCredentials(writePrivateFile(t, "targets: {}\n"), cfg)
 	if err != nil || credentials.Targets == nil || len(credentials.Targets) != 0 {
 		t.Fatalf("targetless role credentials = %#v/%v", credentials, err)
 	}
-	notifiers, err := LoadNotifierCredentials(writePrivateFile(t, "notifiers: {}\n"), cfg)
-	if err != nil || notifiers == nil || len(notifiers) != 0 {
-		t.Fatalf("targetless notifier credentials = %#v/%v", notifiers, err)
-	}
 	if err := ValidatePasswordDirectory(privateDirectory(t), cfg); err != nil {
 		t.Fatalf("empty password directory = %v", err)
 	}
-
 	for name, document := range map[string]string{
-		"missing targets":       "upgrade_verification_targets: []\nnotifiers: []\n",
-		"missing verification":  "targets: []\nnotifiers: []\n",
-		"nonempty verification": "upgrade_verification_targets:\n  - primary\ntargets: []\nnotifiers: []\n",
+		"missing targets":   "notifiers: []\n",
+		"missing notifiers": "targets: []\n",
+		"null targets":      "targets:\nnotifiers: []\n",
+		"null notifiers":    "targets: []\nnotifiers:\n",
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -126,15 +129,6 @@ func TestTargetlessBackupRequiresExplicitEmptyPrivateMaterial(t *testing.T) {
 				t.Fatal("invalid targetless configuration was accepted")
 			}
 		})
-	}
-}
-
-func TestYAMLErrorsDoNotEchoSecretValues(t *testing.T) {
-	t.Parallel()
-	secret := "must-not-appear-in-errors"
-	_, err := DecodeBackup([]byte(minimalBackupYAML + "unexpected: " + secret + "\n"))
-	if err == nil || strings.Contains(err.Error(), secret) {
-		t.Fatalf("unsafe decode error: %v", err)
 	}
 }
 
@@ -168,13 +162,16 @@ func TestRoleCredentialsRequireExactTargetsAndCleanEnvironment(t *testing.T) {
 	}
 
 	for name, invalid := range map[string]string{
-		"extra target":    valid + "  extra:\n    environment: {}\n",
-		"unknown field":   strings.Replace(valid, "    environment:", "    other: value\n    environment:", 1),
-		"reserved restic": strings.Replace(valid, "      AWS_ACCESS_KEY_ID:", "      RESTIC_PASSWORD: forbidden\n      AWS_ACCESS_KEY_ID:", 1),
-		"reserved home":   strings.Replace(valid, "      AWS_ACCESS_KEY_ID:", "      HOME: forbidden\n      AWS_ACCESS_KEY_ID:", 1),
-		"bad name":        strings.Replace(valid, "      AWS_ACCESS_KEY_ID:", "      lowercase: forbidden\n      AWS_ACCESS_KEY_ID:", 1),
-		"empty value":     strings.Replace(valid, "synthetic-access", `""`, 1),
-		"implicit value":  strings.Replace(valid, "synthetic-access", "123", 1),
+		"missing target":   "targets: {}\n",
+		"extra target":     valid + "  extra:\n    environment: {}\n",
+		"unknown field":    strings.Replace(valid, "    environment:", "    other: value\n    environment:", 1),
+		"reserved restic":  strings.Replace(valid, "      AWS_ACCESS_KEY_ID:", "      RESTIC_PASSWORD: forbidden\n      AWS_ACCESS_KEY_ID:", 1),
+		"reserved home":    strings.Replace(valid, "      AWS_ACCESS_KEY_ID:", "      HOME: forbidden\n      AWS_ACCESS_KEY_ID:", 1),
+		"bad name":         strings.Replace(valid, "      AWS_ACCESS_KEY_ID:", "      lowercase: forbidden\n      AWS_ACCESS_KEY_ID:", 1),
+		"empty value":      strings.Replace(valid, "synthetic-access", `""`, 1),
+		"implicit value":   strings.Replace(valid, "synthetic-access", "123", 1),
+		"missing targets":  "other: value\n",
+		"implicit targets": "targets:\n",
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -185,72 +182,56 @@ func TestRoleCredentialsRequireExactTargetsAndCleanEnvironment(t *testing.T) {
 	}
 }
 
-func TestNotifierFieldsAndBarkKeyAreStrict(t *testing.T) {
+func TestInlineNotifierTypesAreStrictAndRedacted(t *testing.T) {
 	t.Parallel()
-	backup := strings.Replace(minimalBackupYAML, "notifiers: []", `notifiers:
+	key := p256PKCS8(t)
+	valid := `targets: []
+notifiers:
   - name: operations
     type: wechat
+    webhook_url: https://example.test/hooks/send?key=must-not-leak
   - name: phone
-    type: bark`, 1)
-	cfg, err := DecodeBackup([]byte(backup))
-	if err != nil {
-		t.Fatal(err)
-	}
-	key := p256PKCS8(t)
-	validCredentials := `notifiers:
-  operations:
-    webhook_url: https://example.test/hooks/send?key=placeholder
-  phone:
+    type: bark
     device_token: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     auth_key: |
 ` + indent(key, 6) + `    key_id: KEY123
     team_id: TEAM123
     topic: me.example.app
 `
-	resolved, err := LoadNotifierCredentials(writePrivateFile(t, validCredentials), cfg)
-	if err != nil || len(resolved) != 2 || resolved[0].WebhookURL == "" || resolved[1].Sound != "1107" {
-		t.Fatalf("resolved notifier credentials = %#v/%v", resolved, err)
+	cfg, err := DecodeBackup([]byte(valid))
+	if err != nil || len(cfg.Notifiers) != 2 || cfg.Notifiers[0].WebhookURL == "" || cfg.Notifiers[1].Sound != "1107" {
+		t.Fatalf("resolved inline notifiers = %#v/%v", cfg, err)
 	}
-	for name, credentials := range map[string]string{
-		"http webhook":   strings.Replace(validCredentials, "https://", "http://", 1),
-		"wrong key":      strings.Replace(validCredentials, "-----BEGIN PRIVATE KEY-----", "not-a-key", 1),
-		"trailing PEM":   strings.Replace(validCredentials, "    key_id:", "      extra\n    key_id:", 1),
-		"wechat extra":   strings.Replace(validCredentials, "    webhook_url:", "    sound: chime\n    webhook_url:", 1),
-		"bark missing":   strings.Replace(validCredentials, "    topic: me.example.app\n", "", 1),
-		"extra notifier": validCredentials + "  unexpected:\n    webhook_url: https://example.test/hook\n",
+	for name, document := range map[string]string{
+		"http webhook":       strings.Replace(valid, "https://", "http://", 1),
+		"wrong key":          strings.Replace(valid, "-----BEGIN PRIVATE KEY-----", "not-a-key", 1),
+		"trailing PEM":       strings.Replace(valid, "    key_id:", "      extra\n    key_id:", 1),
+		"wechat bark field":  strings.Replace(valid, "    webhook_url:", "    sound: \"\"\n    webhook_url:", 1),
+		"bark wechat field":  strings.Replace(valid, "    device_token:", "    webhook_url: \"\"\n    device_token:", 1),
+		"bark missing":       strings.Replace(valid, "    topic: me.example.app\n", "", 1),
+		"unsupported type":   strings.Replace(valid, "type: wechat", "type: email", 1),
+		"duplicate notifier": strings.Replace(valid, "name: phone", "name: operations", 1),
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			if _, err := LoadNotifierCredentials(writePrivateFile(t, credentials), cfg); err == nil {
-				t.Fatal("invalid notifier credentials were accepted")
+			_, err := DecodeBackup([]byte(document))
+			if err == nil {
+				t.Fatal("invalid notifier was accepted")
+			}
+			if strings.Contains(err.Error(), "must-not-leak") {
+				t.Fatalf("notifier secret leaked in error: %v", err)
 			}
 		})
 	}
 }
 
-func TestEmptyNotifierSetStillRequiresStrictCredentialFile(t *testing.T) {
-	t.Parallel()
-	cfg, err := DecodeBackup([]byte(minimalBackupYAML))
-	if err != nil {
-		t.Fatal(err)
-	}
-	resolved, err := LoadNotifierCredentials(writePrivateFile(t, "notifiers: {}\n"), cfg)
-	if err != nil || resolved == nil || len(resolved) != 0 {
-		t.Fatalf("empty notifier credentials = %#v/%v", resolved, err)
-	}
-	if _, err := LoadNotifierCredentials(writePrivateFile(t, "notifiers: {}\nunknown: value\n"), cfg); err == nil {
-		t.Fatal("invalid empty notifier credential file was accepted")
-	}
-}
-
-func TestPasswordDirectoryRequiresExactSetAndOnePrivateLine(t *testing.T) {
+func TestPasswordDirectoryIsAnExactSet(t *testing.T) {
 	t.Parallel()
 	cfg, err := DecodeBackup([]byte(minimalBackupYAML))
 	if err != nil {
 		t.Fatal(err)
 	}
 	directory := privateDirectory(t)
-	writeModeFile(t, filepath.Join(directory, "primary.example"), "template\n", 0o644)
 	writeModeFile(t, filepath.Join(directory, "primary"), "password\n", 0o600)
 	if err := ValidatePasswordDirectory(directory, cfg); err != nil {
 		t.Fatal(err)
@@ -267,14 +248,25 @@ func TestPasswordDirectoryRequiresExactSetAndOnePrivateLine(t *testing.T) {
 			}
 		})
 	}
-	writeModeFile(t, filepath.Join(directory, "unexpected"), "password", 0o600)
-	if err := ValidatePasswordDirectory(directory, cfg); err == nil {
-		t.Fatal("unexpected password file was accepted")
+	for _, unexpected := range []string{"primary.example", "unexpected"} {
+		t.Run(unexpected, func(t *testing.T) {
+			directory := privateDirectory(t)
+			writeModeFile(t, filepath.Join(directory, "primary"), "password", 0o600)
+			writeModeFile(t, filepath.Join(directory, unexpected), "password", 0o600)
+			if err := ValidatePasswordDirectory(directory, cfg); err == nil {
+				t.Fatal("unexpected password file was accepted")
+			}
+		})
 	}
 }
 
-func TestPrivateConfigFileAndFixedPolicy(t *testing.T) {
+func TestYAMLErrorsAndPrivateFileBoundary(t *testing.T) {
 	t.Parallel()
+	secret := "must-not-appear-in-errors"
+	_, err := DecodeBackup([]byte(minimalBackupYAML + "unexpected: " + secret + "\n"))
+	if err == nil || strings.Contains(err.Error(), secret) {
+		t.Fatalf("unsafe decode error: %v", err)
+	}
 	directory := privateDirectory(t)
 	path := filepath.Join(directory, "backup.yaml")
 	writeModeFile(t, path, minimalBackupYAML, 0o600)
@@ -287,6 +279,10 @@ func TestPrivateConfigFileAndFixedPolicy(t *testing.T) {
 	if _, err := LoadBackup(path); err == nil {
 		t.Fatal("public config file was accepted")
 	}
+}
+
+func TestFixedRuntimePolicy(t *testing.T) {
+	t.Parallel()
 	if QuietWindow != 30*time.Second || MaximumQuietWindow != 2*time.Minute || MinimumCheckInterval != 5*time.Minute ||
 		FallbackCheckInterval != 12*time.Hour || ConsistencyRetry != 30*time.Second || FailureRetry != 5*time.Minute ||
 		DegradedAfter != 30*time.Minute || EventRetry != 30*time.Second || TargetTimeout != 2*time.Hour ||

@@ -8,8 +8,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -148,7 +146,13 @@ func TestServeStartsWithoutDeploymentStateGate(t *testing.T) {
 
 func TestConfigValidateRolesReturnsOrderedTargets(t *testing.T) {
 	for _, role := range []string{"backup", "maintenance"} {
-		stdout, stderr, code := executeCommand(testEnvironment(nil, nil), "config", "validate", "--role", role)
+		environment := testEnvironment(nil, nil)
+		var directories []string
+		environment.validateDirectory = func(path string) error {
+			directories = append(directories, path)
+			return nil
+		}
+		stdout, stderr, code := executeCommand(environment, "config", "validate", "--role", role)
 		if code != 0 || stderr != "" {
 			t.Fatalf("config validate %s = %d/%q/%q", role, code, stdout, stderr)
 		}
@@ -157,14 +161,20 @@ func TestConfigValidateRolesReturnsOrderedTargets(t *testing.T) {
 		if !result.Valid || result.Role != role || !slices.Equal(result.Targets, []string{"primary"}) {
 			t.Fatalf("config validate result = %#v", result)
 		}
+		wantDirectories := []string{"/cache", "/restore"}
+		if role == "backup" {
+			wantDirectories = []string{"/data", "/staging", "/cache"}
+		}
+		if !slices.Equal(directories, wantDirectories) {
+			t.Fatalf("config validate %s directories = %#v", role, directories)
+		}
 	}
 
 	environment := testEnvironment(nil, nil)
 	environment.loadBackup = func(string) (*config.Backup, error) {
 		return &config.Backup{
-			UpgradeVerificationTargets: []string{},
-			Targets:                    []config.Target{},
-			Notifiers:                  []config.Notifier{},
+			Targets:   []config.Target{},
+			Notifiers: []config.Notifier{},
 		}, nil
 	}
 	environment.loadCredentials = func(string, *config.Backup) (*config.RoleCredentials, error) {
@@ -183,27 +193,23 @@ func TestConfigValidateRolesReturnsOrderedTargets(t *testing.T) {
 	}
 }
 
-func TestValidateMountedPathRequiresExactNonSymlinkObject(t *testing.T) {
-	root := t.TempDir()
-	expected := filepath.Join(root, "expected")
-	other := filepath.Join(root, "other")
-	link := filepath.Join(root, "link")
-	if err := os.WriteFile(expected, []byte("expected"), 0o600); err != nil {
-		t.Fatal(err)
+func TestTargetlessReturnsBeforeRepositoryFactory(t *testing.T) {
+	called := false
+	environment := testEnvironment(nil, nil)
+	environment.repository = func(*config.Backup) (repository, error) {
+		called = true
+		return nil, errors.New("must not construct repository")
 	}
-	if err := os.WriteFile(other, []byte("other"), 0o600); err != nil {
-		t.Fatal(err)
+	if _, err := environment.repositoryFor(&config.Backup{Targets: []config.Target{}}); err == nil || called {
+		t.Fatalf("targetless repository factory = err:%v called:%t", err, called)
 	}
-	if err := os.Symlink(expected, link); err != nil {
-		t.Fatal(err)
+
+	environment.loadBackup = func(string) (*config.Backup, error) {
+		return &config.Backup{Targets: []config.Target{}, Notifiers: []config.Notifier{}}, nil
 	}
-	if err := validateMountedPath(expected, expected); err != nil {
-		t.Fatal(err)
-	}
-	for _, mounted := range []string{other, link, "relative"} {
-		if err := validateMountedPath(expected, mounted); err == nil {
-			t.Fatalf("unsafe mounted path %q was accepted", mounted)
-		}
+	stdout, stderr, code := executeCommand(environment, "repo", "snapshots", "--target", "primary")
+	if code != 2 || stdout != "" || errorCode(t, stderr) != codeUsageError || called {
+		t.Fatalf("targetless repo command = %d/%q/%q/called=%t", code, stdout, stderr, called)
 	}
 }
 
@@ -215,7 +221,7 @@ func TestWorkerClientCommandsValidateSemanticResponses(t *testing.T) {
 			writer.WriteHeader(http.StatusAccepted)
 			_, _ = writer.Write([]byte("{\"accepted\":true}\n"))
 		case worker.StatusPath:
-			_, _ = writer.Write([]byte("{\"targets\":[],\"last_check\":null,\"next_check_at\":null,\"started_at\":\"2026-08-27T12:00:00.000Z\",\"state\":\"idle\"}"))
+			_, _ = writer.Write([]byte("{\"targets\":[],\"last_check\":null,\"next_check_at\":null,\"started_at\":\"2026-08-27T12:00:00.000Z\",\"state\":\"idle\",\"future_field\":true}"))
 		case worker.HealthPath:
 			writer.Header().Del("Content-Type")
 			writer.WriteHeader(http.StatusNoContent)
@@ -288,9 +294,8 @@ func testEnvironment(repositoryClient repository, server *httptest.Server, resto
 	environment := commandEnvironment{
 		loadBackup: func(string) (*config.Backup, error) {
 			return &config.Backup{
-				UpgradeVerificationTargets: []string{"primary"},
-				Targets:                    []config.Target{{Name: "primary", Repository: "s3:https://objects.example.test/bucket", Options: []config.Option{}}},
-				Notifiers:                  []config.Notifier{},
+				Targets:   []config.Target{{Name: "primary", Repository: "s3:https://objects.example.test/bucket", Options: []config.Option{}}},
+				Notifiers: []config.Notifier{},
 			}, nil
 		},
 		loadCredentials: func(string, *config.Backup) (*config.RoleCredentials, error) {
@@ -298,23 +303,17 @@ func testEnvironment(repositoryClient repository, server *httptest.Server, resto
 				"primary": {Environment: map[string]string{"AWS_ACCESS_KEY_ID": "test"}},
 			}}, nil
 		},
-		loadNotifiers:     func(string, *config.Backup) ([]config.Notifier, error) { return []config.Notifier{}, nil },
 		validatePasswords: func(string, *config.Backup) error { return nil },
 		validateDirectory: func(string) error { return nil },
-		validateFile:      func(string) error { return nil },
-		validateMount:     func(string, string) error { return nil },
 		repository:        func(*config.Backup) (repository, error) { return repositoryClient, nil },
 		restore: func(_ context.Context, _ restoretool.Repository, _ restoretool.Request) (restoretool.Result, error) {
 			return restoretool.Result{}, errors.New("restore should not be called")
 		},
 		httpClient:      &http.Client{Timeout: time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }},
 		workerURL:       "http://127.0.0.1:1",
-		vaultwardenPath: "/deployment/vaultwarden.env",
 		credentialsPath: "/credentials/role.yaml",
-		notifierPath:    "/credentials/notifiers.yaml",
 		passwordRoot:    "/credentials/restic",
 		resticBinary:    "restic",
-		deploymentRoot:  "/deployment-root",
 		dataDir:         "/data",
 		stagingDir:      "/staging",
 		cacheDir:        "/cache",
