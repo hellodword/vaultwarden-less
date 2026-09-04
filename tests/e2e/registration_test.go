@@ -13,8 +13,8 @@ import (
 	"github.com/hellodword/vaultwarden-less/tests/e2e/register"
 )
 
-// registerAccount is the first of two narrow protocol fixtures because the
-// official Bitwarden CLI deliberately does not expose account registration.
+// registerAccount is a narrow protocol fixture because the official
+// Bitwarden CLI deliberately does not expose account registration.
 // Every ordinary vault operation uses the Nix-provided official bw.
 func registerAccount(ctx context.Context, t *testing.T, server, email, password string) register.Registration {
 	t.Helper()

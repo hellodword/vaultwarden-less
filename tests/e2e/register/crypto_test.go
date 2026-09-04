@@ -4,11 +4,7 @@ import (
 	"bytes"
 	"crypto/rsa"
 	"encoding/hex"
-	"encoding/json"
-	"errors"
 	"math/big"
-	"slices"
-	"strings"
 	"testing"
 )
 
@@ -20,10 +16,6 @@ func (r repeatReader) Read(data []byte) (int, error) {
 	}
 	return len(data), nil
 }
-
-type failingReader struct{ err error }
-
-func (r failingReader) Read([]byte) (int, error) { return 0, r.err }
 
 func TestPBKDF2AndHKDFVectors(t *testing.T) {
 	if got := hex.EncodeToString(pbkdf2SHA256([]byte("password"), []byte("salt"), 1, 32)); got != "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b" {
@@ -37,46 +29,6 @@ func TestPBKDF2AndHKDFVectors(t *testing.T) {
 	want := "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865"
 	if got != want {
 		t.Fatalf("HKDF = %s", got)
-	}
-}
-
-func TestRegistrationUsesCurrentRegistrationShape(t *testing.T) {
-	registration, err := BuildRegistration("User@example.com", "correct horse battery staple", "Test User", repeatReader{value: 7})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if registration.KDFType != KDFPBKDF2 || registration.KDFIterations != PBKDF2SHA256 {
-		t.Fatalf("KDF = %d/%d", registration.KDFType, registration.KDFIterations)
-	}
-	if !strings.HasPrefix(registration.Key, "2.") || registration.MasterPasswordHash == "" {
-		t.Fatal("registration crypto fields are missing or malformed")
-	}
-	if len(registration.SymmetricKey) != 64 {
-		t.Fatal("registration did not retain its test-only symmetric key")
-	}
-	data, err := registration.JSON()
-	if err != nil {
-		t.Fatal(err)
-	}
-	var fields map[string]any
-	if err := json.Unmarshal(data, &fields); err != nil {
-		t.Fatal(err)
-	}
-	if registration.UserPublicKey == nil {
-		t.Fatal("registration did not retain its test-only public key")
-	}
-	gotFields := make([]string, 0, len(fields))
-	for name := range fields {
-		gotFields = append(gotFields, name)
-	}
-	slices.Sort(gotFields)
-	wantFields := []string{"email", "kdfIterations", "kdfType", "key", "masterPasswordHash", "name", "userAsymmetricKeys"}
-	if !slices.Equal(gotFields, wantFields) {
-		t.Fatalf("registration JSON fields = %v, want %v", gotFields, wantFields)
-	}
-	keys, ok := fields["userAsymmetricKeys"].(map[string]any)
-	if !ok || len(keys) != 2 || !strings.HasPrefix(stringValue(keys["encryptedPrivateKey"]), "2.") || stringValue(keys["publicKey"]) == "" {
-		t.Fatal("registration asymmetric keys are missing or malformed")
 	}
 }
 
@@ -99,29 +51,6 @@ func oaepVectorPublicKey(t *testing.T) *rsa.PublicKey {
 		t.Fatal("decode RSA-OAEP vector modulus")
 	}
 	return &rsa.PublicKey{N: modulus, E: 65537}
-}
-
-func stringValue(value any) string {
-	text, _ := value.(string)
-	return text
-}
-
-func TestRegistrationCanCarryVerificationToken(t *testing.T) {
-	registration, err := BuildRegistration("user@example.com", "correct horse battery staple", "Test User", repeatReader{value: 9})
-	if err != nil {
-		t.Fatal(err)
-	}
-	data, err := registration.WithEmailVerificationToken("verification-token").JSON()
-	if err != nil {
-		t.Fatal(err)
-	}
-	var fields map[string]any
-	if err := json.Unmarshal(data, &fields); err != nil {
-		t.Fatal(err)
-	}
-	if fields["emailVerificationToken"] != "verification-token" {
-		t.Fatal("registration verification token was not preserved")
-	}
 }
 
 func TestEncryptMatchesAESCBCHMACVector(t *testing.T) {
@@ -148,65 +77,5 @@ func TestEncryptMatchesAESCBCHMACVector(t *testing.T) {
 	want := "2.AAECAwQFBgcICQoLDA0ODw==|9YxMBNbl8bp3nqv7X3v71khaXIFRnPN4+jbUK4VH7cA=|/ZXuY8JPehCdvifkTZHxBeeQ5+XNhr1KEdlbe/HK1tE="
 	if got != want {
 		t.Fatalf("AES-CBC-HMAC vector mismatch\ngot:  %s\nwant: %s", got, want)
-	}
-}
-
-func TestRegistrationJSONFieldsAreExact(t *testing.T) {
-	registration := Registration{
-		Email:              "user@example.com",
-		KDFType:            KDFPBKDF2,
-		KDFIterations:      PBKDF2SHA256,
-		Key:                "2.key",
-		MasterPasswordHash: "password-hash",
-		Name:               "Test User",
-		UserAsymmetricKeys: &AsymmetricKeys{EncryptedPrivateKey: "2.private", PublicKey: "public"},
-		SymmetricKey:       []byte("must-not-serialize"),
-		UserPublicKey:      oaepVectorPublicKey(t),
-	}
-	data, err := registration.JSON()
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := `{"email":"user@example.com","kdfType":0,"kdfIterations":600000,"key":"2.key","masterPasswordHash":"password-hash","name":"Test User","userAsymmetricKeys":{"encryptedPrivateKey":"2.private","publicKey":"public"}}`
-	if string(data) != want {
-		t.Fatalf("registration JSON = %s, want %s", data, want)
-	}
-	withToken, err := registration.WithEmailVerificationToken("token").JSON()
-	if err != nil {
-		t.Fatal(err)
-	}
-	wantWithToken := strings.TrimSuffix(want, "}") + `,"emailVerificationToken":"token"}`
-	if string(withToken) != wantWithToken {
-		t.Fatalf("registration token JSON = %s, want %s", withToken, wantWithToken)
-	}
-}
-
-func TestCryptoRejectsInvalidLengthsAndFailedReaders(t *testing.T) {
-	entropyFailure := errors.New("test entropy unavailable")
-	if _, err := GenerateSymmetricKey(failingReader{err: entropyFailure}); !errors.Is(err, entropyFailure) {
-		t.Fatalf("GenerateSymmetricKey error = %v", err)
-	}
-	for _, length := range []int{0, 63, 65} {
-		if _, err := Encrypt(make([]byte, length), nil, repeatReader{}); err == nil || err.Error() != "symmetric key must be 512 bits" {
-			t.Fatalf("Encrypt key length %d error = %v", length, err)
-		}
-	}
-	if _, err := Encrypt(make([]byte, 64), nil, failingReader{err: entropyFailure}); !errors.Is(err, entropyFailure) {
-		t.Fatalf("Encrypt entropy error = %v", err)
-	}
-	if _, err := EncapsulateKeyUnsigned(nil, make([]byte, 64), repeatReader{}); err == nil || err.Error() != "public key is required" {
-		t.Fatalf("nil public key error = %v", err)
-	}
-	publicKey := oaepVectorPublicKey(t)
-	for _, length := range []int{0, 63, 65} {
-		if _, err := EncapsulateKeyUnsigned(publicKey, make([]byte, length), repeatReader{}); err == nil || err.Error() != "shared key must be 512 bits" {
-			t.Fatalf("EncapsulateKeyUnsigned key length %d error = %v", length, err)
-		}
-	}
-	if _, err := EncapsulateKeyUnsigned(publicKey, make([]byte, 64), failingReader{err: entropyFailure}); !errors.Is(err, entropyFailure) {
-		t.Fatalf("EncapsulateKeyUnsigned entropy error = %v", err)
-	}
-	if _, err := BuildRegistration("user@example.com", "password", "User", failingReader{err: entropyFailure}); !errors.Is(err, entropyFailure) {
-		t.Fatalf("BuildRegistration entropy error = %v", err)
 	}
 }

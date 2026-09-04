@@ -1,5 +1,5 @@
 // Package register contains the small, standard-library-only V1 crypto builder
-// used by the registration and initial-organization E2E fixtures. Its protocol
+// used by the registration E2E fixture. Its protocol
 // fields are reviewed against the Bitwarden CLI and Vaultwarden commits in
 // UPSTREAMS.toml. It intentionally does not implement a general client.
 package register

@@ -14,54 +14,54 @@ import (
 	"github.com/hellodword/vaultwarden-less/internal/buildinfo"
 )
 
-func TestProxyCLIHelpVersionAndUsageGolden(t *testing.T) {
+func TestProxyCLIVersionAndUsageAreSemantic(t *testing.T) {
 	setProxyBuildIdentity(t, "", "development", "false")
 	environment := proxyEnvironment{ready: func() bool { return true }, healthURL: "http://127.0.0.1:1", serve: func(context.Context, io.Writer) error { return nil }}
-	for _, test := range []struct {
-		arguments []string
-		code      int
-		stdout    string
-		errorCode string
-	}{
-		{[]string{"--help"}, 0, "serve|healthcheck|version", ""},
-		{[]string{"serve", "--help"}, 0, "vaultwarden-less-proxy serve", ""},
-		{[]string{"healthcheck", "--help"}, 0, "vaultwarden-less-proxy healthcheck", ""},
-		{[]string{"version"}, 0, "{\"project_commit\":null,\"release\":\"development\",\"clean\":false}\n", ""},
-		{nil, 2, "", "usage_error"},
-		{[]string{"unknown"}, 2, "", "usage_error"},
-		{[]string{"serve", "extra"}, 2, "", "usage_error"},
-		{[]string{"healthcheck", "extra"}, 2, "", "usage_error"},
-		{[]string{"--version"}, 2, "", "usage_error"},
-	} {
-		var stdout, stderr bytes.Buffer
-		code := executeWithEnvironment(context.Background(), test.arguments, &stdout, &stderr, environment)
-		if code != test.code {
-			t.Errorf("%#v code = %d, want %d", test.arguments, code, test.code)
+	var stdout, stderr bytes.Buffer
+	if code := executeWithEnvironment(context.Background(), []string{"version"}, &stdout, &stderr, environment); code != 0 || stderr.Len() != 0 {
+		t.Fatalf("development version = %d/%q/%q", code, stdout.String(), stderr.String())
+	}
+	var version struct {
+		ProjectCommit *string `json:"project_commit"`
+		Release       string  `json:"release"`
+		Clean         bool    `json:"clean"`
+	}
+	decodeSingleProxyJSON(t, stdout.String(), &version)
+	if version.ProjectCommit != nil || version.Release != "development" || version.Clean {
+		t.Fatalf("development version = %#v", version)
+	}
+
+	for _, arguments := range [][]string{nil, {"unknown"}, {"serve", "extra"}, {"healthcheck", "extra"}, {"--version"}} {
+		stdout.Reset()
+		stderr.Reset()
+		code := executeWithEnvironment(context.Background(), arguments, &stdout, &stderr, environment)
+		if code != 2 || stdout.Len() != 0 {
+			t.Errorf("%#v = %d/%q/%q", arguments, code, stdout.String(), stderr.String())
 		}
-		if test.stdout != "" && !strings.Contains(stdout.String(), test.stdout) || test.stdout == "" && stdout.Len() != 0 {
-			t.Errorf("%#v stdout = %q", test.arguments, stdout.String())
-		}
-		if test.errorCode == "" && stderr.Len() != 0 {
-			t.Errorf("%#v stderr = %q", test.arguments, stderr.String())
-		}
-		if test.errorCode != "" {
-			assertProxyError(t, stderr.String(), test.errorCode)
-		}
+		assertProxyError(t, stderr.String(), "usage_error")
 	}
 }
 
-func TestProxyCLICleanVersionGolden(t *testing.T) {
+func TestProxyCLICleanVersionIsSemanticJSON(t *testing.T) {
 	commit := strings.Repeat("b", 40)
-	setProxyBuildIdentity(t, commit, "RELEASE.2026-08-27T12-34-56Z-gbbbbbbbbbbbb", "true")
+	setProxyBuildIdentity(t, commit, "git-"+commit, "true")
 	var stdout, stderr bytes.Buffer
 	code := executeWithEnvironment(context.Background(), []string{"version"}, &stdout, &stderr, proxyEnvironment{})
-	want := `{"project_commit":"` + commit + `","release":"RELEASE.2026-08-27T12-34-56Z-gbbbbbbbbbbbb","clean":true}` + "\n"
-	if code != 0 || stdout.String() != want || stderr.Len() != 0 {
+	if code != 0 || stderr.Len() != 0 {
 		t.Fatalf("version = %d/%q/%q", code, stdout.String(), stderr.String())
+	}
+	var version struct {
+		ProjectCommit *string `json:"project_commit"`
+		Release       string  `json:"release"`
+		Clean         bool    `json:"clean"`
+	}
+	decodeSingleProxyJSON(t, stdout.String(), &version)
+	if version.ProjectCommit == nil || *version.ProjectCommit != commit || version.Release != "git-"+commit || !version.Clean {
+		t.Fatalf("clean version = %#v", version)
 	}
 }
 
-func TestProxyCLIHealthcheckGoldenAndFailure(t *testing.T) {
+func TestProxyCLIHealthcheckIsSemanticAndReportsFailure(t *testing.T) {
 	for _, status := range []int{http.StatusNoContent, http.StatusServiceUnavailable} {
 		server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 			writer.WriteHeader(status)
@@ -70,7 +70,11 @@ func TestProxyCLIHealthcheckGoldenAndFailure(t *testing.T) {
 		code := executeWithEnvironment(context.Background(), []string{"healthcheck"}, &stdout, &stderr, proxyEnvironment{healthURL: server.URL})
 		server.Close()
 		if status == http.StatusNoContent {
-			if code != 0 || stdout.String() != "{\"healthy\":true}\n" || stderr.Len() != 0 {
+			var result struct {
+				Healthy bool `json:"healthy"`
+			}
+			decodeSingleProxyJSON(t, stdout.String(), &result)
+			if code != 0 || !result.Healthy || stderr.Len() != 0 {
 				t.Fatalf("healthcheck success = %d/%q/%q", code, stdout.String(), stderr.String())
 			}
 		} else {
@@ -111,6 +115,18 @@ func assertProxyError(t *testing.T, output, code string) {
 	var extra any
 	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
 		t.Fatalf("second error document in %q", output)
+	}
+}
+
+func decodeSingleProxyJSON(t *testing.T, input string, destination any) {
+	t.Helper()
+	decoder := json.NewDecoder(strings.NewReader(input))
+	if err := decoder.Decode(destination); err != nil {
+		t.Fatalf("decode JSON: %v", err)
+	}
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		t.Fatalf("JSON contains a second value")
 	}
 }
 

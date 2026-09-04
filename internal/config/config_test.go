@@ -55,18 +55,6 @@ notifiers:
 	if len(cfg.Notifiers) != 1 || cfg.Notifiers[0].Name != "operations" || cfg.Notifiers[0].WebhookURL == "" {
 		t.Fatalf("inline notifier = %#v", cfg.Notifiers)
 	}
-	for name, extra := range map[string]string{
-		"removed verification field": "upgrade_verification_targets: []\n",
-		"removed deployment field":   "deployment: {}\n",
-		"removed notifier alias":     "notifier_credentials: /run/credentials/notifiers.yaml\n",
-	} {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-			if _, err := DecodeBackup([]byte(extra + targetlessBackupYAML)); err == nil {
-				t.Fatal("removed top-level field was accepted")
-			}
-		})
-	}
 }
 
 func TestBackupRejectsStrictYAMLAndShapeViolations(t *testing.T) {

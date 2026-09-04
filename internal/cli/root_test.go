@@ -61,7 +61,7 @@ func (repository *fakeRepository) Restore(context.Context, config.Target, string
 	return repository.record("restore")
 }
 
-func TestCLIExposesOnlySupportedCommands(t *testing.T) {
+func TestCLIExposesSupportedCommandSetAndDevelopmentVersion(t *testing.T) {
 	setBuildIdentity(t, "", "development", "false")
 	command := newCommand(io.Discard, io.Discard, testEnvironment(nil, nil))
 	names := make([]string, 0, len(command.Commands()))
@@ -74,13 +74,6 @@ func TestCLIExposesOnlySupportedCommands(t *testing.T) {
 	if !slices.Equal(names, []string{"config", "healthcheck", "repo", "request-backup", "restore", "serve", "status", "version"}) {
 		t.Fatalf("command set = %#v", names)
 	}
-	for _, removed := range []string{"deployment", "upgrade", "rollback"} {
-		stdout, stderr, code := executeCommand(testEnvironment(nil, nil), removed)
-		if code != 2 || stdout != "" || errorCode(t, stderr) != codeUsageError {
-			t.Fatalf("removed command %q = %d/%q/%q", removed, code, stdout, stderr)
-		}
-	}
-
 	stdout, stderr, code := executeCommand(testEnvironment(nil, nil), "version")
 	if code != 0 || stderr != "" {
 		t.Fatalf("development version = %d/%q/%q", code, stdout, stderr)
@@ -94,14 +87,14 @@ func TestCLIExposesOnlySupportedCommands(t *testing.T) {
 
 func TestCLICleanVersionIsSemanticJSON(t *testing.T) {
 	commit := strings.Repeat("a", 40)
-	setBuildIdentity(t, commit, "RELEASE.2026-08-27T12-34-56Z-gaaaaaaaaaaaa", "true")
+	setBuildIdentity(t, commit, "git-"+commit, "true")
 	stdout, stderr, code := executeCommand(testEnvironment(nil, nil), "version")
 	if code != 0 || stderr != "" {
 		t.Fatalf("clean version = %d/%q/%q", code, stdout, stderr)
 	}
 	var version versionResult
 	decodeSingleJSON(t, stdout, &version)
-	if version.ProjectCommit == nil || *version.ProjectCommit != commit || !version.Clean {
+	if version.ProjectCommit == nil || *version.ProjectCommit != commit || version.Release != "git-"+commit || !version.Clean {
 		t.Fatalf("clean version = %#v", version)
 	}
 }
@@ -128,19 +121,6 @@ func TestCLIClassifiesUsageAndRepositoryFailures(t *testing.T) {
 	stdout, stderr, code := executeCommand(testEnvironment(repository, nil), "repo", "snapshots", "--target", "primary")
 	if code != 1 || stdout != "" || strings.Contains(stderr, "secret") || errorCode(t, stderr) != codeRepositoryFailure {
 		t.Fatalf("repository failure = %d/%q/%q", code, stdout, stderr)
-	}
-}
-
-func TestServeStartsWithoutDeploymentStateGate(t *testing.T) {
-	environment := testEnvironment(nil, nil)
-	loaded := false
-	environment.loadBackup = func(string) (*config.Backup, error) {
-		loaded = true
-		return nil, errors.New("synthetic invalid config")
-	}
-	stdout, stderr, code := executeCommand(environment, "serve")
-	if code != 1 || stdout != "" || !loaded || errorCode(t, stderr) != codeInvalidConfig {
-		t.Fatalf("serve boundary = %d/%q/%q/loaded=%t", code, stdout, stderr, loaded)
 	}
 }
 

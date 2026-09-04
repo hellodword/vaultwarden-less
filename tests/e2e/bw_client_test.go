@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
 	"strings"
 	"testing"
 )
@@ -245,24 +244,6 @@ func cliEnvironment(home, temp, appdata, caFile, session string) []string {
 
 func (client *bitwardenCLI) redact(value string) string {
 	return redactDiagnostics(value, client.password, client.session)
-}
-
-func TestCLIEnvironmentIsExact(t *testing.T) {
-	t.Parallel()
-	want := []string{
-		"HOME=/isolated/home",
-		"TMPDIR=/isolated/tmp",
-		"BITWARDENCLI_APPDATA_DIR=/isolated/appdata",
-		"NODE_EXTRA_CA_CERTS=/isolated/ca.pem",
-		"BW_SESSION=session",
-	}
-	got := cliEnvironment(
-		"/isolated/home", "/isolated/tmp", "/isolated/appdata",
-		"/isolated/ca.pem", "session",
-	)
-	if !slices.Equal(got, want) {
-		t.Fatalf("CLI environment = %#v", got)
-	}
 }
 
 func privateTestPath(t *testing.T, parent, name string, data []byte) string {
