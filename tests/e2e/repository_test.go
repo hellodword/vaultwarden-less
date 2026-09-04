@@ -285,7 +285,7 @@ func rejectB2Endpoint(t *testing.T, h *e2eHarness) func() {
 	const service = "moto-b2"
 	h.compose("--profile", "e2e-repositories", "stop", service)
 	container := h.containerID(service)
-	network := h.project + "_egress"
+	network := h.project + "_default"
 	if output, err := h.docker("network", "disconnect", network, container); err != nil {
 		t.Fatalf("disconnect stopped b2 endpoint: %v: %s", err, harnessDiagnostics(output))
 	}

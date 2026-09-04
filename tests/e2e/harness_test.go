@@ -348,7 +348,6 @@ func (h *e2eHarness) writeOverride() {
         target: /data
         bind:
           create_host_path: false
-    networks: [test-ingress]
     healthcheck:
       test: [CMD, /healthcheck.sh]
       interval: 2s
@@ -372,7 +371,6 @@ func (h *e2eHarness) writeOverride() {
     tmpfs: [/tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777]
     security_opt: [no-new-privileges:true]
     cap_drop: [ALL]
-    networks: [egress]
   moto-b2:
     profiles: [e2e-repositories]
     image: vaultwarden-less-moto:local
@@ -383,10 +381,7 @@ func (h *e2eHarness) writeOverride() {
     tmpfs: [/tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777]
     security_opt: [no-new-privileges:true]
     cap_drop: [ALL]
-    networks: [egress]
 %s%s%s
-networks:
-  test-ingress: {}
 `, h.vaultwardenPort, uid, gid, uid, gid, sourceService,
 		service("restored-primary", filepath.Join(h.deploymentRoot, "restore", "primary-copy"), h.primaryPort),
 		service("restored-b2", filepath.Join(h.deploymentRoot, "restore", "b2-copy"), h.b2Port),
@@ -401,9 +396,15 @@ func (h *e2eHarness) validateComposeModel() {
 	)
 	var model struct {
 		Services map[string]struct {
-			User     string `json:"user"`
-			ReadOnly bool   `json:"read_only"`
-			Volumes  []struct {
+			User     string         `json:"user"`
+			ReadOnly bool           `json:"read_only"`
+			Networks map[string]any `json:"networks"`
+			Ports    []struct {
+				HostIP    string `json:"host_ip"`
+				Target    int    `json:"target"`
+				Published string `json:"published"`
+			} `json:"ports"`
+			Volumes []struct {
 				Type string `json:"type"`
 				Bind struct {
 					CreateHostPath bool `json:"create_host_path"`
@@ -417,6 +418,14 @@ func (h *e2eHarness) validateComposeModel() {
 	if err := json.Unmarshal([]byte(output), &model); err != nil {
 		h.t.Fatalf("decode Compose model: %v: %s", err, harnessDiagnostics(output))
 	}
+	for name, service := range model.Services {
+		if len(service.Networks) != 1 {
+			h.t.Fatalf("service %s does not use exactly one network: %#v", name, service.Networks)
+		}
+		if _, exists := service.Networks["default"]; !exists {
+			h.t.Fatalf("service %s does not use the default network: %#v", name, service.Networks)
+		}
+	}
 	for _, name := range []string{"vaultwarden", "backup", "proxy", "maintenance"} {
 		service, exists := model.Services[name]
 		if !exists || service.User != fmt.Sprintf("%d:%d", os.Geteuid(), os.Getegid()) || !service.ReadOnly {
@@ -428,8 +437,16 @@ func (h *e2eHarness) validateComposeModel() {
 			}
 		}
 	}
-	if network, exists := model.Networks["backend"]; !exists || !network.Internal {
-		h.t.Fatalf("backend network is not internal: %#v", model.Networks)
+	if len(model.Networks) != 1 {
+		h.t.Fatalf("Compose model does not have exactly one network: %#v", model.Networks)
+	}
+	if network, exists := model.Networks["default"]; !exists || network.Internal {
+		h.t.Fatalf("default network is missing or internal: %#v", model.Networks)
+	}
+	proxy := model.Services["proxy"]
+	if len(proxy.Ports) != 1 || proxy.Ports[0].HostIP != "127.0.0.1" ||
+		proxy.Ports[0].Target != 8080 || proxy.Ports[0].Published != strconv.Itoa(h.proxyPort) {
+		h.t.Fatalf("proxy lost its exact loopback publication: %#v", proxy.Ports)
 	}
 }
 
@@ -489,8 +506,18 @@ func (h *e2eHarness) startProduction() {
 	for _, service := range []string{"vaultwarden", "backup", "proxy"} {
 		h.waitHealthy(service, 3*time.Minute)
 	}
+	h.validateProxyBinding()
 	h.setBackend(loopbackEndpoint(h.proxyPort))
 	h.waitHTTP(h.publicTLS+"/.vaultwarden-less/healthz", http.StatusNoContent, time.Minute)
+}
+
+func (h *e2eHarness) validateProxyBinding() {
+	h.t.Helper()
+	address := strings.TrimSpace(h.compose("port", "proxy", "8080"))
+	expected := net.JoinHostPort("127.0.0.1", strconv.Itoa(h.proxyPort))
+	if address != expected {
+		h.t.Fatalf("proxy published address = %q, want %q", address, expected)
+	}
 }
 
 func (h *e2eHarness) startSource() {

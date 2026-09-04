@@ -154,6 +154,7 @@ func TestTwoTargetBackupRestore(t *testing.T) {
 	// occurs between the failed attempt and the b2 catch-up.
 	h.compose("up", "--detach", "proxy")
 	h.waitHealthy("proxy", 3*time.Minute)
+	h.validateProxyBinding()
 	h.setBackend(loopbackEndpoint(h.proxyPort))
 	h.waitHTTP(h.publicTLS+"/.vaultwarden-less/healthz", 204, time.Minute)
 	restoreB2()

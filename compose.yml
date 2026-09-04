@@ -66,8 +66,6 @@ services:
         target: /data
         bind:
           create_host_path: false
-    networks:
-      - backend
     healthcheck:
       test: [CMD, /healthcheck.sh]
       interval: 10s
@@ -103,9 +101,6 @@ services:
         read_only: true
         bind:
           create_host_path: false
-    networks:
-      - backend
-      - egress
     healthcheck:
       test: [CMD, /bin/vaultwarden-less-backup, healthcheck]
       interval: 10s
@@ -126,8 +121,6 @@ services:
         condition: service_healthy
     ports:
       - "127.0.0.1:${LISTEN_PORT:?LISTEN_PORT is required}:8080"
-    networks:
-      - backend
     healthcheck:
       test: [CMD, /bin/vaultwarden-less-proxy, healthcheck]
       interval: 10s
@@ -157,15 +150,8 @@ services:
         read_only: true
         bind:
           create_host_path: false
-    networks:
-      - egress
     healthcheck:
       test: [CMD, /bin/vaultwarden-less-backup, version]
       interval: 10s
       timeout: 3s
       retries: 3
-
-networks:
-  backend:
-    internal: true
-  egress: {}
