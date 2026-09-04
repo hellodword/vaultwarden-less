@@ -15,19 +15,15 @@ import (
 
 	"github.com/hellodword/vaultwarden-less/internal/buildinfo"
 	"github.com/hellodword/vaultwarden-less/internal/config"
-	"github.com/hellodword/vaultwarden-less/internal/deployment"
-	"github.com/hellodword/vaultwarden-less/internal/importer"
 	"github.com/hellodword/vaultwarden-less/internal/privatefs"
 	"github.com/hellodword/vaultwarden-less/internal/restic"
 	restoretool "github.com/hellodword/vaultwarden-less/internal/restore"
 	"github.com/hellodword/vaultwarden-less/internal/snapshot"
-	"github.com/hellodword/vaultwarden-less/internal/upgrade"
 )
 
 type repository interface {
 	VerifyVersion(context.Context) error
 	Ensure(context.Context, config.Target, snapshot.Manifest) (restic.SyncResult, error)
-	EnsureExact(context.Context, config.Target, snapshot.Manifest) (restic.SyncResult, error)
 	Snapshots(context.Context, config.Target, int) ([]restic.Snapshot, bool, error)
 	Init(context.Context, config.Target) error
 	Unlock(context.Context, config.Target) error
@@ -41,7 +37,6 @@ type restoreFunc func(context.Context, restoretool.Repository, restoretool.Reque
 
 type commandEnvironment struct {
 	loadBackup        func(string) (*config.Backup, error)
-	loadDeployment    func() (config.Deployment, error)
 	loadCredentials   func(string, *config.Backup) (*config.RoleCredentials, error)
 	loadNotifiers     func(string, *config.Backup) ([]config.Notifier, error)
 	validatePasswords func(string, *config.Backup) error
@@ -50,9 +45,6 @@ type commandEnvironment struct {
 	validateMount     func(string, string) error
 	repository        func(*config.Backup) (repository, error)
 	restore           restoreFunc
-	requireActive     func(string, string, string) error
-	allowServe        func(context.Context, string, string, deployment.Identity, config.Deployment) error
-	drillCheck        func(context.Context) error
 	httpClient        *http.Client
 	workerURL         string
 	deploymentRoot    string
@@ -65,7 +57,6 @@ type commandEnvironment struct {
 	stagingDir        string
 	cacheDir          string
 	restoreRoot       string
-	stateDir          string
 	now               func() time.Time
 	ready             func() bool
 	logger            *slog.Logger
@@ -75,7 +66,6 @@ func defaultEnvironment(stderr io.Writer) commandEnvironment {
 	logger := slog.New(slog.NewJSONHandler(stderr, nil))
 	environment := commandEnvironment{
 		loadBackup:        config.LoadBackup,
-		loadDeployment:    config.LoadDeployment,
 		loadCredentials:   config.LoadRoleCredentials,
 		loadNotifiers:     config.LoadNotifierCredentials,
 		validatePasswords: config.ValidatePasswordDirectory,
@@ -92,17 +82,6 @@ func defaultEnvironment(stderr io.Writer) commandEnvironment {
 		},
 		validateMount: validateMountedPath,
 		restore:       restoretool.Run,
-		requireActive: func(stateDir, projectCommit, release string) error {
-			_, err := deployment.RequireActive(stateDir, deployment.Identity{ProjectCommit: projectCommit, Release: release})
-			return err
-		},
-		allowServe: func(ctx context.Context, stateDir, dataDir string, identity deployment.Identity, configured config.Deployment) error {
-			if err := importer.NormalServingAllowed(stateDir, identity); err != nil {
-				return err
-			}
-			return upgrade.ServingAllowed(ctx, stateDir, dataDir, identity, configured)
-		},
-		drillCheck: checkUpgradeDrill,
 		httpClient: &http.Client{
 			Timeout: 5 * time.Second,
 			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
@@ -120,7 +99,6 @@ func defaultEnvironment(stderr io.Writer) commandEnvironment {
 		stagingDir:      config.StagingDir,
 		cacheDir:        config.CacheDir,
 		restoreRoot:     config.RestoreRoot,
-		stateDir:        config.StateDir,
 		now:             time.Now,
 		ready:           buildinfo.Ready,
 		logger:          logger,

@@ -19,7 +19,6 @@ import (
 	"time"
 
 	"github.com/hellodword/vaultwarden-less/internal/upstream"
-	"github.com/mattn/go-sqlite3"
 )
 
 const (
@@ -309,29 +308,6 @@ func TestBuilderCreatesAndVerifiesExactRecoverySet(t *testing.T) {
 	}
 	if second.ContentID != manifest.ContentID {
 		t.Fatal("unchanged source produced a different content ID")
-	}
-}
-
-func TestVerifyOwnedBindsTheCompleteTreeToTheExpectedIdentity(t *testing.T) {
-	data := syntheticData(t, true)
-	_, point := buildFixture(t, data.dataDir)
-	uid, gid := uint32(os.Geteuid()), uint32(os.Getegid())
-	if _, err := VerifyOwned(context.Background(), point, uid, gid); err != nil {
-		t.Fatalf("verify explicit owner: %v", err)
-	}
-	wrongUID := uid + 1
-	if wrongUID == 0 {
-		wrongUID = uid - 1
-	}
-	if _, err := VerifyOwned(context.Background(), point, wrongUID, gid); err == nil {
-		t.Fatal("recovery point owned by a different UID was accepted")
-	}
-	wrongGID := gid + 1
-	if wrongGID == 0 {
-		wrongGID = gid - 1
-	}
-	if _, err := VerifyOwned(context.Background(), point, uid, wrongGID); err == nil {
-		t.Fatal("recovery point owned by a different GID was accepted")
 	}
 }
 
@@ -637,164 +613,6 @@ func TestOnlineBackupCapturesOneConsistentWALTransactionDuringWrites(t *testing.
 			t.Fatalf("recovery retained SQLite sidecar %s: %v", suffix, err)
 		}
 	}
-}
-
-func TestPrepareStoppedDatabaseCheckpointsPersistentWAL(t *testing.T) {
-	data := syntheticData(t, true)
-	data.database.SetMaxOpenConns(1)
-	data.database.SetMaxIdleConns(1)
-	connection, err := data.database.Conn(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := connection.Raw(func(raw any) error {
-		sqlite, ok := raw.(*sqlite3.SQLiteConn)
-		if !ok {
-			return fmt.Errorf("unexpected SQLite driver")
-		}
-		return sqlite.SetFileControlInt("main", sqlite3.SQLITE_FCNTL_PERSIST_WAL, 1)
-	}); err != nil {
-		_ = connection.Close()
-		t.Fatal(err)
-	}
-	const marker = "stopped-wal-marker"
-	if _, err := connection.ExecContext(
-		context.Background(),
-		"UPDATE ciphers SET name = ? WHERE uuid = ?",
-		marker,
-		testCipherID,
-	); err != nil {
-		_ = connection.Close()
-		t.Fatal(err)
-	}
-	if err := connection.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := data.database.Close(); err != nil {
-		t.Fatal(err)
-	}
-	databasePath := filepath.Join(data.dataDir, "db.sqlite3")
-	for _, suffix := range []string{"", "-wal", "-shm"} {
-		path := databasePath + suffix
-		if info, err := os.Lstat(path); err != nil || !info.Mode().IsRegular() {
-			t.Fatalf("persistent SQLite file %q = %v/%v", suffix, info, err)
-		}
-		if err := os.Chmod(path, 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	if err := PrepareStoppedDatabase(context.Background(), databasePath); err != nil {
-		t.Fatal(err)
-	}
-	for _, suffix := range []string{"-wal", "-shm", "-journal"} {
-		if _, err := os.Lstat(databasePath + suffix); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("prepared database retained %s: %v", suffix, err)
-		}
-	}
-	prepared, err := sql.Open("sqlite3", sqliteURI(databasePath, "ro"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = prepared.Close() }()
-	var gotMarker, journalMode string
-	if err := prepared.QueryRow("SELECT name FROM ciphers WHERE uuid = ?", testCipherID).Scan(&gotMarker); err != nil {
-		t.Fatal(err)
-	}
-	if err := prepared.QueryRow("PRAGMA journal_mode").Scan(&journalMode); err != nil {
-		t.Fatal(err)
-	}
-	if gotMarker != marker || journalMode != "delete" {
-		t.Fatalf("prepared database marker/journal = %q/%q", gotMarker, journalMode)
-	}
-}
-
-func TestPrepareStoppedDatabaseRejectsLiveReaderWithoutRemovingWAL(t *testing.T) {
-	data := syntheticData(t, true)
-	reader, err := data.database.Begin()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = reader.Rollback() }()
-	var count int
-	if err := reader.QueryRow("SELECT count(*) FROM ciphers").Scan(&count); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := data.database.Exec(
-		"UPDATE ciphers SET name = 'after-reader' WHERE uuid = ?",
-		testCipherID,
-	); err != nil {
-		t.Fatal(err)
-	}
-	databasePath := filepath.Join(data.dataDir, "db.sqlite3")
-	ctx, cancel := context.WithTimeout(context.Background(), 7*time.Second)
-	defer cancel()
-	if err := PrepareStoppedDatabase(ctx, databasePath); err == nil {
-		t.Fatal("database with a live reader was prepared")
-	}
-	if info, err := os.Lstat(databasePath + "-wal"); err != nil || !info.Mode().IsRegular() || info.Size() == 0 {
-		t.Fatalf("live WAL was removed or replaced: %v/%v", info, err)
-	}
-	var marker string
-	if err := data.database.QueryRow("SELECT name FROM ciphers WHERE uuid = ?", testCipherID).Scan(&marker); err != nil {
-		t.Fatal(err)
-	}
-	if marker != "after-reader" {
-		t.Fatalf("live database marker = %q", marker)
-	}
-}
-
-func TestPrepareStoppedDatabaseRejectsUnsafeOrCorruptInput(t *testing.T) {
-	t.Run("corrupt", func(t *testing.T) {
-		dataDir := filepath.Join(t.TempDir(), "data")
-		if err := os.Mkdir(dataDir, 0o700); err != nil {
-			t.Fatal(err)
-		}
-		path := filepath.Join(dataDir, "db.sqlite3")
-		original := []byte("not a SQLite database")
-		writeFixture(t, path, original)
-		if err := PrepareStoppedDatabase(context.Background(), path); err == nil {
-			t.Fatal("corrupt database was prepared")
-		}
-		if got, err := os.ReadFile(path); err != nil || !bytes.Equal(got, original) {
-			t.Fatalf("corrupt database changed = %q/%v", got, err)
-		}
-	})
-	t.Run("symlink", func(t *testing.T) {
-		root := t.TempDir()
-		dataDir := filepath.Join(root, "data")
-		if err := os.Mkdir(dataDir, 0o700); err != nil {
-			t.Fatal(err)
-		}
-		target := filepath.Join(root, "target")
-		writeFixture(t, target, []byte("target"))
-		path := filepath.Join(dataDir, "db.sqlite3")
-		if err := os.Symlink(target, path); err != nil {
-			t.Fatal(err)
-		}
-		if err := PrepareStoppedDatabase(context.Background(), path); err == nil {
-			t.Fatal("symlink database was prepared")
-		}
-		if got, err := os.ReadFile(target); err != nil || string(got) != "target" {
-			t.Fatalf("symlink target changed = %q/%v", got, err)
-		}
-	})
-	t.Run("hard link", func(t *testing.T) {
-		root := t.TempDir()
-		dataDir := filepath.Join(root, "data")
-		if err := os.Mkdir(dataDir, 0o700); err != nil {
-			t.Fatal(err)
-		}
-		target := filepath.Join(root, "target")
-		writeFixture(t, target, []byte("target"))
-		path := filepath.Join(dataDir, "db.sqlite3")
-		if err := os.Link(target, path); err != nil {
-			t.Fatal(err)
-		}
-		if err := PrepareStoppedDatabase(context.Background(), path); err == nil {
-			t.Fatal("hard-linked database was prepared")
-		}
-	})
 }
 
 func TestBuilderRejectsMissingAttachmentAndSendWithoutPublishing(t *testing.T) {

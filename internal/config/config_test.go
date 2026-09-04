@@ -6,7 +6,6 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"encoding/pem"
-	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -271,46 +270,6 @@ func TestPasswordDirectoryRequiresExactSetAndOnePrivateLine(t *testing.T) {
 	writeModeFile(t, filepath.Join(directory, "unexpected"), "password", 0o600)
 	if err := ValidatePasswordDirectory(directory, cfg); err == nil {
 		t.Fatal("unexpected password file was accepted")
-	}
-}
-
-func TestDeploymentEnvironmentUsesExactResolvedValues(t *testing.T) {
-	valid := map[string]string{
-		"DEPLOYMENT_ROOT": "/srv/vaultwarden-less",
-		"RUNTIME_UID":     fmt.Sprint(os.Geteuid()),
-		"RUNTIME_GID":     fmt.Sprint(os.Getegid()),
-		"LISTEN_PORT":     "8080",
-		"DRILL_PORT":      "8081",
-	}
-	for name, value := range valid {
-		t.Setenv(name, value)
-	}
-	deployment, err := LoadDeployment()
-	if err != nil || deployment.ListenPort != 8080 || deployment.DrillPort != 8081 {
-		t.Fatalf("deployment = %#v/%v", deployment, err)
-	}
-	for name, mutate := range map[string]func(map[string]string){
-		"missing":      func(values map[string]string) { delete(values, "LISTEN_PORT") },
-		"quote":        func(values map[string]string) { values["LISTEN_PORT"] = `"8080"` },
-		"leading zero": func(values map[string]string) { values["LISTEN_PORT"] = "08080" },
-		"same ports":   func(values map[string]string) { values["DRILL_PORT"] = "8080" },
-		"low port":     func(values map[string]string) { values["LISTEN_PORT"] = "80" },
-		"root":         func(values map[string]string) { values["DEPLOYMENT_ROOT"] = "/" },
-		"relative root": func(values map[string]string) {
-			values["DEPLOYMENT_ROOT"] = "deployment"
-		},
-		"mismatched uid": func(values map[string]string) { values["RUNTIME_UID"] = "4294967294" },
-	} {
-		t.Run(name, func(t *testing.T) {
-			values := make(map[string]string, len(valid))
-			for key, value := range valid {
-				values[key] = value
-			}
-			mutate(values)
-			if _, err := decodeDeploymentEnvironment(values); err == nil {
-				t.Fatal("invalid deployment environment was accepted")
-			}
-		})
 	}
 }
 

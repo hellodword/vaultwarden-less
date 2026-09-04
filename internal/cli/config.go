@@ -35,12 +35,6 @@ func configCommand(configPath *string, environment commandEnvironment) *cobra.Co
 			return nil
 		},
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			if environment.loadDeployment == nil {
-				return commandFailure(codeInternal, "Deployment validation is unavailable", nil)
-			}
-			if _, err := environment.loadDeployment(); err != nil {
-				return commandFailure(codeInvalidConfig, "The deployment environment is invalid", err)
-			}
 			cfg, err := environment.backup(*configPath)
 			if err != nil {
 				return commandFailure(codeInvalidConfig, "The backup configuration is invalid", err)
@@ -66,7 +60,7 @@ func configCommand(configPath *string, environment commandEnvironment) *cobra.Co
 			if environment.validateDirectory == nil {
 				return commandFailure(codeInternal, "Private directory validation is unavailable", nil)
 			}
-			for _, path := range []string{environment.deploymentRoot, environment.dataDir, environment.stagingDir, environment.cacheDir, environment.restoreRoot, environment.stateDir} {
+			for _, path := range []string{environment.deploymentRoot, environment.dataDir, environment.stagingDir, environment.cacheDir, environment.restoreRoot} {
 				if err := environment.validateDirectory(path); err != nil {
 					return commandFailure(codeUnsafePath, fmt.Sprintf("A required private directory is unsafe: %s", path), err)
 				}
@@ -83,7 +77,6 @@ func configCommand(configPath *string, environment commandEnvironment) *cobra.Co
 				{filepath.Join(environment.deploymentRoot, "data"), environment.dataDir},
 				{filepath.Join(environment.deploymentRoot, "staging"), environment.stagingDir},
 				{filepath.Join(environment.deploymentRoot, "restore"), environment.restoreRoot},
-				{filepath.Join(environment.deploymentRoot, "state"), environment.stateDir},
 			}
 			if role == "backup" {
 				mounts = append(mounts, [2]string{

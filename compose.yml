@@ -23,7 +23,6 @@ x-deployment-environment: &deployment-environment
   RUNTIME_UID: "${RUNTIME_UID:?RUNTIME_UID is required}"
   RUNTIME_GID: "${RUNTIME_GID:?RUNTIME_GID is required}"
   LISTEN_PORT: "${LISTEN_PORT:?LISTEN_PORT is required}"
-  DRILL_PORT: "${DRILL_PORT:?DRILL_PORT is required}"
 
 x-backup-config-mount: &backup-config-mount
   type: bind
@@ -54,7 +53,6 @@ services:
     image: "vaultwarden-less-vaultwarden:${VWLESS_IMAGE_TAG:?VWLESS_IMAGE_TAG is required}"
     pull_policy: never
     hostname: vaultwarden
-    command: [normal]
     environment: *deployment-environment
     env_file:
       - "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/config/vaultwarden.env"
@@ -62,12 +60,6 @@ services:
       - type: bind
         source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/data"
         target: /data
-        bind:
-          create_host_path: false
-      - type: bind
-        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/state"
-        target: /state
-        read_only: true
         bind:
           create_host_path: false
     networks:
@@ -101,11 +93,6 @@ services:
       - type: bind
         source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/staging"
         target: /staging
-        bind:
-          create_host_path: false
-      - type: bind
-        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/state"
-        target: /state
         bind:
           create_host_path: false
       - type: bind
@@ -145,13 +132,6 @@ services:
         condition: service_healthy
     ports:
       - "127.0.0.1:${LISTEN_PORT:?LISTEN_PORT is required}:8080"
-    volumes:
-      - type: bind
-        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/state"
-        target: /state
-        read_only: true
-        bind:
-          create_host_path: false
     networks:
       - app
       - events
@@ -202,11 +182,6 @@ services:
       - type: bind
         source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/restore"
         target: /restore
-        bind:
-          create_host_path: false
-      - type: bind
-        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/state"
-        target: /state
         bind:
           create_host_path: false
       - type: bind
@@ -265,11 +240,6 @@ services:
         bind:
           create_host_path: false
       - type: bind
-        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/state"
-        target: /state
-        bind:
-          create_host_path: false
-      - type: bind
         source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/credentials/maintenance.yaml"
         target: /run/credentials/role.yaml
         read_only: true
@@ -306,11 +276,6 @@ services:
         bind:
           create_host_path: false
       - type: bind
-        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/state"
-        target: /state
-        bind:
-          create_host_path: false
-      - type: bind
         source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/credentials/maintenance.yaml"
         target: /run/credentials/role.yaml
         read_only: true
@@ -318,87 +283,6 @@ services:
           create_host_path: false
     networks:
       - maintenance-outbound
-
-  deployment-admin:
-    <<: *service-defaults
-    image: "vaultwarden-less-backup:${VWLESS_IMAGE_TAG:?VWLESS_IMAGE_TAG is required}"
-    pull_policy: never
-    profiles: [deployment]
-    restart: "no"
-    network_mode: none
-    entrypoint: [/bin/vaultwarden-less-backup]
-    command: [--help]
-    environment: *deployment-environment
-    volumes:
-      - type: bind
-        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}"
-        target: /deployment-root
-        bind:
-          create_host_path: false
-      - type: bind
-        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/data"
-        target: /data
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/state"
-        target: /state
-        bind:
-          create_host_path: false
-
-  import-vaultwarden:
-    <<: *service-defaults
-    image: "vaultwarden-less-vaultwarden:${VWLESS_IMAGE_TAG:?VWLESS_IMAGE_TAG is required}"
-    pull_policy: never
-    profiles: [import]
-    restart: "no"
-    hostname: import-vaultwarden
-    command: [import]
-    env_file:
-      - "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/config/vaultwarden.env"
-    environment:
-      <<: *deployment-environment
-      DATA_FOLDER: /data
-      DATABASE_URL: sqlite:///data/db.sqlite3
-      RSA_KEY_FILENAME: /data/rsa_key
-      ATTACHMENTS_FOLDER: /data/attachments
-      SENDS_FOLDER: /data/sends
-      WEB_VAULT_ENABLED: "false"
-      ENABLE_WEBSOCKET: "false"
-      PUSH_ENABLED: "false"
-      SIGNUPS_ALLOWED: "false"
-      INVITATIONS_ALLOWED: "false"
-      DISABLE_ICON_DOWNLOAD: "true"
-    volumes:
-      - type: bind
-        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/import/source"
-        target: /import/source
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/import/candidate"
-        target: /data
-        bind:
-          create_host_path: false
-      - type: bind
-        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/state"
-        target: /state
-        read_only: true
-        bind:
-          create_host_path: false
-    ports:
-      - "127.0.0.1:${DRILL_PORT:?DRILL_PORT is required}:80"
-    networks:
-      - import
-      - import-ingress
-    healthcheck:
-      test: [CMD, /healthcheck.sh]
-      interval: 10s
-      timeout: 5s
-      retries: 12
-      start_period: 30s
 
   restore:
     <<: *service-defaults
@@ -419,11 +303,6 @@ services:
         bind:
           create_host_path: false
       - type: bind
-        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/state"
-        target: /state
-        bind:
-          create_host_path: false
-      - type: bind
         source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/credentials/maintenance.yaml"
         target: /run/credentials/role.yaml
         read_only: true
@@ -431,81 +310,6 @@ services:
           create_host_path: false
     networks:
       - maintenance-outbound
-
-  drill-copy:
-    <<: *service-defaults
-    image: "vaultwarden-less-vaultwarden:${VWLESS_IMAGE_TAG:?VWLESS_IMAGE_TAG is required}"
-    pull_policy: never
-    profiles: [drill]
-    restart: "no"
-    user: "0:0"
-    network_mode: none
-    environment:
-      <<: *deployment-environment
-    cap_add: [CHOWN, DAC_OVERRIDE, FOWNER]
-    entrypoint: [/bin/vaultwarden-less-drill-copy]
-    volumes:
-      - type: bind
-        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/restore/drill"
-        target: /source
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: volume
-        source: drill-data
-        target: /drill-data
-
-  drill-vaultwarden:
-    <<: *service-defaults
-    image: "vaultwarden-less-vaultwarden:${VWLESS_IMAGE_TAG:?VWLESS_IMAGE_TAG is required}"
-    pull_policy: never
-    profiles: [drill]
-    restart: "no"
-    command: [drill]
-    depends_on:
-      drill-copy:
-        condition: service_completed_successfully
-    environment:
-      <<: *deployment-environment
-      DOMAIN: "http://127.0.0.1:${DRILL_PORT:?DRILL_PORT is required}"
-      DATA_FOLDER: /data
-      DATABASE_URL: sqlite:///data/db.sqlite3
-      RSA_KEY_FILENAME: /data/rsa_key
-      ATTACHMENTS_FOLDER: /data/attachments
-      SENDS_FOLDER: /data/sends
-      WEB_VAULT_ENABLED: "false"
-      ENABLE_WEBSOCKET: "false"
-      PUSH_ENABLED: "false"
-      SIGNUPS_ALLOWED: "false"
-      INVITATIONS_ALLOWED: "false"
-      DISABLE_ICON_DOWNLOAD: "true"
-    volumes:
-      - type: volume
-        source: drill-data
-        target: /data
-      - type: bind
-        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/restore/drill"
-        target: /recovery
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
-        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/state"
-        target: /state
-        read_only: true
-        bind:
-          create_host_path: false
-    ports:
-      - "127.0.0.1:${DRILL_PORT:?DRILL_PORT is required}:80"
-    networks:
-      - drill
-      - drill-ingress
-    healthcheck:
-      test: [CMD, /healthcheck.sh]
-      interval: 10s
-      timeout: 5s
-      retries: 12
-      start_period: 30s
 
 networks:
   app:
@@ -517,16 +321,3 @@ networks:
       com.docker.network.bridge.enable_ip_masquerade: "false"
   backup-outbound: {}
   maintenance-outbound: {}
-  drill:
-    internal: true
-  drill-ingress:
-    driver_opts:
-      com.docker.network.bridge.enable_ip_masquerade: "false"
-  import:
-    internal: true
-  import-ingress:
-    driver_opts:
-      com.docker.network.bridge.enable_ip_masquerade: "false"
-
-volumes:
-  drill-data: {}

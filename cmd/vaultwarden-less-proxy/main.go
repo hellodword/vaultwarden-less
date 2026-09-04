@@ -15,18 +15,13 @@ import (
 	"time"
 
 	"github.com/hellodword/vaultwarden-less/internal/buildinfo"
-	"github.com/hellodword/vaultwarden-less/internal/config"
-	deploymentstate "github.com/hellodword/vaultwarden-less/internal/deployment"
-	"github.com/hellodword/vaultwarden-less/internal/importer"
 	proxyserver "github.com/hellodword/vaultwarden-less/internal/proxy"
-	"github.com/hellodword/vaultwarden-less/internal/upgrade"
 )
 
 type proxyEnvironment struct {
-	ready      func() bool
-	allowServe func() error
-	healthURL  string
-	serve      func(context.Context, io.Writer) error
+	ready     func() bool
+	healthURL string
+	serve     func(context.Context, io.Writer) error
 }
 
 type proxyCommandError struct {
@@ -46,27 +41,7 @@ func main() {
 
 func execute(ctx context.Context, arguments []string, stdout, stderr io.Writer) int {
 	environment := proxyEnvironment{
-		ready: buildinfo.Ready,
-		allowServe: func() error {
-			deployment, err := config.LoadDeployment()
-			if err != nil {
-				return err
-			}
-			if _, err := deploymentstate.RequireActive(config.StateDir, deploymentstate.Identity{
-				ProjectCommit: buildinfo.ProjectCommit,
-				Release:       buildinfo.Release,
-			}); err != nil {
-				return err
-			}
-			identity := deploymentstate.Identity{
-				ProjectCommit: buildinfo.ProjectCommit,
-				Release:       buildinfo.Release,
-			}
-			if err := importer.NormalServingAllowed(config.StateDir, identity); err != nil {
-				return err
-			}
-			return upgrade.StateOnlyServingAllowed(ctx, config.StateDir, identity, deployment)
-		},
+		ready:     buildinfo.Ready,
 		healthURL: "http://127.0.0.1:8080" + proxyserver.HealthPath,
 		serve:     serve,
 	}
@@ -118,12 +93,6 @@ func executeWithEnvironment(ctx context.Context, arguments []string, stdout, std
 	case "serve":
 		if environment.ready == nil || !environment.ready() {
 			return writeProxyError(stderr, &proxyCommandError{code: "not_ready", message: "A clean release identity is required for this command"})
-		}
-		if environment.allowServe == nil {
-			return writeProxyError(stderr, &proxyCommandError{code: "internal_error", message: "Upgrade serving gate is unavailable"})
-		}
-		if err := environment.allowServe(); err != nil {
-			return writeProxyError(stderr, &proxyCommandError{code: "not_ready", message: "Proxy serving is frozen pending upgrade completion"})
 		}
 		if environment.serve == nil {
 			return writeProxyError(stderr, &proxyCommandError{code: "internal_error", message: "Proxy serving is unavailable"})

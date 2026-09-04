@@ -45,14 +45,10 @@ func DecodeManifest(data []byte) (Manifest, error) {
 }
 
 func Verify(ctx context.Context, root string) (Manifest, error) {
-	return VerifyOwned(ctx, root, uint32(os.Geteuid()), uint32(os.Getegid()))
+	return verifyOwned(ctx, root, uint32(os.Geteuid()), uint32(os.Getegid()))
 }
 
-// VerifyOwned verifies a recovery point whose complete tree is owned by the
-// explicitly supplied identity. It is used by the bounded root-only drill copy
-// helper; normal callers should use Verify to bind ownership to their effective
-// identity.
-func VerifyOwned(ctx context.Context, root string, uid, gid uint32) (Manifest, error) {
+func verifyOwned(ctx context.Context, root string, uid, gid uint32) (Manifest, error) {
 	if err := validateDirectoryOwnership(root, uid, gid); err != nil {
 		return Manifest{}, fmt.Errorf("recovery root is invalid: %w", err)
 	}

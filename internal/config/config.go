@@ -13,7 +13,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -34,7 +33,6 @@ const (
 	ResticPasswordRoot      = "/run/credentials/restic"
 	NotifierCredentialsPath = "/run/credentials/notifiers.yaml"
 	DeploymentRoot          = "/deployment-root"
-	ImportRoot              = "/import"
 
 	ListenAddress     = "0.0.0.0:9090"
 	WorkerURL         = "http://backup:9090"
@@ -43,7 +41,6 @@ const (
 	RecoveryPointPath = "/staging/point"
 	CacheDir          = "/cache"
 	RestoreRoot       = "/restore"
-	StateDir          = "/state"
 	ResticBinary      = "/bin/restic"
 
 	QuietWindow           = 30 * time.Second
@@ -64,7 +61,6 @@ const (
 var (
 	namePattern        = regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`)
 	environmentPattern = regexp.MustCompile(`^[A-Z_][A-Z0-9_]{0,127}$`)
-	canonicalDecimal   = regexp.MustCompile(`^[1-9][0-9]*$`)
 	forbiddenEnvNames  = map[string]struct{}{
 		"PATH": {}, "HOME": {}, "TMPDIR": {}, "TMP": {}, "TEMP": {},
 		"LD_PRELOAD": {}, "LD_LIBRARY_PATH": {}, "GODEBUG": {},
@@ -127,14 +123,6 @@ type RoleTarget struct {
 
 type RoleCredentials struct {
 	Targets map[string]RoleTarget `yaml:"targets"`
-}
-
-type Deployment struct {
-	Root       string
-	RuntimeUID uint32
-	RuntimeGID uint32
-	ListenPort uint16
-	DrillPort  uint16
 }
 
 func LoadBackup(path string) (*Backup, error) {
@@ -490,65 +478,6 @@ func parseHTTPSURL(raw string) (*url.URL, error) {
 		return nil, fmt.Errorf("URL is invalid")
 	}
 	return parsed, nil
-}
-
-func LoadDeployment() (Deployment, error) {
-	values := make(map[string]string, len(deploymentEnvironmentNames))
-	for _, name := range deploymentEnvironmentNames {
-		value, present := os.LookupEnv(name)
-		if !present || value == "" {
-			return Deployment{}, fmt.Errorf("%s is required", name)
-		}
-		values[name] = value
-	}
-	return decodeDeploymentEnvironment(values)
-}
-
-var deploymentEnvironmentNames = [...]string{
-	"DEPLOYMENT_ROOT", "RUNTIME_UID", "RUNTIME_GID", "LISTEN_PORT", "DRILL_PORT",
-}
-
-func decodeDeploymentEnvironment(values map[string]string) (Deployment, error) {
-	root := values["DEPLOYMENT_ROOT"]
-	if root == "" || root == string(filepath.Separator) || !filepath.IsAbs(root) || filepath.Clean(root) != root {
-		return Deployment{}, fmt.Errorf("DEPLOYMENT_ROOT is invalid")
-	}
-	deployment := Deployment{Root: root}
-	uid, err := parseCanonicalUint(values["RUNTIME_UID"], 1, 4294967294)
-	if err != nil {
-		return Deployment{}, fmt.Errorf("RUNTIME_UID is invalid")
-	}
-	gid, err := parseCanonicalUint(values["RUNTIME_GID"], 1, 4294967294)
-	if err != nil {
-		return Deployment{}, fmt.Errorf("RUNTIME_GID is invalid")
-	}
-	listen, err := parseCanonicalUint(values["LISTEN_PORT"], 1024, 65535)
-	if err != nil {
-		return Deployment{}, fmt.Errorf("LISTEN_PORT is invalid")
-	}
-	drill, err := parseCanonicalUint(values["DRILL_PORT"], 1024, 65535)
-	if err != nil || drill == listen {
-		return Deployment{}, fmt.Errorf("DRILL_PORT is invalid or duplicates LISTEN_PORT")
-	}
-	deployment.RuntimeUID = uint32(uid)
-	deployment.RuntimeGID = uint32(gid)
-	deployment.ListenPort = uint16(listen)
-	deployment.DrillPort = uint16(drill)
-	if deployment.RuntimeUID != uint32(os.Geteuid()) || deployment.RuntimeGID != uint32(os.Getegid()) {
-		return Deployment{}, fmt.Errorf("runtime identity does not match the validating process")
-	}
-	return deployment, nil
-}
-
-func parseCanonicalUint(raw string, minimum, maximum uint64) (uint64, error) {
-	if !canonicalDecimal.MatchString(raw) {
-		return 0, fmt.Errorf("not canonical decimal")
-	}
-	value, err := strconv.ParseUint(raw, 10, 64)
-	if err != nil || value < minimum || value > maximum {
-		return 0, fmt.Errorf("out of range")
-	}
-	return value, nil
 }
 
 func ReadPassword(root, target string) (string, error) {

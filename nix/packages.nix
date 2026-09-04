@@ -56,18 +56,6 @@ let
     cgoEnabled = false;
   };
 
-  drillCopy = productPackage {
-    name = "vaultwarden-less-drill-copy";
-    subPackage = "cmd/vaultwarden-less-drill-copy";
-    cgoEnabled = true;
-  };
-
-  vaultwardenGate = productPackage {
-    name = "vaultwarden-less-vaultwarden";
-    subPackage = "cmd/vaultwarden-less-vaultwarden";
-    cgoEnabled = false;
-  };
-
   labels =
     title:
     {
@@ -136,15 +124,12 @@ let
       '';
       contents = [
         pkgs.vaultwarden
-        drillCopy
         vaultwardenHealthcheck
-        vaultwardenGate
         pkgs.cacert
         pkgs.tzdata
       ];
       config = commonImageConfig // {
-        Entrypoint = [ "/bin/vaultwarden-less-vaultwarden" ];
-        Cmd = [ "normal" ];
+        Entrypoint = [ "/bin/vaultwarden" ];
         Env = [
           "ROCKET_ADDRESS=0.0.0.0"
           "ROCKET_PORT=80"
@@ -203,7 +188,6 @@ let
         install -m 0644 ${releaseManifest} "$out/release.json"
         install -m 0644 ${source}/RELEASE.md "$out/RELEASE.md"
         install -m 0644 ${source}/compose.yml "$out/compose.yml"
-        install -m 0644 ${source}/compose.upgrade.yml "$out/compose.upgrade.yml"
         substitute ${source}/.env.example "$out/.env.example" \
           --replace-fail 'VWLESS_IMAGE_TAG=local' 'VWLESS_IMAGE_TAG=${identity.release}'
 

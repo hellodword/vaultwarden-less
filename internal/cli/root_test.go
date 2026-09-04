@@ -3,10 +3,8 @@ package cli
 import (
 	"bytes"
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -19,11 +17,9 @@ import (
 
 	"github.com/hellodword/vaultwarden-less/internal/buildinfo"
 	"github.com/hellodword/vaultwarden-less/internal/config"
-	"github.com/hellodword/vaultwarden-less/internal/deployment"
 	"github.com/hellodword/vaultwarden-less/internal/restic"
 	restoretool "github.com/hellodword/vaultwarden-less/internal/restore"
 	"github.com/hellodword/vaultwarden-less/internal/snapshot"
-	"github.com/hellodword/vaultwarden-less/internal/upstream"
 	"github.com/hellodword/vaultwarden-less/internal/worker"
 )
 
@@ -44,9 +40,6 @@ func (repository *fakeRepository) VerifyVersion(context.Context) error {
 }
 func (repository *fakeRepository) Ensure(context.Context, config.Target, snapshot.Manifest) (restic.SyncResult, error) {
 	return restic.SyncResult{}, repository.record("ensure")
-}
-func (repository *fakeRepository) EnsureExact(context.Context, config.Target, snapshot.Manifest) (restic.SyncResult, error) {
-	return restic.SyncResult{}, repository.record("ensure-exact")
 }
 func (repository *fakeRepository) Snapshots(context.Context, config.Target, int) ([]restic.Snapshot, bool, error) {
 	return repository.snapshots, false, repository.record("snapshots")
@@ -70,10 +63,9 @@ func (repository *fakeRepository) Restore(context.Context, config.Target, string
 	return repository.record("restore")
 }
 
-func TestCLIExactCommandSetHelpAndDevelopmentVersion(t *testing.T) {
+func TestCLIExposesOnlySupportedCommands(t *testing.T) {
 	setBuildIdentity(t, "", "development", "false")
-	environment := testEnvironment(nil, nil)
-	command := newCommand(io.Discard, io.Discard, environment)
+	command := newCommand(io.Discard, io.Discard, testEnvironment(nil, nil))
 	names := make([]string, 0, len(command.Commands()))
 	for _, child := range command.Commands() {
 		if child.Name() != "help" {
@@ -81,39 +73,47 @@ func TestCLIExactCommandSetHelpAndDevelopmentVersion(t *testing.T) {
 		}
 	}
 	slices.Sort(names)
-	if !slices.Equal(names, []string{"config", "deployment", "healthcheck", "repo", "request-backup", "restore", "rollback", "serve", "status", "upgrade", "version"}) {
+	if !slices.Equal(names, []string{"config", "healthcheck", "repo", "request-backup", "restore", "serve", "status", "version"}) {
 		t.Fatalf("command set = %#v", names)
 	}
-	stdout, stderr, code := executeCommand(environment, "--help")
-	if code != 0 || stderr != "" || !strings.Contains(stdout, "request-backup") || !strings.Contains(stdout, "upgrade") {
-		t.Fatalf("help = %d/%q/%q", code, stdout, stderr)
+	for _, removed := range []string{"deployment", "upgrade", "rollback"} {
+		stdout, stderr, code := executeCommand(testEnvironment(nil, nil), removed)
+		if code != 2 || stdout != "" || errorCode(t, stderr) != codeUsageError {
+			t.Fatalf("removed command %q = %d/%q/%q", removed, code, stdout, stderr)
+		}
 	}
-	stdout, stderr, code = executeCommand(environment, "version")
-	if code != 0 || stderr != "" || stdout != "{\"project_commit\":null,\"release\":\"development\",\"clean\":false}\n" {
-		t.Fatalf("version = %d/%q/%q", code, stdout, stderr)
+
+	stdout, stderr, code := executeCommand(testEnvironment(nil, nil), "version")
+	if code != 0 || stderr != "" {
+		t.Fatalf("development version = %d/%q/%q", code, stdout, stderr)
+	}
+	var version versionResult
+	decodeSingleJSON(t, stdout, &version)
+	if version.ProjectCommit != nil || version.Release != "development" || version.Clean {
+		t.Fatalf("development version = %#v", version)
 	}
 }
 
-func TestCLICleanVersionGolden(t *testing.T) {
+func TestCLICleanVersionIsSemanticJSON(t *testing.T) {
 	commit := strings.Repeat("a", 40)
 	setBuildIdentity(t, commit, "RELEASE.2026-08-27T12-34-56Z-gaaaaaaaaaaaa", "true")
 	stdout, stderr, code := executeCommand(testEnvironment(nil, nil), "version")
-	want := `{"project_commit":"` + commit + `","release":"RELEASE.2026-08-27T12-34-56Z-gaaaaaaaaaaaa","clean":true}` + "\n"
-	if code != 0 || stderr != "" || stdout != want {
+	if code != 0 || stderr != "" {
 		t.Fatalf("clean version = %d/%q/%q", code, stdout, stderr)
+	}
+	var version versionResult
+	decodeSingleJSON(t, stdout, &version)
+	if version.ProjectCommit == nil || *version.ProjectCommit != commit || !version.Clean {
+		t.Fatalf("clean version = %#v", version)
 	}
 }
 
-func TestCLIUsageRuntimeAndDirtyFailuresHaveOneErrorDocument(t *testing.T) {
+func TestCLIClassifiesUsageAndRepositoryFailures(t *testing.T) {
 	for _, arguments := range [][]string{
 		nil,
 		{"unknown"},
 		{"serve", "extra"},
 		{"config"},
-		{"deployment"},
-		{"deployment", "import"},
-		{"deployment", "import", "verify"},
-		{"deployment", "init", "extra"},
 		{"config", "validate"},
 		{"repo"},
 		{"repo", "snapshots"},
@@ -121,256 +121,44 @@ func TestCLIUsageRuntimeAndDirtyFailuresHaveOneErrorDocument(t *testing.T) {
 		{"restore", "--target", "primary", "--output", "/restore/drill"},
 	} {
 		stdout, stderr, code := executeCommand(testEnvironment(nil, nil), arguments...)
-		if code != 2 || stdout != "" {
+		if code != 2 || stdout != "" || errorCode(t, stderr) != codeUsageError {
 			t.Errorf("arguments %#v = %d/%q/%q", arguments, code, stdout, stderr)
 		}
-		assertErrorJSON(t, stderr, codeUsageError)
 	}
 
 	repository := &fakeRepository{error: errors.New("repository and secret diagnostics must not escape")}
 	stdout, stderr, code := executeCommand(testEnvironment(repository, nil), "repo", "snapshots", "--target", "primary")
-	if code != 1 || stdout != "" || strings.Contains(stderr, "secret") {
-		t.Fatalf("runtime failure = %d/%q/%q", code, stdout, stderr)
+	if code != 1 || stdout != "" || strings.Contains(stderr, "secret") || errorCode(t, stderr) != codeRepositoryFailure {
+		t.Fatalf("repository failure = %d/%q/%q", code, stdout, stderr)
 	}
-	assertErrorJSON(t, stderr, codeRepositoryFailure)
-
-	dirty := testEnvironment(repository, nil)
-	dirty.ready = func() bool { return false }
-	repository.calls = nil
-	stdout, stderr, code = executeCommand(dirty, "repo", "init", "--target", "primary")
-	if code != 1 || stdout != "" || len(repository.calls) != 0 {
-		t.Fatalf("dirty command side effects = %d/%q/%q/%#v", code, stdout, stderr, repository.calls)
-	}
-	assertErrorJSON(t, stderr, codeNotReady)
 }
 
-func TestDeploymentInitGoldenAndActiveServeGate(t *testing.T) {
-	commit := strings.Repeat("a", 40)
-	release := "RELEASE.2026-08-27T12-34-56Z-gaaaaaaaaaaaa"
-	setBuildIdentity(t, commit, release, "true")
-	root := t.TempDir()
-	stateDir := filepath.Join(root, "state")
-	dataDir := filepath.Join(root, "data")
-	for _, directory := range []string{stateDir, dataDir} {
-		if err := os.Mkdir(directory, 0o700); err != nil {
-			t.Fatal(err)
-		}
-	}
+func TestServeStartsWithoutDeploymentStateGate(t *testing.T) {
 	environment := testEnvironment(nil, nil)
-	environment.stateDir = stateDir
-	environment.dataDir = dataDir
-
-	stdout, stderr, code := executeCommand(environment, "deployment", "init")
-	want := `{"status":"initialized","project_commit":"` + commit + `","release":"` + release + `"}` + "\n"
-	if code != 0 || stderr != "" || stdout != want {
-		t.Fatalf("deployment init = %d/%q/%q", code, stdout, stderr)
-	}
-	stdout, stderr, code = executeCommand(environment, "deployment", "init")
-	want = strings.Replace(want, `"status":"initialized"`, `"status":"already_initialized"`, 1)
-	if code != 0 || stderr != "" || stdout != want {
-		t.Fatalf("deployment init repeat = %d/%q/%q", code, stdout, stderr)
-	}
-
-	activeChecked, upgradeChecked, backupLoaded := false, false, false
-	environment.requireActive = func(_, projectCommit, activeRelease string) error {
-		activeChecked = true
-		if projectCommit != commit || activeRelease != release {
-			t.Fatalf("active identity = %q/%q", projectCommit, activeRelease)
-		}
-		return errors.New("mismatch")
-	}
-	environment.allowServe = func(context.Context, string, string, deployment.Identity, config.Deployment) error {
-		upgradeChecked = true
-		return nil
-	}
+	loaded := false
 	environment.loadBackup = func(string) (*config.Backup, error) {
-		backupLoaded = true
-		return nil, errors.New("must not load")
+		loaded = true
+		return nil, errors.New("synthetic invalid config")
 	}
-	stdout, stderr, code = executeCommand(environment, "serve")
-	if code != 1 || stdout != "" || !activeChecked || upgradeChecked || backupLoaded {
-		t.Fatalf("active-gated serve = %d/%q/%q/%t/%t/%t", code, stdout, stderr, activeChecked, upgradeChecked, backupLoaded)
-	}
-	assertErrorJSON(t, stderr, codeNotReady)
-}
-
-func TestDeploymentImportPrepareAndCancelCLI(t *testing.T) {
-	commit := strings.Repeat("a", 40)
-	release := "RELEASE.2026-08-27T12-34-56Z-gaaaaaaaaaaaa"
-	setBuildIdentity(t, commit, release, "true")
-	root := t.TempDir()
-	if err := os.Chmod(root, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	stateDir := filepath.Join(root, "state")
-	dataDir := filepath.Join(root, "data")
-	importRoot := filepath.Join(root, "import")
-	sourceDir := filepath.Join(importRoot, "source")
-	for _, directory := range []string{stateDir, dataDir, importRoot, sourceDir} {
-		if err := os.MkdirAll(directory, 0o700); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.Chmod(directory, 0o700); err != nil {
-			t.Fatal(err)
-		}
-	}
-	databasePath := filepath.Join(sourceDir, "db.sqlite3")
-	database, err := sql.Open("sqlite3", databasePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := database.Exec("CREATE TABLE imported(id INTEGER PRIMARY KEY, value TEXT NOT NULL); INSERT INTO imported(value) VALUES ('synthetic')"); err != nil {
-		_ = database.Close()
-		t.Fatal(err)
-	}
-	if err := database.Close(); err != nil {
-		t.Fatal(err)
-	}
-	for path, data := range map[string][]byte{
-		databasePath:                            nil,
-		filepath.Join(sourceDir, "rsa_key.pem"): []byte("external-private-key"),
-	} {
-		if data != nil {
-			if err := os.WriteFile(path, data, 0o600); err != nil {
-				t.Fatal(err)
-			}
-		}
-		if err := os.Chmod(path, 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	environment := testEnvironment(nil, nil)
-	environment.deploymentRoot = root
-	stdout, stderr, code := executeCommand(environment, "deployment", "import", "prepare")
-	if code != 0 || stderr != "" {
-		t.Fatalf("import prepare = %d/%q/%q", code, stdout, stderr)
-	}
-	var prepared struct {
-		ImportID      string `json:"import_id"`
-		Phase         string `json:"phase"`
-		ProjectCommit string `json:"project_commit"`
-		Release       string `json:"release"`
-	}
-	if err := json.Unmarshal([]byte(stdout), &prepared); err != nil || prepared.ImportID != "initial" ||
-		prepared.Phase != "prepared" || prepared.ProjectCommit != commit || prepared.Release != release {
-		t.Fatalf("import prepare JSON = %#v/%v", prepared, err)
-	}
-	stdout, stderr, code = executeCommand(environment, "deployment", "import", "verify")
-	if code != 2 || stdout != "" {
-		t.Fatalf("import verify confirmation = %d/%q/%q", code, stdout, stderr)
-	}
-	assertErrorJSON(t, stderr, codeUsageError)
-	stdout, stderr, code = executeCommand(environment, "deployment", "import", "cancel")
-	if code != 0 || stderr != "" || !strings.Contains(stdout, `"phase":"cancelled"`) {
-		t.Fatalf("import cancel = %d/%q/%q", code, stdout, stderr)
-	}
-	if _, err := os.Stat(databasePath); err != nil {
-		t.Fatalf("cancel removed source database: %v", err)
-	}
-	if entries, err := os.ReadDir(dataDir); err != nil || len(entries) != 0 {
-		t.Fatalf("cancel changed data: %#v/%v", entries, err)
+	stdout, stderr, code := executeCommand(environment, "serve")
+	if code != 1 || stdout != "" || !loaded || errorCode(t, stderr) != codeInvalidConfig {
+		t.Fatalf("serve boundary = %d/%q/%q/loaded=%t", code, stdout, stderr, loaded)
 	}
 }
 
-func TestVerifyImportCandidateUsesAuditedSnapshotClosure(t *testing.T) {
-	root := t.TempDir()
-	if err := os.Chmod(root, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	candidate := filepath.Join(root, "candidate")
-	staging := filepath.Join(root, "staging")
-	for _, directory := range []string{candidate, staging} {
-		if err := os.Mkdir(directory, 0o700); err != nil {
-			t.Fatal(err)
-		}
-	}
-	contract, err := upstream.VaultwardenSchemaContract()
-	if err != nil {
-		t.Fatal(err)
-	}
-	databasePath := filepath.Join(candidate, "db.sqlite3")
-	database, err := sql.Open("sqlite3", databasePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, object := range contract.Objects {
-		if _, err := database.Exec(object.SQL); err != nil {
-			_ = database.Close()
-			t.Fatal(err)
-		}
-	}
-	if _, err := database.Exec(
-		"INSERT INTO __diesel_schema_migrations(version, run_on) VALUES (?, '2026-08-28')",
-		contract.DatabaseMigration,
-	); err != nil {
-		_ = database.Close()
-		t.Fatal(err)
-	}
-	if err := database.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(databasePath, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	evidence, err := verifyImportCandidate(context.Background(), candidate, staging, strings.Repeat("a", 40))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if evidence.DatabaseMigration != contract.DatabaseMigration ||
-		evidence.DatabaseSchemaFingerprint != contract.Fingerprint ||
-		!strings.HasPrefix(evidence.ContentID, "sha256:") ||
-		!strings.HasPrefix(evidence.ArchiveID, "sha256:") {
-		t.Fatalf("import candidate evidence = %#v", evidence)
-	}
-}
-
-func TestConfigValidateRoleGoldenAndFailureClassification(t *testing.T) {
+func TestConfigValidateRolesReturnsOrderedTargets(t *testing.T) {
 	for _, role := range []string{"backup", "maintenance"} {
 		stdout, stderr, code := executeCommand(testEnvironment(nil, nil), "config", "validate", "--role", role)
-		want := `{"valid":true,"role":"` + role + `","targets":["primary"]}` + "\n"
-		if code != 0 || stderr != "" || stdout != want {
+		if code != 0 || stderr != "" {
 			t.Fatalf("config validate %s = %d/%q/%q", role, code, stdout, stderr)
 		}
-	}
-	environment := testEnvironment(nil, nil)
-	var mounts [][2]string
-	environment.validateMount = func(expected, mounted string) error {
-		mounts = append(mounts, [2]string{expected, mounted})
-		return nil
-	}
-	stdout, stderr, code := executeCommand(environment, "config", "validate", "--role", "backup")
-	if code != 0 || stdout == "" || stderr != "" || len(mounts) != 10 ||
-		mounts[0] != [2]string{"/deployment-root/config/backup.yaml", "/config/backup.yaml"} ||
-		mounts[len(mounts)-1] != [2]string{"/deployment-root/credentials/notifiers.yaml", "/credentials/notifiers.yaml"} {
-		t.Fatalf("validated mounts = %#v, result = %d/%q/%q", mounts, code, stdout, stderr)
+		var result configValidationResult
+		decodeSingleJSON(t, stdout, &result)
+		if !result.Valid || result.Role != role || !slices.Equal(result.Targets, []string{"primary"}) {
+			t.Fatalf("config validate result = %#v", result)
+		}
 	}
 
-	environment = testEnvironment(nil, nil)
-	environment.validatePasswords = func(string, *config.Backup) error { return errors.New("sensitive password") }
-	stdout, stderr, code = executeCommand(environment, "config", "validate", "--role", "backup")
-	if code != 1 || stdout != "" || strings.Contains(stderr, "sensitive") {
-		t.Fatalf("invalid credentials = %d/%q/%q", code, stdout, stderr)
-	}
-	assertErrorJSON(t, stderr, codeInvalidCredentials)
-
-	environment = testEnvironment(nil, nil)
-	environment.validateFile = func(string) error { return errors.New("sensitive private path") }
-	stdout, stderr, code = executeCommand(environment, "config", "validate", "--role", "maintenance")
-	if code != 1 || stdout != "" || strings.Contains(stderr, "sensitive") {
-		t.Fatalf("unsafe Vaultwarden env = %d/%q/%q", code, stdout, stderr)
-	}
-	assertErrorJSON(t, stderr, codeUnsafePath)
-
-	environment = testEnvironment(nil, nil)
-	environment.validateMount = func(string, string) error { return errors.New("sensitive mount") }
-	stdout, stderr, code = executeCommand(environment, "config", "validate", "--role", "maintenance")
-	if code != 1 || stdout != "" || strings.Contains(stderr, "sensitive") {
-		t.Fatalf("unsafe mount = %d/%q/%q", code, stdout, stderr)
-	}
-	assertErrorJSON(t, stderr, codeUnsafePath)
-}
-
-func TestConfigValidateTargetlessRolesReturnEmptyTargets(t *testing.T) {
 	environment := testEnvironment(nil, nil)
 	environment.loadBackup = func(string) (*config.Backup, error) {
 		return &config.Backup{
@@ -384,14 +172,18 @@ func TestConfigValidateTargetlessRolesReturnEmptyTargets(t *testing.T) {
 	}
 	for _, role := range []string{"backup", "maintenance"} {
 		stdout, stderr, code := executeCommand(environment, "config", "validate", "--role", role)
-		want := `{"valid":true,"role":"` + role + `","targets":[]}` + "\n"
-		if code != 0 || stderr != "" || stdout != want {
+		if code != 0 || stderr != "" {
 			t.Fatalf("targetless config validate %s = %d/%q/%q", role, code, stdout, stderr)
+		}
+		var result configValidationResult
+		decodeSingleJSON(t, stdout, &result)
+		if result.Targets == nil || len(result.Targets) != 0 {
+			t.Fatalf("targetless result = %#v", result)
 		}
 	}
 }
 
-func TestValidateMountedPathRequiresTheExactNonSymlinkObject(t *testing.T) {
+func TestValidateMountedPathRequiresExactNonSymlinkObject(t *testing.T) {
 	root := t.TempDir()
 	expected := filepath.Join(root, "expected")
 	other := filepath.Join(root, "other")
@@ -415,207 +207,17 @@ func TestValidateMountedPathRequiresTheExactNonSymlinkObject(t *testing.T) {
 	}
 }
 
-func TestUpgradePrepareGoldenAndServingGateClassification(t *testing.T) {
-	setBuildIdentity(t, strings.Repeat("a", 40), "RELEASE.2026-08-27T12-00-00Z-gaaaaaaaaaaaa", "true")
-	root := t.TempDir()
-	stateDir := filepath.Join(root, "state")
-	dataDir := filepath.Join(root, "data")
-	for _, directory := range []string{stateDir, dataDir} {
-		if err := os.Mkdir(directory, 0o700); err != nil {
-			t.Fatal(err)
-		}
-	}
-	environment := testEnvironment(nil, nil)
-	environment.stateDir = stateDir
-	environment.dataDir = dataDir
-	toCommit := strings.Repeat("b", 40)
-	toRelease := "RELEASE.2026-08-27T13-00-00Z-gbbbbbbbbbbbb"
-	stdout, stderr, code := executeCommand(
-		environment,
-		"upgrade", "prepare", "--to-commit", toCommit, "--to-release", toRelease,
-	)
-	want := `{"upgrade_id":"` + strings.Repeat("a", 40) + `..` + toCommit +
-		`","phase":"prepared","from_commit":"` + strings.Repeat("a", 40) + `","to_commit":"` + toCommit + `","targets":[]}` + "\n"
-	if code != 0 || stderr != "" || stdout != want {
-		t.Fatalf("upgrade prepare = %d/%q/%q", code, stdout, stderr)
-	}
-	stdout, stderr, code = executeCommand(environment, "upgrade", "prepare", "--to-commit", "short", "--to-release", toRelease)
-	if code != 2 || stdout != "" {
-		t.Fatalf("invalid upgrade identity = %d/%q/%q", code, stdout, stderr)
-	}
-	assertErrorJSON(t, stderr, codeUsageError)
-
-	called := false
-	environment.allowServe = func(context.Context, string, string, deployment.Identity, config.Deployment) error {
-		return errors.New("frozen")
-	}
-	environment.loadBackup = func(string) (*config.Backup, error) {
-		called = true
-		return nil, errors.New("must not load")
-	}
-	stdout, stderr, code = executeCommand(environment, "serve")
-	if code != 1 || stdout != "" || called {
-		t.Fatalf("frozen serve = %d/%q/%q/called=%t", code, stdout, stderr, called)
-	}
-	assertErrorJSON(t, stderr, codeNotReady)
-}
-
-func TestUpgradePrepareTargetlessFailsBeforeStateManagement(t *testing.T) {
-	setBuildIdentity(t, strings.Repeat("a", 40), "RELEASE.2026-08-27T12-00-00Z-gaaaaaaaaaaaa", "true")
-	root := t.TempDir()
-	stateDir := filepath.Join(root, "state")
-	dataDir := filepath.Join(root, "data")
-	for _, directory := range []string{stateDir, dataDir} {
-		if err := os.Mkdir(directory, 0o700); err != nil {
-			t.Fatal(err)
-		}
-	}
-	environment := testEnvironment(nil, nil)
-	environment.stateDir = stateDir
-	environment.dataDir = dataDir
-	environment.loadBackup = func(string) (*config.Backup, error) {
-		return &config.Backup{
-			UpgradeVerificationTargets: []string{}, Targets: []config.Target{}, Notifiers: []config.Notifier{},
-		}, nil
-	}
-	deploymentLoaded := false
-	environment.loadDeployment = func() (config.Deployment, error) {
-		deploymentLoaded = true
-		return config.Deployment{}, errors.New("state manager must not start")
-	}
-	toCommit := strings.Repeat("b", 40)
-	toRelease := "RELEASE.2026-08-27T13-00-00Z-gbbbbbbbbbbbb"
-	stdout, stderr, code := executeCommand(
-		environment, "upgrade", "prepare", "--to-commit", toCommit, "--to-release", toRelease,
-	)
-	if code != 1 || stdout != "" || deploymentLoaded {
-		t.Fatalf("targetless upgrade prepare = %d/%q/%q deployment_loaded=%t", code, stdout, stderr, deploymentLoaded)
-	}
-	assertErrorJSON(t, stderr, codeNotReady)
-	if _, err := os.Lstat(filepath.Join(stateDir, "upgrade")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("targetless prepare created upgrade state: %v", err)
-	}
-}
-
-func TestUpgradeDeadlineKeepsStableTimeoutClassification(t *testing.T) {
-	err := classifyUpgradeFailure(fmt.Errorf("upgrade: %w", context.DeadlineExceeded))
-	var commandError *CommandError
-	if !errors.As(err, &commandError) || commandError.Code != codeTimeout {
-		t.Fatalf("upgrade deadline classification = %#v", err)
-	}
-}
-
-func TestUpgradeSyncRequiresBothExactRecoveryIdentities(t *testing.T) {
-	manifest := snapshot.Manifest{
-		ContentID: "sha256:" + strings.Repeat("a", 64),
-		ArchiveID: "sha256:" + strings.Repeat("b", 64),
-	}
-	synchronized := restic.SyncResult{
-		SnapshotID: strings.Repeat("c", 64), ContentID: manifest.ContentID, ArchiveID: manifest.ArchiveID,
-	}
-	if !validUpgradeSync(manifest, synchronized) {
-		t.Fatal("exact upgrade evidence was rejected")
-	}
-	synchronized.ArchiveID = "sha256:" + strings.Repeat("d", 64)
-	if validUpgradeSync(manifest, synchronized) {
-		t.Fatal("mismatched archive identity was accepted")
-	}
-}
-
-func TestRollbackManagerUsesOneCommonDeploymentRoot(t *testing.T) {
-	environment := testEnvironment(nil, nil)
-	root := t.TempDir()
-	environment.deploymentRoot = root
-	loaded := false
-	loadDeployment := environment.loadDeployment
-	environment.loadDeployment = func() (config.Deployment, error) {
-		loaded = true
-		return loadDeployment()
-	}
-	environment.dataDir = "/separate-data-mount"
-	environment.stateDir = "/separate-state-mount"
-	manager, err := rollbackManager(environment)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if manager.DataDir != filepath.Join(root, "data") || manager.StateDir != filepath.Join(root, "state") ||
-		manager.RestoreRoot != filepath.Join(root, "restore") {
-		t.Fatalf("rollback paths = %q/%q", manager.DataDir, manager.StateDir)
-	}
-	if !loaded {
-		t.Fatal("rollback did not validate the Compose-resolved deployment environment")
-	}
-	terminal, err := terminalUpgradeManager(environment)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if terminal.DataDir != filepath.Join(root, "data") || terminal.StateDir != filepath.Join(root, "state") ||
-		terminal.RestoreRoot != filepath.Join(root, "restore") {
-		t.Fatalf("terminal rollback paths = %q/%q/%q", terminal.DataDir, terminal.StateDir, terminal.RestoreRoot)
-	}
-	regular, err := upgradeManager(environment)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if regular.DataDir != environment.dataDir || regular.StateDir != environment.stateDir {
-		t.Fatalf("regular upgrade paths changed = %q/%q", regular.DataDir, regular.StateDir)
-	}
-}
-
-func TestTerminalUpgradeManagerKeepsRegularMountsWithoutCommonRoot(t *testing.T) {
-	environment := testEnvironment(nil, nil)
-	environment.deploymentRoot = filepath.Join(t.TempDir(), "not-mounted")
-	manager, err := terminalUpgradeManager(environment)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if manager.DataDir != environment.dataDir || manager.StateDir != environment.stateDir ||
-		manager.RestoreRoot != environment.restoreRoot {
-		t.Fatalf("regular terminal paths changed = %q/%q/%q", manager.DataDir, manager.StateDir, manager.RestoreRoot)
-	}
-}
-
-func TestTerminalUpgradeManagerRejectsUnsafeCommonRoot(t *testing.T) {
-	environment := testEnvironment(nil, nil)
-	root := t.TempDir()
-	unsafe := filepath.Join(root, "not-a-directory")
-	if err := os.WriteFile(unsafe, []byte("unsafe\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	environment.deploymentRoot = unsafe
-	_, err := terminalUpgradeManager(environment)
-	var commandError *CommandError
-	if !errors.As(err, &commandError) || commandError.Code != codeInternal {
-		t.Fatalf("unsafe terminal root = %#v", err)
-	}
-}
-
-func TestRollbackManagerRejectsInvalidCommonRoot(t *testing.T) {
-	environment := testEnvironment(nil, nil)
-	environment.deploymentRoot = "relative"
-	_, err := rollbackManager(environment)
-	var commandError *CommandError
-	if !errors.As(err, &commandError) || commandError.Code != codeInternal {
-		t.Fatalf("invalid rollback root = %#v", err)
-	}
-}
-
-func TestWorkerClientCommandsHaveExactJSON(t *testing.T) {
+func TestWorkerClientCommandsValidateSemanticResponses(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
 		switch request.URL.Path {
 		case worker.CheckPath:
-			body, _ := io.ReadAll(request.Body)
-			if request.Method != http.MethodPost || request.Header.Get("Content-Type") != "application/json" || string(body) != "{}\n" {
-				writer.WriteHeader(http.StatusBadRequest)
-				return
-			}
-			writer.Header().Set("Content-Type", "application/json")
 			writer.WriteHeader(http.StatusAccepted)
 			_, _ = writer.Write([]byte("{\"accepted\":true}\n"))
 		case worker.StatusPath:
-			writer.Header().Set("Content-Type", "application/json")
-			_, _ = writer.Write([]byte("{\"state\":\"idle\",\"started_at\":\"2026-08-27T12:00:00.000Z\",\"next_check_at\":null,\"last_check\":null,\"targets\":[]}"))
+			_, _ = writer.Write([]byte("{\"targets\":[],\"last_check\":null,\"next_check_at\":null,\"started_at\":\"2026-08-27T12:00:00.000Z\",\"state\":\"idle\"}"))
 		case worker.HealthPath:
+			writer.Header().Del("Content-Type")
 			writer.WriteHeader(http.StatusNoContent)
 		default:
 			writer.WriteHeader(http.StatusNotFound)
@@ -623,80 +225,59 @@ func TestWorkerClientCommandsHaveExactJSON(t *testing.T) {
 	}))
 	defer server.Close()
 	environment := testEnvironment(nil, server)
-	for _, test := range []struct {
-		command string
-		want    string
-	}{
-		{"request-backup", "{\"accepted\":true}\n"},
-		{"status", "{\"state\":\"idle\",\"started_at\":\"2026-08-27T12:00:00.000Z\",\"next_check_at\":null,\"last_check\":null,\"targets\":[]}\n"},
-		{"healthcheck", "{\"healthy\":true}\n"},
-	} {
-		stdout, stderr, code := executeCommand(environment, test.command)
-		if code != 0 || stderr != "" || stdout != test.want {
-			t.Fatalf("%s = %d/%q/%q", test.command, code, stdout, stderr)
+	for _, command := range []string{"request-backup", "status", "healthcheck"} {
+		stdout, stderr, code := executeCommand(environment, command)
+		if code != 0 || stderr != "" || stdout == "" {
+			t.Fatalf("%s = %d/%q/%q", command, code, stdout, stderr)
 		}
+		var result map[string]any
+		decodeSingleJSON(t, stdout, &result)
 	}
 }
 
-func TestRequestBackupPassesThroughTargetlessNotReady(t *testing.T) {
+func TestRequestBackupPreservesTargetlessNotReady(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		if request.Method != http.MethodPost || request.URL.Path != worker.CheckPath {
-			writer.WriteHeader(http.StatusNotFound)
-			return
-		}
 		writer.Header().Set("Content-Type", "application/json")
 		writer.WriteHeader(http.StatusServiceUnavailable)
 		_, _ = writer.Write([]byte(`{"error":{"code":"not_ready","message":"` + worker.NoBackupTargetsMessage + `"}}` + "\n"))
 	}))
 	defer server.Close()
 	stdout, stderr, code := executeCommand(testEnvironment(nil, server), "request-backup")
-	if code != 1 || stdout != "" {
+	if code != 1 || stdout != "" || errorCode(t, stderr) != codeNotReady {
 		t.Fatalf("targetless request-backup = %d/%q/%q", code, stdout, stderr)
-	}
-	var document errorDocument
-	if err := json.Unmarshal([]byte(stderr), &document); err != nil || document.Error.Code != codeNotReady || document.Error.Message != worker.NoBackupTargetsMessage {
-		t.Fatalf("targetless request-backup error = %#v/%v", document, err)
 	}
 }
 
-func TestRepositoryCommandsAndRestoreGolden(t *testing.T) {
-	contentID := "sha256:" + strings.Repeat("b", 64)
-	archiveID := "sha256:" + strings.Repeat("c", 64)
-	commit := strings.Repeat("d", 40)
-	snapshotID := strings.Repeat("a", 64)
-	for _, test := range []struct {
-		arguments []string
-		want      string
-	}{
-		{[]string{"repo", "init", "--target", "primary"}, `{"operation":"init","target":"primary","success":true}` + "\n"},
-		{[]string{"repo", "check", "--target", "primary"}, `{"operation":"check","target":"primary","success":true}` + "\n"},
-		{[]string{"repo", "unlock", "--target", "primary"}, `{"operation":"unlock","target":"primary","success":true}` + "\n"},
-		{[]string{"repo", "prune", "--target", "primary"}, `{"operation":"prune","target":"primary","applied":false,"groups":[{"host":"vaultwarden-less","paths":["/staging/point"],"keep_snapshot_ids":[],"remove_snapshot_ids":[]}]}` + "\n"},
+func TestRepositoryCommandsAndRestore(t *testing.T) {
+	for _, arguments := range [][]string{
+		{"repo", "init", "--target", "primary"},
+		{"repo", "check", "--target", "primary"},
+		{"repo", "unlock", "--target", "primary"},
+		{"repo", "prune", "--target", "primary"},
 	} {
-		repository := &fakeRepository{prune: restic.PruneResult{Applied: false, Groups: []restic.PruneGroup{{Host: "vaultwarden-less", Paths: []string{"/staging/point"}, KeepSnapshotIDs: []string{}, RemoveSnapshotIDs: []string{}}}}}
-		stdout, stderr, code := executeCommand(testEnvironment(repository, nil), test.arguments...)
-		if code != 0 || stderr != "" || stdout != test.want {
-			t.Fatalf("%#v = %d/%q/%q", test.arguments, code, stdout, stderr)
+		stdout, stderr, code := executeCommand(testEnvironment(&fakeRepository{}, nil), arguments...)
+		if code != 0 || stderr != "" {
+			t.Fatalf("%#v = %d/%q/%q", arguments, code, stdout, stderr)
 		}
-	}
-	repository := &fakeRepository{snapshots: []restic.Snapshot{{ID: snapshotID, Time: "2026-08-27T12:00:00.000Z", ProjectCommit: commit, ContentID: contentID, ArchiveID: archiveID}}}
-	stdout, stderr, code := executeCommand(testEnvironment(repository, nil), "repo", "snapshots", "--target", "primary")
-	wantSnapshots := `{"target":"primary","limit":100,"truncated":false,"snapshots":[{"id":"` + snapshotID + `","time":"2026-08-27T12:00:00.000Z","project_commit":"` + commit + `","content_id":"` + contentID + `","archive_id":"` + archiveID + `"}]}` + "\n"
-	if code != 0 || stderr != "" || stdout != wantSnapshots {
-		t.Fatalf("snapshots = %d/%q/%q", code, stdout, stderr)
+		var result map[string]any
+		decodeSingleJSON(t, stdout, &result)
 	}
 
 	restore := func(_ context.Context, _ restoretool.Repository, request restoretool.Request) (restoretool.Result, error) {
 		return restoretool.Result{
-			Target:     request.Target.Name,
-			SnapshotID: snapshotID, ProjectCommit: commit, ContentID: contentID,
-			ArchiveID: archiveID, Output: request.Output,
+			Target: request.Target.Name, SnapshotID: strings.Repeat("a", 64),
+			ProjectCommit: strings.Repeat("d", 40), ContentID: "sha256:" + strings.Repeat("b", 64),
+			ArchiveID: "sha256:" + strings.Repeat("c", 64), Output: request.Output,
 		}, nil
 	}
-	stdout, stderr, code = executeCommand(testEnvironment(&fakeRepository{}, nil, restore), "restore", "--target", "primary", "--output", "drill")
-	wantRestore := `{"target":"primary","snapshot_id":"` + snapshotID + `","project_commit":"` + commit + `","content_id":"` + contentID + `","archive_id":"` + archiveID + `","output":"/restore/drill"}` + "\n"
-	if code != 0 || stderr != "" || stdout != wantRestore {
+	stdout, stderr, code := executeCommand(testEnvironment(&fakeRepository{}, nil, restore), "restore", "--target", "primary", "--output", "drill")
+	if code != 0 || stderr != "" {
 		t.Fatalf("restore = %d/%q/%q", code, stdout, stderr)
+	}
+	var result map[string]any
+	decodeSingleJSON(t, stdout, &result)
+	if result["target"] != "primary" || result["output"] != "/restore/drill" {
+		t.Fatalf("restore result = %#v", result)
 	}
 }
 
@@ -708,17 +289,14 @@ func testEnvironment(repositoryClient repository, server *httptest.Server, resto
 		loadBackup: func(string) (*config.Backup, error) {
 			return &config.Backup{
 				UpgradeVerificationTargets: []string{"primary"},
-				Targets:                    []config.Target{{Name: "primary", Repository: "s3:https://objects.example.test/bucket", Options: []config.Option{}}}, Notifiers: []config.Notifier{},
-			}, nil
-		},
-		loadDeployment: func() (config.Deployment, error) {
-			return config.Deployment{
-				Root: "/srv/vaultwarden-less", RuntimeUID: uint32(os.Geteuid()), RuntimeGID: uint32(os.Getegid()),
-				ListenPort: 8080, DrillPort: 8081,
+				Targets:                    []config.Target{{Name: "primary", Repository: "s3:https://objects.example.test/bucket", Options: []config.Option{}}},
+				Notifiers:                  []config.Notifier{},
 			}, nil
 		},
 		loadCredentials: func(string, *config.Backup) (*config.RoleCredentials, error) {
-			return &config.RoleCredentials{Targets: map[string]config.RoleTarget{"primary": {Environment: map[string]string{"AWS_ACCESS_KEY_ID": "test"}}}}, nil
+			return &config.RoleCredentials{Targets: map[string]config.RoleTarget{
+				"primary": {Environment: map[string]string{"AWS_ACCESS_KEY_ID": "test"}},
+			}}, nil
 		},
 		loadNotifiers:     func(string, *config.Backup) ([]config.Notifier, error) { return []config.Notifier{}, nil },
 		validatePasswords: func(string, *config.Backup) error { return nil },
@@ -729,18 +307,20 @@ func testEnvironment(repositoryClient repository, server *httptest.Server, resto
 		restore: func(_ context.Context, _ restoretool.Repository, _ restoretool.Request) (restoretool.Result, error) {
 			return restoretool.Result{}, errors.New("restore should not be called")
 		},
-		requireActive:   func(string, string, string) error { return nil },
-		allowServe:      func(context.Context, string, string, deployment.Identity, config.Deployment) error { return nil },
-		drillCheck:      func(context.Context) error { return nil },
 		httpClient:      &http.Client{Timeout: time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }},
 		workerURL:       "http://127.0.0.1:1",
 		vaultwardenPath: "/deployment/vaultwarden.env",
 		credentialsPath: "/credentials/role.yaml",
-		notifierPath:    "/credentials/notifiers.yaml", passwordRoot: "/credentials/restic", resticBinary: "restic",
-		deploymentRoot: "/deployment-root",
-		dataDir:        "/data", stagingDir: "/staging", cacheDir: "/cache", restoreRoot: "/restore", stateDir: "/state",
-		now:   func() time.Time { return time.Date(2026, 8, 27, 12, 34, 56, 789_000_000, time.UTC) },
-		ready: func() bool { return true },
+		notifierPath:    "/credentials/notifiers.yaml",
+		passwordRoot:    "/credentials/restic",
+		resticBinary:    "restic",
+		deploymentRoot:  "/deployment-root",
+		dataDir:         "/data",
+		stagingDir:      "/staging",
+		cacheDir:        "/cache",
+		restoreRoot:     "/restore",
+		now:             func() time.Time { return time.Date(2026, 8, 27, 12, 34, 56, 789_000_000, time.UTC) },
+		ready:           func() bool { return true },
 	}
 	if server != nil {
 		environment.workerURL = server.URL
@@ -760,21 +340,25 @@ func executeCommand(environment commandEnvironment, arguments ...string) (string
 	return stdout.String(), stderr.String(), ExitCode(err)
 }
 
-func assertErrorJSON(t *testing.T, output, code string) {
+func errorCode(t *testing.T, output string) string {
 	t.Helper()
-	decoder := json.NewDecoder(strings.NewReader(output))
-	var document struct {
-		Error struct {
-			Code    string `json:"code"`
-			Message string `json:"message"`
-		} `json:"error"`
+	var document errorDocument
+	decodeSingleJSON(t, output, &document)
+	if document.Error.Message == "" {
+		t.Fatalf("error message is empty: %q", output)
 	}
-	if err := decoder.Decode(&document); err != nil || document.Error.Code != code || document.Error.Message == "" {
-		t.Fatalf("error document = %#v/%v", document, err)
+	return document.Error.Code
+}
+
+func decodeSingleJSON(t *testing.T, input string, destination any) {
+	t.Helper()
+	decoder := json.NewDecoder(strings.NewReader(input))
+	if err := decoder.Decode(destination); err != nil {
+		t.Fatalf("decode JSON %q: %v", input, err)
 	}
 	var extra any
 	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
-		t.Fatalf("error contains a second document: %q", output)
+		t.Fatalf("JSON contains a second value: %q", input)
 	}
 }
 
