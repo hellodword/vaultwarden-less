@@ -31,9 +31,11 @@ just release
 - `just check` runs the ordinary flake checks: formatting, all ordinary Go
   tests, `go vet`, worker/proxy race tests, maintenance-script tests, and
   upstream pin assertions.
-- `just check-release` runs the two release-level Docker E2E scenarios. The Go
-  test process and Docker daemon must share bind-mount paths; otherwise the
-  mandatory canary fails rather than skipping.
+- `just check-release` builds and runs the formal NixOS VM acceptance test. It
+  requires clean `x86_64-linux` source, KVM, and a Nix daemon that advertises
+  the `kvm` and `nixos-test` system features. Inside the disposable guest, the
+  two release-level Docker E2E scenarios use the exact release archives and
+  the official Bitwarden CLI.
 - `just release` is exactly `nix build .#release`. It accepts only a clean Git
   flake and creates the standard `result` link for a bundle identified as
   `git-<full-commit>`.

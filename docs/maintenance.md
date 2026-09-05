@@ -111,20 +111,28 @@ It runs formatting (gofmt, nixfmt, and Ruff), `go test ./... -count=1`,
 `go vet ./...`, worker/proxy race tests, both maintenance-script suites, and
 Nix assertions tying packages to the reviewed inventory.
 
-From one unchanged clean commit, run the formal Docker boundary when the Go
-test process and Docker daemon share bind paths:
+From one unchanged clean commit on an `x86_64-linux` KVM host, run the formal
+release acceptance test:
 
 ```sh
 just check-release
 ```
 
-That command directly runs exactly
+This is exactly `nix build --no-link -L .#release-test`. It builds the release
+archives, the test-only Moto image, the Go E2E executable, and a disposable
+NixOS guest. Inside that guest, a non-root user and the guest's local Docker
+daemon run exactly
 `TestTargetlessDeploymentAndFullDataAdoption` and
-`TestTwoTargetBackupRestore`. Their mandatory bind canary fails on a remote or
-otherwise non-shared daemon; such a result is an environment limitation, not a
-skip or pass. The scenarios dynamically create all configuration, credentials,
-TLS CA, Moto endpoints, client application data, and runtime resources, then
-verify cleanup.
+`TestTwoTargetBackupRestore` against the three archives from that same release
+bundle and the official Bitwarden CLI. Their mandatory bind canary must pass,
+and the scenarios dynamically create all configuration, credentials, TLS CA,
+Moto endpoints, client application data, and runtime resources before
+verifying cleanup.
+
+The VM test is intentionally absent from `just check`, the default package, and
+the release bundle. A machine without KVM must report the missing feature; do
+not replace the gate with TCG emulation, a remote Docker daemon, an SSH-driven
+distribution exercise, or an independently built set of images.
 
 Build the strict release from the same clean commit:
 

@@ -86,6 +86,12 @@ HTTPS reverse proxy must forward root-path HTTP and WebSocket traffic to the
 loopback port and must apply the operator's public access and forwarding-header
 policy.
 
+All four Compose services share the one non-internal project `default` bridge;
+there are no custom networks. Treat every service on that network as trusted:
+the shared bridge is connectivity, not a security boundary. The resident
+worker has no published port, and only proxy port `8080` is published as the
+configured `127.0.0.1:${LISTEN_PORT}` host endpoint.
+
 ## Backup YAML
 
 `config/backup.yaml` has only two required top-level arrays: ordered `targets`

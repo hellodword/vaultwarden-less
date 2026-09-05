@@ -89,6 +89,19 @@ docker compose --env-file "$vwless_env" --file "$vwless_compose" \
   config validate --role maintenance
 ```
 
+The rendered model has exactly one non-internal project `default` network, and
+every active service joins only that network. It is not an isolation boundary;
+all four services are trusted. The worker has no host-published port, while the
+proxy publishes only `127.0.0.1:${LISTEN_PORT}`.
+
+When moving an existing deployment from the former custom-network topology,
+schedule a short outage and recreate the project's containers and network from
+the new `compose.yml`. Keep the release directory and every bind-mounted path
+intact. Run `docker compose down` with the old release, without `--volumes`,
+then start the new release normally. Never remove, migrate, overwrite, or
+recursively change ownership of `data`, configuration, credentials, `cache`,
+`staging`, or `restore` merely to adapt the network topology.
+
 ## Targetless first start and first account
 
 Targetless operation is the only supported start without a repository. It is
