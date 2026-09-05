@@ -47,6 +47,8 @@ let
     installPhase = ''
       runHook preInstall
       install -D -m 0755 vaultwarden-less-e2e "$out/bin/vaultwarden-less-e2e"
+      install -D -m 0644 compose.yml "$out/share/vaultwarden-less-e2e/compose.yml"
+      install -D -m 0644 flake.nix "$out/share/vaultwarden-less-e2e/flake.nix"
       runHook postInstall
     '';
   };
@@ -81,7 +83,7 @@ let
     "-e2e-product-image-tag=${identity.release}"
   ];
   testerCommand =
-    "cd ${lib.escapeShellArg (toString source)} && "
+    "cd ${e2eTest}/share/vaultwarden-less-e2e && "
     + "exec env HOME=/home/tester TMPDIR=/home/tester/tmp "
     + "DOCKER_HOST=unix:///var/run/docker.sock ${e2eCommand}";
   runAsTester = "sudo -u tester -H ${lib.getExe pkgs.bash} -c ${lib.escapeShellArg testerCommand}";
@@ -127,17 +129,18 @@ pkgs.testers.runNixOSTest {
         e2eTest
         imageArchives
         releaseBundle
-        source
       ];
     };
 
   testScript = ''
+    from datetime import timedelta
+
     start_all()
     machine.wait_for_unit("docker.service")
     machine.succeed("install -d -o tester -g users -m 0700 /home/tester/tmp")
     machine.succeed("sudo -u tester -H docker info")
     machine.succeed("sudo -u tester -H docker compose version")
     machine.succeed("cd ${releaseBundle} && sha256sum --check SHA256SUMS")
-    print(machine.succeed(${builtins.toJSON runAsTester}, timeout=65 * 60))
+    print(machine.succeed(${builtins.toJSON runAsTester}, timeout=timedelta(minutes=65)))
   '';
 }
