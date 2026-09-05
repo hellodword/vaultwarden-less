@@ -266,10 +266,12 @@ func (h *e2eHarness) startTLSProxy() {
 			h.backendMu.RUnlock()
 			if backend == nil {
 				request.SetURL(&url.URL{Scheme: "http", Host: "127.0.0.1:1"})
+				request.SetXForwarded()
 				return
 			}
 			request.SetURL(backend)
 			request.Out.Host = request.In.Host
+			request.SetXForwarded()
 		},
 		Transport: &http.Transport{Proxy: nil, DisableKeepAlives: true},
 	}
@@ -428,7 +430,8 @@ func (h *e2eHarness) writeOverride() {
     platform: linux/amd64
     user: "%d:%d"
     read_only: true
-    tmpfs: [/tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777]
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
     security_opt: [no-new-privileges:true]
     cap_drop: [ALL]
   moto-b2:
@@ -438,7 +441,8 @@ func (h *e2eHarness) writeOverride() {
     platform: linux/amd64
     user: "%d:%d"
     read_only: true
-    tmpfs: [/tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777]
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
     security_opt: [no-new-privileges:true]
     cap_drop: [ALL]
 %s%s%s
