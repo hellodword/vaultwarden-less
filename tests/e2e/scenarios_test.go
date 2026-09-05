@@ -134,7 +134,7 @@ func TestTwoTargetBackupRestore(t *testing.T) {
 	partial := h.waitStatus(4*time.Minute, func(status productworker.Status) bool {
 		primary, b2 := exactTwoTargets(t, status)
 		return status.State == "partial" && status.LastCheck != nil && status.LastCheck.Result == "partial" &&
-			status.LastCheck.ContentID != nil && status.LastCheck.ArchiveID != nil &&
+			status.LastCheck.ContentID != nil && status.LastCheck.ArchiveID != nil && status.NextCheckAt != nil &&
 			primary.State == "healthy" && primary.SnapshotID != nil && primary.ContentID != nil &&
 			b2.State == "retrying" && b2.SnapshotID == nil && b2.ContentID == nil && b2.ErrorCode != nil
 	})
@@ -144,6 +144,7 @@ func TestTwoTargetBackupRestore(t *testing.T) {
 		t.Fatalf("partial target identities are incomplete: %#v", partial)
 	}
 	logicalContent := *partial.LastCheck.ContentID
+	partialRetryAt := parseWorkerTime(t, *partial.NextCheckAt)
 	primarySnapshotID := *partialPrimary.SnapshotID
 	primarySnapshots := h.waitTargetSnapshotCount("primary", 1, 2*time.Minute)
 	if primarySnapshots.Snapshots[0].ID != primarySnapshotID || primarySnapshots.Snapshots[0].ContentID != logicalContent {
@@ -157,11 +158,17 @@ func TestTwoTargetBackupRestore(t *testing.T) {
 	h.validateProxyBinding()
 	h.setBackend(loopbackEndpoint(h.proxyPort))
 	h.waitHTTP(h.publicTLS+"/.vaultwarden-less/healthz", 204, time.Minute)
+	h.waitStatus(time.Minute, func(status productworker.Status) bool {
+		return status.State == "partial" && status.LastCheck != nil && partial.LastCheck != nil &&
+			status.LastCheck.FinishedAt == partial.LastCheck.FinishedAt && status.NextCheckAt != nil &&
+			parseWorkerTime(t, *status.NextCheckAt).Before(partialRetryAt)
+	})
 	restoreB2()
 	h.requestBackup()
 	recovered := h.waitStatus(8*time.Minute, func(status productworker.Status) bool {
 		primary, b2 := exactTwoTargets(t, status)
 		return status.State == "idle" && status.LastCheck != nil && status.LastCheck.Result == "created" &&
+			status.NextCheckAt != nil &&
 			primary.State == "healthy" && b2.State == "healthy" &&
 			primary.SnapshotID != nil && b2.SnapshotID != nil &&
 			primary.ContentID != nil && b2.ContentID != nil &&
@@ -171,12 +178,63 @@ func TestTwoTargetBackupRestore(t *testing.T) {
 	if *recoveredPrimary.SnapshotID != primarySnapshotID {
 		t.Fatalf("b2 catch-up replaced the primary snapshot: %#v", recoveredPrimary)
 	}
+	recoveredFinishedAt := parseWorkerTime(t, recovered.LastCheck.FinishedAt)
+	recoveredFallbackAt := parseWorkerTime(t, *recovered.NextCheckAt)
+	if recoveredFallbackAt.Sub(recoveredFinishedAt) != 12*time.Hour {
+		t.Fatalf("recovered worker did not return to its fallback schedule: %#v", recovered)
+	}
 	primarySnapshots = h.waitTargetSnapshotCount("primary", 1, 2*time.Minute)
 	b2Snapshots := h.waitTargetSnapshotCount("b2", 1, 2*time.Minute)
+	baselinePrimarySnapshot, baselineB2Snapshot := primarySnapshots.Snapshots[0], b2Snapshots.Snapshots[0]
+	if baselinePrimarySnapshot.ContentID != logicalContent || baselineB2Snapshot.ContentID != logicalContent ||
+		baselineB2Snapshot.ID != *recoveredB2.SnapshotID || baselinePrimarySnapshot.ID == baselineB2Snapshot.ID {
+		t.Fatalf("repositories did not converge independently: primary=%#v b2=%#v", baselinePrimarySnapshot, baselineB2Snapshot)
+	}
+
+	// The official client still uses the public TLS facade, whose backend now is
+	// the production proxy. Do not request a backup after this write: the proxy's
+	// completed successful response must be the only source of new worker demand.
+	const updatedItemPassword = "proxy-triggered-e2e-item-password"
+	item := client.getItem(ctx, fixture.itemID)
+	setItemPassword(t, item, updatedItemPassword)
+	client.editItem(ctx, fixture.itemID, item)
+	fixture.itemPassword = updatedItemPassword
+
+	eventScheduled := h.waitStatus(time.Minute, func(status productworker.Status) bool {
+		return status.State == "debouncing" && status.LastCheck != nil && recovered.LastCheck != nil &&
+			status.LastCheck.FinishedAt == recovered.LastCheck.FinishedAt &&
+			status.LastCheck.ContentID != nil && *status.LastCheck.ContentID == logicalContent &&
+			status.NextCheckAt != nil && parseWorkerTime(t, *status.NextCheckAt).Before(recoveredFallbackAt)
+	})
+	eventCheckAt := parseWorkerTime(t, *eventScheduled.NextCheckAt)
+	automatic := h.waitStatus(7*time.Minute, func(status productworker.Status) bool {
+		primary, b2 := exactTwoTargets(t, status)
+		return status.State == "idle" && status.LastCheck != nil && status.LastCheck.Result == "created" &&
+			status.LastCheck.FinishedAt != recovered.LastCheck.FinishedAt &&
+			status.LastCheck.ContentID != nil && *status.LastCheck.ContentID != logicalContent &&
+			status.LastCheck.ArchiveID != nil && status.NextCheckAt != nil &&
+			primary.State == "healthy" && b2.State == "healthy" &&
+			primary.SnapshotID != nil && b2.SnapshotID != nil &&
+			primary.ContentID != nil && b2.ContentID != nil &&
+			*primary.ContentID == *status.LastCheck.ContentID && *b2.ContentID == *status.LastCheck.ContentID
+	})
+	if parseWorkerTime(t, automatic.LastCheck.StartedAt).Before(eventCheckAt) {
+		t.Fatalf("automatic check started before the proxy event was scheduled: %#v", automatic)
+	}
+	automaticPrimary, automaticB2 := exactTwoTargets(t, automatic)
+	automaticContent := *automatic.LastCheck.ContentID
+	automaticArchive := *automatic.LastCheck.ArchiveID
+	primarySnapshots = h.waitTargetSnapshotCount("primary", 2, 2*time.Minute)
+	b2Snapshots = h.waitTargetSnapshotCount("b2", 2, 2*time.Minute)
 	primarySnapshot, b2Snapshot := primarySnapshots.Snapshots[0], b2Snapshots.Snapshots[0]
-	if primarySnapshot.ContentID != logicalContent || b2Snapshot.ContentID != logicalContent ||
-		b2Snapshot.ID != *recoveredB2.SnapshotID || primarySnapshot.ID == b2Snapshot.ID {
-		t.Fatalf("repositories did not converge independently: primary=%#v b2=%#v", primarySnapshot, b2Snapshot)
+	if primarySnapshots.Snapshots[1].ID != baselinePrimarySnapshot.ID ||
+		b2Snapshots.Snapshots[1].ID != baselineB2Snapshot.ID ||
+		primarySnapshot.ID == baselinePrimarySnapshot.ID || b2Snapshot.ID == baselineB2Snapshot.ID ||
+		primarySnapshot.ID == b2Snapshot.ID ||
+		primarySnapshot.ID != *automaticPrimary.SnapshotID || b2Snapshot.ID != *automaticB2.SnapshotID ||
+		primarySnapshot.ContentID != automaticContent || b2Snapshot.ContentID != automaticContent ||
+		primarySnapshot.ArchiveID != automaticArchive || b2Snapshot.ArchiveID != automaticArchive {
+		t.Fatalf("proxy write did not create one independent recovery point per repository: primary=%#v b2=%#v", primarySnapshots, b2Snapshots)
 	}
 	for _, target := range targets {
 		h.repositoryCheck(target)
@@ -231,6 +289,15 @@ func TestTwoTargetBackupRestore(t *testing.T) {
 	if b2RSA == sourceRSA || b2RSA == primaryRSA {
 		t.Fatal("restored copies did not generate independent new RSA identities")
 	}
+}
+
+func parseWorkerTime(t *testing.T, value string) time.Time {
+	t.Helper()
+	parsed, err := time.Parse(time.RFC3339Nano, value)
+	if err != nil {
+		t.Fatalf("invalid worker timestamp %q: %v", value, err)
+	}
+	return parsed
 }
 
 func createVaultFixture(
