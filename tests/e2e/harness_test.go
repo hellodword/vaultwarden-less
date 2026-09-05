@@ -244,7 +244,8 @@ func (h *e2eHarness) requireSharedBindPath() {
 	output, err := h.docker(
 		"run", "--rm", "--pull", "never", "--name", name,
 		"--label", "vaultwarden-less.e2e.project="+h.project,
-		"--read-only", "--security-opt", "no-new-privileges:true", "--cap-drop", "ALL",
+		"--user", fmt.Sprintf("%d:%d", os.Geteuid(), os.Getegid()),
+		"--read-only", "--security-opt", "no-new-privileges=true", "--cap-drop", "ALL",
 		"--mount", "type=bind,source="+canary+",target=/canary/token,readonly",
 		"--entrypoint", "/bin/python3", "vaultwarden-less-moto:local", "-c", program, token,
 	)
