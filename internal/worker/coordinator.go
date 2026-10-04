@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -137,7 +138,7 @@ func copyTargets(cfg *config.Backup) []config.Target {
 	}
 	targets := make([]config.Target, len(cfg.Targets))
 	for index, target := range cfg.Targets {
-		target.Options = append([]config.Option(nil), target.Options...)
+		target.Options = slices.Clone(target.Options)
 		targets[index] = target
 	}
 	return targets

@@ -339,6 +339,13 @@ golden encodings remain unchanged. SQLite schema and projection validation,
 concurrent WAL consistency, available-space checks, and atomic publication are
 required.
 
+Schema comparison accepts the exact compact Diesel 1.x migration-ledger DDL
+as equivalent to the multiline Diesel 2.x DDL. This formatting-only equivalence
+is applied in memory to `__diesel_schema_migrations`, preserving the existing
+schema fingerprint and logical identity. All other schema objects, constraints,
+columns, and the accepted migration remain strictly validated; no database SQL
+or migration record is rewritten.
+
 Recovery-point construction uses a process-owned `.build-*` directory with
 mode `0700`. Cleanup may remove only a real directory whose name and ownership
 prove it belongs to that convention. An unsafe same-prefix file, symlink,

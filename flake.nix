@@ -18,7 +18,10 @@
     }:
     let
       system = "x86_64-linux";
-      pkgs = import nixpkgs { inherit system; };
+      pkgs = import ./nix/upstreams.nix {
+        inherit upstreams;
+        pkgs = import nixpkgs { inherit system; };
+      };
       upstreams = builtins.fromTOML (builtins.readFile ./UPSTREAMS.toml);
       clean = self ? rev;
       projectCommit = if clean then self.rev else "";

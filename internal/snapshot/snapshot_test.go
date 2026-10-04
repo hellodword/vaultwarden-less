@@ -811,6 +811,70 @@ func TestBuilderRejectsSchemaDriftAtTheSameMigration(t *testing.T) {
 	}
 }
 
+func TestLegacyDieselMigrationTable(t *testing.T) {
+	// Diesel's older SQLite setup emitted this compact DDL. Upgrading
+	// Vaultwarden leaves an existing migration ledger's SQL unchanged.
+	const legacySQL = "CREATE TABLE __diesel_schema_migrations (version VARCHAR(50) PRIMARY KEY NOT NULL,run_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+	for name, statement := range map[string]string{
+		"legacy":           legacySQL,
+		"changed type":     strings.Replace(legacySQL, "VARCHAR(50)", "VARCHAR(51)", 1),
+		"missing not null": strings.Replace(legacySQL, "PRIMARY KEY NOT NULL", "PRIMARY KEY", 1),
+		"changed default":  strings.Replace(legacySQL, "CURRENT_TIMESTAMP", "'CURRENT_TIMESTAMP'", 1),
+		"extra column":     strings.TrimSuffix(legacySQL, ")") + ", unexpected TEXT)",
+	} {
+		t.Run(name, func(t *testing.T) {
+			data := syntheticData(t, true)
+			builder := Builder{DataDir: data.dataDir, StagingDir: privateDirectory(t), ProjectCommit: testProjectCommit}
+			original, err := builder.Build(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			contract, err := upstream.VaultwardenSchemaContract()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := data.database.Exec("DROP TABLE __diesel_schema_migrations;" + statement); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := data.database.Exec("INSERT INTO __diesel_schema_migrations(version, run_on) VALUES (?, '2026-05-05')", contract.DatabaseMigration); err != nil {
+				t.Fatal(err)
+			}
+			builder.StagingDir = privateDirectory(t)
+			adopted, err := builder.Build(context.Background())
+			if name != "legacy" {
+				if err == nil {
+					t.Fatal("migration table schema drift was accepted")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if adopted.ContentID != original.ContentID {
+				t.Fatal("legacy ledger formatting changed logical recovery identity")
+			}
+			point := filepath.Join(builder.StagingDir, "point")
+			if _, err := Verify(context.Background(), point); err != nil {
+				t.Fatalf("verify legacy recovery point: %v", err)
+			}
+			for _, path := range []string{filepath.Join(data.dataDir, "db.sqlite3"), filepath.Join(point, "db.sqlite3")} {
+				database, err := sql.Open("sqlite3", sqliteURI(path, "ro"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer database.Close()
+				var actual string
+				if err := database.QueryRow("SELECT sql FROM sqlite_schema WHERE name = '__diesel_schema_migrations'").Scan(&actual); err != nil {
+					t.Fatal(err)
+				}
+				if actual != legacySQL {
+					t.Fatal("validation rewrote the database schema")
+				}
+			}
+		})
+	}
+}
+
 func TestVerifyRejectsEveryTreeMismatch(t *testing.T) {
 	tests := map[string]func(t *testing.T, point string){
 		"extra file": func(t *testing.T, point string) {

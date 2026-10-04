@@ -1,5 +1,5 @@
 {
-  "vaultwarden_version": "1.37.2",
+  "vaultwarden_version": "1.37.3",
   "database_migration": "20260505120000",
   "fingerprint": "sha256:a16973f04bdd389a70562e86e6b1dc5ff336d6118f195ebb13e6085e47b65175",
   "objects": [

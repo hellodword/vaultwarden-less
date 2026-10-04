@@ -550,6 +550,28 @@ func TestWorkerCopiesTargetsAndOptionsAtConstruction(t *testing.T) {
 	}
 }
 
+func TestWorkerBacksUpTargetWithEmptyOptions(t *testing.T) {
+	t.Parallel()
+	cfg, err := config.DecodeBackup([]byte("targets:\n  - name: primary\n    repository: /repository\n    options: []\nnotifiers: []\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := workerManifest(t)
+	worker := New(cfg, (&fixedSource{manifest: manifest}).Build,
+		func(_ context.Context, target config.Target, point snapshot.Manifest) (restic.SyncResult, error) {
+			if err := target.Validate(); err != nil {
+				return restic.SyncResult{}, err
+			}
+			return syncResult('a', point.ContentID, true), nil
+		}, nil, discardLogger())
+	if outcome := worker.check(context.Background()); outcome.result != "created" {
+		t.Fatalf("backup with empty options failed: %#v", outcome)
+	}
+	if target := worker.Status().Targets[0]; target.State != "healthy" || target.SnapshotID == nil {
+		t.Fatalf("empty-options target did not become healthy: %#v", target)
+	}
+}
+
 func TestTargetlessWorkerStaysIdleWithoutSchedulingOrRecoveryAccess(t *testing.T) {
 	t.Parallel()
 	buildCalls, ensureCalls := 0, 0

@@ -57,8 +57,20 @@ assert pkgs.restic.version == versionFromTag "v" upstreams.restic.source_tag;
 assert sourceRevMatches pkgs.restic upstreams.restic.source_tag;
 assert pkgs.bitwarden-cli.version == versionFromTag "cli-v" upstreams.bitwarden_cli.source_tag;
 assert sourceRevMatches pkgs.bitwarden-cli upstreams.bitwarden_cli.source_tag;
+assert sourceRevMatches pkgs.bitwarden-cli.npmDeps upstreams.bitwarden_cli.source_tag;
 assert pkgs.python3Packages.moto.version == upstreams.moto.source_tag;
 assert sourceRevMatches pkgs.python3Packages.moto upstreams.moto.source_tag;
+assert lib.all
+  (
+    name:
+    pkgs.python3Packages.${name}.version == upstreams.moto.${name}.source_tag
+    && sourceRevMatches pkgs.python3Packages.${name} upstreams.moto.${name}.source_tag
+  )
+  [
+    "boto3"
+    "botocore"
+    "s3transfer"
+  ];
 assert pkgs.go.version == versionFromTag "go" upstreams.go.source_tag;
 assert lib.any (lib.hasInfix "${upstreams.go.source_tag}.src.tar.gz") goSourceURLs;
 {

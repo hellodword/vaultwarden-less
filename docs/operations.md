@@ -5,6 +5,11 @@ Docker Compose plugin, GNU file utilities, and checksum/copy tools. Nix, Git,
 Go, Python, Just, and the source tree are build-host concerns, not deployment
 dependencies.
 
+The pinned Vaultwarden 1.37.3 is tested with Bitwarden CLI 2026.8.0.
+CLI 2026.9.0 and 2026.9.1 fail password login against this server because a
+required key-ID endpoint is absent; see the
+[compatibility pin](maintenance.md#component-review-boundaries).
+
 Examples use task-specific variables:
 
 ```sh
@@ -219,6 +224,14 @@ backup, and confirm each target independently before relying on it.
 Existing-data adoption is an offline operator file operation. There is no
 project import command or state machine. Only a stopped SQLite Vaultwarden is
 supported.
+
+For a legacy archive containing both `data/` and `git-backup/`, adopt the complete
+`data/` tree. The legacy Git backup is not a runtime input. Extract into a new
+private directory after rejecting absolute paths, traversal, duplicate paths,
+links, and special files. Keep `db.sqlite3-wal` and `db.sqlite3-shm` beside the
+database: committed vault records may exist only in the WAL. Do not checkpoint,
+vacuum, or rewrite the source to make it resemble a fresh database. The historical
+Diesel migration-table whitespace is accepted without changing stored data.
 
 1. Stop the source Vaultwarden completely and retain the original directory as
    the recovery copy.

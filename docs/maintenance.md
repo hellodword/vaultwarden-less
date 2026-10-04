@@ -13,6 +13,17 @@ commit, and audited paths; Vaultwarden also records the accepted SQLite
 migration and generated schema/projection paths.
 
 `flake.nix` and the tool-generated `flake.lock` own the Nix dependency graph.
+`nix/upstreams.nix` supplies reviewed compatible releases independently of the
+pinned nixpkgs defaults. Source and npm dependency hashes for these overrides live
+in `UPSTREAMS.toml`; obtain them through Nix fetchers, including rebuilding the
+CLI dependency cache from the candidate's unchanged upstream lockfile. Keep the
+development shell and VM test on the same package set. Moto's nested AWS SDK
+pins keep its service models and boto3/botocore/s3transfer requirements aligned;
+retain their upstream package tests when updating them.
+The Moto scheduler fixture follows the timestamp-precision correction in
+[upstream #10259](https://github.com/getmoto/moto/pull/10259), with exact
+microsecond equality for the pinned newer SDK. Remove that adaptation when
+adopting a Moto release that already incorporates the correction.
 `go.mod` and the tool-generated `go.sum` own the Go module graph. Never edit a
 dependency lockfile by hand. Change an authoritative input and use the declared
 dependency tool, then review the complete generated diff. A shared Nix input
@@ -83,6 +94,15 @@ For the official Bitwarden CLI, review the server-selection, login, unlock,
 sync, item/folder, attachment, and Send commands used by the two E2E scenarios,
 plus the PBKDF2/HKDF, RSA-OAEP, and AES-CBC-HMAC behavior required by the narrow
 registration helper. The CLI is test tooling, not a production dependency.
+
+CLI 2026.8.0 is the compatibility ceiling for the pinned Vaultwarden 1.37.3.
+CLI 2026.9.0 and 2026.9.1 require the user-key-ID backfill endpoint during
+password login; the unmodified server returns 404 and login fails. See
+[Vaultwarden #7750](https://github.com/dani-garcia/vaultwarden/issues/7750) and
+the merged, unreleased [fix #7693](https://github.com/dani-garcia/vaultwarden/pull/7693).
+Keep both dependencies on official releases. Revisit this CLI pin when a
+Vaultwarden release includes that fix, review its database migration and
+projection together, and rerun both scenarios without bypassing login errors.
 
 For Restic, review the unmodified `init`, `backup`, `snapshots`, `check`,
 `unlock`, `forget --prune`, and `restore` arguments and JSON; format-2

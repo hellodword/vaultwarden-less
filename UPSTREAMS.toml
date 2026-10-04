@@ -1,7 +1,7 @@
 [vaultwarden]
 repository = "https://github.com/dani-garcia/vaultwarden"
-source_tag = "1.37.2"
-source_commit = "46d71107f5094460dd5ecbe1dbac6e6c71e5189a"
+source_tag = "1.37.3"
+source_commit = "eb212e23fad88e6136723f43e5b73543fa7026d3"
 database_migration = "20260505120000"
 schema_contract = "internal/upstream/vaultwarden-schema.json"
 recovery_projection = "internal/upstream/recovery-projection.json"
@@ -15,13 +15,17 @@ audit_paths = [
 
 [bitwarden_cli]
 repository = "https://github.com/bitwarden/clients"
-source_tag = "cli-v2026.7.0"
-source_commit = "82186c3d92c0da14aa86c848b781d949a8a6202a"
+# 2026.9.x requires an endpoint absent from stable Vaultwarden; see maintenance.md.
+source_tag = "cli-v2026.8.0"
+source_commit = "77d62ade0fe91a502b7cfb9d8d894c2746c5609a"
+source_hash = "sha256-Kz7vy3mt4uLGA6wGtH527P5vY55UYSZtq6e8IyNJvc4="
+npm_deps_hash = "sha256-5i6/TlqBhPLv00tN0sxFA/iRQ8QRyUxhCqYkhVBLz3w="
 audit_paths = [
   "apps/cli/**",
   "libs/auth/**",
   "libs/common/**",
   "libs/key-management/**",
+  "libs/legacy-crypto/**",
   "libs/node/**",
 ]
 
@@ -39,8 +43,9 @@ audit_paths = [
 
 [moto]
 repository = "https://github.com/getmoto/moto"
-source_tag = "5.2.2"
-source_commit = "837595545cc4a4bb8fede2cff84b2b2373443981"
+source_tag = "5.2.3"
+source_commit = "3acd662d8196355a1dbbcdb36f7b9ee63d6c70d9"
+source_hash = "sha256-7wE44MYdRf9p3/ac2qOPpLaS0bkpoh84R+rdJp5oycU="
 audit_paths = [
   "moto/s3/**",
   "moto/server.py",
@@ -50,8 +55,8 @@ audit_paths = [
 
 [go]
 repository = "https://go.googlesource.com/go"
-source_tag = "go1.26.7"
-source_commit = "e3336a22ad3f0a90bd252c95d8b5544e02674205"
+source_tag = "go1.27.1"
+source_commit = "862c888e612ac346c7c4d99c9392bdfd265f33b0"
 audit_paths = [
   "src/cmd/**",
   "src/crypto/**",
@@ -60,3 +65,19 @@ audit_paths = [
   "src/os/**",
   "src/runtime/**",
 ]
+
+# Moto's service models require a newer, matching AWS SDK than nixpkgs supplies.
+[moto.boto3]
+source_tag = "1.43.107"
+source_commit = "402e09ca457c8b8ea37097e32dcf2de7c612bb2f"
+source_hash = "sha256-d8Vr7Vh234J7rWTdPCW5g7wZKTqvcm2vPEgvCWwqwYM="
+
+[moto.botocore]
+source_tag = "1.43.107"
+source_commit = "646bd4ec3f99d60798e95195e2d7153bcd37055d"
+source_hash = "sha256-l0cHn0rqov6ayazKqCpIoqMX2P4DV9r0XgwTWeitrT4="
+
+[moto.s3transfer]
+source_tag = "0.19.2"
+source_commit = "467a75265eca43937a760c2c169488954df44246"
+source_hash = "sha256-BOK8kfTdxM6CInouXrBsQf4/zgL3l/A+VElh1VJj4mA="

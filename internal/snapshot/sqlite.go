@@ -275,6 +275,23 @@ func validateDatabase(ctx context.Context, path string) (databaseValidation, err
 			return databaseValidation{}, fmt.Errorf("read database schema object: %w", err)
 		}
 		object.SQL = strings.TrimSpace(object.SQL)
+		// Diesel 1.x migrations_internals/src/lib.rs created this exact compact
+		// ledger; Diesel 2.x uses setup_migration_table.sql with newlines. Existing
+		// databases retain the old spelling after all Vaultwarden migrations.
+		// Canonicalize only that audited variant in memory, preserving both the
+		// database bytes and the existing recovery schema fingerprint.
+		if object == (upstream.SchemaObject{
+			Type:  "table",
+			Name:  "__diesel_schema_migrations",
+			Table: "__diesel_schema_migrations",
+			SQL: "CREATE TABLE __diesel_schema_migrations (" +
+				"version VARCHAR(50) PRIMARY KEY NOT NULL," +
+				"run_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)",
+		}) {
+			object.SQL = "CREATE TABLE __diesel_schema_migrations (\n" +
+				"       version VARCHAR(50) PRIMARY KEY NOT NULL,\n" +
+				"       run_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP\n)"
+		}
 		objects = append(objects, object)
 	}
 	if err := rows.Err(); err != nil {

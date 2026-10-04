@@ -99,7 +99,7 @@ pkgs.testers.runNixOSTest {
   qemu.forceAccel = true;
 
   nodes.machine =
-    { pkgs, ... }:
+    { ... }:
     {
       virtualisation = {
         cores = 4;

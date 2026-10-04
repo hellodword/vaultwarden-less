@@ -7,7 +7,7 @@
 
 let
   lib = pkgs.lib;
-  productVendorHash = "sha256-kOSaH7fkHW/WUqKKWFU8lqmJsvzW/quxqnLOaorRyI8=";
+  productVendorHash = "sha256-Ktk0q0selvc6e+bYUjt63BFcZkaBhUz6j/Obi4uNILg=";
   cleanString = if identity.clean then "true" else "false";
 
   productPackage =
