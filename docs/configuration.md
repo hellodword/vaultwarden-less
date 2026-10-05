@@ -1,5 +1,9 @@
 # Configuration
 
+For the preparation sequence, use [deployment](deployment.md). This page is
+the reference for the files in [templates](../templates/README.md); their inline
+comments explain required values and when to restart or recreate a service.
+
 The supplied [Compose file](../compose.yml) runs `vaultwarden`, `proxy` and
 `backup` with a non-root UID/GID, read-only root filesystems, a temporary
 `/tmp`, dropped capabilities and bounded logs. Only Vaultwarden writes the
@@ -32,22 +36,58 @@ the bundle, a non-root runtime UID/GID and the loopback listener port. Compose
 owns interpolation of this file. A build from a Git revision records that
 revision as provenance; a working-tree build uses `development`.
 
-The Vaultwarden template sets:
+## Vaultwarden profile and precedence
+
+The supplied minimal-feature profile sets:
 
 ```dotenv
 WEB_VAULT_ENABLED=false
 ADMIN_TOKEN=
 DISABLE_ADMIN_TOKEN=false
 SIGNUPS_ALLOWED=false
+SIGNUPS_DOMAINS_WHITELIST=
 INVITATIONS_ALLOWED=false
 DISABLE_ICON_DOWNLOAD=true
+HTTP_REQUEST_BLOCK_NON_GLOBAL_IPS=true
+PASSWORD_HINTS_ALLOWED=false
+SHOW_PASSWORD_HINT=false
+SENDS_ALLOWED=false
+EMERGENCY_ACCESS_ALLOWED=false
+ORG_CREATION_USERS=none
 ```
 
-Other Vaultwarden settings remain upstream settings. Existing `data/config.json`
-keeps its upstream precedence and is included in backups. Review it when
-changing environment defaults. Compose fixes the SQLite database, RSA,
-attachment and Send paths under `/data`. Supply trusted external HTTPS for
-official Bitwarden clients.
+An empty admin token with `DISABLE_ADMIN_TOKEN=false` disables the admin panel.
+The empty signup domain whitelist prevents an exception to closed registration.
+The HTTP destination block applies to Vaultwarden HTTP clients that enforce it;
+it is neither a general firewall nor a setting for backup/restic/notifier
+connections. Icon downloads are separately disabled. These settings do not
+alter inbound listeners or the external reverse proxy.
+
+The feature switches do not erase existing data. `SENDS_ALLOWED=false` blocks
+new or modified Sends; existing Sends can still be accessed and deleted.
+`ORG_CREATION_USERS=none` prevents new organizations and retains existing ones.
+Emergency access is disabled. Re-enable individual features deliberately when
+your installation needs them. Request and login limits retain upstream defaults;
+the template does not configure separate limit values.
+
+Existing `data/config.json` retains
+[Vaultwarden's precedence](https://github.com/dani-garcia/vaultwarden/wiki/Configuration-overview)
+over editable environment settings and is included in backups. Review it before
+relying on template defaults. Compose's explicit `environment` entries override
+the service `env_file` and fix the SQLite database, RSA, attachment and Send
+paths under `/data`. Other fields use the selected Vaultwarden's upstream
+settings; consult its `.env.template` when changing them.
+
+`compose.env` and `vaultwarden.env` use
+[Compose's interpolation and quoting rules](https://docs.docker.com/compose/how-tos/environment-variables/variable-interpolation/).
+Exported shell variables take precedence over `compose.env`, so keep any
+exported deployment values consistent with the file. Single-quote values
+containing literal `$`, such as an Argon2 admin
+token hash. Restic credential env files use the different literal rules below.
+Never source any of these files. After changing a Compose env file, run
+`compose up --detach` to recreate affected containers; `restart` alone does
+not reload their environment. Restart backup for changes to its mounted YAML,
+target credential files or APNs key. Use 0600 permissions for secrets.
 
 ## Destinations
 

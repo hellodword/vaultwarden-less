@@ -11,9 +11,7 @@ import (
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	command := cli.New(os.Stdout, os.Stderr)
-	command.SetContext(ctx)
-	err := cli.Execute(command, os.Args[1:])
+	err := cli.Execute(ctx, os.Args[1:], os.Stdout, os.Stderr)
 	cli.WriteError(os.Stderr, err)
 	stop()
 	os.Exit(cli.ExitCode(err))

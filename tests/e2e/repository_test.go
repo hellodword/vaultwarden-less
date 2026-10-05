@@ -32,7 +32,7 @@ func (h *e2eHarness) nativeRestic(target string, mounts []string, arguments ...s
 	for _, mount := range mounts {
 		command = append(command, "--mount", mount)
 	}
-	command = append(command, "--entrypoint", "/bin/restic", "vaultwarden-less-backup:"+h.imageTag, "-o", "s3.bucket-lookup=path", "-o", "s3.region=us-east-1")
+	command = append(command, "--entrypoint", "/bin/restic", h.services["backup"].Image, "-o", "s3.bucket-lookup=path", "-o", "s3.region=us-east-1")
 	return h.mustDocker(append(command, arguments...)...)
 }
 func (h *e2eHarness) snapshots(target string) []nativeSnapshot {
@@ -141,23 +141,27 @@ func (h *e2eHarness) restore(target, id, name string) string {
 }
 func (h *e2eHarness) sqlite(root, sql string) string {
 	h.t.Helper()
-	return h.mustDocker("run", "--rm", "--pull", "never", "--user", h.identity(), "--read-only", "--mount", "type=bind,source="+root+",target=/data", "--entrypoint", "/bin/sqlite3", "vaultwarden-less-backup:"+h.imageTag, "-batch", "-bail", "/data/db.sqlite3", sql)
+	return h.mustDocker("run", "--rm", "--pull", "never", "--user", h.identity(), "--read-only", "--mount", "type=bind,source="+root+",target=/data", "--entrypoint", "/bin/sqlite3", h.services["backup"].Image, "-batch", "-bail", "/data/db.sqlite3", sql)
 }
 func (h *e2eHarness) sqliteReadOnly(root, sql string) string {
 	h.t.Helper()
-	return h.mustDocker("run", "--rm", "--pull", "never", "--user", h.identity(), "--read-only", "--mount", "type=bind,source="+root+",target=/restore,readonly", "--entrypoint", "/bin/sqlite3", "vaultwarden-less-backup:"+h.imageTag, "-batch", "-bail", "-readonly", "file:/restore/db.sqlite3?immutable=1", sql)
+	return h.mustDocker("run", "--rm", "--pull", "never", "--user", h.identity(), "--read-only", "--mount", "type=bind,source="+root+",target=/restore,readonly", "--entrypoint", "/bin/sqlite3", h.services["backup"].Image, "-batch", "-bail", "-readonly", "file:/restore/db.sqlite3?immutable=1", sql)
 }
 func (h *e2eHarness) startRestored(root, name string) {
 	h.t.Helper()
 	port := unusedLoopbackPort(h.t)
 	container := h.project + "-" + name
-	h.mustDocker("run", "--detach", "--pull", "never", "--name", container, "--label", "vaultwarden-less.e2e.project="+h.project,
+	command := []string{"run", "--detach", "--pull", "never", "--name", container, "--label", "vaultwarden-less.e2e.project=" + h.project,
 		"--user", h.identity(), "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
-		"--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777", "--mount", "type=bind,source="+root+",target=/data",
-		"--publish", fmt.Sprintf("127.0.0.1:%d:80", port), "--env", "DATA_FOLDER=/data", "--env", "DATABASE_URL=sqlite:///data/db.sqlite3",
-		"--env", "RSA_KEY_FILENAME=/data/rsa_key", "--env", "ATTACHMENTS_FOLDER=/data/attachments", "--env", "SENDS_FOLDER=/data/sends",
-		"--env", "WEB_VAULT_ENABLED=false", "--env", "SIGNUPS_ALLOWED=false", "--env", "INVITATIONS_ALLOWED=false", "--env", "ADMIN_TOKEN=",
-		"--env", "DISABLE_ADMIN_TOKEN=false", "--env", "DISABLE_ICON_DOWNLOAD=true", "vaultwarden-less-vaultwarden:"+h.imageTag)
+		"--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777", "--mount", "type=bind,source=" + root + ",target=/data",
+		"--publish", fmt.Sprintf("127.0.0.1:%d:80", port)}
+	// Use the rendered product configuration before any test-only overrides.
+	// Sends stay disabled here: existing Sends must still be readable on restore.
+	for key, value := range h.services["vaultwarden"].Environment {
+		command = append(command, "--env", key+"="+value)
+	}
+	command = append(command, h.services["vaultwarden"].Image)
+	h.mustDocker(command...)
 	h.t.Cleanup(func() { h.cleanupContainer(container) })
 	h.setBackend(loopbackEndpoint(port))
 	h.waitHTTP(h.publicTLS+"/alive", 200, 3*time.Minute)

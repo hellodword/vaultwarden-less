@@ -1,10 +1,25 @@
+# Read by the backup worker at startup from /config/backup.yaml. Restart backup
+# after editing this mounted file. YAML scalars are parsed as data: no shell or
+# environment-variable expansion. Unknown fields are rejected. Keep this file
+# private if notifier URLs or signing secrets are configured below.
+# Empty targets/notifiers lists are valid. Invalid entries are disabled and
+# reported independently; malformed root YAML prevents the worker from starting.
 targets:
+  # Required unique name shown in status and notifications, not a repository URL.
   - name: primary
+    # Required absolute CONTAINER path. Compose mounts credentials/backup here;
+    # maintenance credentials are deliberately unavailable to the worker.
     env_file: /run/credentials/backup/primary.env
+    # Optional native restic backend options. Each string becomes one --option
+    # argument; do not include command flags or credentials here. For example:
+    # options: [s3.bucket-lookup=path, s3.region=us-east-1]
     options: []
 
-# All entries are independent. Empty targets and notifiers lists are valid.
-# Supported types: wecom, feishu, dingtalk, bark.
-# Webhooks use HTTPS; Feishu and DingTalk accept an optional secret.
-# Bark reads a P-256 PKCS#8 .p8 file from auth_key_file and connects to APNs.
+# Optional independent notification destinations; [] disables notifications.
+# Supported types: wecom, feishu, dingtalk, bark. Each needs a unique name.
+# Webhooks require HTTPS; Feishu/DingTalk accept an optional signing secret.
+# Bark pushes directly to Apple APNs for display in the Bark app, not through a
+# Bark server. Its auth_key_file is a CONTAINER path to a private P-256 PKCS#8
+# .p8 key mounted under /run/credentials/backup. Credentials must be authorized
+# for the configured APNs topic. See docs/configuration.md for complete examples.
 notifiers: []

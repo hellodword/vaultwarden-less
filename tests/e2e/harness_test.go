@@ -32,6 +32,10 @@ var (
 	runE2E            = flag.Bool("run-e2e", false, "run Docker release acceptance")
 	releaseDirectory  = flag.String("release-dir", "", "absolute deployment bundle directory")
 	workDirectory     = flag.String("work-dir", "", "retained work directory shared with the Docker host at the same absolute path")
+	dockerSocket      = flag.String("docker-socket", "/var/run/docker.sock", "local Docker socket shared with the host at the same absolute path")
+	runnerImage       = flag.String("runner-image", "", "test runner image reference supplied by Nix")
+	motoImage         = flag.String("moto-image", "", "Moto image reference supplied by Nix")
+	motoArchive       = flag.String("moto-archive", "", "Moto image archive supplied by Nix")
 	lowerHex64Pattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 )
 
@@ -47,6 +51,13 @@ type e2eHarness struct {
 	tlsServer                                            *httptest.Server
 	backendMu                                            sync.RWMutex
 	backend                                              *url.URL
+	services                                             map[string]composeService
+	vaultwardenOverrides                                 map[string]string
+}
+
+type composeService struct {
+	Image       string            `json:"image"`
+	Environment map[string]string `json:"environment"`
 }
 
 func newE2EHarness(t *testing.T, ctx context.Context) *e2eHarness {
@@ -54,10 +65,13 @@ func newE2EHarness(t *testing.T, ctx context.Context) *e2eHarness {
 	if os.Geteuid() == 0 || os.Getegid() == 0 {
 		t.Fatal("acceptance requires a non-root runtime identity")
 	}
-	for _, path := range []string{*releaseDirectory, *workDirectory} {
+	for _, path := range []string{*releaseDirectory, *workDirectory, *dockerSocket, *motoArchive} {
 		if !filepath.IsAbs(path) || filepath.Clean(path) != path {
-			t.Fatal("release-dir and work-dir must be clean absolute shared paths")
+			t.Fatal("release-dir, work-dir, docker-socket and moto-archive must be clean absolute paths")
 		}
+	}
+	if *runnerImage == "" || *motoImage == "" {
+		t.Fatal("runner-image and moto-image must be supplied by the packaged runner")
 	}
 	root, err := os.MkdirTemp(*workDirectory, "acceptance-")
 	if err != nil {
@@ -101,17 +115,36 @@ func newE2EHarness(t *testing.T, ctx context.Context) *e2eHarness {
 	}
 	t.Cleanup(h.cleanup)
 	h.mustDocker("info", "--format", "{{.ServerVersion}}")
-	h.mustDocker("load", "--input", "/share/moto.tar.gz")
+	h.mustDocker("load", "--input", *motoArchive)
 	canary := filepath.Join(root, "bind-canary")
 	writePrivateFile(t, canary, h.project)
-	h.mustDocker("run", "--rm", "--pull", "never", "--user", h.identity(), "--mount", "type=bind,source="+canary+",target=/canary,readonly", "--entrypoint", "/bin/python3", "vaultwarden-less-moto:local", "-c", `import pathlib,sys; assert pathlib.Path('/canary').read_text()==sys.argv[1]`, h.project)
+	h.mustDocker("run", "--rm", "--pull", "never", "--user", h.identity(), "--mount", "type=bind,source="+canary+",target=/canary,readonly", "--entrypoint", "/bin/python3", *motoImage, "-c", `import pathlib,sys; assert pathlib.Path('/canary').read_text()==sys.argv[1]`, h.project)
 	for _, name := range []string{"vaultwarden", "backup", "proxy"} {
 		h.mustDocker("load", "--input", filepath.Join(h.releaseRoot, "images", name+".tar.gz"))
 	}
 	h.startTLSProxy()
 	h.prepareDeployment()
 	h.writeOverride()
+	h.services, err = parseComposeServices(h.compose("config", "--format", "json"))
+	if err != nil {
+		t.Fatal("cannot parse rendered Compose services")
+	}
+	for _, name := range []string{"vaultwarden", "backup", "proxy"} {
+		if h.services[name].Image == "" {
+			t.Fatalf("Compose has no image for %s", name)
+		}
+	}
 	return h
+}
+
+func parseComposeServices(data string) (map[string]composeService, error) {
+	var rendered struct {
+		Services map[string]composeService `json:"services"`
+	}
+	// Compose config doubles every dollar for subsequent Compose interpolation,
+	// including in JSON. Undo that serialization escape before docker run --env.
+	err := json.Unmarshal([]byte(strings.ReplaceAll(data, "$$", "$")), &rendered)
+	return rendered.Services, err
 }
 
 func (h *e2eHarness) identity() string { return fmt.Sprintf("%d:%d", os.Geteuid(), os.Getegid()) }
@@ -121,7 +154,7 @@ func (h *e2eHarness) prepareDeployment() {
 	if err != nil {
 		h.t.Fatal(err)
 	}
-	writePrivateFile(h.t, filepath.Join(h.deploymentRoot, "config/vaultwarden.env"), strings.ReplaceAll(string(data), "SIGNUPS_ALLOWED=false", "SIGNUPS_ALLOWED=true"))
+	writePrivateFile(h.t, filepath.Join(h.deploymentRoot, "config/vaultwarden.env"), string(data))
 	configuration := "targets:\n"
 	for _, name := range []string{"primary", "secondary"} {
 		configuration += fmt.Sprintf("  - name: %s\n    env_file: /run/credentials/backup/%s.env\n    options: [s3.bucket-lookup=path, s3.region=us-east-1]\n", name, name)
@@ -138,19 +171,32 @@ func (h *e2eHarness) writeOverride() {
 	mount := func(source, target string, ro bool) map[string]any {
 		return map[string]any{"type": "bind", "source": source, "target": target, "read_only": ro, "bind": map[string]any{"create_host_path": false}}
 	}
+	vaultwarden := map[string]any{"ports": []string{fmt.Sprintf("127.0.0.1:%d:80", h.vaultwardenPort)}}
+	if len(h.vaultwardenOverrides) > 0 {
+		vaultwarden["environment"] = h.vaultwardenOverrides
+	}
 	services := map[string]any{
-		"vaultwarden": map[string]any{"ports": []string{fmt.Sprintf("127.0.0.1:%d:80", h.vaultwardenPort)}},
+		"vaultwarden": vaultwarden,
 		"backup":      map[string]any{"environment": map[string]string{"SSL_CERT_FILE": "/stub/ca.pem"}, "volumes": []any{mount(filepath.Join(h.testRoot, "stub"), "/stub", true)}},
-		"notify-stub": map[string]any{"image": "vaultwarden-less-test-runner:local", "pull_policy": "never", "user": h.identity(), "read_only": true, "cap_drop": []string{"ALL"}, "security_opt": []string{"no-new-privileges:true"}, "entrypoint": []string{"/bin/vaultwarden-less-tests"}, "environment": map[string]string{"VWLESS_E2E_STUB": "/stub"}, "volumes": []any{mount(filepath.Join(h.testRoot, "stub"), "/stub", false)}, "networks": map[string]any{"default": map[string]any{"aliases": []string{"api.push.apple.com"}}}},
+		"notify-stub": map[string]any{"image": *runnerImage, "pull_policy": "never", "user": h.identity(), "read_only": true, "cap_drop": []string{"ALL"}, "security_opt": []string{"no-new-privileges:true"}, "entrypoint": []string{"/bin/vaultwarden-less-tests"}, "environment": map[string]string{"VWLESS_E2E_STUB": "/stub"}, "volumes": []any{mount(filepath.Join(h.testRoot, "stub"), "/stub", false)}, "networks": map[string]any{"default": map[string]any{"aliases": []string{"api.push.apple.com"}}}},
 	}
 	for _, name := range []string{"primary", "secondary"} {
-		services["moto-"+name] = map[string]any{"image": "vaultwarden-less-moto:local", "pull_policy": "never", "user": h.identity(), "read_only": true, "tmpfs": []string{"/tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777"}, "cap_drop": []string{"ALL"}, "security_opt": []string{"no-new-privileges:true"}}
+		services["moto-"+name] = map[string]any{"image": *motoImage, "pull_policy": "never", "user": h.identity(), "read_only": true, "tmpfs": []string{"/tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777"}, "cap_drop": []string{"ALL"}, "security_opt": []string{"no-new-privileges:true"}}
 	}
 	data, err := json.Marshal(map[string]any{"services": services})
 	if err != nil {
 		h.t.Fatal(err)
 	}
 	writePrivateFile(h.t, h.overrideFile, string(data))
+}
+
+func (h *e2eHarness) overrideVaultwarden(values map[string]string) {
+	// Test-only provisioning and Send coverage must not modify the shipped profile.
+	h.vaultwardenOverrides = values
+	h.writeOverride()
+	h.compose("up", "--detach", "--no-deps", "vaultwarden")
+	h.waitHealthy("vaultwarden", 3*time.Minute)
+	h.waitHTTP(h.publicTLS+"/alive", http.StatusOK, time.Minute)
 }
 func (h *e2eHarness) start() {
 	h.compose("up", "--detach", "moto-primary", "moto-secondary", "notify-stub", "vaultwarden")
@@ -190,6 +236,24 @@ func (h *e2eHarness) validateBoundaries() {
 		item := inspect[0]
 		if item.Config.User != h.identity() {
 			h.t.Fatal("product runtime is not the test user")
+		}
+		if name == "vaultwarden" {
+			values := map[string]string{}
+			for _, entry := range item.Config.Env {
+				key, value, _ := strings.Cut(entry, "=")
+				values[key] = value
+			}
+			for key, want := range map[string]string{
+				"WEB_VAULT_ENABLED": "false", "ADMIN_TOKEN": "", "DISABLE_ADMIN_TOKEN": "false",
+				"SIGNUPS_ALLOWED": "false", "SIGNUPS_DOMAINS_WHITELIST": "", "INVITATIONS_ALLOWED": "false",
+				"DISABLE_ICON_DOWNLOAD": "true", "HTTP_REQUEST_BLOCK_NON_GLOBAL_IPS": "true",
+				"PASSWORD_HINTS_ALLOWED": "false", "SHOW_PASSWORD_HINT": "false",
+				"SENDS_ALLOWED": "false", "EMERGENCY_ACCESS_ALLOWED": "false", "ORG_CREATION_USERS": "none",
+			} {
+				if got, exists := values[key]; !exists || got != want {
+					h.t.Fatalf("shipped Vaultwarden profile: %s=%q, want %q", key, got, want)
+				}
+			}
 		}
 		if name == "backup" {
 			found := false
@@ -254,7 +318,7 @@ func (h *e2eHarness) cleanupContainer(name string) {
 	}
 }
 func (h *e2eHarness) dockerContext(ctx context.Context, arguments ...string) (string, error) {
-	return runCommand(ctx, h.testRoot, nil, h.dockerEnv, h.dockerPath, append([]string{"--config", h.dockerConfig, "--host", "unix:///var/run/docker.sock"}, arguments...)...)
+	return runCommand(ctx, h.testRoot, nil, h.dockerEnv, h.dockerPath, append([]string{"--config", h.dockerConfig, "--host", "unix://" + *dockerSocket}, arguments...)...)
 }
 func (h *e2eHarness) mustDocker(arguments ...string) string {
 	h.t.Helper()
@@ -389,7 +453,7 @@ func runCommandCombined(ctx context.Context, directory string, environment []str
 func isolatedDockerEnvironment(configDirectory string) []string {
 	environment := make([]string, 0, len(os.Environ())+1)
 	for _, entry := range os.Environ() {
-		if !strings.HasPrefix(entry, "DOCKER_CONFIG=") {
+		if !strings.HasPrefix(entry, "DOCKER_") && !strings.HasPrefix(entry, "COMPOSE_") {
 			environment = append(environment, entry)
 		}
 	}

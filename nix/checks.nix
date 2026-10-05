@@ -39,7 +39,13 @@ in
   vet = goCheck "vaultwarden-less-vet" "go vet ./...";
   race = goCheck "vaultwarden-less-race" "go test -race ./internal/... ./cmd/... ./tests/e2e/... -count=1";
   script-tests =
-    pkgs.runCommand "vaultwarden-less-script-tests" { nativeBuildInputs = [ pkgs.python3 ]; }
+    pkgs.runCommand "vaultwarden-less-script-tests"
+      {
+        nativeBuildInputs = [
+          pkgs.python3
+          pkgs.just
+        ];
+      }
       ''
         cd ${source}
         python3 -m unittest discover -s tests/scripts -p 'test_*.py'

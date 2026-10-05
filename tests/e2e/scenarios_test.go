@@ -34,9 +34,16 @@ func TestNativeReleaseAcceptance(t *testing.T) {
 	h.waitStatus(3*time.Minute, settled)
 	dataRoot := filepath.Join(h.deploymentRoot, "data")
 	email := "acceptance@example.com"
+	t.Log("shipped profile rejects registration; enable it only for test enrollment")
+	expectRegistrationRejected(ctx, t, loopbackEndpoint(h.proxyPort), email, testPassword)
+	h.overrideVaultwarden(map[string]string{"SIGNUPS_ALLOWED": "true"})
 	registerAccount(ctx, t, loopbackEndpoint(h.proxyPort), email, testPassword)
+	h.overrideVaultwarden(map[string]string{})
 	client := newBitwardenCLI(t, filepath.Join(h.testRoot, "bw-source"), h.publicTLS, h.tlsCAFile, email)
 	client.login(ctx)
+	t.Log("shipped profile rejects Send creation; enable Sends only for recovery coverage")
+	client.expectSendRejected(ctx)
+	h.overrideVaultwarden(map[string]string{"SENDS_ALLOWED": "true"})
 	fixture := createVaultFixture(t, ctx, h.testRoot, client, "Native recovery")
 	beforeRequests := time.Now()
 	item := client.getItem(ctx, fixture.itemID)
@@ -159,7 +166,7 @@ func TestNativeReleaseAcceptance(t *testing.T) {
 	h.mustDocker("run", "--detach", "--pull", "never", "--name", rejector,
 		"--network", h.project+"_default", "--network-alias", "moto-secondary",
 		"--user", h.identity(), "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
-		"--env", "VWLESS_E2E_REJECTOR=1", "--entrypoint", "/bin/vaultwarden-less-tests", "vaultwarden-less-test-runner:local")
+		"--env", "VWLESS_E2E_REJECTOR=1", "--entrypoint", "/bin/vaultwarden-less-tests", *runnerImage)
 	t.Cleanup(func() { h.cleanupContainer(rejector) })
 	h.wait(time.Minute, "rejecting object-store endpoint ready", func() bool {
 		_, err := h.docker("exec", h.containerID("moto-primary"), "/bin/python3", "-c", `import urllib.error,urllib.request

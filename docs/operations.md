@@ -1,23 +1,15 @@
 # Operations
 
-Use the bundle's `compose.yml` and [configuration tree](configuration.md).
+Complete [deployment](deployment.md) first. Use the bundle's `compose.yml` and
+[configuration tree](configuration.md).
 Run examples with Bash as the non-root runtime user. Replace paths, image
 tags, IDs and provider inputs with reviewed values before running them.
 Do not enable shell tracing around credentials.
 
-## Start and inspect
+## Checks and status
 
-Load the three archives from the release directory:
-
-```sh
-set -euo pipefail
-for image in vaultwarden proxy backup; do
-  docker load --input "$RELEASE_DIR/images/$image.tar.gz"
-done
-```
-
-After populating the configuration and creating the private data/cache
-directories, render Compose and validate local backup inputs:
+Set `RELEASE_DIR` and `DEPLOYMENT_ROOT` to the existing release and deployment.
+In each new shell, define the Compose helper:
 
 ```sh
 set -euo pipefail
@@ -25,25 +17,9 @@ compose() {
   docker compose --env-file "$DEPLOYMENT_ROOT/compose.env" \
     --file "$RELEASE_DIR/compose.yml" "$@"
 }
-compose config --quiet
-compose run --rm --no-deps backup validate
-compose up --detach
 compose ps
 compose exec --no-TTY backup /bin/vaultwarden-less-backup status
 ```
-
-Initialize each repository with the native command below before expecting a
-successful upload. Start Vaultwarden on an empty data directory, or adopt a
-complete stopped SQLite Vaultwarden directory. For adoption, stop all source
-writers and copy into a newly created destination, preserving the entire
-database/WAL/SHM set, RSA files, configuration, attachments, Sends and links.
-Never copy only a live `db.sqlite3`.
-
-The supplied template disables signup and invitations. For initial enrollment,
-temporarily enable only the upstream settings your workflow requires, enroll
-through a trusted HTTPS origin, and disable them again. Existing
-`config.json` may override environment settings. Web Vault is disabled;
-normal access uses official Bitwarden clients.
 
 Request a check and then inspect completion separately:
 
@@ -123,9 +99,9 @@ channel's byte limit; the source, target totals and report counts remain.
 
 ## Native restic maintenance
 
-Use a dedicated repository/prefix for this installation. Set `RESTIC_IMAGE`
-to the bundle's backup image reference. The following helper invokes the native
-restic binary and uses the maintenance environment file, parsed by Docker.
+Use a dedicated repository/prefix for this installation. Obtain `RESTIC_IMAGE`
+from `compose config --images backup` using the helper above. The following
+invokes the native restic binary and uses the maintenance environment file, parsed by Docker.
 It mounts only the password directory. It works without a running worker.
 
 ```sh
@@ -140,13 +116,14 @@ restic_primary() {
     --entrypoint /bin/restic "$RESTIC_IMAGE" \
     --option s3.bucket-lookup=path --option s3.region=us-east-1 "$@"
 }
-restic_primary init
 restic_primary snapshots --host vaultwarden-less --group-by host
 restic_primary check
 ```
 
-Adjust backend options to match the destination. Run `init` once for an empty
-repository. Use separate credentials and invocations for each destination.
+Adjust backend options to match the destination. During first deployment,
+define the helper, then run `restic_primary init` once for a new empty repository
+before the `snapshots`/`check` examples above. Use separate credentials and
+invocations for each destination.
 List and record explicit native snapshot IDs before recovery. Neither local
 status nor a notification replaces verification of remote snapshots.
 

@@ -34,6 +34,10 @@
       };
       devShells.${system}.default = import ./nix/dev-shells.nix { inherit formatter pkgs; };
       formatter.${system} = formatter.config.build.wrapper;
+      apps.${system} = import ./nix/apps.nix {
+        inherit packages pkgs;
+        source = ./.;
+      };
       checks.${system} = import ./nix/checks.nix {
         inherit
           formatter

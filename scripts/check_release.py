@@ -1,45 +1,61 @@
-"""Build and run the packaged acceptance suite on the current local Docker host."""
+"""Run prebuilt acceptance artifacts on an explicitly selected local Docker socket.
+
+The Nix app supplies the artifacts and tools; this script never invokes Nix.
+The host and runner must see each bind source at the same absolute path.
+"""
 
 import argparse
 import json
 import os
+import stat
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
 
-def build(root: Path, attribute: str) -> Path:
-    result = subprocess.run(
-        ["nix", "build", "--no-link", "--print-out-paths", ".#" + attribute],
-        cwd=root,
-        check=True,
-        text=True,
-        stdout=subprocess.PIPE,
-    )
-    return Path(result.stdout.strip())
+def docker_environment(config: Path) -> dict[str, str]:
+    # A caller's remote context, TLS settings or credentials must not redirect
+    # an acceptance run away from the explicitly selected local socket.
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(("DOCKER_", "COMPOSE_"))
+    }
+    return env | {"DOCKER_CONFIG": str(config)}
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--release-dir", type=Path)
-    parser.add_argument("--work-dir", type=Path)
-    args = parser.parse_args()
-    root = Path(__file__).resolve().parent.parent
-    release = args.release_dir.resolve() if args.release_dir else build(root, "release")
-    runner = build(root, "test-runner-image")
-    base = (
-        args.work_dir.resolve() if args.work_dir else root / "tmp/agent/release-tests"
-    )
+    parser.add_argument("--release-dir", type=Path, required=True)
+    parser.add_argument("--runner-archive", type=Path, required=True)
+    parser.add_argument("--runner-image", required=True)
+    parser.add_argument("--work-dir", type=Path, required=True)
+    parser.add_argument("--docker-socket", type=Path, required=True)
+    args = parser.parse_args(argv)
+    release, runner = args.release_dir.resolve(), args.runner_archive.resolve()
+    base, socket = args.work_dir.resolve(), args.docker_socket.resolve()
+    if not (release / "compose.yml").is_file():
+        parser.error("release-dir must contain the deployment bundle's compose.yml")
+    if not runner.is_file():
+        parser.error("runner-archive must be an existing image archive")
+    if not args.runner_image or args.runner_image.startswith("-"):
+        parser.error("runner-image must be an image reference")
+    if not socket.exists() or not stat.S_ISSOCK(socket.stat().st_mode):
+        parser.error(f"docker-socket must be a local Unix socket: {socket}")
+    if os.geteuid() == 0 or os.getegid() == 0:
+        parser.error("acceptance requires a non-root user and group with Docker access")
+    # Docker --mount uses comma-separated fields. Spaces are supported; commas
+    # would otherwise silently change the meaning of a mount specification.
+    if any("," in str(path) for path in (release, base, socket)):
+        parser.error("shared bind paths must not contain commas")
     base.mkdir(parents=True, exist_ok=True)
     work = Path(tempfile.mkdtemp(prefix="release-", dir=base))
     docker_config = work / "docker-config"
-    docker_config.mkdir()
+    docker_config.mkdir(mode=0o700)
     (docker_config / "config.json").write_text(json.dumps({"auths": {}}))
-    env = os.environ | {"DOCKER_CONFIG": str(docker_config)}
-    socket = Path("/var/run/docker.sock")
-    if not socket.exists():
-        parser.error("the current host must provide /var/run/docker.sock")
-    docker = ["docker", "--host", "unix:///var/run/docker.sock"]
+    env = docker_environment(docker_config)
+    docker = ["docker", "--config", str(docker_config), "--host", f"unix://{socket}"]
     subprocess.run(docker + ["load", "--input", str(runner)], env=env, check=True)
     command = docker + [
         "run",
@@ -60,11 +76,13 @@ def main() -> None:
         f"type=bind,source={work},target={work}",
         "--env",
         f"DOCKER_CONFIG={docker_config}",
-        "vaultwarden-less-test-runner:local",
+        args.runner_image,
         "--release-dir",
         str(release),
         "--work-dir",
         str(work),
+        "--docker-socket",
+        str(socket),
     ]
     print(f"Acceptance results: {work / 'results.log'}", flush=True)
     with (work / "results.log").open("w") as log:
@@ -79,8 +97,15 @@ def main() -> None:
             print(line, end="", flush=True)
             log.write(line)
             log.flush()
-        raise SystemExit(process.wait())
+        return process.wait()
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        raise SystemExit(main())
+    except subprocess.CalledProcessError as error:
+        print(f"Docker command failed (exit {error.returncode}).", file=sys.stderr)
+        raise SystemExit(error.returncode)
+    except OSError as error:
+        print(f"Acceptance setup failed: {error}", file=sys.stderr)
+        raise SystemExit(1)

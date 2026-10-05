@@ -115,6 +115,13 @@ diagnostics and safe JSON errors use stderr. Exit codes are 0 for success,
 1 for runtime failure and 2 for invalid input. Stdin is unused.
 The proxy exposes `serve`, `healthcheck` and `version`.
 
+The backup CLI uses Go's standard `flag` parser with explicit subcommands.
+`help`, `help COMMAND`, `-h` and `--help` print text help to stdout and exit 0.
+`--config PATH` and `--config=PATH` are accepted for `serve` and `validate`;
+`--full`, `--full=true` and `--full=false` are accepted for `check`. There are
+no positional operands, inherited environment options or shell completion
+commands. Invalid commands/flags produce a safe JSON error without usage text.
+
 The private backup listener at port 9090 provides:
 
 | Endpoint | Result |
@@ -159,8 +166,16 @@ One channel cannot block another or affect backup or client responses.
 The bundle contains three product images, Compose, templates, documentation
 and license notices. A separate `test-runner-image` contains compiled
 acceptance tests, official Bitwarden CLI, Docker CLI and native tools.
-It accepts `--release-dir` and `--work-dir`; the Docker host and runner share
-those absolute paths and the Docker socket. The suite has a 75-minute limit.
+It accepts `--release-dir`, `--work-dir` and `--docker-socket` (default
+`/var/run/docker.sock`); the Docker host and runner share those absolute paths.
+Nix injects test image references and the Moto archive path into the entrypoint.
+Product image references and restored service environment come from rendered
+Compose. The suite has a 75-minute limit.
+
+Source workflows follow Just → Nix → scripts. Nix owns tool selection, source
+pins and build dependencies; scripts accept explicit artifacts/paths and never
+invoke Nix. The deployment bundle remains a Docker/Compose product, with no
+source-workflow tools required on its target host.
 
 Acceptance covers client writes and reads, attachments and Sends, independent
 targets, incomplete sources and repairs, cache loss, native restore, and

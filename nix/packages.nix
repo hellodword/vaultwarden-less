@@ -5,7 +5,7 @@
 }:
 let
   lib = pkgs.lib;
-  productVendorHash = "sha256-ZeG8rqE7j7NeJlZB2X1c6JXSyNEl8DIYgwn347lbseQ=";
+  productVendorHash = "sha256-NwNhfVDicjkKenOTbTVksU4vvDrD6yWEx2RQhFQ+bxc=";
   product =
     name: subPackage:
     pkgs.buildGoModule {

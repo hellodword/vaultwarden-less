@@ -1,7 +1,7 @@
 """Extract the notification catalog from the flake-selected Vaultwarden source.
 
 This updates classification only. The request exclusions are handwritten policy.
-Run inside nix develop: python3 scripts/routes.py SOURCE --output OUTPUT
+Use just routes; Nix supplies the selected source and Python interpreter.
 """
 
 import argparse

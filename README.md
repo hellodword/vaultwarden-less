@@ -21,23 +21,30 @@ templates and operator documentation. It needs Docker Engine and Compose on
 the deployment host. TLS and public access control belong to the operator;
 the shipped proxy port binds to loopback.
 
-```sh
-nix develop --command just check
-nix develop --command just release
-nix develop --command just check-release
-```
+For deployment, read these in order:
 
-`check` runs ordinary Nix checks. `release` builds the deployment bundle.
-`check-release` runs the packaged acceptance suite on the current Docker host,
-using official Bitwarden CLI operations, two Moto repositories and four
-notification protocol peers. Its retained results are reported on stdout.
-The Docker host and runner must share the same absolute work path.
-
-- [Configuration](docs/configuration.md): deployment paths, environment files,
-  destinations and notification channels.
-- [Operations](docs/operations.md): startup, checks, native repository
-  maintenance, restore and upgrade.
+- [Deployment](docs/deployment.md): prerequisites, bundle, configuration,
+  existing data, repository initialization and first startup.
+- [Configuration](docs/configuration.md): file readers, security defaults,
+  precedence, destinations and notification channels. Inline comments in
+  [templates](templates/README.md) explain what to fill in.
+- [Operations](docs/operations.md): status, checks, native repository
+  maintenance, restore and upgrade after deployment.
 - [Product contracts](docs/contracts.md): trigger, comparison, scheduling and
   failure behavior.
-- [Maintenance](docs/maintenance.md): Nix inputs, upstream review and tests.
+
+For source development, start with [Maintenance](docs/maintenance.md). Just
+selects Nix outputs; Nix supplies tools and inputs; scripts perform the work:
+
+```sh
+just check
+just release
+just check-release
+```
+
+`check` runs ordinary checks without a Docker daemon. `release` builds the
+deployment bundle. `check-release` runs the packaged Docker acceptance suite
+and reports retained results. Target deployment hosts need Docker and Compose;
+they do not need Just, Nix or the source scripts.
+
 - [NOTICE](NOTICE.md): distribution and corresponding-source obligations.

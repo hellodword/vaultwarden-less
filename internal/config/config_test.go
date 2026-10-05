@@ -107,3 +107,33 @@ notifiers:
 		t.Fatal("explicit sound or varying token length changed")
 	}
 }
+
+func TestShippedBackupTemplatesUseConsumerSyntax(t *testing.T) {
+	root := filepath.Join("..", "..", "templates")
+	document, err := os.ReadFile(filepath.Join(root, "config", "backup.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, role := range []string{"backup", "maintenance"} {
+		envPath, err := filepath.Abs(filepath.Join(root, "credentials", role, "primary.env"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(t.TempDir(), "backup.yaml")
+		data := strings.ReplaceAll(string(document), "/run/credentials/backup/primary.env", envPath)
+		if err := os.WriteFile(path, []byte(data), 0600); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := LoadBackup(path)
+		if err != nil || !cfg.Valid() || len(cfg.Targets) != 1 || len(cfg.Notifiers) != 0 {
+			t.Fatalf("invalid %s template: %v", role, err)
+		}
+		if len(cfg.Targets[0].Environment) != 4 || cfg.Targets[0].Environment[1] != "RESTIC_PASSWORD_FILE=/run/credentials/restic/primary" {
+			t.Fatalf("comments or container paths changed the %s environment", role)
+		}
+	}
+	password, err := os.ReadFile(filepath.Join(root, "credentials", "restic", "primary"))
+	if err != nil || len(password) != 0 {
+		t.Fatal("raw password placeholder must be empty, with instructions outside the file")
+	}
+}

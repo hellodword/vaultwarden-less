@@ -1,6 +1,6 @@
 """Review a candidate Git ref against the source actually selected by the flake.
 
-Run inside nix develop. This reports changes; it is never an upgrade or runtime
+Use just upstream-diff. This reports changes; it is never an upgrade or runtime
 admission gate. It does not modify the flake or any source pin.
 """
 
@@ -14,7 +14,6 @@ from pathlib import Path
 
 COMPONENTS = {
     "vaultwarden": (
-        "vaultwarden",
         "https://github.com/dani-garcia/vaultwarden",
         [
             "src/api/**",
@@ -28,47 +27,19 @@ COMPONENTS = {
         ],
     ),
     "restic": (
-        "restic",
         "https://github.com/restic/restic",
         ["cmd/**", "internal/**", "go.mod", "go.sum", "CHANGELOG.md"],
     ),
     "bitwarden-cli": (
-        "bitwarden-cli",
         "https://github.com/bitwarden/clients",
         ["apps/cli/**", "libs/**"],
     ),
     "moto": (
-        "python3Packages.moto",
         "https://github.com/getmoto/moto",
         ["moto/**", "pyproject.toml", "CHANGELOG.md"],
     ),
-    "go": ("go", "https://go.googlesource.com/go", ["src/**", "go.mod", "VERSION"]),
+    "go": ("https://go.googlesource.com/go", ["src/**", "go.mod", "VERSION"]),
 }
-
-
-def selected_source(component: str, root: Path) -> Path:
-    attr = COMPONENTS[component][0]
-    expression = (
-        "let flake = builtins.getFlake (toString ./.); "
-        'pkgs = import ./nix/upstreams.nix { pkgs = import flake.inputs.nixpkgs { system = "x86_64-linux"; }; }; '
-        f"in pkgs.{attr}.src"
-    )
-    result = subprocess.run(
-        [
-            "nix",
-            "build",
-            "--no-link",
-            "--print-out-paths",
-            "--impure",
-            "--expr",
-            expression,
-        ],
-        cwd=root,
-        check=True,
-        text=True,
-        stdout=subprocess.PIPE,
-    )
-    return Path(result.stdout.strip())
 
 
 def files(root: Path, patterns: list[str]) -> set[Path]:
@@ -83,8 +54,8 @@ def files(root: Path, patterns: list[str]) -> set[Path]:
 
 
 def audit_changes(baseline: Path, candidate: Path, component: str) -> str:
-    paths = files(baseline, COMPONENTS[component][2]) | files(
-        candidate, COMPONENTS[component][2]
+    paths = files(baseline, COMPONENTS[component][1]) | files(
+        candidate, COMPONENTS[component][1]
     )
     changes = []
     for path in sorted(paths):
@@ -103,17 +74,20 @@ def audit_changes(baseline: Path, candidate: Path, component: str) -> str:
     return "".join(changes)
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("component", choices=COMPONENTS)
     parser.add_argument("ref", help="candidate Git commit, branch, or tag")
-    args = parser.parse_args()
+    parser.add_argument("--baseline", type=Path, required=True)
+    parser.add_argument("--work-dir", type=Path, required=True)
+    args = parser.parse_args(argv)
     if not args.ref or args.ref.startswith("-"):
         parser.error("candidate ref must not start with a dash")
-    root = Path(__file__).resolve().parent.parent
-    scratch = root / "tmp/agent/upstream-audit"
+    baseline = args.baseline.resolve()
+    if not baseline.exists():
+        parser.error("baseline must be a source directory or archive")
+    scratch = args.work_dir.resolve()
     scratch.mkdir(parents=True, exist_ok=True)
-    baseline = selected_source(args.component, root)
     with tempfile.TemporaryDirectory(dir=scratch) as directory:
         workspace = Path(directory)
         if baseline.is_file():
@@ -134,7 +108,7 @@ def main() -> None:
                 str(repository),
                 "fetch",
                 "--depth=1",
-                COMPONENTS[args.component][1],
+                COMPONENTS[args.component][0],
                 args.ref,
             ],
             check=True,

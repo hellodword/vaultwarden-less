@@ -26,6 +26,14 @@ func (client *bitwardenCLI) createFileSend(ctx context.Context, path, name strin
 	return client.createFileSendWithLimit(ctx, path, name, 0)
 }
 
+func (client *bitwardenCLI) expectSendRejected(ctx context.Context) {
+	path := privateTestPath(client.t, client.home, "disabled-send.txt", []byte("synthetic disabled Send"))
+	output, diagnostics, err := client.tryRun(ctx, nil, "--raw", "send", "--file", path, "--name", "Disabled Send", "--fullObject")
+	if err == nil || !strings.Contains(string(output)+diagnostics, "only able to delete an existing Send") {
+		client.t.Fatalf("expected Send policy rejection: %v: %s", err, client.redact(string(output)+diagnostics))
+	}
+}
+
 func (client *bitwardenCLI) createFileSendWithLimit(ctx context.Context, path, name string, maximumAccesses int) string {
 	arguments := []string{"--raw", "send", "--file", path, "--name", name, "--fullObject"}
 	if maximumAccesses > 0 {

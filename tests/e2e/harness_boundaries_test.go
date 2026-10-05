@@ -4,8 +4,44 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
+
+func TestDockerEnvironmentIgnoresAmbientDaemonAndComposeSettings(t *testing.T) {
+	for _, key := range []string{"DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_TLS_VERIFY", "DOCKER_CONFIG", "DOCKER_AUTH_CONFIG", "COMPOSE_FILE", "COMPOSE_ENV_FILES"} {
+		t.Setenv(key, "private-unrelated-setting")
+	}
+	env := isolatedDockerEnvironment("/test/private docker config")
+	configCount := 0
+	for _, entry := range env {
+		if entry == "DOCKER_CONFIG=/test/private docker config" {
+			configCount++
+		} else if strings.HasPrefix(entry, "DOCKER_") || strings.HasPrefix(entry, "COMPOSE_") {
+			t.Fatal("Docker inherited an ambient daemon or Compose setting")
+		}
+	}
+	if configCount != 1 {
+		t.Fatal("Docker private config missing or duplicated")
+	}
+}
+
+func TestComposeServicesPreserveResolvedImageAndLiteralEnvironment(t *testing.T) {
+	services, err := parseComposeServices(`{"services":{"backup":{"image":"custom-backup:release"},"vaultwarden":{"image":"custom-vaultwarden:release","environment":{"ADMIN_TOKEN":"$$argon2id$$v=19$$synthetic","LITERAL":"$$HOME $$$$ 'quoted'","EMPTY":""}}}}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if services["backup"].Image != "custom-backup:release" || services["vaultwarden"].Image != "custom-vaultwarden:release" {
+		t.Fatal("product image references were not read from Compose")
+	}
+	env := services["vaultwarden"].Environment
+	if env["ADMIN_TOKEN"] != "$argon2id$v=19$synthetic" || env["LITERAL"] != "$HOME $$ 'quoted'" || env["EMPTY"] != "" {
+		t.Fatal("rendered environment was expanded or retained Compose dollar escaping")
+	}
+	if _, err := parseComposeServices("not JSON"); err == nil {
+		t.Fatal("malformed Compose output accepted")
+	}
+}
 
 func TestTLSProxyReportsExternalHTTPS(t *testing.T) {
 	observed := make(chan *http.Request, 1)

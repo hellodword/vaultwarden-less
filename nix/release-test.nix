@@ -6,6 +6,8 @@
   source,
 }:
 let
+  runnerName = "vaultwarden-less-test-runner";
+  runnerTag = "local";
   tests = pkgs.stdenv.mkDerivation {
     pname = "vaultwarden-less-tests";
     version = identity.release;
@@ -27,7 +29,10 @@ let
     '';
   };
   runner = pkgs.writeShellScriptBin "test-runner" ''
-    exec ${tests}/bin/vaultwarden-less-tests -test.v -test.timeout=75m -run-e2e "$@"
+    exec ${tests}/bin/vaultwarden-less-tests -test.v -test.timeout=75m -run-e2e \
+      -runner-image ${runnerName}:${runnerTag} \
+      -moto-image ${motoImage.imageName}:${motoImage.imageTag} \
+      -moto-archive /share/moto.tar.gz "$@"
   '';
   motoArchive = pkgs.runCommand "vaultwarden-less-moto-archive" { } ''
     mkdir -p "$out/share"
@@ -35,8 +40,8 @@ let
   '';
 in
 pkgs.dockerTools.buildLayeredImage {
-  name = "vaultwarden-less-test-runner";
-  tag = "local";
+  name = runnerName;
+  tag = runnerTag;
   created = identity.created;
   contents = [
     tests
