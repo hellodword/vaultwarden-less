@@ -33,8 +33,12 @@ deployment/
 Copy the files from `templates/`, then replace their placeholders.
 `compose.env` selects the absolute deployment root, the image tag supplied by
 the bundle, a non-root runtime UID/GID and the loopback listener port. Compose
-owns interpolation of this file. A build from a Git revision records that
-revision as provenance; a working-tree build uses `development`.
+owns interpolation of this file. A clean Git build uses the `git-<commit>` image
+tag; a dirty working-tree build uses `development`. All three product images
+record the full commit hash in the `org.opencontainers.image.revision` label,
+with `-dirty` appended for uncommitted tracked changes. The backup and proxy
+`version` commands expose the same value as `project_commit`. Sources without
+Git revision metadata omit the revision label and `project_commit`.
 
 ## Vaultwarden profile and precedence
 

@@ -18,7 +18,7 @@
       system = "x86_64-linux";
       pkgs = import ./nix/upstreams.nix { pkgs = import nixpkgs { inherit system; }; };
       identity = {
-        projectCommit = self.rev or "";
+        projectCommit = self.rev or self.dirtyRev or "";
         release = if self ? rev then "git-${self.rev}" else "development";
         created = "1970-01-01T00:00:01Z";
       };
