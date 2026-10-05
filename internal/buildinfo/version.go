@@ -1,34 +1,17 @@
-// Package buildinfo contains values stamped into product binaries at build time.
+// Package buildinfo displays build provenance without gating runtime commands.
 package buildinfo
 
-import (
-	"encoding/hex"
-	"regexp"
-	"strings"
-)
+import "runtime"
 
-var releasePattern = regexp.MustCompile(`^git-([0-9a-f]{40})$`)
+var ProjectCommit = ""
+var Release = "development"
 
-var (
-	// ProjectCommit is a full clean Git commit or the empty string for a dirty
-	// development build.
-	ProjectCommit = ""
+type Info struct {
+	ProjectCommit string `json:"project_commit,omitempty"`
+	Release       string `json:"release"`
+	Go            string `json:"go"`
+}
 
-	// Release is the immutable release tag or "development".
-	Release = "development"
-
-	// Clean is stamped to "true" only for a clean Git flake source.
-	Clean = "false"
-)
-
-// Ready reports whether the binary has a complete clean Git release identity.
-func Ready() bool {
-	if Clean != "true" || len(ProjectCommit) != 40 || ProjectCommit != strings.ToLower(ProjectCommit) || Release == "development" {
-		return false
-	}
-	if _, err := hex.DecodeString(ProjectCommit); err != nil {
-		return false
-	}
-	match := releasePattern.FindStringSubmatch(Release)
-	return len(match) == 2 && match[1] == ProjectCommit
+func Current() Info {
+	return Info{ProjectCommit: ProjectCommit, Release: Release, Go: runtime.Version()}
 }

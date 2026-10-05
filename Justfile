@@ -2,10 +2,10 @@
 check:
     nix flake check
 
-# Run the full optional release checks for one unchanged clean commit.
+# Build the runner and execute the same suite on the current Docker host.
 check-release:
-    nix build --no-link -L .#release-test
+    python3 scripts/check_release.py
 
-# Build the immutable deployment bundle.
+# Build the deployment bundle.
 release:
     nix build .#release

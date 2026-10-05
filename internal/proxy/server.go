@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -13,38 +12,41 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/hellodword/vaultwarden-less/internal/routes"
 )
 
 const (
-	HealthPath    = "/.vaultwarden-less/healthz"
+	HealthPath    = "/healthz"
+	HealthAddress = "127.0.0.1:8081"
 	ListenAddress = "0.0.0.0:8080"
 	UpstreamURL   = "http://vaultwarden:80"
 	EventsURL     = "http://backup:9090/events"
 
-	MaxRequestBytes               = int64(600 << 20)
 	ReadHeaderTimeout             = 10 * time.Second
 	ReadTimeout                   = 30 * time.Minute
 	WriteTimeout                  = 30 * time.Minute
 	IdleTimeout                   = 2 * time.Minute
 	UpstreamResponseHeaderTimeout = 5 * time.Minute
 	EventTimeout                  = 2 * time.Second
-	EventRetry                    = 30 * time.Second
+	EventRetry                    = time.Second
 	ShutdownTimeout               = 2 * time.Minute
 )
 
 type Server struct {
-	upstream  *url.URL
-	markDirty func()
-	log       *slog.Logger
-	proxy     *httputil.ReverseProxy
-	http      *http.Server
+	upstream *url.URL
+	record   func(string, string, bool)
+	log      *slog.Logger
+	proxy    *httputil.ReverseProxy
+	http     *http.Server
+	health   *http.Server
 }
 
-func NewServer(markDirty func(), log *slog.Logger) *Server {
-	return newServer(mustURL(UpstreamURL), markDirty, log)
+func NewServer(record func(string, string, bool), log *slog.Logger) *Server {
+	return newServer(mustURL(UpstreamURL), record, log)
 }
 
-func newServer(upstream *url.URL, markDirty func(), log *slog.Logger) *Server {
+func newServer(upstream *url.URL, record func(string, string, bool), log *slog.Logger) *Server {
 	transport := &http.Transport{
 		Proxy:                 nil,
 		DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
@@ -57,9 +59,8 @@ func newServer(upstream *url.URL, markDirty func(), log *slog.Logger) *Server {
 		ResponseHeaderTimeout: UpstreamResponseHeaderTimeout,
 	}
 	rp := &httputil.ReverseProxy{Transport: transport}
-	s := &Server{upstream: upstream, markDirty: markDirty, log: log, proxy: rp}
+	s := &Server{upstream: upstream, record: record, log: log, proxy: rp}
 	rp.Rewrite = s.rewrite
-	rp.ModifyResponse = s.modifyResponse
 	rp.ErrorHandler = s.proxyError
 	s.http = &http.Server{
 		Addr:              ListenAddress,
@@ -70,30 +71,39 @@ func newServer(upstream *url.URL, markDirty func(), log *slog.Logger) *Server {
 		IdleTimeout:       IdleTimeout,
 		MaxHeaderBytes:    1 << 20,
 	}
+	s.health = &http.Server{Addr: HealthAddress, Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != HealthPath {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 5 * time.Second, WriteTimeout: 5 * time.Second, IdleTimeout: 30 * time.Second}
 	return s
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path == HealthPath {
-		if r.Method != http.MethodGet && r.Method != http.MethodHead {
-			w.Header().Set("Allow", "GET, HEAD")
-			writeError(w, http.StatusMethodNotAllowed, "usage_error", "Method not allowed")
-			return
-		}
-		w.Header().Set("Cache-Control", "no-store")
-		w.WriteHeader(http.StatusNoContent)
-		return
+	if s.record != nil && routes.Trigger(r.Method, r.URL.EscapedPath()) {
+		s.record(r.Method, r.URL.EscapedPath(), true)
+		defer s.record(r.Method, r.URL.EscapedPath(), false)
 	}
-	if r.ContentLength > MaxRequestBytes {
-		writeError(w, http.StatusRequestEntityTooLarge, "usage_error", "Request body exceeds the configured limit")
-		return
-	}
-	r.Body = http.MaxBytesReader(w, r.Body, MaxRequestBytes)
 	s.proxy.ServeHTTP(w, r)
 }
 
 func (s *Server) ListenAndServe() error {
-	err := s.http.ListenAndServe()
+	business, err := net.Listen("tcp", s.http.Addr)
+	if err != nil {
+		return err
+	}
+	defer business.Close()
+	health, err := net.Listen("tcp", s.health.Addr)
+	if err != nil {
+		return err
+	}
+	defer health.Close()
+	done := make(chan error, 2)
+	go func() { done <- s.http.Serve(business) }()
+	go func() { done <- s.health.Serve(health) }()
+	err = <-done
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
 	}
@@ -101,7 +111,7 @@ func (s *Server) ListenAndServe() error {
 }
 
 func (s *Server) Shutdown(ctx context.Context) error {
-	return s.http.Shutdown(ctx)
+	return errors.Join(s.http.Shutdown(ctx), s.health.Shutdown(ctx))
 }
 
 func (s *Server) rewrite(pr *httputil.ProxyRequest) {
@@ -110,44 +120,10 @@ func (s *Server) rewrite(pr *httputil.ProxyRequest) {
 	copyForwardingHeaders(pr.Out.Header, pr.In.Header)
 }
 
-func (s *Server) modifyResponse(resp *http.Response) error {
-	if s.markDirty != nil && shouldRequestBackup(resp.Request.Method, resp.Request.URL.Path, resp.StatusCode) {
-		resp.Body = &completeResponseBody{ReadCloser: resp.Body, complete: s.markDirty}
+func (s *Server) proxyError(w http.ResponseWriter, _ *http.Request, _ error) {
+	if s.log != nil {
+		s.log.Error("upstream request failed", "error_code", "upstream_unavailable")
 	}
-	return nil
-}
-
-type completeResponseBody struct {
-	io.ReadCloser
-	complete   func()
-	reachedEOF bool
-	closed     bool
-}
-
-func (body *completeResponseBody) Read(buffer []byte) (int, error) {
-	count, err := body.ReadCloser.Read(buffer)
-	if errors.Is(err, io.EOF) {
-		body.reachedEOF = true
-	}
-	return count, err
-}
-
-func (body *completeResponseBody) Close() error {
-	err := body.ReadCloser.Close()
-	if !body.closed && body.reachedEOF && err == nil {
-		body.closed = true
-		body.complete()
-	}
-	return err
-}
-
-func (s *Server) proxyError(w http.ResponseWriter, _ *http.Request, err error) {
-	var tooLarge *http.MaxBytesError
-	if errors.As(err, &tooLarge) {
-		writeError(w, http.StatusRequestEntityTooLarge, "usage_error", "Request body exceeds the configured limit")
-		return
-	}
-	s.log.Error("upstream request failed", "error_code", "upstream_unavailable")
 	writeError(w, http.StatusBadGateway, "internal_error", "Upstream unavailable")
 }
 

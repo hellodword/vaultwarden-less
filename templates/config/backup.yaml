@@ -1,44 +1,10 @@
-# Configure every target before validation. The empty repository values are
-# intentionally invalid so a newly copied template cannot contact a repository.
-#
-# AWS S3 example:
-#   repository: s3:s3.ap-southeast-1.amazonaws.com/example-bucket/vaultwarden
-#
-# Backblaze B2 S3-compatible example:
-#   repository: s3:https://s3.us-west-004.backblazeb2.com/example-bucket/vaultwarden
-# B2 requires path-style bucket lookup, retained below.
 targets:
   - name: primary
-    repository: ""
+    env_file: /run/credentials/backup/primary.env
     options: []
-  - name: b2
-    repository: ""
-    options:
-      - name: s3.bucket-lookup
-        value: path
 
-# Notifier values live in this file because it is private operator input.
-# To use WeChat, replace [] with:
-#   - name: operations
-#     type: wechat
-#     webhook_url: https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=...
-#
-# To use Bark/APNs, replace [] with:
-#   - name: operations
-#     type: bark
-#     device_token: <64 lowercase hexadecimal characters>
-#     auth_key: |
-#       -----BEGIN PRIVATE KEY-----
-#       ... one P-256 PKCS#8 private key ...
-#       -----END PRIVATE KEY-----
-#     key_id: <Apple key ID>
-#     team_id: <Apple team ID>
-#     topic: me.fin.bark
-#     sound: "1107"
+# All entries are independent. Empty targets and notifiers lists are valid.
+# Supported types: wecom, feishu, dingtalk, bark.
+# Webhooks use HTTPS; Feishu and DingTalk accept an optional secret.
+# Bark reads a P-256 PKCS#8 .p8 file from auth_key_file and connects to APNs.
 notifiers: []
-
-# For intentional targetless operation, replace this file with exactly:
-#   targets: []
-#   notifiers: []
-# Both role files must then contain `targets: {}`, and credentials/restic must
-# be an actually empty directory.

@@ -4,640 +4,321 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"errors"
 	"fmt"
-	"io"
+	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 
-	"github.com/hellodword/vaultwarden-less/internal/privatefs"
+	"github.com/hellodword/vaultwarden-less/internal/capture"
 	productworker "github.com/hellodword/vaultwarden-less/internal/worker"
 )
 
 type vaultFixture struct {
-	folderID       string
-	folderName     string
-	itemID         string
-	itemPassword   string
-	attachmentID   string
-	attachmentData []byte
-	sendID         string
-	sendData       []byte
+	folderID, folderName, itemID, itemPassword, attachmentID, sendID string
+	attachmentData, sendData                                         []byte
 }
 
-func TestTargetlessDeploymentAndFullDataAdoption(t *testing.T) {
+func TestNativeReleaseAcceptance(t *testing.T) {
 	if !*runE2E {
-		t.Skip("pass -run-e2e to run the release-level Docker scenarios")
+		t.Skip("pass -run-e2e with the packaged runner for Docker acceptance")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 70*time.Minute)
 	defer cancel()
-	h := newE2EHarness(t, ctx, []string{})
-	h.validateConfiguration([]string{})
-	assertEmptyDirectory(t, filepath.Join(h.deploymentRoot, "credentials", "restic"))
-
-	// Build a realistic stopped external Vaultwarden tree through the official
-	// client, then adopt the complete tree as an offline operator copy.
-	h.startSource()
-	unique := time.Now().UnixNano()
-	email := fmt.Sprintf("vaultwarden-less-targetless-%d@example.com", unique)
-	registerAccount(ctx, t, loopbackEndpoint(h.sourcePort), email, testPassword)
-	sourceClient := newBitwardenCLI(
-		t, filepath.Join(h.testRoot, "bw-source"), h.publicTLS, h.tlsCAFile, email,
-	)
-	sourceClient.login(ctx)
-	fixture := createVaultFixture(t, ctx, h.testRoot, sourceClient, "Targetless adoption")
-	assertVaultFixture(t, ctx, filepath.Join(h.testRoot, "verify-source"), sourceClient, fixture)
-	h.stopService("source-vaultwarden")
-
-	sourceRoot := filepath.Join(h.testRoot, "source-data")
-	assertCompleteVaultwardenTree(t, sourceRoot)
-	sourceIdentity := privateTreeIdentity(t, sourceRoot)
-	sourceRSA := privateFileDigest(t, filepath.Join(sourceRoot, "rsa_key.pem"))
-	copyCompleteTreeIntoEmpty(t, sourceRoot, filepath.Join(h.deploymentRoot, "data"))
-	if got := privateTreeIdentity(t, filepath.Join(h.deploymentRoot, "data")); got != sourceIdentity {
-		t.Fatalf("adopted data tree identity = %q, want %q", got, sourceIdentity)
-	}
-	if got := privateFileDigest(t, filepath.Join(h.deploymentRoot, "data", "rsa_key.pem")); got != sourceRSA {
-		t.Fatalf("adopted RSA digest = %q, want %q", got, sourceRSA)
-	}
-	if got := privateTreeIdentity(t, sourceRoot); got != sourceIdentity {
-		t.Fatal("full data adoption modified the stopped source tree")
-	}
-
-	h.startProduction()
-	assertTargetlessRuntime(t, h)
-	assertNoRepositoryServices(t, h)
-	adoptedClient := newBitwardenCLI(
-		t, filepath.Join(h.testRoot, "bw-adopted"), h.publicTLS, h.tlsCAFile, email,
-	)
-	adoptedClient.login(ctx)
-	assertVaultFixture(t, ctx, filepath.Join(h.testRoot, "verify-adopted"), adoptedClient, fixture)
-
-	oldContainer := h.containerID("vaultwarden")
-	setSignupsAllowed(t, filepath.Join(h.deploymentRoot, "config", "vaultwarden.env"), false)
-	h.compose("up", "--detach", "--force-recreate", "vaultwarden")
-	h.waitHealthy("vaultwarden", 3*time.Minute)
-	newContainer := h.containerID("vaultwarden")
-	if newContainer == oldContainer {
-		t.Fatal("Vaultwarden was not force-recreated after disabling signup")
-	}
-	if got := privateFileDigest(t, filepath.Join(h.deploymentRoot, "data", "rsa_key.pem")); got != sourceRSA {
-		t.Fatalf("force recreation changed the adopted RSA digest: %q != %q", got, sourceRSA)
-	}
-	restartedClient := newBitwardenCLI(
-		t, filepath.Join(h.testRoot, "bw-restarted"), h.publicTLS, h.tlsCAFile, email,
-	)
-	restartedClient.login(ctx)
-	assertVaultFixture(t, ctx, filepath.Join(h.testRoot, "verify-restarted"), restartedClient, fixture)
-	expectRegistrationRejected(
-		ctx,
-		t,
-		loopbackEndpoint(h.proxyPort),
-		fmt.Sprintf("vaultwarden-less-rejected-%d@example.com", unique),
-		"Rejected registration password 2026!",
-	)
-	assertTargetlessStatusAndFilesystem(t, h)
-}
-
-func TestTwoTargetBackupRestore(t *testing.T) {
-	if !*runE2E {
-		t.Skip("pass -run-e2e to run the release-level Docker scenarios")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 35*time.Minute)
-	defer cancel()
-	targets := []string{"primary", "b2"}
-	h := newE2EHarness(t, ctx, targets)
-	h.validateConfiguration(targets)
-	h.startRepositories()
-	h.startVaultwarden()
-
-	unique := time.Now().UnixNano()
-	email := fmt.Sprintf("vaultwarden-less-two-target-%d@example.com", unique)
-	registerAccount(ctx, t, loopbackEndpoint(h.vaultwardenPort), email, testPassword)
-	client := newBitwardenCLI(
-		t, filepath.Join(h.testRoot, "bw-two-target"), h.publicTLS, h.tlsCAFile, email,
-	)
+	h := newE2EHarness(t, ctx)
+	t.Log("start three products, two independent object stores and notification peer")
+	h.start()
+	h.waitStatus(3*time.Minute, settled)
+	dataRoot := filepath.Join(h.deploymentRoot, "data")
+	email := "acceptance@example.com"
+	registerAccount(ctx, t, loopbackEndpoint(h.proxyPort), email, testPassword)
+	client := newBitwardenCLI(t, filepath.Join(h.testRoot, "bw-source"), h.publicTLS, h.tlsCAFile, email)
 	client.login(ctx)
-	fixture := createVaultFixture(t, ctx, h.testRoot, client, "Two target recovery")
-	assertVaultFixture(t, ctx, filepath.Join(h.testRoot, "verify-two-target-source"), client, fixture)
-	sourceRSA := privateFileDigest(t, filepath.Join(h.deploymentRoot, "data", "rsa_key.pem"))
-
-	// The failed endpoint is a real network peer returning 403. Primary must
-	// publish the point independently while b2 remains retryable.
-	restoreB2 := rejectB2Endpoint(t, h)
-	h.compose("up", "--detach", "backup")
-	h.waitHealthy("backup", 3*time.Minute)
-	partial := h.waitStatus(4*time.Minute, func(status productworker.Status) bool {
-		primary, b2 := exactTwoTargets(t, status)
-		return status.State == "partial" && status.LastCheck != nil && status.LastCheck.Result == "partial" &&
-			status.LastCheck.ContentID != nil && status.LastCheck.ArchiveID != nil && status.NextCheckAt != nil &&
-			primary.State == "healthy" && primary.SnapshotID != nil && primary.ContentID != nil &&
-			b2.State == "retrying" && b2.SnapshotID == nil && b2.ContentID == nil && b2.ErrorCode != nil
-	})
-	partialPrimary, _ := exactTwoTargets(t, partial)
-	if partial.LastCheck == nil || partial.LastCheck.ContentID == nil || partialPrimary.ContentID == nil ||
-		*partialPrimary.ContentID != *partial.LastCheck.ContentID {
-		t.Fatalf("partial target identities are incomplete: %#v", partial)
-	}
-	logicalContent := *partial.LastCheck.ContentID
-	partialRetryAt := parseWorkerTime(t, *partial.NextCheckAt)
-	primarySnapshotID := *partialPrimary.SnapshotID
-	primarySnapshots := h.waitTargetSnapshotCount("primary", 1, 2*time.Minute)
-	if primarySnapshots.Snapshots[0].ID != primarySnapshotID || primarySnapshots.Snapshots[0].ContentID != logicalContent {
-		t.Fatalf("primary repository does not contain the partial recovery point: %#v", primarySnapshots)
-	}
-
-	// Bringing up the proxy delivers its startup event, but no Vaultwarden write
-	// occurs between the failed attempt and the b2 catch-up.
-	h.compose("up", "--detach", "proxy")
-	h.waitHealthy("proxy", 3*time.Minute)
-	h.validateProxyBinding()
-	h.setBackend(loopbackEndpoint(h.proxyPort))
-	h.waitHTTP(h.publicTLS+"/.vaultwarden-less/healthz", 204, time.Minute)
-	h.waitStatus(time.Minute, func(status productworker.Status) bool {
-		return status.State == "partial" && status.LastCheck != nil && partial.LastCheck != nil &&
-			status.LastCheck.FinishedAt == partial.LastCheck.FinishedAt && status.NextCheckAt != nil &&
-			parseWorkerTime(t, *status.NextCheckAt).Before(partialRetryAt)
-	})
-	restoreB2()
-	h.requestBackup()
-	recovered := h.waitStatus(8*time.Minute, func(status productworker.Status) bool {
-		primary, b2 := exactTwoTargets(t, status)
-		return status.State == "idle" && status.LastCheck != nil && status.LastCheck.Result == "created" &&
-			status.NextCheckAt != nil &&
-			primary.State == "healthy" && b2.State == "healthy" &&
-			primary.SnapshotID != nil && b2.SnapshotID != nil &&
-			primary.ContentID != nil && b2.ContentID != nil &&
-			*primary.ContentID == logicalContent && *b2.ContentID == logicalContent
-	})
-	recoveredPrimary, recoveredB2 := exactTwoTargets(t, recovered)
-	if *recoveredPrimary.SnapshotID != primarySnapshotID {
-		t.Fatalf("b2 catch-up replaced the primary snapshot: %#v", recoveredPrimary)
-	}
-	recoveredFinishedAt := parseWorkerTime(t, recovered.LastCheck.FinishedAt)
-	recoveredFallbackAt := parseWorkerTime(t, *recovered.NextCheckAt)
-	if recoveredFallbackAt.Sub(recoveredFinishedAt) != 12*time.Hour {
-		t.Fatalf("recovered worker did not return to its fallback schedule: %#v", recovered)
-	}
-	primarySnapshots = h.waitTargetSnapshotCount("primary", 1, 2*time.Minute)
-	b2Snapshots := h.waitTargetSnapshotCount("b2", 1, 2*time.Minute)
-	baselinePrimarySnapshot, baselineB2Snapshot := primarySnapshots.Snapshots[0], b2Snapshots.Snapshots[0]
-	if baselinePrimarySnapshot.ContentID != logicalContent || baselineB2Snapshot.ContentID != logicalContent ||
-		baselineB2Snapshot.ID != *recoveredB2.SnapshotID || baselinePrimarySnapshot.ID == baselineB2Snapshot.ID {
-		t.Fatalf("repositories did not converge independently: primary=%#v b2=%#v", baselinePrimarySnapshot, baselineB2Snapshot)
-	}
-
-	// The official client still uses the public TLS facade, whose backend now is
-	// the production proxy. Do not request a backup after this write: the proxy's
-	// completed successful response must be the only source of new worker demand.
-	const updatedItemPassword = "proxy-triggered-e2e-item-password"
+	fixture := createVaultFixture(t, ctx, h.testRoot, client, "Native recovery")
+	beforeRequests := time.Now()
 	item := client.getItem(ctx, fixture.itemID)
-	setItemPassword(t, item, updatedItemPassword)
+	fixture.itemPassword = "edited-e2e-password"
+	setItemPassword(t, item, fixture.itemPassword)
 	client.editItem(ctx, fixture.itemID, item)
-	fixture.itemPassword = updatedItemPassword
+	assertVaultFixture(t, ctx, filepath.Join(h.testRoot, "verify-source"), client, fixture)
+	h.waitNewRequestCheck(beforeRequests)
 
-	eventScheduled := h.waitStatus(time.Minute, func(status productworker.Status) bool {
-		return status.State == "debouncing" && status.LastCheck != nil && recovered.LastCheck != nil &&
-			status.LastCheck.FinishedAt == recovered.LastCheck.FinishedAt &&
-			status.LastCheck.ContentID != nil && *status.LastCheck.ContentID == logicalContent &&
-			status.NextCheckAt != nil && parseWorkerTime(t, *status.NextCheckAt).Before(recoveredFallbackAt)
-	})
-	eventCheckAt := parseWorkerTime(t, *eventScheduled.NextCheckAt)
-	automatic := h.waitStatus(7*time.Minute, func(status productworker.Status) bool {
-		primary, b2 := exactTwoTargets(t, status)
-		return status.State == "idle" && status.LastCheck != nil && status.LastCheck.Result == "created" &&
-			status.LastCheck.FinishedAt != recovered.LastCheck.FinishedAt &&
-			status.LastCheck.ContentID != nil && *status.LastCheck.ContentID != logicalContent &&
-			status.LastCheck.ArchiveID != nil && status.NextCheckAt != nil &&
-			primary.State == "healthy" && b2.State == "healthy" &&
-			primary.SnapshotID != nil && b2.SnapshotID != nil &&
-			primary.ContentID != nil && b2.ContentID != nil &&
-			*primary.ContentID == *status.LastCheck.ContentID && *b2.ContentID == *status.LastCheck.ContentID
-	})
-	if parseWorkerTime(t, automatic.LastCheck.StartedAt).Before(eventCheckAt) {
-		t.Fatalf("automatic check started before the proxy event was scheduled: %#v", automatic)
+	t.Log("burst requests merge; unknown GET and authentication-only changes cause no upload")
+	before := h.check(false)
+	requestStart := time.Now()
+	for i := 0; i < 8; i++ {
+		response, err := h.tlsServer.Client().Get(h.publicTLS + fmt.Sprintf("/e2e-private-path-%d", i))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = response.Body.Close()
+		if response.StatusCode != http.StatusNotFound {
+			t.Fatalf("unknown route status %d", response.StatusCode)
+		}
 	}
-	automaticPrimary, automaticB2 := exactTwoTargets(t, automatic)
-	automaticContent := *automatic.LastCheck.ContentID
-	automaticArchive := *automatic.LastCheck.ArchiveID
-	primarySnapshots = h.waitTargetSnapshotCount("primary", 2, 2*time.Minute)
-	b2Snapshots = h.waitTargetSnapshotCount("b2", 2, 2*time.Minute)
-	primarySnapshot, b2Snapshot := primarySnapshots.Snapshots[0], b2Snapshots.Snapshots[0]
-	if primarySnapshots.Snapshots[1].ID != baselinePrimarySnapshot.ID ||
-		b2Snapshots.Snapshots[1].ID != baselineB2Snapshot.ID ||
-		primarySnapshot.ID == baselinePrimarySnapshot.ID || b2Snapshot.ID == baselineB2Snapshot.ID ||
-		primarySnapshot.ID == b2Snapshot.ID ||
-		primarySnapshot.ID != *automaticPrimary.SnapshotID || b2Snapshot.ID != *automaticB2.SnapshotID ||
-		primarySnapshot.ContentID != automaticContent || b2Snapshot.ContentID != automaticContent ||
-		primarySnapshot.ArchiveID != automaticArchive || b2Snapshot.ArchiveID != automaticArchive {
-		t.Fatalf("proxy write did not create one independent recovery point per repository: primary=%#v b2=%#v", primarySnapshots, b2Snapshots)
+	immediate := h.status()
+	if !immediate.LastCheck.Equal(before.LastCheck) {
+		t.Fatal("request burst bypassed the quiet window")
 	}
-	for _, target := range targets {
-		h.repositoryCheck(target)
+	after := h.waitNewRequestCheck(requestStart)
+	h.assertUnchangedIDs(before, after)
+	if after.LastCheck.Sub(requestStart) < 29*time.Second {
+		t.Fatal("request quiet window too short")
+	}
+	h.assertNotifications()
+	before = after
+	second := newBitwardenCLI(t, filepath.Join(h.testRoot, "bw-auth"), h.publicTLS, h.tlsCAFile, email)
+	authStart := time.Now()
+	second.login(ctx)
+	after = h.waitNewRequestCheck(authStart)
+	h.assertUnchangedIDs(before, after)
+	full := h.check(true)
+	h.assertNewIDs(after, full)
+	if full.Source != "complete" {
+		t.Fatalf("native fixture captured as %s: %v", full.Source, full.Issues)
 	}
 
-	primaryRestore := h.restoreTarget("primary", primarySnapshot.ID, "primary-copy")
-	b2Restore := h.restoreTarget("b2", b2Snapshot.ID, "b2-copy")
-	assertRestoreMatchesSnapshot(t, primaryRestore, primarySnapshot)
-	assertRestoreMatchesSnapshot(t, b2Restore, b2Snapshot)
-	primaryRoot := filepath.Join(h.deploymentRoot, "restore", "primary-copy")
-	b2Root := filepath.Join(h.deploymentRoot, "restore", "b2-copy")
-	assertRecoveryExcludesRSA(t, primaryRoot)
-	assertRecoveryExcludesRSA(t, b2Root)
-
-	marker := filepath.Join(primaryRoot, "operator-marker")
-	writePrivateFile(t, marker, "existing restore must survive\n")
-	failedOutput, failedErr := h.tryRestoreTarget("primary", primarySnapshot.ID, "primary-copy")
-	if failedErr == nil || exactCommandErrorCode(t, failedOutput) != "verification_failure" {
-		t.Fatalf("second restore did not reject an existing output: %v: %s", failedErr, harnessDiagnostics(failedOutput))
-	}
-	if data, err := os.ReadFile(marker); err != nil || string(data) != "existing restore must survive\n" {
-		t.Fatalf("failed restore changed its existing output marker: %q/%v", data, err)
-	}
-	if err := os.Remove(marker); err != nil {
+	t.Log("file-only changes include orphan files, RSA identity, links and empty directories")
+	rsa := fileDigest(t, filepath.Join(dataRoot, "rsa_key.pem"))
+	writePrivateFile(t, filepath.Join(dataRoot, "orphan.bin"), "orphan bytes\n")
+	if err := os.Mkdir(filepath.Join(dataRoot, "unknown-empty"), 0700); err != nil {
 		t.Fatal(err)
 	}
-	assertNoRestoreTemporaryDirectories(t, filepath.Join(h.deploymentRoot, "restore"))
-
-	h.stopService("proxy")
-	h.stopService("backup")
-	h.stopService("vaultwarden")
-	h.startRestored("restored-primary", h.primaryPort)
-	client.expectSyncFailure(ctx)
-	primaryClient := newBitwardenCLI(
-		t, filepath.Join(h.testRoot, "bw-restored-primary"), h.publicTLS, h.tlsCAFile, email,
-	)
-	primaryClient.login(ctx)
-	assertVaultFixture(t, ctx, filepath.Join(h.testRoot, "verify-restored-primary"), primaryClient, fixture)
-	primaryRSA := privateFileDigest(t, filepath.Join(primaryRoot, "rsa_key.pem"))
-	if primaryRSA == sourceRSA {
-		t.Fatal("primary restore retained the production RSA identity")
+	if err := os.Symlink("orphan.bin", filepath.Join(dataRoot, "unknown-link")); err != nil {
+		t.Fatal(err)
 	}
-	h.compose("--profile", "e2e-vaultwarden", "stop", "restored-primary")
-
-	h.startRestored("restored-b2", h.b2Port)
-	b2Client := newBitwardenCLI(
-		t, filepath.Join(h.testRoot, "bw-restored-b2"), h.publicTLS, h.tlsCAFile, email,
-	)
-	b2Client.login(ctx)
-	assertVaultFixture(t, ctx, filepath.Join(h.testRoot, "verify-restored-b2"), b2Client, fixture)
-	b2RSA := privateFileDigest(t, filepath.Join(b2Root, "rsa_key.pem"))
-	if b2RSA == sourceRSA || b2RSA == primaryRSA {
-		t.Fatal("restored copies did not generate independent new RSA identities")
+	before = full
+	after = h.check(false)
+	h.assertNewIDs(before, after)
+	if after.Source != "complete" {
+		t.Fatalf("file capture failed: %v", after.Issues)
 	}
-}
 
-func parseWorkerTime(t *testing.T, value string) time.Time {
-	t.Helper()
-	parsed, err := time.Parse(time.RFC3339Nano, value)
+	t.Log("native incomplete snapshots retain references and all available data")
+	attachment := filepath.Join(dataRoot, "attachments", fixture.itemID, fixture.attachmentID)
+	encrypted, err := os.ReadFile(attachment)
 	if err != nil {
-		t.Fatalf("invalid worker timestamp %q: %v", value, err)
+		t.Fatal(err)
 	}
-	return parsed
+	if err = os.Remove(attachment); err != nil {
+		t.Fatal(err)
+	}
+	unreadable := filepath.Join(dataRoot, "unreadable.bin")
+	writePrivateFile(t, unreadable, "temporarily unreadable")
+	if err = os.Chmod(unreadable, 0000); err != nil {
+		t.Fatal(err)
+	}
+	// Always restore readability so retained diagnostic artifacts can be inspected.
+	t.Cleanup(func() { _ = os.Chmod(unreadable, 0600) })
+	before = after
+	after = h.check(false)
+	h.assertNewIDs(before, after)
+	if after.Source != "incomplete" || len(after.Issues) == 0 {
+		t.Fatal("missing and unreadable files did not mark incomplete")
+	}
+	incomplete := h.latest("primary")
+	if !slices.Contains(incomplete.Tags, "incomplete") {
+		t.Fatal("native incomplete tag missing")
+	}
+	restored := h.restore("primary", incomplete.ID, "incomplete")
+	count := h.sqliteReadOnly(restored, "SELECT count(*) FROM attachments WHERE id='"+fixture.attachmentID+"';")
+	if strings.TrimSpace(count) != "1" {
+		t.Fatal("incomplete capture removed a database reference")
+	}
+	if _, err = os.Lstat(filepath.Join(restored, "attachments", fixture.itemID, fixture.attachmentID)); !os.IsNotExist(err) {
+		t.Fatal("incomplete snapshot substituted an old attachment")
+	}
+	h.assertUnchangedIDs(after, h.check(false))
+	if err = os.WriteFile(attachment, encrypted, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.Chmod(unreadable, 0600); err != nil {
+		t.Fatal(err)
+	}
+	before = after
+	after = h.check(false)
+	h.assertNewIDs(before, after)
+	if after.Source != "complete" {
+		t.Fatalf("repaired capture still incomplete: %v", after.Issues)
+	}
+
+	t.Log("unknown SQLite schema and values survive backup and native restore")
+	h.sqlite(dataRoot, "CREATE TABLE acceptance_future (value BLOB, detail TEXT); INSERT INTO acceptance_future VALUES (x'0001ff', '{\"future\":{}}'), (NULL, 'duplicate'), (NULL, 'duplicate');")
+	before = after
+	after = h.check(false)
+	h.assertNewIDs(before, after)
+
+	t.Log("one destination fails independently and recovers with the newest waiting version")
+	failedID := after.Targets[1].SuccessID
+	secondaryContainer := h.containerID("moto-secondary")
+	h.mustDocker("network", "disconnect", h.project+"_default", secondaryContainer)
+	rejector := h.project + "-rejector"
+	h.mustDocker("run", "--detach", "--pull", "never", "--name", rejector,
+		"--network", h.project+"_default", "--network-alias", "moto-secondary",
+		"--user", h.identity(), "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
+		"--env", "VWLESS_E2E_REJECTOR=1", "--entrypoint", "/bin/vaultwarden-less-tests", "vaultwarden-less-test-runner:local")
+	t.Cleanup(func() { h.cleanupContainer(rejector) })
+	h.wait(time.Minute, "rejecting object-store endpoint ready", func() bool {
+		_, err := h.docker("exec", h.containerID("moto-primary"), "/bin/python3", "-c", `import urllib.error,urllib.request
+try:
+    urllib.request.urlopen("http://moto-secondary:5000",timeout=2)
+except urllib.error.HTTPError as error:
+    raise SystemExit(0 if error.code==403 else 1)
+raise SystemExit(1)
+`)
+		return err == nil
+	})
+	writePrivateFile(t, filepath.Join(dataRoot, "failure-window"), "first")
+	h.check(false)
+	failed := h.waitStatus(time.Minute, func(s productworker.Status) bool {
+		return len(s.Targets) == 2 && s.Targets[1].Error != "" && s.Targets[0].Error == "" && !s.Targets[0].Waiting && !s.Targets[0].Uploading
+	})
+	if failed.Targets[1].SuccessID != failedID {
+		t.Fatal("failed restic advanced its baseline")
+	}
+	writePrivateFile(t, filepath.Join(dataRoot, "failure-window"), "newest")
+	secondFailure := h.check(false)
+	if secondFailure.Targets[0].SuccessID == failed.Targets[0].SuccessID {
+		t.Fatal("healthy destination stalled")
+	}
+	if !secondFailure.Targets[1].RetryAt.Equal(failed.Targets[1].RetryAt) {
+		t.Fatal("new content reset destination backoff")
+	}
+	h.mustDocker("rm", "--force", rejector)
+	h.mustDocker("network", "connect", "--alias", "moto-secondary", h.project+"_default", secondaryContainer)
+	client.sync(ctx)
+	h.waitStatus(7*time.Minute, func(s productworker.Status) bool {
+		return settled(s) && s.Targets[1].Error == "" && s.Targets[1].SuccessID != failedID
+	})
+
+	t.Log("backup outage leaves client service usable; restart reuses native baseline")
+	before = h.check(true)
+	beforeOutage := h.restore("primary", before.Targets[0].SuccessID, "before-outage")
+	h.compose("stop", "backup")
+	client.sync(ctx)
+	h.compose("start", "backup")
+	h.waitHealthy("backup", time.Minute)
+	after = h.waitStatus(3*time.Minute, settled)
+	// Official CLI sync refreshes the token and updates devices.updated_at.
+	// Startup is a full check, so it must preserve that authentication change.
+	h.assertNewIDs(before, after)
+	afterOutage := h.restore("primary", after.Targets[0].SuccessID, "after-outage")
+	beforeDigest, err := capture.CompareDigest(ctx, filepath.Join(beforeOutage, "db.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterDigest, err := capture.CompareDigest(ctx, filepath.Join(afterOutage, "db.sqlite3"))
+	if err != nil || beforeDigest.Business != afterDigest.Business || beforeDigest.Full == afterDigest.Full {
+		t.Fatalf("outage sync did not preserve an authentication-only change: %v", err)
+	}
+	// Restart again without traffic to independently verify cache reuse.
+	before = after
+	counts := map[string]int{"primary": len(h.snapshots("primary")), "secondary": len(h.snapshots("secondary"))}
+	h.compose("restart", "backup")
+	h.waitHealthy("backup", time.Minute)
+	after = h.waitStatus(3*time.Minute, settled)
+	h.assertUnchangedIDs(before, after)
+	for name, count := range counts {
+		if len(h.snapshots(name)) != count {
+			t.Fatalf("restart uploaded unchanged content to %s", name)
+		}
+	}
+
+	t.Log("cache loss establishes a deduplicated native baseline")
+	h.compose("stop", "backup")
+	cache := filepath.Join(h.deploymentRoot, "cache")
+	// Move only this harness's synthetic cache; retain it for investigation.
+	if err = os.Rename(cache, filepath.Join(h.testRoot, "cache-before-loss")); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.Mkdir(cache, 0700); err != nil {
+		t.Fatal(err)
+	}
+	h.compose("up", "--detach", "--force-recreate", "backup")
+	h.waitHealthy("backup", time.Minute)
+	after = h.waitStatus(3*time.Minute, settled)
+	h.assertNewIDs(before, after)
+	for name, count := range counts {
+		list := h.snapshots(name)
+		if len(list) != count+1 {
+			t.Fatalf("cache loss snapshot count for %s: %d", name, len(list))
+		}
+		latest := list[len(list)-1]
+		if latest.Parent == "" || latest.Summary.DataAdded > 65536 {
+			t.Fatalf("cache loss did not reuse native parent/deduplication for %s", name)
+		}
+	}
+
+	t.Log("restore each destination into a new root and read it through official clients")
+	h.compose("stop", "backup", "vaultwarden")
+	for _, name := range []string{"primary", "secondary"} {
+		latest := h.latest(name)
+		root := h.restore(name, latest.ID, name)
+		if fileDigest(t, filepath.Join(root, "rsa_key.pem")) != rsa {
+			t.Fatal("RSA identity was not preserved")
+		}
+		assertFileContent(t, filepath.Join(root, "orphan.bin"), []byte("orphan bytes\n"))
+		assertFileContent(t, filepath.Join(root, "failure-window"), []byte("newest"))
+		link, err := os.Readlink(filepath.Join(root, "unknown-link"))
+		if err != nil || link != "orphan.bin" {
+			t.Fatal("symbolic link was not restored")
+		}
+		info, err := os.Stat(filepath.Join(root, "unknown-empty"))
+		if err != nil || !info.IsDir() {
+			t.Fatal("empty directory was not restored")
+		}
+		if strings.TrimSpace(h.sqliteReadOnly(root, "SELECT count(*) FROM acceptance_future;")) != "3" {
+			t.Fatal("unknown database records were not restored")
+		}
+		h.startRestored(root, "restored-"+name)
+		recovered := newBitwardenCLI(t, filepath.Join(h.testRoot, "bw-restored-"+name), h.publicTLS, h.tlsCAFile, email)
+		recovered.login(ctx)
+		assertVaultFixture(t, ctx, filepath.Join(h.testRoot, "verify-"+name), recovered, fixture)
+	}
 }
 
-func createVaultFixture(
-	t *testing.T,
-	ctx context.Context,
-	root string,
-	client *bitwardenCLI,
-	label string,
-) vaultFixture {
+func createVaultFixture(t *testing.T, ctx context.Context, root string, client *bitwardenCLI, label string) vaultFixture {
 	t.Helper()
-	fixture := vaultFixture{
-		folderName:     label + " folder",
-		itemPassword:   initialItemPassword,
-		attachmentData: []byte("vaultwarden-less attachment for " + label + "\n"),
-		sendData:       bytes.Repeat([]byte("vaultwarden-less file Send payload\n"), 64),
-	}
-	fixture.folderID = client.createFolder(ctx, fixture.folderName)
-	fixture.itemID = client.createItem(ctx, label+" login", fixture.itemPassword, fixture.folderID)
-	attachment := privateTestPath(t, root, fmt.Sprintf("attachment-%d.txt", time.Now().UnixNano()), fixture.attachmentData)
-	fixture.attachmentID = client.createAttachment(ctx, fixture.itemID, attachment)
-	send := privateTestPath(t, root, fmt.Sprintf("send-%d.bin", time.Now().UnixNano()), fixture.sendData)
-	fixture.sendID = client.createFileSend(ctx, send, label+" Send")
-	return fixture
+	f := vaultFixture{folderName: label + " folder", itemPassword: initialItemPassword, attachmentData: []byte("vaultwarden-less attachment for " + label + "\n"), sendData: bytes.Repeat([]byte("vaultwarden-less file Send payload\n"), 64)}
+	f.folderID = client.createFolder(ctx, f.folderName)
+	f.itemID = client.createItem(ctx, label+" login", f.itemPassword, f.folderID)
+	f.attachmentID = client.createAttachment(ctx, f.itemID, privateTestPath(t, root, "attachment.txt", f.attachmentData))
+	f.sendID = client.createFileSend(ctx, privateTestPath(t, root, "send.bin", f.sendData), label+" Send")
+	return f
 }
-
-func assertVaultFixture(
-	t *testing.T,
-	ctx context.Context,
-	outputRoot string,
-	client *bitwardenCLI,
-	fixture vaultFixture,
-) {
+func assertVaultFixture(t *testing.T, ctx context.Context, root string, client *bitwardenCLI, f vaultFixture) {
 	t.Helper()
 	client.sync(ctx)
-	if folder := client.getFolder(ctx, fixture.folderID); stringValue(folder["name"]) != fixture.folderName {
-		t.Fatalf("folder did not survive: %#v", folder)
+	if stringValue(client.getFolder(ctx, f.folderID)["name"]) != f.folderName {
+		t.Fatal("folder was not recovered")
 	}
-	item := client.getItem(ctx, fixture.itemID)
-	if itemPassword(t, item) != fixture.itemPassword || stringValue(item["folderId"]) != fixture.folderID {
-		t.Fatalf("item did not survive: %#v", item)
+	item := client.getItem(ctx, f.itemID)
+	if itemPassword(t, item) != f.itemPassword || stringValue(item["folderId"]) != f.folderID {
+		t.Fatal("edited item was not recovered")
 	}
-	if err := os.Mkdir(outputRoot, 0o700); err != nil {
+	if err := os.Mkdir(root, 0700); err != nil {
 		t.Fatal(err)
 	}
-	attachment := filepath.Join(outputRoot, "attachment")
-	client.getAttachment(ctx, fixture.attachmentID, fixture.itemID, attachment)
-	assertFileContent(t, attachment, fixture.attachmentData)
-	send := filepath.Join(outputRoot, "send")
-	client.getFileSend(ctx, fixture.sendID, send)
-	assertFileContent(t, send, fixture.sendData)
+	client.getAttachment(ctx, f.attachmentID, f.itemID, filepath.Join(root, "attachment"))
+	assertFileContent(t, filepath.Join(root, "attachment"), f.attachmentData)
+	client.getFileSend(ctx, f.sendID, filepath.Join(root, "send"))
+	assertFileContent(t, filepath.Join(root, "send"), f.sendData)
 }
-
-func assertTargetlessRuntime(t *testing.T, h *e2eHarness) {
+func assertFileContent(t *testing.T, path string, want []byte) {
 	t.Helper()
-	container := h.containerID("backup")
-	logs, err := h.dockerLogs("--tail", "200", container)
-	if err != nil {
-		t.Fatalf("read targetless backup logs: %v: %s", err, harnessDiagnostics(logs))
-	}
-	if strings.Count(logs, `"warning_code":"no_backup_targets"`) != 1 ||
-		!strings.Contains(logs, `"level":"WARN"`) ||
-		!strings.Contains(logs, "Vaultwarden data is not being backed up") {
-		t.Fatalf("targetless startup warning is missing or duplicated: %s", harnessDiagnostics(logs))
-	}
-	assertTargetlessStatusAndFilesystem(t, h)
-	requestOutput, requestErr := h.tryCompose(
-		h.ctx,
-		"exec", "--no-TTY", "backup", "/bin/vaultwarden-less-backup", "request-backup",
-	)
-	if requestErr == nil || exactCommandErrorCode(t, requestOutput) != "not_ready" ||
-		!strings.Contains(requestOutput, productworker.NoBackupTargetsMessage) {
-		t.Fatalf("targetless request-backup = %v: %s", requestErr, harnessDiagnostics(requestOutput))
+	got, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(got, want) {
+		t.Fatalf("file payload differs: %s", filepath.Base(path))
 	}
 }
-
-func assertTargetlessStatusAndFilesystem(t *testing.T, h *e2eHarness) {
-	t.Helper()
-	status := h.status()
-	if status.State != "idle" || status.LastCheck != nil || status.NextCheckAt != nil || status.Targets == nil || len(status.Targets) != 0 {
-		t.Fatalf("targetless worker status = %#v", status)
-	}
-	point := filepath.Join(h.deploymentRoot, "staging", "point")
-	if _, err := os.Lstat(point); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("targetless worker created a staging point: %v", err)
-	}
-}
-
-func assertNoRepositoryServices(t *testing.T, h *e2eHarness) {
-	t.Helper()
-	for _, service := range []string{"moto-primary", "moto-b2"} {
-		output, err := h.tryCompose(h.ctx, "--profile", "e2e-repositories", "ps", "--all", "--quiet", service)
-		if err != nil || strings.TrimSpace(output) != "" {
-			t.Fatalf("targetless deployment started %s: %v: %s", service, err, harnessDiagnostics(output))
-		}
-	}
-}
-
-func assertCompleteVaultwardenTree(t *testing.T, root string) {
-	t.Helper()
-	for _, relative := range []string{"db.sqlite3", "rsa_key.pem", "attachments", "sends"} {
-		info, err := os.Lstat(filepath.Join(root, relative))
-		if err != nil || info.Mode()&os.ModeSymlink != 0 ||
-			(relative == "db.sqlite3" || relative == "rsa_key.pem") != info.Mode().IsRegular() ||
-			(relative == "attachments" || relative == "sends") != info.IsDir() {
-			t.Fatalf("external Vaultwarden tree lacks safe %s: %#v/%v", relative, info, err)
-		}
-	}
-}
-
-func copyCompleteTreeIntoEmpty(t *testing.T, source, destination string) {
-	t.Helper()
-	if err := privatefs.ValidatePrivateDirectory(source); err != nil {
-		t.Fatalf("validate stopped source root: %v", err)
-	}
-	if err := privatefs.ValidatePrivateDirectory(destination); err != nil {
-		t.Fatalf("validate empty destination root: %v", err)
-	}
-	assertEmptyDirectory(t, destination)
-	err := filepath.WalkDir(source, func(path string, entry os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if path == source {
-			return nil
-		}
-		relative, err := filepath.Rel(source, path)
-		if err != nil || relative == "." || filepath.IsAbs(relative) || filepath.Clean(relative) != relative {
-			return fmt.Errorf("invalid stopped source path")
-		}
-		info, err := os.Lstat(path)
-		if err != nil {
-			return err
-		}
-		stat, ok := info.Sys().(*syscall.Stat_t)
-		if !ok || stat.Uid != uint32(os.Geteuid()) || stat.Gid != uint32(os.Getegid()) || info.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("stopped source contains an unsafe owner or symlink")
-		}
-		target := filepath.Join(destination, relative)
-		if info.IsDir() {
-			return os.Mkdir(target, 0o700)
-		}
-		if !info.Mode().IsRegular() || stat.Nlink != 1 {
-			return fmt.Errorf("stopped source contains a special or multiply linked file")
-		}
-		input, err := os.Open(path)
-		if err != nil {
-			return err
-		}
-		output, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-		if err != nil {
-			_ = input.Close()
-			return err
-		}
-		_, copyErr := io.Copy(output, input)
-		syncErr := output.Sync()
-		closeOutputErr := output.Close()
-		closeInputErr := input.Close()
-		for _, candidate := range []error{copyErr, syncErr, closeOutputErr, closeInputErr} {
-			if candidate != nil {
-				return candidate
-			}
-		}
-		return nil
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	directory, err := os.Open(destination)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := directory.Sync(); err != nil {
-		_ = directory.Close()
-		t.Fatal(err)
-	}
-	if err := directory.Close(); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func privateTreeIdentity(t *testing.T, root string) string {
-	t.Helper()
-	digest := sha256.New()
-	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if path == root {
-			return nil
-		}
-		relative, err := filepath.Rel(root, path)
-		if err != nil {
-			return err
-		}
-		relative = filepath.ToSlash(relative)
-		info, err := os.Lstat(path)
-		if err != nil {
-			return err
-		}
-		if info.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("tree contains a symlink")
-		}
-		if info.IsDir() {
-			_, err = fmt.Fprintf(digest, "D\x00%s\x00", relative)
-			return err
-		}
-		if !info.Mode().IsRegular() {
-			return fmt.Errorf("tree contains a special file")
-		}
-		if _, err := fmt.Fprintf(digest, "F\x00%s\x00%d\x00", relative, info.Size()); err != nil {
-			return err
-		}
-		file, err := os.Open(path)
-		if err != nil {
-			return err
-		}
-		_, copyErr := io.Copy(digest, file)
-		closeErr := file.Close()
-		if copyErr != nil {
-			return copyErr
-		}
-		return closeErr
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	return fmt.Sprintf("sha256:%x", digest.Sum(nil))
-}
-
-func privateFileDigest(t *testing.T, path string) string {
-	t.Helper()
-	info, err := os.Lstat(path)
-	if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
-		t.Fatalf("private digest input is not a regular file: %#v/%v", info, err)
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	digest := sha256.Sum256(data)
-	return fmt.Sprintf("sha256:%x", digest[:])
-}
-
-func setSignupsAllowed(t *testing.T, path string, allowed bool) {
+func fileDigest(t *testing.T, path string) [32]byte {
 	t.Helper()
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	from, to := "SIGNUPS_ALLOWED=true\n", "SIGNUPS_ALLOWED=false\n"
-	if allowed {
-		from, to = to, from
-	}
-	if strings.Count(string(data), from) != 1 || strings.Contains(string(data), to) {
-		t.Fatal("Vaultwarden signup setting has an unexpected shape")
-	}
-	updated := []byte(strings.Replace(string(data), from, to, 1))
-	parent := filepath.Dir(path)
-	file, err := os.CreateTemp(parent, ".vaultwarden.env-*.tmp")
-	if err != nil {
-		t.Fatal(err)
-	}
-	temporary := file.Name()
-	open := true
-	defer func() {
-		if open {
-			_ = file.Close()
-		}
-		_ = os.Remove(temporary)
-	}()
-	if err := file.Chmod(0o600); err != nil {
-		t.Fatal(err)
-	}
-	if written, err := file.Write(updated); err != nil || written != len(updated) {
-		if err == nil {
-			err = io.ErrShortWrite
-		}
-		t.Fatal(err)
-	}
-	if err := file.Sync(); err != nil {
-		t.Fatal(err)
-	}
-	if err := file.Close(); err != nil {
-		open = false
-		t.Fatal(err)
-	}
-	open = false
-	if err := os.Rename(temporary, path); err != nil {
-		t.Fatal(err)
-	}
-	directory, err := os.Open(parent)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := directory.Sync(); err != nil {
-		_ = directory.Close()
-		t.Fatal(err)
-	}
-	if err := directory.Close(); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func assertRecoveryExcludesRSA(t *testing.T, root string) {
-	t.Helper()
-	for _, name := range []string{"rsa_key", "rsa_key.pem", "rsa_key.pub.pem", "rsa_key.der"} {
-		if _, err := os.Lstat(filepath.Join(root, name)); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("recovery point retained %s: %v", name, err)
-		}
-	}
-}
-
-func assertNoRestoreTemporaryDirectories(t *testing.T, root string) {
-	t.Helper()
-	entries, err := os.ReadDir(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, entry := range entries {
-		if strings.HasPrefix(entry.Name(), ".vaultwarden-less-restore-") {
-			t.Fatalf("restore left temporary output %s", entry.Name())
-		}
-	}
-}
-
-func assertEmptyDirectory(t *testing.T, path string) {
-	t.Helper()
-	entries, err := os.ReadDir(path)
-	if err != nil || len(entries) != 0 {
-		t.Fatalf("directory %s is not empty: %#v/%v", filepath.Base(path), entries, err)
-	}
-}
-
-func assertFileContent(t *testing.T, path string, expected []byte) {
-	t.Helper()
-	actual, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(actual, expected) {
-		t.Fatalf("file %s differs", filepath.Base(path))
-	}
+	return sha256.Sum256(data)
 }

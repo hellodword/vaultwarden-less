@@ -3,103 +3,54 @@ package cli
 import (
 	"context"
 	"errors"
-	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"sync"
+	"time"
 
-	"github.com/hellodword/vaultwarden-less/internal/buildinfo"
+	"github.com/hellodword/vaultwarden-less/internal/capture"
+	"github.com/hellodword/vaultwarden-less/internal/config"
 	"github.com/hellodword/vaultwarden-less/internal/notify"
-	"github.com/hellodword/vaultwarden-less/internal/snapshot"
+	"github.com/hellodword/vaultwarden-less/internal/restic"
 	"github.com/hellodword/vaultwarden-less/internal/worker"
-	"github.com/spf13/cobra"
 )
 
-func serveCommand(configPath *string, environment commandEnvironment) *cobra.Command {
-	return &cobra.Command{
-		Use:   "serve",
-		Short: "Run the in-memory scheduler, backup worker, and internal HTTP API",
-		Args:  noArguments,
-		RunE: func(cmd *cobra.Command, _ []string) error {
-			cfg, err := environment.backup(*configPath)
-			if err != nil {
-				return commandFailure(codeInvalidConfig, "The backup configuration is invalid", err)
-			}
-			logger := environment.logger
-			if logger == nil {
-				logger = slog.New(slog.NewJSONHandler(cmd.ErrOrStderr(), nil))
-			}
-			notifications, err := notify.NewManager(cfg.Notifiers, logger)
-			if err != nil {
-				return commandFailure(codeInvalidCredentials, "Notifier credentials are invalid", err)
-			}
-			ctx, cancel := context.WithCancel(cmd.Context())
-			defer cancel()
-			var backupWorker *worker.Worker
-			if len(cfg.Targets) == 0 {
-				logger.Warn(
-					"Vaultwarden data is not being backed up because no backup targets are configured",
-					"warning_code", "no_backup_targets",
-				)
-				backupWorker = worker.New(cfg, nil, nil, notifications.Enqueue, logger)
-			} else {
-				repository, err := environment.repositoryFor(cfg)
-				if err != nil {
-					return commandFailure(codeInvalidCredentials, "Backup role credentials are invalid", err)
-				}
-				if err := repository.VerifyVersion(cmd.Context()); err != nil {
-					return commandFailure(codeRepositoryFailure, "Restic version verification failed", err)
-				}
-				builder := snapshot.Builder{
-					DataDir: environment.dataDir, StagingDir: environment.stagingDir,
-					ProjectCommit: buildinfo.ProjectCommit,
-				}
-				backupWorker = worker.New(cfg, builder.Build, repository.Ensure, notifications.Enqueue, logger)
-			}
-			server := worker.NewHTTPServer(backupWorker)
-			serverError := make(chan error, 1)
-			workerDone := make(chan struct{})
-			var background sync.WaitGroup
-			background.Go(func() { notifications.Run(ctx) })
-			background.Go(func() {
-				defer close(workerDone)
-				backupWorker.Run(ctx)
-			})
-			go func() { serverError <- server.ListenAndServe() }()
-			logger.Info("backup worker started", "listen_address", server.Addr)
-
-			var result error
-			select {
-			case <-cmd.Context().Done():
-			case err := <-serverError:
-				if err != nil && !errors.Is(err, http.ErrServerClosed) {
-					result = fmt.Errorf("internal HTTP server failed")
-				}
-			case <-workerDone:
-				if cmd.Context().Err() == nil {
-					result = fmt.Errorf("backup scheduler stopped unexpectedly")
-				}
-			}
-
-			cancel()
-			shutdownContext, shutdownCancel := context.WithTimeout(context.WithoutCancel(cmd.Context()), shutdownTimeout)
-			defer shutdownCancel()
-			if err := server.Shutdown(shutdownContext); err != nil && result == nil {
-				result = fmt.Errorf("internal HTTP server shutdown failed")
-			}
-			select {
-			case <-workerDone:
-			case <-shutdownContext.Done():
-				if result == nil {
-					result = fmt.Errorf("backup scheduler shutdown timed out")
-				}
-			}
-			background.Wait()
-			logger.Info("backup worker stopped")
-			if result != nil {
-				return commandFailure(codeInternal, "The backup worker stopped unexpectedly", result)
-			}
-			return nil
-		},
+func serve(ctx context.Context, path string, stderr io.Writer) error {
+	cfg, err := config.LoadBackup(path)
+	if err != nil {
+		return inputError("Invalid local configuration")
 	}
+	logger := slog.New(slog.NewJSONHandler(stderr, nil))
+	if len(cfg.Targets) == 0 {
+		logger.Warn("No backup targets configured; data is not being backed up")
+	}
+	notifications := notify.NewManager(cfg.Notifiers)
+	repo := restic.NewRunner("restic", config.CacheDir)
+	backupWorker := worker.New(cfg, capture.Builder{DataDir: config.DataDir, CacheDir: config.CacheDir}, repo, notifications, logger)
+	server := worker.NewHTTPServer(backupWorker)
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var background sync.WaitGroup
+	background.Go(func() { notifications.Run(runCtx) })
+	background.Go(func() { backupWorker.Run(runCtx) })
+	done := make(chan error, 1)
+	go func() { done <- server.ListenAndServe() }()
+	logger.Info("backup process started")
+	var result error
+	select {
+	case <-ctx.Done():
+	case err := <-done:
+		if !errors.Is(err, http.ErrServerClosed) {
+			result = &commandError{message: "Backup HTTP service stopped"}
+		}
+	}
+	cancel()
+	shutdownCtx, stop := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer stop()
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		result = &commandError{message: "Backup shutdown failed"}
+	}
+	background.Wait()
+	return result
 }

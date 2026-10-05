@@ -4,11 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"testing"
-
-	"github.com/goccy/go-yaml"
 )
 
 func TestTLSProxyReportsExternalHTTPS(t *testing.T) {
@@ -55,40 +51,5 @@ func TestTLSProxyReportsExternalHTTPS(t *testing.T) {
 	}
 	if forwarded.Host != request.Host {
 		t.Fatalf("forwarded Host = %q, want %q", forwarded.Host, request.Host)
-	}
-}
-
-func TestGeneratedOverrideKeepsTmpfsOptionsTogether(t *testing.T) {
-	testRoot := t.TempDir()
-	harness := &e2eHarness{
-		t:               t,
-		testRoot:        testRoot,
-		deploymentRoot:  filepath.Join(testRoot, "deployment"),
-		overrideFile:    filepath.Join(testRoot, "compose.e2e.yml"),
-		images:          e2eImageSet{productTag: "git-0123456789abcdef0123456789abcdef01234567"},
-		vaultwardenPort: 18080,
-		sourcePort:      18081,
-		primaryPort:     18082,
-		b2Port:          18083,
-	}
-	harness.writeOverride()
-
-	document, err := os.ReadFile(harness.overrideFile)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var model struct {
-		Services map[string]struct {
-			Tmpfs []string `yaml:"tmpfs"`
-		} `yaml:"services"`
-	}
-	if err := yaml.Unmarshal(document, &model); err != nil {
-		t.Fatalf("decode generated Compose override: %v", err)
-	}
-	const expected = "/tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777"
-	for _, service := range []string{"moto-primary", "moto-b2"} {
-		if got := model.Services[service].Tmpfs; len(got) != 1 || got[0] != expected {
-			t.Fatalf("%s tmpfs = %#v, want [%q]", service, got, expected)
-		}
 	}
 }

@@ -16,6 +16,9 @@ pkgs.mkShell {
     pkgs.git
     pkgs.gzip
     pkgs.restic
+    pkgs.sqlite
+    pkgs.just
+    pkgs.nixfmt
   ];
   GOTOOLCHAIN = "local";
   CGO_ENABLED = "1";

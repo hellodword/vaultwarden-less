@@ -18,29 +18,6 @@ x-service-defaults: &service-defaults
       max-size: 20m
       max-file: "3"
 
-x-backup-config-mount: &backup-config-mount
-  type: bind
-  source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/config/backup.yaml"
-  target: /config/backup.yaml
-  read_only: true
-  bind:
-    create_host_path: false
-
-x-restic-passwords-mount: &restic-passwords-mount
-  type: bind
-  source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/credentials/restic"
-  target: /run/credentials/restic
-  read_only: true
-  bind:
-    create_host_path: false
-
-x-cache-mount: &cache-mount
-  type: bind
-  source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/cache"
-  target: /cache
-  bind:
-    create_host_path: false
-
 services:
   vaultwarden:
     <<: *service-defaults
@@ -55,9 +32,6 @@ services:
       RSA_KEY_FILENAME: /data/rsa_key
       ATTACHMENTS_FOLDER: /data/attachments
       SENDS_FOLDER: /data/sends
-      WEB_VAULT_ENABLED: "false"
-      DISABLE_ICON_DOWNLOAD: "true"
-      ICON_CACHE_TTL: "0"
     env_file:
       - "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/config/vaultwarden.env"
     volumes:
@@ -78,26 +52,34 @@ services:
     image: "vaultwarden-less-backup:${VWLESS_IMAGE_TAG:?VWLESS_IMAGE_TAG is required}"
     pull_policy: never
     hostname: backup
-    entrypoint: [/bin/vaultwarden-less-backup]
     command: [serve]
     volumes:
-      - *backup-config-mount
-      - *restic-passwords-mount
-      - *cache-mount
       - type: bind
-        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/data"
-        target: /data
+        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/config/backup.yaml"
+        target: /config/backup.yaml
         read_only: true
         bind:
           create_host_path: false
       - type: bind
-        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/staging"
-        target: /staging
+        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/credentials/backup"
+        target: /run/credentials/backup
+        read_only: true
         bind:
           create_host_path: false
       - type: bind
-        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/credentials/backup.yaml"
-        target: /run/credentials/role.yaml
+        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/credentials/restic"
+        target: /run/credentials/restic
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/cache"
+        target: /cache
+        bind:
+          create_host_path: false
+      - type: bind
+        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/data"
+        target: /data
         read_only: true
         bind:
           create_host_path: false
@@ -112,12 +94,9 @@ services:
     image: "vaultwarden-less-proxy:${VWLESS_IMAGE_TAG:?VWLESS_IMAGE_TAG is required}"
     pull_policy: never
     hostname: proxy
-    entrypoint: [/bin/vaultwarden-less-proxy]
     command: [serve]
     depends_on:
       vaultwarden:
-        condition: service_healthy
-      backup:
         condition: service_healthy
     ports:
       - "127.0.0.1:${LISTEN_PORT:?LISTEN_PORT is required}:8080"
@@ -126,32 +105,3 @@ services:
       interval: 10s
       timeout: 3s
       retries: 6
-
-  maintenance:
-    <<: *service-defaults
-    image: "vaultwarden-less-backup:${VWLESS_IMAGE_TAG:?VWLESS_IMAGE_TAG is required}"
-    pull_policy: never
-    profiles: [maintenance]
-    restart: "no"
-    entrypoint: [/bin/vaultwarden-less-backup]
-    command: [--help]
-    volumes:
-      - *backup-config-mount
-      - *restic-passwords-mount
-      - *cache-mount
-      - type: bind
-        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/restore"
-        target: /restore
-        bind:
-          create_host_path: false
-      - type: bind
-        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/credentials/maintenance.yaml"
-        target: /run/credentials/role.yaml
-        read_only: true
-        bind:
-          create_host_path: false
-    healthcheck:
-      test: [CMD, /bin/vaultwarden-less-backup, version]
-      interval: 10s
-      timeout: 3s
-      retries: 3

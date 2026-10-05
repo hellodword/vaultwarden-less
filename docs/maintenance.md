@@ -1,189 +1,104 @@
 # Maintenance
 
-Upstream changes are one-component reviews against exact source evidence, not
-automatic updates to the newest tag. A candidate is unsupported until a clean
-project commit records it, all generated contracts are reviewed, the pinned
-Nix graph supplies it, and the relevant checks pass.
+`flake.lock` owns the selected nixpkgs and formatting inputs.
+[nix/upstreams.nix](../nix/upstreams.nix) owns the compatible Bitwarden CLI,
+Moto and AWS SDK pins and their fetch hashes. Vaultwarden, restic and SQLite
+come directly from the selected package set. `go.mod` and tool-generated
+`go.sum` own the Go module graph. Use dependency tools to update their
+lockfiles, then inspect the generated differences.
 
-## Authoritative inputs
+The official Bitwarden CLI is acceptance tooling. Its pin preserves the login
+protocol supported by the selected Vaultwarden. Moto and its aligned AWS SDK
+are test-only dependencies. Their upstream tests remain enabled.
 
-[UPSTREAMS.toml](../UPSTREAMS.toml) is the reviewed inventory for Vaultwarden,
-the official Bitwarden CLI, Restic, Moto, and Go. It records repository, tag,
-commit, and audited paths; Vaultwarden also records the accepted SQLite
-migration and generated schema/projection paths.
+## Upstream review
 
-`flake.nix` and the tool-generated `flake.lock` own the Nix dependency graph.
-`nix/upstreams.nix` supplies reviewed compatible releases independently of the
-pinned nixpkgs defaults. Source and npm dependency hashes for these overrides live
-in `UPSTREAMS.toml`; obtain them through Nix fetchers, including rebuilding the
-CLI dependency cache from the candidate's unchanged upstream lockfile. Keep the
-development shell and VM test on the same package set. Moto's nested AWS SDK
-pins keep its service models and boto3/botocore/s3transfer requirements aligned;
-retain their upstream package tests when updating them.
-The Moto scheduler fixture follows the timestamp-precision correction in
-[upstream #10259](https://github.com/getmoto/moto/pull/10259), with exact
-microsecond equality for the pinned newer SDK. Remove that adaptation when
-adopting a Moto release that already incorporates the correction.
-`go.mod` and the tool-generated `go.sum` own the Go module graph. Never edit a
-dependency lockfile by hand. Change an authoritative input and use the declared
-dependency tool, then review the complete generated diff. A shared Nix input
-can move several inventoried components, so inspect every one before accepting
-the change.
-
-Resolve changing facts from current official release notes, security notices,
-source repositories, registries, and local package output. Do not rely on
-remembered versions, flags, advisories, or maintenance status.
-
-## Upstream diff
-
-Start from a clean passing commit and generate the ignored report for exactly
-one candidate:
+Run a candidate audit within the development shell:
 
 ```sh
-git status --short --branch
-just check
-nix develop --command python3 scripts/upstream_diff.py \
-  vaultwarden <candidate-tag>
+nix develop --command python3 scripts/upstream_diff.py vaultwarden <candidate-git-ref>
 ```
 
-The allowed component names are `vaultwarden`, `bitwarden-cli`, `restic`,
-`moto`, and `go`. The script verifies the expected origin, resolves current and
-candidate tags to commits, and records the complete name-status change plus the
-configured audit-path subset under an ignored temporary path. The report is an
-index for human source review, not approval.
+The supported components are `vaultwarden`, `bitwarden-cli`, `restic`,
+`moto` and `go`. The baseline comes from the source actually selected by the
+flake. The candidate is fetched by Git ref. The command prints a source diff
+for the component's relevant paths and does not change dependencies or
+introduce an upgrade or runtime admission check.
 
-Review official release/security notes, provenance, license changes, the full
-source diff, and every path selected by `audit_paths`. Do not mix an upstream
-change with unrelated cleanup, configuration redesign, or formatting churn.
+For Vaultwarden, review routes and handlers, models and SQLite migrations,
+`src/config.rs`, `.env.template` and `.env.example`. Revisit request
+exclusions and business comparison policy using the relevant handler/model
+semantics. An unknown route, table, column or JSON shape is conservatively
+included at runtime.
 
-## Vaultwarden schema and projection
-
-Vaultwarden is the durable-data and API boundary. Review every intervening
-SQLite migration; tables, columns, indexes, triggers, and migration records;
-attachment and file-Send models and paths; API write routes and ignored proxy
-routes; registration/authentication behavior; environment defaults; signals;
-filesystem ownership; Web Vault exclusion; and distribution obligations.
-
-Build the candidate only through the declared Nix input. Start it against a
-new ignored private directory and let it create a fresh SQLite database. With
-that process stopped, capture the deterministic schema:
+The route catalog is the one generated classification asset:
 
 ```sh
-nix develop --command python3 scripts/capture_vaultwarden_schema.py \
-  --database /absolute/path/to/fresh/db.sqlite3 \
-  --output internal/upstream/vaultwarden-schema.json
+nix develop --command python3 scripts/routes.py \
+  /absolute/path/to/selected/vaultwarden/source \
+  --output internal/routes/catalog.txt
 ```
 
-The script opens SQLite read-only with WAL awareness, checks integrity and the
-recorded migration, and writes deterministic JSON. Review every generated
-change. Update the tag, commit, migration, complete schema, and
-`internal/upstream/recovery-projection.json` as one coherent unit. The
-projection is reviewed policy, not generator output: each included/excluded
-table and column needs source evidence, and attachment/Send closure must remain
-complete.
+Use the source path selected by the flake, review its diff, and check that a
+second generation is identical. The exclusion list and content policy are
+reviewed code, not generated database schema or recovery definitions.
 
-The two JSON contracts are tracked generated artifacts because builds and
-tests consume them. Temporary databases, source checkouts, reports, logs, and
-captures remain ignored and must be removed after review. Never inspect an
-unknown local database; only the newly created test database belongs in this
-workflow.
+For restic, review native backup/snapshot JSON, parent selection, S3 behavior,
+restore and maintenance flags, output bounds and cancellation. For Go, review
+networking, TLS/HTTP2, cryptography, filesystem behavior, subprocesses and race
+tests. Consult official sources for changing external facts and security
+notices.
 
-## Component review boundaries
-
-For the official Bitwarden CLI, review the server-selection, login, unlock,
-sync, item/folder, attachment, and Send commands used by the two E2E scenarios,
-plus the PBKDF2/HKDF, RSA-OAEP, and AES-CBC-HMAC behavior required by the narrow
-registration helper. The CLI is test tooling, not a production dependency.
-
-CLI 2026.8.0 is the compatibility ceiling for the pinned Vaultwarden 1.37.3.
-CLI 2026.9.0 and 2026.9.1 require the user-key-ID backfill endpoint during
-password login; the unmodified server returns 404 and login fails. See
-[Vaultwarden #7750](https://github.com/dani-garcia/vaultwarden/issues/7750) and
-the merged, unreleased [fix #7693](https://github.com/dani-garcia/vaultwarden/pull/7693).
-Keep both dependencies on official releases. Revisit this CLI pin when a
-Vaultwarden release includes that fix, review its database migration and
-projection together, and rerun both scenarios without bypassing login errors.
-
-For Restic, review the unmodified `init`, `backup`, `snapshots`, `check`,
-`unlock`, `forget --prune`, and `restore` arguments and JSON; format-2
-repositories; S3 behavior; identity tags; full snapshot IDs; subprocess
-cancellation; output bounds; and license/security changes. The project never
-runs repository-format migration implicitly.
-
-For Moto, review only the S3 server behavior used by tests: endpoint startup,
-bucket creation, list/read/write/delete, multipart behavior, error responses,
-and cleanup. Moto is excluded from release output and proves no real-provider
-IAM or durability claim.
-
-For Go, review compiler/runtime, crypto, networking, `database/sql`, filesystem,
-process, syscall, CGO SQLite, race-detector, and module-requirement changes.
-The pinned Nix Go version, `go.mod`, and `UPSTREAMS.toml` must agree.
-
-## Validation
-
-Run the narrowest affected tests first. The ordinary project gate is:
+## Validation and acceptance
 
 ```sh
-just check
+nix develop --command just check
+nix develop --command just release
+nix develop --command just check-release
 ```
 
-It runs formatting (gofmt, nixfmt, and Ruff), `go test ./... -count=1`,
-`go vet ./...`, worker/proxy race tests, both maintenance-script suites, and
-Nix assertions tying packages to the reviewed inventory.
+`check` is `nix flake check`: formatting, Go tests, vet, race tests and
+Python script tests. Product builds disable CGO; race checking uses the
+development toolchain. Native SQLite/restic integration tests run in ordinary
+checks. Tests use a fake clock for long scheduling and notification retry
+policies.
 
-From one unchanged clean commit on an `x86_64-linux` KVM host, run the formal
-release acceptance test:
+`release` builds the three images, Compose, templates and documentation.
+`check-release` builds that bundle and `test-runner-image`, then runs the
+packaged suite on the current local Docker socket. It requires a non-root
+runtime user with Docker access. It reports an ignored work directory containing
+results and synthetic diagnostic data. Keep useful failed-run artifacts for
+reproduction.
+
+To use a Docker-only isolated host, transfer the deployment bundle and the
+test-runner image archive, load the runner, and run it with host networking:
 
 ```sh
-just check-release
+set -euo pipefail
+docker load --input "$RUNNER_ARCHIVE"
+docker run --rm --network host --user "$(id -u):$(id -g)" \
+  --group-add "$(stat -c %g /var/run/docker.sock)" \
+  --mount type=bind,source=/var/run/docker.sock,target=/var/run/docker.sock \
+  --mount "type=bind,source=$RELEASE_DIR,target=$RELEASE_DIR,readonly" \
+  --mount "type=bind,source=$WORK_DIR,target=$WORK_DIR" \
+  vaultwarden-less-test-runner:local \
+  --release-dir "$RELEASE_DIR" --work-dir "$WORK_DIR"
 ```
 
-This is exactly `nix build --no-link -L .#release-test`. It builds the release
-archives, the test-only Moto image, the Go E2E executable, and a disposable
-NixOS guest. Inside that guest, a non-root user and the guest's local Docker
-daemon run exactly
-`TestTargetlessDeploymentAndFullDataAdoption` and
-`TestTwoTargetBackupRestore` against the three archives from that same release
-bundle and the official Bitwarden CLI. Their mandatory bind canary must pass,
-and the scenarios dynamically create all configuration, credentials, TLS CA,
-Moto endpoints, client application data, and runtime resources before
-verifying cleanup.
+Use absolute paths. The runner and host must see the work directory at the
+same path; a bind canary verifies that boundary before product startup.
+The runner includes compiled tests, official Bitwarden CLI, Docker CLI, native
+restic/SQLite tools and its Moto archive. The host needs no Nix installation.
+The suite timeout is 75 minutes.
 
-The VM test is intentionally absent from `just check`, the default package, and
-the release bundle. A machine without KVM must report the missing feature; do
-not replace the gate with TCG emulation, a remote Docker daemon, an SSH-driven
-distribution exercise, or an independently built set of images.
+The suite exercises client login, sync, editing, attachments, Sends, request
+merging, two destinations, incomplete capture and repair, restart and cache
+loss, and native restore from both repositories followed by client reads.
+Four notification peers verify payloads, signing, explicit failures and retry
+recovery. Docker DNS and a test CA route Apple's production hostname to the
+HTTP/2 peer without a production endpoint setting.
 
-Build the strict release from the same clean commit:
-
-```sh
-just release
-(cd result && sha256sum --check SHA256SUMS)
-```
-
-Require the exact allowlisted file set, standard loading of all three image
-archives, one shared `git-<full-commit>` tag, matching OCI version/revision
-labels, and absence of source, tests, Moto, private data, schemas, scripts, and
-extra documentation. Release building does not run or consume other evidence.
-
-## Final review
-
-Before committing one upstream unit:
-
-- inspect status and both staged and unstaged diffs;
-- confirm every external version and revision with authoritative evidence;
-- review generated-artifact ownership and the complete tool-generated lock
-  diff, if any;
-- search code, tests, templates, and documentation for the replaced identity
-  and obsolete assumptions;
-- classify failures as introduced, pre-existing, or environment-caused and
-  rerun the narrowest failing command;
-- remove ignored reports, databases, logs, releases, client state, and runtime
-  resources; and
-- stage only explicit task paths.
-
-Record the exact project commit, upstream before/after identities, evidence
-consulted, generated files, commands and results, unverified external
-boundaries, and cleanup. Do not claim compatibility from a version string, a
-compiled-but-skipped scenario, Moto, or a test framework that did not execute
-the required path.
+Acceptance does not establish real provider durability/IAM or delivery to
+external robot groups and Apple devices. Report those boundaries explicitly.
+Before any authorized commit, review the complete status and diff, retain
+needed diagnostics outside tracked inputs, and stage only explicit task paths.

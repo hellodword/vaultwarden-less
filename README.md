@@ -1,59 +1,43 @@
 # vaultwarden-less
 
-`vaultwarden-less` is a Linux/amd64 runtime and recovery toolkit for one pinned
-Vaultwarden release. It runs Vaultwarden behind a loopback-only, write-aware
-proxy and builds verified SQLite recovery points for zero or more Restic
-targets. Recovery points include the database plus referenced attachments and
-file Sends; they deliberately exclude Vaultwarden RSA keys.
+Run the upstream SQLite Vaultwarden behind a transparent request proxy, with
+an independent Go worker that saves the complete native data tree to one or
+more restic repositories. Backups include RSA keys, attachments, Sends,
+configuration, orphan files, empty directories and symbolic links.
 
-The project owns the Vaultwarden, backup, and proxy containers; consistent
-recovery-point construction; multi-target synchronization; status and manual
-backup requests; repository maintenance; and verified restore outputs. TLS,
-public access control, provider administration, existing-data adoption,
-release transitions, production-data replacement, publication, and
-redistribution compliance remain operator responsibilities.
+The worker uses SQLite's online backup command against a read-only source
+mount. Ordinary checks ignore explicitly identified authentication noise when
+deciding whether to upload; the saved database always contains every table
+and row. Full checks compare all database content. Missing source files produce
+an explicitly incomplete backup containing the full database and available
+files. Each destination has its own successful baseline and retry schedule.
 
-The exact supported behavior is frozen in [Product contracts](docs/contracts.md).
-This is an early-project breaking redesign: older CLI, configuration, Compose,
-and state-document formats have no compatibility layer. Recovery manifests,
-identity tags, and Restic repository format remain stable.
+Restic owns snapshot IDs, storage, deduplication, retention and restore. A
+native `restic restore ID --verify --target NEW_DIRECTORY` produces
+`db.sqlite3` and the native file tree at its root.
 
-## Build and verification
-
-Use the pinned Nix environment; do not install project tooling globally.
+The deployment bundle contains three Linux/amd64 images, Compose, configuration
+templates and operator documentation. It needs Docker Engine and Compose on
+the deployment host. TLS and public access control belong to the operator;
+the shipped proxy port binds to loopback.
 
 ```sh
-just check
-just check-release
-just release
+nix develop --command just check
+nix develop --command just release
+nix develop --command just check-release
 ```
 
-- `just check` runs the ordinary flake checks: formatting, all ordinary Go
-  tests, `go vet`, worker/proxy race tests, maintenance-script tests, and
-  upstream pin assertions.
-- `just check-release` builds and runs the formal NixOS VM acceptance test. It
-  requires clean `x86_64-linux` source, KVM, and a Nix daemon that advertises
-  the `kvm` and `nixos-test` system features. Inside the disposable guest, the
-  two release-level Docker E2E scenarios use the exact release archives and
-  the official Bitwarden CLI.
-- `just release` is exactly `nix build .#release`. It accepts only a clean Git
-  flake and creates the standard `result` link for a bundle identified as
-  `git-<full-commit>`.
+`check` runs ordinary Nix checks. `release` builds the deployment bundle.
+`check-release` runs the packaged acceptance suite on the current Docker host,
+using official Bitwarden CLI operations, two Moto repositories and four
+notification protocol peers. Its retained results are reported on stdout.
+The Docker host and runner must share the same absolute work path.
 
-## Documentation
-
-- [Configuration](docs/configuration.md) — deployment tree, permissions,
-  target and notifier YAML, AWS/B2 inputs, and targetless configuration.
-- [Operations](docs/operations.md) — release transfer, startup, official-client
-  enrollment, data adoption, repository work, restore, exercises, production
-  recovery, and release transitions.
-- [Product contracts](docs/contracts.md) — the sole normative public contract.
-- [Maintenance](docs/maintenance.md) — upstream pins, schema capture, diff
-  review, generated contracts, and maintainer checks.
-- [NOTICE](NOTICE.md) — licensing and the included Vaultwarden image's AGPL
-  corresponding-source obligation.
-
-The reviewed component inventory is [UPSTREAMS.toml](UPSTREAMS.toml). The
-deployment host needs the release bundle, Docker Engine, the Docker Compose
-plugin, checksum tools, and ordinary file-copy tools; it does not need this
-source tree, Nix, Go, Python, or Just.
+- [Configuration](docs/configuration.md): deployment paths, environment files,
+  destinations and notification channels.
+- [Operations](docs/operations.md): startup, checks, native repository
+  maintenance, restore and upgrade.
+- [Product contracts](docs/contracts.md): trigger, comparison, scheduling and
+  failure behavior.
+- [Maintenance](docs/maintenance.md): Nix inputs, upstream review and tests.
+- [NOTICE](NOTICE.md): distribution and corresponding-source obligations.

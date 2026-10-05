@@ -1,185 +1,145 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
+	"net/http"
+	"time"
 
 	"github.com/hellodword/vaultwarden-less/internal/buildinfo"
 	"github.com/hellodword/vaultwarden-less/internal/config"
-	"github.com/hellodword/vaultwarden-less/internal/restic"
 	"github.com/spf13/cobra"
 )
 
-const (
-	codeUsageError         = "usage_error"
-	codeInvalidConfig      = "invalid_config"
-	codeInvalidCredentials = "invalid_credentials"
-	codeUnsafePath         = "unsafe_path"
-	codeNotReady           = "not_ready"
-	codeConflict           = "conflict"
-	codeRepositoryFailure  = "repository_failure"
-	codeVerification       = "verification_failure"
-	codeTimeout            = "timeout"
-	codeInternal           = "internal_error"
-)
-
-var stableErrorCodes = map[string]struct{}{
-	codeUsageError: {}, codeInvalidConfig: {}, codeInvalidCredentials: {}, codeUnsafePath: {}, codeNotReady: {},
-	codeConflict: {}, codeRepositoryFailure: {}, codeVerification: {}, codeTimeout: {}, codeInternal: {},
+type commandError struct {
+	message string
+	input   bool
 }
 
-type CommandError struct {
-	Code    string
-	Message string
-	Usage   bool
-	Cause   error
-}
-
-func (err *CommandError) Error() string { return err.Message }
-func (err *CommandError) Unwrap() error { return err.Cause }
-
-type errorDocument struct {
-	Error struct {
-		Code    string `json:"code"`
-		Message string `json:"message"`
-	} `json:"error"`
-}
-
+func (e *commandError) Error() string { return e.message }
 func ExitCode(err error) int {
 	if err == nil {
 		return 0
 	}
-	classified := classifyError(err)
-	if classified.Usage {
+	var e *commandError
+	if errors.As(err, &e) && e.input {
 		return 2
 	}
 	return 1
 }
-
-func WriteError(writer io.Writer, err error) {
+func WriteError(out io.Writer, err error) {
 	if err == nil {
 		return
 	}
-	classified := classifyError(err)
-	document := errorDocument{}
-	document.Error.Code = classified.Code
-	document.Error.Message = classified.Message
-	_ = json.NewEncoder(writer).Encode(document)
-}
-
-func classifyError(err error) *CommandError {
-	var commandError *CommandError
-	if errors.As(err, &commandError) {
-		if _, valid := stableErrorCodes[commandError.Code]; valid && commandError.Message != "" {
-			return commandError
-		}
-		return commandFailure(codeInternal, "The command failed internally", err)
+	message := "The operation failed"
+	var e *commandError
+	if errors.As(err, &e) {
+		message = e.message
 	}
-	if errors.Is(err, context.DeadlineExceeded) {
-		return commandFailure(codeTimeout, "The operation timed out", err)
-	}
-	var operationError *restic.OperationError
-	if errors.As(err, &operationError) {
-		if operationError.Code == "timeout" {
-			return commandFailure(codeTimeout, "The repository operation timed out", err)
-		}
-		return commandFailure(codeRepositoryFailure, "The repository operation failed", err)
-	}
-	return commandFailure(codeInternal, "The command failed internally", err)
+	json.NewEncoder(out).Encode(map[string]any{"error": map[string]string{"message": message, "code": map[bool]string{true: "input_error", false: "operation_failed"}[ExitCode(err) == 2]}})
 }
-
-func commandFailure(code, message string, cause error) *CommandError {
-	return &CommandError{Code: code, Message: message, Cause: cause}
-}
-
-func New(stdout, stderr io.Writer) *cobra.Command {
-	return newCommand(stdout, stderr, defaultEnvironment(stderr))
-}
-
-// Execute classifies Cobra's otherwise untyped command-resolution failures at
-// the boundary, before any command action can run.
-func Execute(command *cobra.Command, arguments []string) error {
-	command.SetArgs(arguments)
-	if _, _, err := command.Find(arguments); err != nil {
-		return usageError("Invalid command or arguments")
-	}
-	return command.Execute()
-}
-
-func newCommand(stdout, stderr io.Writer, environment commandEnvironment) *cobra.Command {
-	configPath := config.DefaultBackupConfigPath
-	root := &cobra.Command{
-		Use:           "vaultwarden-less-backup",
-		Short:         "Create and restore vaultwarden-less recovery points",
-		SilenceUsage:  true,
-		SilenceErrors: true,
-		Args:          noArguments,
-		RunE: func(_ *cobra.Command, _ []string) error {
-			return usageError("A subcommand is required")
-		},
-		PersistentPreRunE: func(command *cobra.Command, _ []string) error {
-			if dirtyAllowed(command) || environment.isReady() {
-				return nil
-			}
-			return commandFailure(codeNotReady, "A clean release identity is required for this command", nil)
-		},
-	}
-	root.SetOut(stdout)
-	root.SetErr(stderr)
-	root.PersistentFlags().StringVar(&configPath, "config", config.DefaultBackupConfigPath, "path to private backup.yaml")
-	root.SetFlagErrorFunc(func(_ *cobra.Command, _ error) error { return usageError("Invalid command flags") })
-	root.CompletionOptions.DisableDefaultCmd = true
-	root.AddCommand(
-		serveCommand(&configPath, environment),
-		requestBackupCommand(environment),
-		statusCommand(environment),
-		configCommand(&configPath, environment),
-		repoCommand(&configPath, environment),
-		restoreCommand(&configPath, environment),
-		healthcheckCommand(environment),
-		versionCommand(),
-	)
-	return root
-}
-
-func dirtyAllowed(command *cobra.Command) bool {
-	path := command.CommandPath()
-	return path == "vaultwarden-less-backup version" || path == "vaultwarden-less-backup healthcheck" ||
-		path == "vaultwarden-less-backup config validate"
-}
-
-type versionResult struct {
-	ProjectCommit *string `json:"project_commit"`
-	Release       string  `json:"release"`
-	Clean         bool    `json:"clean"`
-}
-
-func versionCommand() *cobra.Command {
-	return &cobra.Command{
-		Use: "version", Short: "Print the build recovery identity", Args: noArguments,
-		RunE: func(command *cobra.Command, _ []string) error {
-			result := versionResult{Release: "development", Clean: false}
-			if buildinfo.Ready() {
-				commit := buildinfo.ProjectCommit
-				result.ProjectCommit = &commit
-				result.Release = buildinfo.Release
-				result.Clean = true
-			}
-			return writeJSON(command.OutOrStdout(), result)
-		},
-	}
-}
-
-func noArguments(_ *cobra.Command, arguments []string) error {
-	if len(arguments) != 0 {
-		return usageError("Unexpected positional arguments")
+func inputError(message string) error { return &commandError{message: message, input: true} }
+func noArguments(_ *cobra.Command, args []string) error {
+	if len(args) > 0 {
+		return inputError("Unexpected positional arguments")
 	}
 	return nil
 }
 
-func usageError(message string, arguments ...any) error {
-	return &CommandError{Code: codeUsageError, Message: fmt.Sprintf(message, arguments...), Usage: true}
+type environment struct {
+	endpoint string
+	client   *http.Client
+	serve    func(context.Context, string, io.Writer) error
+}
+
+func New(stdout, stderr io.Writer) *cobra.Command {
+	return newCommand(stdout, stderr, environment{endpoint: "http://127.0.0.1:9090", client: &http.Client{Timeout: 10 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}, serve: serve})
+}
+func Execute(cmd *cobra.Command, args []string) error {
+	cmd.SetArgs(args)
+	if _, _, err := cmd.Find(args); err != nil {
+		return inputError("Unknown command")
+	}
+	return cmd.Execute()
+}
+
+func newCommand(stdout, stderr io.Writer, env environment) *cobra.Command {
+	root := &cobra.Command{Use: "vaultwarden-less-backup", Short: "Check and back up native Vaultwarden data", SilenceErrors: true, SilenceUsage: true, Args: noArguments, RunE: func(*cobra.Command, []string) error { return inputError("A subcommand is required") }}
+	root.SetOut(stdout)
+	root.SetErr(stderr)
+	root.SetFlagErrorFunc(func(*cobra.Command, error) error { return inputError("Invalid command flags") })
+	root.CompletionOptions.DisableDefaultCmd = true
+	servePath := config.DefaultBackupConfigPath
+	serveCmd := &cobra.Command{Use: "serve", Args: noArguments, RunE: func(cmd *cobra.Command, _ []string) error { return env.serve(cmd.Context(), servePath, stderr) }}
+	serveCmd.Flags().StringVar(&servePath, "config", servePath, "backup configuration path")
+	validatePath := config.DefaultBackupConfigPath
+	validate := &cobra.Command{Use: "validate", Args: noArguments, RunE: func(cmd *cobra.Command, _ []string) error {
+		cfg, err := config.LoadBackup(validatePath)
+		if err != nil {
+			return inputError("Invalid local configuration")
+		}
+		if err := json.NewEncoder(stdout).Encode(cfg); err != nil {
+			return err
+		}
+		if !cfg.Valid() {
+			return inputError("One or more configuration entries are invalid")
+		}
+		return nil
+	}}
+	validate.Flags().StringVar(&validatePath, "config", validatePath, "backup configuration path")
+	full := false
+	check := &cobra.Command{Use: "check", Args: noArguments, RunE: func(cmd *cobra.Command, _ []string) error {
+		return call(cmd.Context(), env, http.MethodPost, "/checks", map[string]bool{"full": full}, http.StatusAccepted, stdout)
+	}}
+	check.Flags().BoolVar(&full, "full", false, "compare all database content")
+	status := &cobra.Command{Use: "status", Args: noArguments, RunE: func(cmd *cobra.Command, _ []string) error {
+		return call(cmd.Context(), env, http.MethodGet, "/status", nil, http.StatusOK, stdout)
+	}}
+	health := &cobra.Command{Use: "healthcheck", Args: noArguments, RunE: func(cmd *cobra.Command, _ []string) error {
+		if err := call(cmd.Context(), env, http.MethodGet, "/healthz", nil, http.StatusNoContent, io.Discard); err != nil {
+			return err
+		}
+		return json.NewEncoder(stdout).Encode(map[string]bool{"healthy": true})
+	}}
+	version := &cobra.Command{Use: "version", Args: noArguments, RunE: func(*cobra.Command, []string) error { return json.NewEncoder(stdout).Encode(buildinfo.Current()) }}
+	root.AddCommand(serveCmd, validate, check, status, health, version)
+	return root
+}
+
+func call(ctx context.Context, env environment, method, path string, body any, status int, out io.Writer) error {
+	var input io.Reader
+	if body != nil {
+		data, err := json.Marshal(body)
+		if err != nil {
+			return err
+		}
+		input = bytes.NewReader(data)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, env.endpoint+path, input)
+	if err != nil {
+		return &commandError{message: "Invalid worker address"}
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	response, err := env.client.Do(req)
+	if err != nil {
+		return &commandError{message: "Backup process unavailable"}
+	}
+	defer response.Body.Close()
+	if response.StatusCode != status {
+		return &commandError{message: "Backup process did not accept the request"}
+	}
+	data, err := io.ReadAll(io.LimitReader(response.Body, (1<<20)+1))
+	if err != nil || len(data) > 1<<20 {
+		return &commandError{message: "Invalid worker response"}
+	}
+	if status != http.StatusNoContent && !json.Valid(data) {
+		return &commandError{message: "Invalid worker response"}
+	}
+	_, err = out.Write(data)
+	return err
 }

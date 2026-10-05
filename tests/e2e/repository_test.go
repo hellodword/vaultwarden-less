@@ -1,354 +1,164 @@
 package e2e_test
 
 import (
-	"context"
+	"encoding/json"
 	"fmt"
 	"os"
-	"regexp"
+	"path/filepath"
+	"slices"
 	"strings"
-	"testing"
 	"time"
 
 	productworker "github.com/hellodword/vaultwarden-less/internal/worker"
 )
 
-type recoverySnapshot struct {
-	ID            string `json:"id"`
-	Time          string `json:"time"`
-	ProjectCommit string `json:"project_commit"`
-	ContentID     string `json:"content_id"`
-	ArchiveID     string `json:"archive_id"`
+type nativeSnapshot struct {
+	ID       string    `json:"id"`
+	Time     time.Time `json:"time"`
+	Hostname string    `json:"hostname"`
+	Tags     []string  `json:"tags"`
+	Parent   string    `json:"parent"`
+	Summary  struct {
+		DataAdded int64 `json:"data_added"`
+	} `json:"summary"`
 }
 
-type snapshotList struct {
-	Target    string             `json:"target"`
-	Limit     int                `json:"limit"`
-	Truncated bool               `json:"truncated"`
-	Snapshots []recoverySnapshot `json:"snapshots"`
-}
-
-type restoreOutput struct {
-	Target        string `json:"target"`
-	SnapshotID    string `json:"snapshot_id"`
-	ProjectCommit string `json:"project_commit"`
-	ContentID     string `json:"content_id"`
-	ArchiveID     string `json:"archive_id"`
-	Output        string `json:"output"`
-}
-
-func (h *e2eHarness) startRepositories() {
-	h.compose("--profile", "e2e-repositories", "up", "--detach", "moto-primary", "moto-b2")
-	for _, target := range []string{"primary", "b2"} {
-		h.createMotoBucket(target)
-		h.initRepository(target)
-	}
-}
-
-func (h *e2eHarness) createMotoBucket(target string) {
+func (h *e2eHarness) nativeRestic(target string, mounts []string, arguments ...string) string {
 	h.t.Helper()
-	service := "moto-" + target
-	bucket := "vaultwarden-less-e2e-" + target
-	const program = `import boto3,sys
-boto3.client(
-    "s3",
-    endpoint_url="http://127.0.0.1:5000",
-    aws_access_key_id="e2e",
-    aws_secret_access_key="e2e",
-    region_name="us-east-1",
-).create_bucket(Bucket=sys.argv[1])
-`
-	deadline := time.Now().Add(90 * time.Second)
-	var last string
-	for time.Now().Before(deadline) {
-		output, err := h.tryCompose(
-			h.ctx,
-			"--profile", "e2e-repositories", "exec", "--no-TTY", service,
-			"/bin/python3", "-c", program, bucket,
-		)
-		last = output
-		if err == nil {
-			return
-		}
-		select {
-		case <-h.ctx.Done():
-			h.t.Fatal(h.ctx.Err())
-		case <-time.After(500 * time.Millisecond):
+	command := []string{"run", "--rm", "--pull", "never", "--network", h.project + "_default", "--user", h.identity(), "--read-only",
+		"--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777", "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
+		"--env-file", filepath.Join(h.deploymentRoot, "credentials/maintenance", target+".env"),
+		"--env", "RESTIC_CACHE_DIR=/tmp/restic", "--mount", "type=bind,source=" + filepath.Join(h.deploymentRoot, "credentials/restic") + ",target=/run/credentials/restic,readonly"}
+	for _, mount := range mounts {
+		command = append(command, "--mount", mount)
+	}
+	command = append(command, "--entrypoint", "/bin/restic", "vaultwarden-less-backup:"+h.imageTag, "-o", "s3.bucket-lookup=path", "-o", "s3.region=us-east-1")
+	return h.mustDocker(append(command, arguments...)...)
+}
+func (h *e2eHarness) snapshots(target string) []nativeSnapshot {
+	h.t.Helper()
+	output := h.nativeRestic(target, nil, "snapshots", "--host", "vaultwarden-less", "--json")
+	var result []nativeSnapshot
+	if err := json.Unmarshal([]byte(output), &result); err != nil {
+		h.t.Fatal("invalid native snapshots response")
+	}
+	for _, s := range result {
+		if !lowerHex64Pattern.MatchString(s.ID) || s.Hostname != "vaultwarden-less" || (!slices.Contains(s.Tags, "complete") && !slices.Contains(s.Tags, "incomplete")) {
+			h.t.Fatal("native snapshot identity or tag missing")
 		}
 	}
-	h.t.Fatalf("Moto target %s did not accept bucket creation: %s", target, harnessDiagnostics(last))
+	slices.SortFunc(result, func(a, b nativeSnapshot) int { return a.Time.Compare(b.Time) })
+	return result
 }
-
-func (h *e2eHarness) initRepository(target string) {
+func (h *e2eHarness) latest(target string) nativeSnapshot {
 	h.t.Helper()
-	output := h.compose(
-		"--profile", "maintenance", "run", "--rm", "--no-deps", "maintenance",
-		"repo", "init", "--target", target,
-	)
-	var result struct {
-		Operation string `json:"operation"`
-		Target    string `json:"target"`
-		Success   bool   `json:"success"`
+	all := h.snapshots(target)
+	if len(all) == 0 {
+		h.t.Fatal("no native snapshots")
 	}
-	if err := decodeExactJSON(output, &result); err != nil || result.Operation != "init" || result.Target != target || !result.Success {
-		h.t.Fatalf("invalid repository init result for %s: %#v/%v: %s", target, result, err, harnessDiagnostics(output))
-	}
+	return all[len(all)-1]
 }
-
-func (h *e2eHarness) repositoryCheck(target string) {
-	h.t.Helper()
-	output := h.compose(
-		"--profile", "maintenance", "run", "--rm", "--no-deps", "maintenance",
-		"repo", "check", "--target", target,
-	)
-	var result struct {
-		Operation string `json:"operation"`
-		Target    string `json:"target"`
-		Success   bool   `json:"success"`
-	}
-	if err := decodeExactJSON(output, &result); err != nil || result.Operation != "check" || result.Target != target || !result.Success {
-		h.t.Fatalf("invalid repository check result for %s: %#v/%v: %s", target, result, err, harnessDiagnostics(output))
-	}
-}
-
 func (h *e2eHarness) status() productworker.Status {
 	h.t.Helper()
 	output := h.compose("exec", "--no-TTY", "backup", "/bin/vaultwarden-less-backup", "status")
-	var result productworker.Status
-	if err := decodeExactJSON(output, &result); err != nil || result.Targets == nil {
-		h.t.Fatalf("invalid worker status: %#v/%v: %s", result, err, harnessDiagnostics(output))
+	var s productworker.Status
+	if err := json.Unmarshal([]byte(output), &s); err != nil {
+		h.t.Fatal("invalid status JSON")
 	}
-	return result
+	writePrivateFile(h.t, filepath.Join(h.testRoot, "last-status.json"), output)
+	return s
 }
-
-func (h *e2eHarness) requestBackup() {
-	h.t.Helper()
-	output := h.compose("exec", "--no-TTY", "backup", "/bin/vaultwarden-less-backup", "request-backup")
-	var result struct {
-		Accepted bool `json:"accepted"`
-	}
-	if err := decodeExactJSON(output, &result); err != nil || !result.Accepted {
-		h.t.Fatalf("invalid backup request result: %#v/%v: %s", result, err, harnessDiagnostics(output))
-	}
-}
-
-func (h *e2eHarness) targetSnapshots(target string) (snapshotList, error) {
-	output, err := h.tryCompose(
-		h.ctx,
-		"exec", "--no-TTY", "backup", "/bin/vaultwarden-less-backup",
-		"repo", "snapshots", "--target", target, "--limit", "100",
-	)
-	if err != nil {
-		return snapshotList{}, fmt.Errorf("list %s snapshots: %w: %s", target, err, harnessDiagnostics(output))
-	}
-	var result snapshotList
-	if err := decodeExactJSON(output, &result); err != nil || result.Target != target || result.Limit != 100 || result.Truncated || result.Snapshots == nil {
-		return snapshotList{}, fmt.Errorf("invalid %s snapshot response", target)
-	}
-	seen := make(map[string]struct{}, len(result.Snapshots))
-	var previous time.Time
-	for index, snapshot := range result.Snapshots {
-		when, parseErr := time.Parse(time.RFC3339Nano, snapshot.Time)
-		_, duplicate := seen[snapshot.ID]
-		if parseErr != nil || !lowerHex64Pattern.MatchString(snapshot.ID) ||
-			!lowerHex40Pattern.MatchString(snapshot.ProjectCommit) ||
-			!contentIDPattern.MatchString(snapshot.ContentID) ||
-			!contentIDPattern.MatchString(snapshot.ArchiveID) || duplicate ||
-			(index > 0 && when.After(previous)) {
-			return snapshotList{}, fmt.Errorf("invalid %s snapshot identity or ordering", target)
-		}
-		seen[snapshot.ID] = struct{}{}
-		previous = when
-	}
-	return result, nil
-}
-
-func (h *e2eHarness) waitTargetSnapshotCount(target string, count int, timeout time.Duration) snapshotList {
-	h.t.Helper()
-	deadline := time.Now().Add(timeout)
-	var lastError error
-	for time.Now().Before(deadline) {
-		result, err := h.targetSnapshots(target)
-		lastError = err
-		if err == nil && len(result.Snapshots) == count {
-			return result
-		}
-		if err == nil && len(result.Snapshots) > count {
-			h.t.Fatalf("%s snapshot count jumped to %d, want %d", target, len(result.Snapshots), count)
-		}
-		select {
-		case <-h.ctx.Done():
-			h.t.Fatal(h.ctx.Err())
-		case <-time.After(3 * time.Second):
-		}
-	}
-	h.t.Fatalf("%s snapshot count did not become %d: %v", target, count, lastError)
-	return snapshotList{}
-}
-
 func (h *e2eHarness) waitStatus(timeout time.Duration, accept func(productworker.Status) bool) productworker.Status {
 	h.t.Helper()
-	deadline := time.Now().Add(timeout)
-	last := productworker.Status{}
-	for time.Now().Before(deadline) {
-		last = h.status()
-		if accept(last) {
-			return last
-		}
-		select {
-		case <-h.ctx.Done():
-			h.t.Fatal(h.ctx.Err())
-		case <-time.After(2 * time.Second):
+	var state productworker.Status
+	h.wait(timeout, "backup status condition", func() bool { state = h.status(); return accept(state) })
+	return state
+}
+func settled(s productworker.Status) bool {
+	if s.Checking || s.LastCheck.IsZero() {
+		return false
+	}
+	for _, t := range s.Targets {
+		if t.Uploading || t.State == "initializing" || (t.Waiting && t.Error == "") {
+			return false
 		}
 	}
-	h.t.Fatalf("worker did not reach the required state; last status: %#v", last)
-	return productworker.Status{}
+	return true
 }
-
-func exactTwoTargets(t *testing.T, status productworker.Status) (productworker.TargetStatus, productworker.TargetStatus) {
-	t.Helper()
-	if len(status.Targets) != 2 || status.Targets[0].Name != "primary" || status.Targets[1].Name != "b2" {
-		t.Fatalf("worker target order = %#v", status.Targets)
-	}
-	return status.Targets[0], status.Targets[1]
-}
-
-func (h *e2eHarness) restoreTarget(target, snapshotID, outputName string) restoreOutput {
+func (h *e2eHarness) check(full bool) productworker.Status {
 	h.t.Helper()
-	output, err := h.tryRestoreTarget(target, snapshotID, outputName)
-	if err != nil {
-		h.t.Fatalf("restore %s to %s: %v: %s", target, outputName, err, harnessDiagnostics(output))
+	before := h.status().LastCheck
+	args := []string{"exec", "--no-TTY", "backup", "/bin/vaultwarden-less-backup", "check"}
+	if full {
+		args = append(args, "--full")
 	}
-	var result restoreOutput
-	if decodeErr := decodeExactJSON(output, &result); decodeErr != nil ||
-		result.Target != target || result.Output != "/restore/"+outputName ||
-		!lowerHex64Pattern.MatchString(result.SnapshotID) ||
-		!lowerHex40Pattern.MatchString(result.ProjectCommit) ||
-		!contentIDPattern.MatchString(result.ContentID) ||
-		!contentIDPattern.MatchString(result.ArchiveID) {
-		h.t.Fatalf("invalid restore output for %s: %#v/%v: %s", target, result, decodeErr, harnessDiagnostics(output))
+	output := h.compose(args...)
+	var accepted map[string]any
+	if json.Unmarshal([]byte(output), &accepted) != nil || accepted["accepted"] != true {
+		h.t.Fatal("manual check not accepted")
 	}
-	return result
+	return h.waitStatus(3*time.Minute, func(s productworker.Status) bool { return s.LastCheck.After(before) && settled(s) })
 }
-
-func (h *e2eHarness) tryRestoreTarget(target, snapshotID, outputName string) (string, error) {
-	if !regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`).MatchString(outputName) {
-		h.t.Fatalf("unsafe restore output name %q", outputName)
-	}
-	arguments := []string{
-		"--profile", "maintenance", "run", "--rm", "--no-deps", "maintenance",
-		"restore", "--target", target, "--output", outputName,
-	}
-	if snapshotID != "" {
-		arguments = append(arguments, "--snapshot", snapshotID)
-	}
-	return h.tryCompose(h.ctx, arguments...)
+func (h *e2eHarness) waitNewRequestCheck(after time.Time) productworker.Status {
+	return h.waitStatus(3*time.Minute, func(s productworker.Status) bool { return s.LastCheck.After(after) && settled(s) })
 }
-
-func assertRestoreMatchesSnapshot(t *testing.T, restored restoreOutput, snapshot recoverySnapshot) {
-	t.Helper()
-	if restored.SnapshotID != snapshot.ID || restored.ProjectCommit != snapshot.ProjectCommit ||
-		restored.ContentID != snapshot.ContentID || restored.ArchiveID != snapshot.ArchiveID {
-		t.Fatalf("restore identity = %#v, want snapshot %#v", restored, snapshot)
+func (h *e2eHarness) assertUnchangedIDs(before productworker.Status, after productworker.Status) {
+	h.t.Helper()
+	if len(before.Targets) != len(after.Targets) {
+		h.t.Fatal("target count changed")
+	}
+	for i := range before.Targets {
+		if before.Targets[i].SuccessID != after.Targets[i].SuccessID {
+			h.t.Fatalf("unchanged content created a snapshot for %s", after.Targets[i].Name)
+		}
 	}
 }
-
-const rejectingS3Endpoint = `from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-
-class Handler(BaseHTTPRequestHandler):
-    def reject(self):
-        self.send_response(403)
-        self.send_header("Content-Length", "0")
-        self.end_headers()
-
-    do_DELETE = reject
-    do_GET = reject
-    do_HEAD = reject
-    do_POST = reject
-    do_PUT = reject
-
-    def log_message(self, format, *arguments):
-        pass
-
-ThreadingHTTPServer(("0.0.0.0", 5000), Handler).serve_forever()
-`
-
-const verifyRejectingS3Endpoint = `import urllib.error,urllib.request
-try:
-    urllib.request.urlopen("http://moto-b2:5000/", timeout=2)
-except urllib.error.HTTPError as error:
-    raise SystemExit(0 if error.code == 403 else 1)
-raise SystemExit(1)
-`
-
-func rejectB2Endpoint(t *testing.T, h *e2eHarness) func() {
-	t.Helper()
-	const service = "moto-b2"
-	h.compose("--profile", "e2e-repositories", "stop", service)
-	container := h.containerID(service)
-	network := h.project + "_default"
-	if output, err := h.docker("network", "disconnect", network, container); err != nil {
-		t.Fatalf("disconnect stopped b2 endpoint: %v: %s", err, harnessDiagnostics(output))
-	}
-
-	rejector := h.project + "-b2-rejector"
-	output, err := h.docker(
-		"run", "--detach", "--pull", "never", "--name", rejector,
-		"--label", "vaultwarden-less.e2e.project="+h.project,
-		"--user", fmt.Sprintf("%d:%d", os.Geteuid(), os.Getegid()),
-		"--read-only", "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777",
-		"--security-opt", "no-new-privileges:true", "--cap-drop", "ALL",
-		"--network", network, "--network-alias", service,
-		"--entrypoint", "/bin/python3", "vaultwarden-less-moto:local", "-c", rejectingS3Endpoint,
-	)
-	if err != nil || !lowerHex64Pattern.MatchString(strings.TrimSpace(output)) {
-		t.Fatalf("start rejecting b2 endpoint: %v: %s", err, harnessDiagnostics(output))
-	}
-	restored := false
-	t.Cleanup(func() {
-		if restored {
-			return
-		}
-		cleanupContext, cancel := context.WithTimeout(context.WithoutCancel(h.ctx), time.Minute)
-		defer cancel()
-		_, _ = h.dockerContext(cleanupContext, "container", "rm", "--force", rejector)
-	})
-
-	deadline := time.Now().Add(30 * time.Second)
-	for {
-		_, probeErr := h.docker(
-			"run", "--rm", "--pull", "never",
-			"--user", fmt.Sprintf("%d:%d", os.Geteuid(), os.Getegid()),
-			"--read-only", "--security-opt", "no-new-privileges:true", "--cap-drop", "ALL",
-			"--network", network, "--entrypoint", "/bin/python3",
-			"vaultwarden-less-moto:local", "-c", verifyRejectingS3Endpoint,
-		)
-		if probeErr == nil {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("rejecting b2 endpoint did not become reachable")
-		}
-		select {
-		case <-h.ctx.Done():
-			t.Fatal(h.ctx.Err())
-		case <-time.After(250 * time.Millisecond):
+func (h *e2eHarness) assertNewIDs(before productworker.Status, after productworker.Status) {
+	h.t.Helper()
+	for i := range before.Targets {
+		if before.Targets[i].SuccessID == after.Targets[i].SuccessID || after.Targets[i].SuccessID == "" {
+			h.t.Fatalf("changed content was not saved to %s", after.Targets[i].Name)
 		}
 	}
-
-	return func() {
-		t.Helper()
-		if restored {
-			t.Fatal("b2 endpoint was restored more than once")
-		}
-		if output, err := h.docker("container", "rm", "--force", rejector); err != nil {
-			t.Fatalf("remove rejecting b2 endpoint: %v: %s", err, harnessDiagnostics(output))
-		}
-		if output, err := h.docker("network", "connect", "--alias", service, network, container); err != nil {
-			t.Fatalf("reconnect b2 endpoint: %v: %s", err, harnessDiagnostics(output))
-		}
-		h.compose("--profile", "e2e-repositories", "start", service)
-		h.createMotoBucket("b2")
-		h.initRepository("b2")
-		restored = true
+}
+func (h *e2eHarness) restore(target, id, name string) string {
+	h.t.Helper()
+	path := filepath.Join(h.deploymentRoot, "restore", name)
+	if _, err := os.Lstat(path); !os.IsNotExist(err) {
+		h.t.Fatal("restore target already exists")
 	}
+	if err := os.Mkdir(path, 0700); err != nil {
+		h.t.Fatal(err)
+	}
+	h.nativeRestic(target, []string{"type=bind,source=" + path + ",target=/restore"}, "restore", id, "--verify", "--target", "/restore")
+	if _, err := os.Stat(filepath.Join(path, "db.sqlite3")); err != nil {
+		h.t.Fatal("native restore did not produce a root database")
+	}
+	if result := h.sqliteReadOnly(path, "PRAGMA integrity_check;"); strings.TrimSpace(result) != "ok" {
+		h.t.Fatal("restored SQLite integrity failed")
+	}
+	return path
+}
+func (h *e2eHarness) sqlite(root, sql string) string {
+	h.t.Helper()
+	return h.mustDocker("run", "--rm", "--pull", "never", "--user", h.identity(), "--read-only", "--mount", "type=bind,source="+root+",target=/data", "--entrypoint", "/bin/sqlite3", "vaultwarden-less-backup:"+h.imageTag, "-batch", "-bail", "/data/db.sqlite3", sql)
+}
+func (h *e2eHarness) sqliteReadOnly(root, sql string) string {
+	h.t.Helper()
+	return h.mustDocker("run", "--rm", "--pull", "never", "--user", h.identity(), "--read-only", "--mount", "type=bind,source="+root+",target=/restore,readonly", "--entrypoint", "/bin/sqlite3", "vaultwarden-less-backup:"+h.imageTag, "-batch", "-bail", "-readonly", "file:/restore/db.sqlite3?immutable=1", sql)
+}
+func (h *e2eHarness) startRestored(root, name string) {
+	h.t.Helper()
+	port := unusedLoopbackPort(h.t)
+	container := h.project + "-" + name
+	h.mustDocker("run", "--detach", "--pull", "never", "--name", container, "--label", "vaultwarden-less.e2e.project="+h.project,
+		"--user", h.identity(), "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
+		"--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777", "--mount", "type=bind,source="+root+",target=/data",
+		"--publish", fmt.Sprintf("127.0.0.1:%d:80", port), "--env", "DATA_FOLDER=/data", "--env", "DATABASE_URL=sqlite:///data/db.sqlite3",
+		"--env", "RSA_KEY_FILENAME=/data/rsa_key", "--env", "ATTACHMENTS_FOLDER=/data/attachments", "--env", "SENDS_FOLDER=/data/sends",
+		"--env", "WEB_VAULT_ENABLED=false", "--env", "SIGNUPS_ALLOWED=false", "--env", "INVITATIONS_ALLOWED=false", "--env", "ADMIN_TOKEN=",
+		"--env", "DISABLE_ADMIN_TOKEN=false", "--env", "DISABLE_ICON_DOWNLOAD=true", "vaultwarden-less-vaultwarden:"+h.imageTag)
+	h.t.Cleanup(func() { h.cleanupContainer(container) })
+	h.setBackend(loopbackEndpoint(port))
+	h.waitHTTP(h.publicTLS+"/alive", 200, 3*time.Minute)
 }

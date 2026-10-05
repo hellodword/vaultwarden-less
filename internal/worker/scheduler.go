@@ -2,111 +2,120 @@ package worker
 
 import (
 	"time"
+
+	"github.com/hellodword/vaultwarden-less/internal/routes"
 )
-
-type timer interface {
-	C() <-chan time.Time
-	Stop() bool
-}
-
-type clock interface {
-	Now() time.Time
-	NewTimer(time.Duration) timer
-}
-
-type realClock struct{}
-
-func (realClock) Now() time.Time { return time.Now().UTC() }
-
-func (realClock) NewTimer(duration time.Duration) timer {
-	return realTimer{Timer: time.NewTimer(duration)}
-}
-
-type realTimer struct{ *time.Timer }
-
-func (timer realTimer) C() <-chan time.Time { return timer.Timer.C }
-
-type triggerKind string
 
 const (
-	triggerDemand   triggerKind = "demand"
-	triggerRetry    triggerKind = "retry"
-	triggerFallback triggerKind = "fallback"
+	quietWindow      = 30 * time.Second
+	maximumWait      = 2 * time.Minute
+	ordinaryInterval = 6 * time.Hour
+	fullInterval     = 7 * 24 * time.Hour
+	sourceRetry      = 5 * time.Minute
 )
 
+type task struct {
+	Full, ReadAll bool
+	Reasons       map[string]uint64
+	Events        routes.Summary
+}
 type schedule struct {
-	demandFirst *time.Time
-	demandLast  time.Time
-	retryAt     *time.Time
-	fallbackAt  *time.Time
-	lastStarted *time.Time
+	pending                task
+	first, last            time.Time
+	urgent                 bool
+	nextOrdinary, nextFull time.Time
+	retryAt                time.Time
+	retryFull              bool
 }
 
-func (state *schedule) demand(now time.Time) {
-	now = now.UTC()
-	if state.demandFirst == nil {
-		first := now
-		state.demandFirst = &first
+func (s *schedule) reason(reason string) {
+	if s.pending.Reasons == nil {
+		s.pending.Reasons = map[string]uint64{}
 	}
-	state.demandLast = now
+	s.pending.Reasons[reason]++
 }
-
-func (state *schedule) next() (time.Time, triggerKind, bool) {
-	var due time.Time
-	var kind triggerKind
-	set := func(candidate time.Time, candidateKind triggerKind) {
-		if due.IsZero() || candidate.Before(due) || candidate.Equal(due) && candidateKind == triggerDemand {
-			due = candidate
-			kind = candidateKind
-		}
-	}
-	if state.demandFirst != nil {
-		demandDue := state.demandLast.Add(quietWindow)
-		maximum := state.demandFirst.Add(maximumQuietWindow)
-		if maximum.Before(demandDue) {
-			demandDue = maximum
-		}
-		if state.lastStarted != nil {
-			minimum := state.lastStarted.Add(minimumCheckInterval)
-			if minimum.After(demandDue) {
-				demandDue = minimum
-			}
-		}
-		set(demandDue, triggerDemand)
-	}
-	if state.retryAt != nil {
-		set(*state.retryAt, triggerRetry)
-	}
-	if state.fallbackAt != nil {
-		set(*state.fallbackAt, triggerFallback)
-	}
-	return due, kind, !due.IsZero()
+func (s *schedule) start(now time.Time) {
+	s.nextOrdinary = now.Add(ordinaryInterval)
+	s.nextFull = now.Add(fullInterval)
+	s.manual(true)
+	s.pending.Reasons = map[string]uint64{"startup": 1}
 }
-
-func (state *schedule) begin(now time.Time) {
-	now = now.UTC()
-	state.lastStarted = &now
-	state.demandFirst = nil
-	state.demandLast = time.Time{}
-	state.retryAt = nil
-	state.fallbackAt = nil
+func (s *schedule) manual(full bool) {
+	s.urgent = true
+	s.pending.Full = s.pending.Full || full
+	s.pending.ReadAll = s.pending.ReadAll || full
+	s.reason("manual")
 }
-
-func (state *schedule) complete(now time.Time, retry bool) {
-	now = now.UTC()
-	state.retryAt = nil
-	state.fallbackAt = nil
+func (s *schedule) event(now time.Time, events routes.Summary) {
+	if s.first.IsZero() {
+		s.first = now
+	}
+	s.last = now
+	s.pending.Events.Merge(events)
+	s.reason("request")
+}
+func (s *schedule) tick(now time.Time) {
+	for !s.nextOrdinary.IsZero() && !s.nextOrdinary.After(now) {
+		s.reason("scheduled")
+		s.pending.ReadAll = true
+		s.urgent = true
+		s.nextOrdinary = s.nextOrdinary.Add(ordinaryInterval)
+	}
+	for !s.nextFull.IsZero() && !s.nextFull.After(now) {
+		s.reason("scheduled_full")
+		s.pending.Full = true
+		s.pending.ReadAll = true
+		s.urgent = true
+		s.nextFull = s.nextFull.Add(fullInterval)
+	}
+	if !s.retryAt.IsZero() && !s.retryAt.After(now) {
+		s.reason("source_retry")
+		s.pending.Full = s.pending.Full || s.retryFull
+		s.pending.ReadAll = true
+		s.urgent = true
+		s.retryAt = time.Time{}
+	}
+}
+func (s *schedule) sourceDue(now time.Time) time.Time {
+	if s.urgent {
+		return now
+	}
+	if s.first.IsZero() {
+		return time.Time{}
+	}
+	return earlier(s.last.Add(quietWindow), s.first.Add(maximumWait))
+}
+func (s *schedule) take() task {
+	value := s.pending
+	value.Full = value.Full || s.retryFull
+	value.ReadAll = value.ReadAll || value.Full
+	s.pending = task{}
+	s.first = time.Time{}
+	s.last = time.Time{}
+	s.urgent = false
+	return value
+}
+func (s *schedule) complete(now time.Time, full, compared, retry bool) {
+	if full && !compared {
+		s.retryFull = true
+	} else if full && compared {
+		s.retryFull = false
+	}
 	if retry {
-		due := now.Add(failureRetry)
-		if state.lastStarted != nil {
-			minimum := state.lastStarted.Add(minimumCheckInterval)
-			if minimum.After(due) {
-				due = minimum
-			}
-		}
-		state.retryAt = &due
-		return
+		s.retryAt = now.Add(sourceRetry)
+	} else {
+		s.retryAt = time.Time{}
 	}
-	due := now.Add(fallbackCheckInterval)
-	state.fallbackAt = &due
+}
+func earlier(a, b time.Time) time.Time {
+	if a.IsZero() {
+		return b
+	}
+	if b.IsZero() || a.Before(b) {
+		return a
+	}
+	return b
+}
+func targetBackoff(failures int) time.Duration {
+	return time.Duration(min(5<<min(max(failures-1, 0), 4), 60)) * time.Minute
 }

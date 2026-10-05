@@ -1,8 +1,8 @@
 /.env
 /config/backup.yaml
 /config/vaultwarden.env
-/credentials/backup.yaml
-/credentials/maintenance.yaml
+/credentials/backup/
+/credentials/maintenance/
 /credentials/restic/*
 /data/
 /staging/

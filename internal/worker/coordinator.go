@@ -2,563 +2,413 @@ package worker
 
 import (
 	"context"
-	"encoding/hex"
 	"errors"
-	"fmt"
 	"log/slog"
-	"slices"
-	"strings"
+	"maps"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
+	"github.com/hellodword/vaultwarden-less/internal/capture"
 	"github.com/hellodword/vaultwarden-less/internal/config"
 	"github.com/hellodword/vaultwarden-less/internal/notify"
 	"github.com/hellodword/vaultwarden-less/internal/restic"
-	"github.com/hellodword/vaultwarden-less/internal/snapshot"
+	"github.com/hellodword/vaultwarden-less/internal/routes"
+	"github.com/hellodword/vaultwarden-less/internal/timing"
 )
 
-type LastCheck struct {
-	StartedAt  string  `json:"started_at"`
-	FinishedAt string  `json:"finished_at"`
-	Result     string  `json:"result"`
-	ContentID  *string `json:"content_id"`
-	ArchiveID  *string `json:"archive_id"`
-	ErrorCode  *string `json:"error_code"`
+type Repository interface {
+	Latest(context.Context, config.Target) (*restic.Snapshot, error)
+	Backup(context.Context, config.Target, string, string) (string, error)
 }
-
+type Notifications interface {
+	Enqueue(notify.Event)
+	Status() []notify.Status
+}
 type TargetStatus struct {
-	Name          string  `json:"name"`
-	State         string  `json:"state"`
-	LastAttemptAt *string `json:"last_attempt_at"`
-	LastSuccessAt *string `json:"last_success_at"`
-	SnapshotID    *string `json:"snapshot_id"`
-	ContentID     *string `json:"content_id"`
-	ArchiveID     *string `json:"archive_id"`
-	ErrorCode     *string `json:"error_code"`
+	Name      string    `json:"name"`
+	SuccessID string    `json:"success_id,omitempty"`
+	SuccessAt time.Time `json:"success_at,omitzero"`
+	Waiting   bool      `json:"waiting"`
+	Uploading bool      `json:"uploading"`
+	RetryAt   time.Time `json:"retry_at,omitzero"`
+	Error     string    `json:"error,omitempty"`
+	State     string    `json:"state"`
 }
-
 type Status struct {
-	State       string         `json:"state"`
-	StartedAt   string         `json:"started_at"`
-	NextCheckAt *string        `json:"next_check_at"`
-	LastCheck   *LastCheck     `json:"last_check"`
-	Targets     []TargetStatus `json:"targets"`
+	Configured    bool            `json:"configured"`
+	Checking      bool            `json:"checking"`
+	Mode          string          `json:"mode"`
+	FullPending   bool            `json:"full_pending"`
+	LastCheck     time.Time       `json:"last_check,omitzero"`
+	LastResult    string          `json:"last_result"`
+	NextOrdinary  time.Time       `json:"next_ordinary,omitzero"`
+	NextFull      time.Time       `json:"next_full,omitzero"`
+	SourceRetryAt time.Time       `json:"source_retry_at,omitzero"`
+	Source        string          `json:"source"`
+	Issues        map[string]int  `json:"issues"`
+	Warnings      []string        `json:"warnings"`
+	Targets       []TargetStatus  `json:"targets"`
+	Notifiers     []notify.Status `json:"notifiers"`
 }
-
-type lastCheckState struct {
-	StartedAt  time.Time
-	FinishedAt time.Time
-	Result     string
-	ContentID  *string
-	ArchiveID  *string
-	ErrorCode  *string
+type targetState struct {
+	config            config.Target
+	status            TargetStatus
+	initialized       bool
+	baseline, running *capture.Payload
+	full, runningFull bool
+	failures          int
 }
-
-type targetStatusState struct {
-	Name          string
-	State         string
-	LastAttemptAt *time.Time
-	LastSuccessAt *time.Time
-	SnapshotID    *string
-	ContentID     *string
-	ArchiveID     *string
-	ErrorCode     *string
+type sourceResult struct {
+	payload *capture.Payload
+	err     error
 }
-
-type statusState struct {
-	State       string
-	StartedAt   time.Time
-	NextCheckAt *time.Time
-	LastCheck   *lastCheckState
-	Targets     []targetStatusState
+type targetResult struct {
+	index    int
+	initial  bool
+	baseline *capture.Payload
+	snapshot *restic.Snapshot
+	id       string
+	err      error
 }
-
-type failureState struct {
-	since    time.Time
-	degraded bool
-}
-
 type Worker struct {
-	targets []config.Target
-	build   func(context.Context) (snapshot.Manifest, error)
-	ensure  func(context.Context, config.Target, snapshot.Manifest) (restic.SyncResult, error)
-	enqueue func(notify.Event)
-	logger  *slog.Logger
-	clock   clock
-	demand  chan struct{}
-
-	mu             sync.RWMutex
-	status         statusState
-	sourceFailure  failureState
-	targetFailures []failureState
+	mu            sync.Mutex
+	clock         timing.Clock
+	build         func(context.Context, *capture.Payload, bool) (*capture.Payload, error)
+	repo          Repository
+	notifications Notifications
+	logger        *slog.Logger
+	cache         string
+	schedule      schedule
+	current       task
+	checking      bool
+	latest        *capture.Payload
+	targets       []*targetState
+	status        Status
+	wake          chan struct{}
+	sourceDone    chan sourceResult
+	targetDone    chan targetResult
+	wait          sync.WaitGroup
 }
 
-func New(
-	cfg *config.Backup,
-	build func(context.Context) (snapshot.Manifest, error),
-	ensure func(context.Context, config.Target, snapshot.Manifest) (restic.SyncResult, error),
-	enqueue func(notify.Event),
-	logger *slog.Logger,
-) *Worker {
-	return newWithClock(cfg, build, ensure, enqueue, logger, realClock{})
+func New(cfg *config.Backup, builder capture.Builder, repo Repository, notifications Notifications, logger *slog.Logger) *Worker {
+	w := &Worker{clock: timing.Real{}, build: builder.Build, repo: repo, notifications: notifications, logger: logger, cache: builder.CacheDir, wake: make(chan struct{}, 1), sourceDone: make(chan sourceResult, 1), targetDone: make(chan targetResult, len(cfg.Targets))}
+	for _, cfg := range cfg.Targets {
+		t := &targetState{config: cfg, status: TargetStatus{Name: cfg.Name, State: "initializing"}}
+		if cfg.Error != "" {
+			t.initialized = true
+			t.status.Error = cfg.Error
+			t.status.State = "invalid"
+		}
+		w.targets = append(w.targets, t)
+	}
+	w.status.Source = "unknown"
+	w.status.Mode = "full"
+	return w
 }
-
-func newWithClock(
-	cfg *config.Backup,
-	build func(context.Context) (snapshot.Manifest, error),
-	ensure func(context.Context, config.Target, snapshot.Manifest) (restic.SyncResult, error),
-	enqueue func(notify.Event),
-	logger *slog.Logger,
-	currentClock clock,
-) *Worker {
-	if enqueue == nil {
-		enqueue = func(notify.Event) {}
-	}
-	started := currentClock.Now().UTC()
-	targets := copyTargets(cfg)
-	targetStatuses := make([]targetStatusState, 0, len(targets))
-	for _, target := range targets {
-		targetStatuses = append(targetStatuses, targetStatusState{Name: target.Name, State: "unknown"})
-	}
-	return &Worker{
-		targets: targets, build: build, ensure: ensure, enqueue: enqueue, logger: logger, clock: currentClock,
-		demand: make(chan struct{}, 1),
-		status: statusState{
-			State:     "idle",
-			StartedAt: started,
-			Targets:   targetStatuses,
-		},
-		targetFailures: make([]failureState, len(targets)),
-	}
-}
-
-func copyTargets(cfg *config.Backup) []config.Target {
-	if cfg == nil || len(cfg.Targets) == 0 {
-		return []config.Target{}
-	}
-	targets := make([]config.Target, len(cfg.Targets))
-	for index, target := range cfg.Targets {
-		target.Options = slices.Clone(target.Options)
-		targets[index] = target
-	}
-	return targets
-}
-
-// Request coalesces all outstanding demand into one in-memory signal.
-func (worker *Worker) Request() {
-	if worker.targetless() {
-		return
-	}
+func (w *Worker) signal() {
 	select {
-	case worker.demand <- struct{}{}:
+	case w.wake <- struct{}{}:
 	default:
 	}
 }
-
-func (worker *Worker) targetless() bool {
-	return len(worker.targets) == 0
-}
-
-func (worker *Worker) Status() Status {
-	worker.mu.RLock()
-	defer worker.mu.RUnlock()
-	result := Status{
-		State:     worker.status.State,
-		StartedAt: formatTime(worker.status.StartedAt),
-		Targets:   make([]TargetStatus, len(worker.status.Targets)),
-	}
-	if worker.status.NextCheckAt != nil {
-		value := formatTime(*worker.status.NextCheckAt)
-		result.NextCheckAt = &value
-	}
-	if worker.status.LastCheck != nil {
-		state := worker.status.LastCheck
-		last := &LastCheck{
-			StartedAt:  formatTime(state.StartedAt),
-			FinishedAt: formatTime(state.FinishedAt),
-			Result:     state.Result,
-			ContentID:  cloneString(state.ContentID),
-			ArchiveID:  cloneString(state.ArchiveID),
-			ErrorCode:  cloneString(state.ErrorCode),
-		}
-		result.LastCheck = last
-	}
-	for index, state := range worker.status.Targets {
-		target := TargetStatus{
-			Name:       state.Name,
-			State:      state.State,
-			SnapshotID: cloneString(state.SnapshotID),
-			ContentID:  cloneString(state.ContentID),
-			ArchiveID:  cloneString(state.ArchiveID),
-			ErrorCode:  cloneString(state.ErrorCode),
-		}
-		if state.LastAttemptAt != nil {
-			value := formatTime(*state.LastAttemptAt)
-			target.LastAttemptAt = &value
-		}
-		if state.LastSuccessAt != nil {
-			value := formatTime(*state.LastSuccessAt)
-			target.LastSuccessAt = &value
-		}
-		result.Targets[index] = target
-	}
-	return result
-}
-
-func (worker *Worker) Run(ctx context.Context) {
-	if worker.targetless() {
-		<-ctx.Done()
+func (w *Worker) Request(full bool) { w.mu.Lock(); w.schedule.manual(full); w.mu.Unlock(); w.signal() }
+func (w *Worker) Events(events routes.Summary) {
+	if events.Empty() {
 		return
 	}
-	var scheduling schedule
-	scheduling.demand(worker.clock.Now())
-	for {
-		due, kind, exists := scheduling.next()
-		if !exists {
-			worker.setWaiting("idle", nil)
-			select {
-			case <-ctx.Done():
-				return
-			case <-worker.demand:
-				scheduling.demand(worker.clock.Now())
-				continue
-			}
-		}
-		now := worker.clock.Now()
-		if due.After(now) {
-			state := "idle"
-			if kind == triggerDemand {
-				state = "debouncing"
-			}
-			worker.setWaiting(state, &due)
-			timer := worker.clock.NewTimer(due.Sub(now))
-			select {
-			case <-ctx.Done():
-				timer.Stop()
-				worker.setWaiting("idle", nil)
-				return
-			case <-worker.demand:
-				timer.Stop()
-				scheduling.demand(worker.clock.Now())
-				continue
-			case <-timer.C():
-			}
-		}
-
-		started := worker.clock.Now()
-		scheduling.begin(started)
-		worker.setChecking()
-		outcome := worker.check(ctx)
-		if outcome.cancelled || ctx.Err() != nil {
-			worker.setWaiting("idle", nil)
-			return
-		}
-		finished := worker.clock.Now()
-		worker.finishCheck(started, finished, outcome)
-		scheduling.complete(finished, outcome.retry)
-		select {
-		case <-worker.demand:
-			scheduling.demand(worker.clock.Now())
-		default:
-		}
+	w.mu.Lock()
+	w.schedule.event(w.clock.Now(), events)
+	w.mu.Unlock()
+	w.signal()
+}
+func (w *Worker) Status() Status {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	s := w.status
+	s.Checking = w.checking
+	s.Configured = len(w.targets) > 0
+	s.FullPending = w.schedule.pending.Full || w.schedule.retryFull
+	s.NextOrdinary = w.schedule.nextOrdinary
+	s.NextFull = w.schedule.nextFull
+	s.SourceRetryAt = w.schedule.retryAt
+	s.Issues = maps.Clone(s.Issues)
+	s.Warnings = append([]string(nil), s.Warnings...)
+	s.Targets = make([]TargetStatus, 0, len(w.targets))
+	for _, t := range w.targets {
+		s.Targets = append(s.Targets, t.status)
 	}
+	if w.notifications != nil {
+		s.Notifiers = w.notifications.Status()
+	} else {
+		s.Notifiers = []notify.Status{}
+	}
+	return s
 }
-
-type checkOutcome struct {
-	result    string
-	contentID string
-	archiveID string
-	errorCode string
-	retry     bool
-	cancelled bool
-}
-
-const targetConcurrency = 2
-
-type targetAttempt struct {
-	result     restic.SyncResult
-	err        error
-	finishedAt time.Time
-}
-
-func (worker *Worker) check(ctx context.Context) checkOutcome {
-	var built snapshot.Manifest
+func (w *Worker) Run(ctx context.Context) {
+	w.mu.Lock()
+	w.schedule.start(w.clock.Now())
+	for index, t := range w.targets {
+		if t.initialized {
+			continue
+		}
+		w.wait.Go(func() {
+			initCtx, cancel := context.WithTimeout(ctx, restic.UploadTimeout)
+			defer cancel()
+			latest, err := w.repo.Latest(initCtx, t.config)
+			var baseline *capture.Payload
+			if err == nil {
+				baseline, _ = loadBaseline(initCtx, w.cache, t.config, latest)
+			}
+			w.targetDone <- targetResult{index: index, initial: true, baseline: baseline, snapshot: latest, err: err}
+		})
+	}
+	w.mu.Unlock()
+	defer w.wait.Wait()
 	for {
-		result, err := worker.build(ctx)
-		if err == nil {
-			built = result
-			worker.sourceSucceeded()
-			break
+		w.mu.Lock()
+		now := w.clock.Now()
+		w.schedule.tick(now)
+		if due := w.schedule.sourceDue(now); !w.checking && !due.IsZero() && !due.After(now) {
+			w.startCapture(ctx)
 		}
-		if ctx.Err() != nil {
-			return checkOutcome{cancelled: true}
+		for index, t := range w.targets {
+			if !t.initialized || t.config.Error != "" || t.running != nil || w.latest == nil {
+				continue
+			}
+			if w.latest.Same(t.baseline, t.full) {
+				t.status.Waiting = false
+				t.full = false
+				if t.status.Error == "" {
+					t.status.State = "unchanged"
+				}
+				continue
+			}
+			t.status.Waiting = true
+			if t.status.RetryAt.After(now) {
+				continue
+			}
+			t.running = w.latest
+			t.runningFull = t.full
+			t.full = false
+			t.status.Uploading = true
+			t.status.State = "uploading"
+			payload := t.running
+			w.wait.Go(func() {
+				id, err := w.repo.Backup(ctx, t.config, payload.Directory, payload.Tag())
+				w.targetDone <- targetResult{index: index, id: id, err: err}
+			})
 		}
-		var consistency *snapshot.ConsistencyError
-		if !errors.As(err, &consistency) {
-			now := worker.clock.Now()
-			worker.sourceFailed(now, "source_check_failed")
-			worker.logFailure("source check failed", "source_check_failed", "")
-			return checkOutcome{result: "failed", errorCode: "source_check_failed", retry: true}
+		due := earlier(w.schedule.nextOrdinary, w.schedule.nextFull)
+		due = earlier(due, w.schedule.retryAt)
+		if !w.checking {
+			due = earlier(due, w.schedule.sourceDue(now))
 		}
-		now := worker.clock.Now()
-		worker.sourceFailed(now, "source_inconsistent")
-		worker.logFailure("source recovery point is not yet consistent", "source_inconsistent", "")
-		timer := worker.clock.NewTimer(consistencyRetry)
+		for _, t := range w.targets {
+			if t.running == nil && t.status.Waiting {
+				due = earlier(due, t.status.RetryAt)
+			}
+		}
+		w.mu.Unlock()
+		if due.IsZero() {
+			due = now.Add(ordinaryInterval)
+		}
+		timer := w.clock.NewTimer(max(due.Sub(now), 0))
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return checkOutcome{cancelled: true}
+			return
+		case <-w.wake:
+			timer.Stop()
 		case <-timer.C():
+		case result := <-w.sourceDone:
+			timer.Stop()
+			w.mu.Lock()
+			w.finishCapture(result)
+			w.mu.Unlock()
+		case result := <-w.targetDone:
+			timer.Stop()
+			w.mu.Lock()
+			w.finishTarget(result)
+			w.mu.Unlock()
 		}
 	}
+}
 
-	attempts, completed := worker.synchronizeTargets(ctx, built)
-	if !completed {
-		return checkOutcome{cancelled: true}
+func (w *Worker) startCapture(ctx context.Context) {
+	w.current = w.schedule.take()
+	w.status.Mode = "ordinary"
+	if w.current.Full {
+		w.status.Mode = "full"
 	}
-	targetNotifications := make([]notify.TargetStatus, len(worker.targets))
-	created := 0
-	succeeded := 0
-	failed := 0
-	for index, target := range worker.targets {
-		attempt := attempts[index]
-		result, err := attempt.result, attempt.err
-		if err == nil && !validSyncResult(result, built) {
-			err = fmt.Errorf("invalid target sync result")
-		}
-		if err != nil {
-			code := targetErrorCode(err)
-			worker.targetFailed(index, attempt.finishedAt, code)
-			targetNotifications[index] = notify.TargetStatus{Name: target.Name, State: "failed", ErrorCode: code}
-			worker.logFailure("target backup failed", code, target.Name)
-			failed++
+	active := false
+	for _, t := range w.targets {
+		active = active || t.config.Error == ""
+	}
+	if !active {
+		w.status.LastCheck = w.clock.Now()
+		w.status.LastResult = "unconfigured"
+		w.status.Source = "unconfigured"
+		w.report(w.current)
+		return
+	}
+	w.checking = true
+	previous := w.latest
+	readAll := w.current.ReadAll
+	w.wait.Go(func() {
+		payload, err := w.build(ctx, previous, readAll)
+		w.sourceDone <- sourceResult{payload: payload, err: err}
+	})
+}
+func (w *Worker) finishCapture(result sourceResult) {
+	w.checking = false
+	now := w.clock.Now()
+	w.status.LastCheck = now
+	if result.err != nil || result.payload == nil {
+		w.status.Source = "failed"
+		w.status.LastResult = "capture_failed"
+		w.status.Issues = nil
+		w.status.Warnings = nil
+		w.schedule.complete(now, w.current.Full, false, true)
+		w.report(w.current)
+		return
+	}
+	p := result.payload
+	w.latest = p
+	w.status.Source = p.Tag()
+	w.status.Issues = p.Issues
+	w.status.Warnings = p.Warnings
+	w.status.LastResult = "no_change"
+	for _, t := range w.targets {
+		t.full = t.full || w.current.Full
+		if t.config.Error != "" {
 			continue
 		}
-		worker.targetSucceeded(index, attempt.finishedAt, result)
-		state := "synced"
-		if result.Created {
-			state = "created"
-			created++
+		t.status.Waiting = !p.Same(t.baseline, t.full)
+		if t.status.Waiting {
+			w.status.LastResult = "captured"
+			if t.running == nil && t.status.Error == "" {
+				t.status.State = "waiting"
+			}
+		} else if t.running == nil && t.status.Error == "" {
+			t.status.State = "unchanged"
 		}
-		targetNotifications[index] = notify.TargetStatus{Name: target.Name, State: state}
-		succeeded++
 	}
-
-	if created > 0 {
-		worker.enqueue(notify.RecoveryPointCreated(built.ContentID, targetNotifications))
-	}
-	if failed == 0 {
-		result := "unchanged"
-		if created > 0 {
-			result = "created"
-		}
-		return checkOutcome{result: result, contentID: built.ContentID, archiveID: built.ArchiveID}
-	}
-	if succeeded > 0 {
-		return checkOutcome{result: "partial", contentID: built.ContentID, archiveID: built.ArchiveID, errorCode: "target_failed", retry: true}
-	}
-	return checkOutcome{result: "failed", contentID: built.ContentID, archiveID: built.ArchiveID, errorCode: "all_targets_failed", retry: true}
+	w.schedule.complete(now, w.current.Full, p.Reliable, !p.Complete() || !p.Reliable)
+	w.report(w.current)
+	w.collect()
 }
-
-func (worker *Worker) synchronizeTargets(ctx context.Context, built snapshot.Manifest) ([]targetAttempt, bool) {
-	attempts := make([]targetAttempt, len(worker.targets))
-	semaphore := make(chan struct{}, targetConcurrency)
-	var wait sync.WaitGroup
-	for index, target := range worker.targets {
-		select {
-		case semaphore <- struct{}{}:
-		case <-ctx.Done():
-			wait.Wait()
-			return nil, false
+func (w *Worker) finishTarget(result targetResult) {
+	t := w.targets[result.index]
+	now := w.clock.Now()
+	if result.initial {
+		t.initialized = true
+		t.baseline = result.baseline
+		if result.snapshot != nil {
+			t.status.SuccessID = result.snapshot.ID
+			t.status.SuccessAt = result.snapshot.Time
 		}
-		worker.recordTargetAttempt(index, worker.clock.Now())
-		wait.Go(func() {
-			defer func() { <-semaphore }()
-			targetContext, cancel := context.WithTimeout(ctx, targetTimeout)
-			result, err := worker.ensure(targetContext, target, built)
-			cancel()
-			attempts[index] = targetAttempt{result: result, err: err, finishedAt: worker.clock.Now()}
+		if result.err == nil {
+			t.status.State = "ready"
+			w.collect()
+			return
+		}
+	} else {
+		t.status.Uploading = false
+		if result.err == nil && !nativeID(result.id) {
+			result.err = errors.New("missing snapshot ID")
+		}
+		if result.err == nil {
+			t.baseline = t.running
+			t.status.SuccessID = result.id
+			t.status.SuccessAt = now
+			t.failures = 0
+			t.status.Error = ""
+			t.status.RetryAt = time.Time{}
+			t.status.State = "uploaded"
+			if err := saveBaseline(w.cache, t.config, result.id, t.baseline); err != nil {
+				w.status.Warnings = append(w.status.Warnings, "baseline_cache_unavailable")
+			}
+		} else {
+			t.full = t.full || t.runningFull
+		}
+		t.running = nil
+	}
+	if result.err != nil {
+		t.failures++
+		t.status.Error = "repository_failed"
+		t.status.RetryAt = now.Add(targetBackoff(t.failures))
+		t.status.State = "failed"
+	}
+	t.status.Waiting = w.latest != nil && !w.latest.Same(t.baseline, t.full)
+	w.report(task{Reasons: map[string]uint64{"target_result": 1}})
+	w.collect()
+}
+func (w *Worker) report(task task) {
+	if w.notifications == nil {
+		return
+	}
+	event := notify.Event{
+		Count: 1, Reasons: maps.Clone(task.Reasons), Source: w.status.Source,
+		Issues: maps.Clone(w.status.Issues), Warnings: append([]string(nil), w.status.Warnings...),
+		Routes: maps.Clone(task.Events.Routes), Unknown: maps.Clone(task.Events.Unknown),
+	}
+	if task.Reasons["target_result"] == 0 {
+		event.Checks = 1
+	}
+	for _, t := range w.targets {
+		event.Targets = append(event.Targets, notify.TargetStatus{
+			Name: t.config.Name, State: t.status.State, Waiting: t.status.Waiting,
+			Uploading: t.status.Uploading, Failed: t.status.Error != "",
 		})
 	}
-	wait.Wait()
-	return attempts, ctx.Err() == nil
+	w.notifications.Enqueue(event)
 }
-
-func (worker *Worker) sourceFailed(now time.Time, code string) {
-	if worker.sourceFailure.since.IsZero() {
-		worker.sourceFailure.since = now
+func (w *Worker) collect() {
+	keep := map[string]bool{}
+	if w.latest != nil {
+		keep[w.latest.Directory] = true
 	}
-	if !worker.sourceFailure.degraded && !now.Before(worker.sourceFailure.since.Add(degradedAfter)) {
-		worker.sourceFailure.degraded = true
-		worker.enqueue(notify.SourceDegraded(code))
-	}
-}
-
-func (worker *Worker) sourceSucceeded() {
-	if worker.sourceFailure.degraded {
-		worker.enqueue(notify.SourceRecovered())
-	}
-	worker.sourceFailure = failureState{}
-}
-
-func (worker *Worker) targetFailed(index int, now time.Time, code string) {
-	failure := &worker.targetFailures[index]
-	if failure.since.IsZero() {
-		failure.since = now
-	}
-	state := "retrying"
-	if !failure.degraded && !now.Before(failure.since.Add(degradedAfter)) {
-		failure.degraded = true
-		worker.enqueue(notify.TargetDegraded(worker.targets[index].Name, code))
-	}
-	if failure.degraded {
-		state = "degraded"
-	}
-	worker.mu.Lock()
-	worker.status.Targets[index].State = state
-	worker.status.Targets[index].ErrorCode = new(code)
-	worker.mu.Unlock()
-}
-
-func (worker *Worker) targetSucceeded(index int, now time.Time, result restic.SyncResult) {
-	failure := worker.targetFailures[index]
-	if failure.degraded {
-		worker.enqueue(notify.TargetRecovered(worker.targets[index].Name))
-	}
-	worker.targetFailures[index] = failureState{}
-	when := now.UTC()
-	worker.mu.Lock()
-	target := &worker.status.Targets[index]
-	target.State = "healthy"
-	target.LastSuccessAt = &when
-	target.SnapshotID = new(result.SnapshotID)
-	target.ContentID = new(result.ContentID)
-	if result.ArchiveID == "" {
-		target.ArchiveID = nil
-	} else {
-		target.ArchiveID = new(result.ArchiveID)
-	}
-	target.ErrorCode = nil
-	worker.mu.Unlock()
-}
-
-func (worker *Worker) recordTargetAttempt(index int, now time.Time) {
-	when := now.UTC()
-	worker.mu.Lock()
-	worker.status.Targets[index].LastAttemptAt = &when
-	worker.mu.Unlock()
-}
-
-func (worker *Worker) setWaiting(state string, next *time.Time) {
-	worker.mu.Lock()
-	if worker.status.State == "partial" || worker.status.State == "degraded" {
-		state = worker.status.State
-	}
-	worker.status.State = state
-	if next == nil {
-		worker.status.NextCheckAt = nil
-	} else {
-		value := next.UTC()
-		worker.status.NextCheckAt = &value
-	}
-	worker.mu.Unlock()
-}
-
-func (worker *Worker) setChecking() {
-	worker.mu.Lock()
-	worker.status.State = "checking"
-	worker.status.NextCheckAt = nil
-	worker.mu.Unlock()
-}
-
-func (worker *Worker) finishCheck(started, finished time.Time, outcome checkOutcome) {
-	last := &lastCheckState{
-		StartedAt:  started.UTC(),
-		FinishedAt: finished.UTC(),
-		Result:     outcome.result,
-	}
-	if outcome.contentID != "" {
-		last.ContentID = new(outcome.contentID)
-	}
-	if outcome.archiveID != "" {
-		last.ArchiveID = new(outcome.archiveID)
-	}
-	if outcome.errorCode != "" {
-		last.ErrorCode = new(outcome.errorCode)
-	}
-	worker.mu.Lock()
-	worker.status.State = "idle"
-	if outcome.result == "partial" {
-		worker.status.State = "partial"
-	}
-	if worker.sourceFailure.degraded {
-		worker.status.State = "degraded"
-	}
-	for _, failure := range worker.targetFailures {
-		if failure.degraded {
-			worker.status.State = "degraded"
-			break
+	for _, t := range w.targets {
+		if !t.initialized {
+			// A slow startup query must not retain every intervening capture.
+			// Protect only the locally associated native baseline while that
+			// target independently verifies its remote latest ID.
+			directory := filepath.Join(w.cache, "baselines", restic.CacheKey(t.config))
+			entries, _ := os.ReadDir(directory)
+			for _, entry := range entries {
+				if !nativeID(entry.Name()) {
+					continue
+				}
+				link, err := os.Readlink(filepath.Join(directory, entry.Name()))
+				name := filepath.Base(link)
+				if err == nil && payloadName(name) && link == filepath.Join("..", "..", "payloads", name) {
+					keep[filepath.Join(w.cache, "payloads", name)] = true
+				}
+			}
+		}
+		if t.baseline != nil {
+			keep[t.baseline.Directory] = true
+		}
+		if t.running != nil {
+			keep[t.running.Directory] = true
 		}
 	}
-	worker.status.NextCheckAt = nil
-	worker.status.LastCheck = last
-	worker.mu.Unlock()
-}
-
-func (worker *Worker) logFailure(message, code, target string) {
-	if worker.logger == nil {
+	if w.checking {
+		return
+	} // The current builder owns its directory until delivery.
+	root := filepath.Join(w.cache, "payloads")
+	entries, err := os.ReadDir(root)
+	if err != nil {
 		return
 	}
-	if target == "" {
-		worker.logger.Error(message, "error_code", code)
-		return
-	}
-	worker.logger.Error(message, "target", target, "error_code", code)
-}
-
-func targetErrorCode(err error) string {
-	var operation *restic.OperationError
-	if errors.As(err, &operation) && validErrorCode(operation.Code) {
-		return operation.Code
-	}
-	return "target_backup_failed"
-}
-
-func validSyncResult(result restic.SyncResult, manifest snapshot.Manifest) bool {
-	if !validHexID(result.SnapshotID) || result.ContentID != manifest.ContentID || !snapshot.IsContentID(result.ArchiveID) {
-		return false
-	}
-	return !result.Created || result.ArchiveID == manifest.ArchiveID
-}
-
-func validHexID(value string) bool {
-	if len(value) != 64 || strings.ToLower(value) != value {
-		return false
-	}
-	_, err := hex.DecodeString(value)
-	return err == nil
-}
-
-func validErrorCode(value string) bool {
-	if value == "" || len(value) > 64 || strings.HasPrefix(value, "_") || strings.HasSuffix(value, "_") {
-		return false
-	}
-	for _, character := range value {
-		if character != '_' && (character < 'a' || character > 'z') {
-			return false
+	for _, entry := range entries {
+		path := filepath.Join(root, entry.Name())
+		if payloadName(entry.Name()) && entry.IsDir() && !keep[path] {
+			if err := os.RemoveAll(path); err != nil && w.logger != nil {
+				w.logger.Warn("unused payload cleanup failed")
+			}
 		}
 	}
-	return true
-}
-
-func formatTime(value time.Time) string {
-	return value.UTC().Format("2006-01-02T15:04:05.000Z")
-}
-
-func cloneString(value *string) *string {
-	if value == nil {
-		return nil
-	}
-	copy := *value
-	return &copy
 }

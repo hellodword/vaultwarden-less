@@ -1,125 +1,85 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
-	"fmt"
+	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
-	"net/url"
-	"strings"
+	"sync"
 	"time"
+
+	"github.com/hellodword/vaultwarden-less/internal/routes"
+	"github.com/hellodword/vaultwarden-less/internal/timing"
 )
 
-const eventBody = "{}\n"
-
-// EventSender coalesces any number of dirty marks into a single bounded signal.
-// Delivery never runs in a request goroutine and never delays the proxy response.
 type EventSender struct {
-	url            *url.URL
-	client         *http.Client
-	log            *slog.Logger
-	signal         chan struct{}
-	retry          time.Duration
-	failing        bool
-	lastFailureLog time.Time
+	mu       sync.Mutex
+	pending  routes.Summary
+	endpoint string
+	client   *http.Client
+	clock    timing.Clock
+	log      *slog.Logger
 }
 
 func NewEventSender(log *slog.Logger) *EventSender {
-	return newEventSender(mustURL(EventsURL), EventTimeout, log)
-}
-
-func newEventSender(target *url.URL, timeout time.Duration, log *slog.Logger) *EventSender {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.Proxy = nil
-	return &EventSender{
-		url: target,
-		client: &http.Client{
-			Transport: transport,
-			Timeout:   timeout,
-			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
-				return http.ErrUseLastResponse
-			},
-		},
-		log:    log,
-		signal: make(chan struct{}, 1),
-		retry:  EventRetry,
-	}
+	return &EventSender{endpoint: EventsURL, client: &http.Client{Transport: transport, Timeout: EventTimeout, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}, clock: timing.Real{}, log: log}
 }
-
-func (s *EventSender) MarkDirty() {
-	select {
-	case s.signal <- struct{}{}:
-	default:
-	}
+func (s *EventSender) Record(method, path string, start bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pending.Record(method, path, start)
 }
-
 func (s *EventSender) Run(ctx context.Context) {
-	pending := true // Startup always requests one worker check.
+	var lastFailure time.Time
 	for {
-		if !pending {
-			select {
-			case <-ctx.Done():
-				return
-			case <-s.signal:
-				pending = true
-			}
+		timer := s.clock.NewTimer(EventRetry)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C():
 		}
-		if err := s.send(ctx); err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			s.recordFailure()
-			timer := time.NewTimer(s.retry)
-			select {
-			case <-ctx.Done():
-				timer.Stop()
-				return
-			case <-timer.C:
-			}
+		s.mu.Lock()
+		event := s.pending
+		s.pending = routes.Summary{}
+		s.mu.Unlock()
+		if event.Empty() {
 			continue
 		}
-		s.recordRecovery()
-		select {
-		case <-s.signal:
-			pending = true
-		default:
-			pending = false
+		if err := s.send(ctx, event); err != nil {
+			s.mu.Lock()
+			s.pending.Merge(event)
+			s.mu.Unlock()
+			if s.log != nil && (lastFailure.IsZero() || s.clock.Now().Sub(lastFailure) >= 5*time.Minute) {
+				s.log.Warn("backup event delivery failed; merged signal retained")
+				lastFailure = s.clock.Now()
+			}
 		}
 	}
 }
-
-func (s *EventSender) recordFailure() {
-	now := time.Now().UTC()
-	if s.log != nil && (!s.failing || now.Sub(s.lastFailureLog) >= 5*time.Minute) {
-		s.log.Error("backup event delivery failed; pending signal retained", "error_code", "event_delivery_failed")
-		s.lastFailureLog = now
-	}
-	s.failing = true
-}
-
-func (s *EventSender) recordRecovery() {
-	if s.failing && s.log != nil {
-		s.log.Info("backup event delivery recovered", "event", "event_delivery_recovered")
-	}
-	s.failing = false
-	s.lastFailureLog = time.Time{}
-}
-
-func (s *EventSender) send(ctx context.Context) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.url.String(), strings.NewReader(eventBody))
+func (s *EventSender) send(ctx context.Context, event routes.Summary) error {
+	body, err := json.Marshal(event)
 	if err != nil {
-		return fmt.Errorf("create event request: %w", err)
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.endpoint, bytes.NewReader(body))
+	if err != nil {
+		return errors.New("event request failed")
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := s.client.Do(req)
+	response, err := s.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("send event: %w", err)
+		return errors.New("event delivery failed")
 	}
-	defer func() { _ = resp.Body.Close() }()
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-	if resp.StatusCode != http.StatusNoContent {
-		return fmt.Errorf("event endpoint returned status %d", resp.StatusCode)
+	defer response.Body.Close()
+	io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
+	if response.StatusCode != http.StatusNoContent {
+		return errors.New("event not accepted")
 	}
 	return nil
 }

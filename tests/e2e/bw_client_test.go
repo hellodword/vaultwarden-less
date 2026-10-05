@@ -105,15 +105,6 @@ func (client *bitwardenCLI) tryRun(ctx context.Context, input []byte, arguments 
 	return stdout.Bytes(), stderr.String(), err
 }
 
-func (client *bitwardenCLI) expectSyncFailure(ctx context.Context) {
-	client.t.Helper()
-	if _, diagnostics, err := client.tryRun(ctx, nil, "sync", "--force"); err == nil {
-		client.t.Fatal("pre-restore authenticated CLI session remained valid after RSA regeneration")
-	} else if containsSecret(diagnostics, client.password, client.session) {
-		client.t.Fatal("CLI diagnostics exposed a password")
-	}
-}
-
 func (client *bitwardenCLI) createItem(ctx context.Context, name, password, folderID string) string {
 	item := map[string]any{
 		"organizationId": nil,

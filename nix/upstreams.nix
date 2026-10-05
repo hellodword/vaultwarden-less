@@ -1,34 +1,47 @@
-{ pkgs, upstreams }:
-
+{ pkgs }:
 let
+  # These are build inputs for the test tools. Keep compatibility pins beside
+  # the overrides that consume them; Vaultwarden and restic come from nixpkgs.
+  sdk = {
+    boto3 = {
+      version = "1.43.107";
+      hash = "sha256-d8Vr7Vh234J7rWTdPCW5g7wZKTqvcm2vPEgvCWwqwYM=";
+    };
+    botocore = {
+      version = "1.43.107";
+      hash = "sha256-l0cHn0rqov6ayazKqCpIoqMX2P4DV9r0XgwTWeitrT4=";
+    };
+    s3transfer = {
+      version = "0.19.2";
+      hash = "sha256-BOK8kfTdxM6CInouXrBsQf4/zgL3l/A+VElh1VJj4mA=";
+    };
+  };
   python3 = pkgs.python3.override {
     packageOverrides =
       pythonFinal: pythonPrev:
-      pkgs.lib.genAttrs [ "boto3" "botocore" "s3transfer" ] (
-        name:
+      pkgs.lib.mapAttrs (
+        name: pin:
         pythonPrev.${name}.overridePythonAttrs {
-          version = upstreams.moto.${name}.source_tag;
+          inherit (pin) version;
           src = pkgs.fetchFromGitHub {
             owner = "boto";
             repo = name;
-            tag = upstreams.moto.${name}.source_tag;
-            hash = upstreams.moto.${name}.source_hash;
+            tag = pin.version;
+            inherit (pin) hash;
           };
         }
-      )
+      ) sdk
       // {
-        moto = pythonPrev.moto.overridePythonAttrs (previousAttrs: {
-          version = upstreams.moto.source_tag;
+        moto = pythonPrev.moto.overridePythonAttrs (previous: {
+          version = "5.2.3";
           src = pkgs.fetchFromGitHub {
             owner = "getmoto";
             repo = "moto";
-            tag = upstreams.moto.source_tag;
-            hash = upstreams.moto.source_hash;
+            tag = "5.2.3";
+            hash = "sha256-7wE44MYdRf9p3/ac2qOPpLaS0bkpoh84R+rdJp5oycU=";
           };
-          # Botocore 1.43.93 preserves fractional Unix timestamps. Adapt the
-          # fixture as in getmoto/moto#10259, retaining strict equality for
-          # our pinned newer SDK instead of accepting both precision modes.
-          postPatch = (previousAttrs.postPatch or "") + ''
+          # The matching SDK preserves fractional scheduler timestamps.
+          postPatch = (previous.postPatch or "") + ''
             substituteInPlace tests/test_scheduler/__init__.py \
               --replace-fail 'to_append.replace(microsecond=0)' 'to_append'
           '';
@@ -38,33 +51,27 @@ let
 in
 pkgs
 // {
-  # nixpkgs still defaults to the preceding Go release.
-  # Scope the compiler change to this project's builds and checks.
   go = pkgs.go_1_27;
   buildGoModule = pkgs.buildGo127Module;
-
-  # Pin reviewed compatible releases independently of nixpkgs defaults, retaining
-  # its source builds, license exclusions, dependency handling, and package tests.
   bitwarden-cli = pkgs.bitwarden-cli.overrideAttrs (
-    finalAttrs: previousAttrs: {
-      version = pkgs.lib.removePrefix "cli-v" upstreams.bitwarden_cli.source_tag;
+    final: previous: {
+      version = "2026.8.0";
       src = pkgs.fetchFromGitHub {
         owner = "bitwarden";
         repo = "clients";
-        tag = upstreams.bitwarden_cli.source_tag;
-        hash = upstreams.bitwarden_cli.source_hash;
+        tag = "cli-v${final.version}";
+        hash = "sha256-Kz7vy3mt4uLGA6wGtH527P5vY55UYSZtq6e8IyNJvc4=";
       };
-      npmDepsHash = upstreams.bitwarden_cli.npm_deps_hash;
+      npmDepsHash = "sha256-5i6/TlqBhPLv00tN0sxFA/iRQ8QRyUxhCqYkhVBLz3w=";
       npmDeps = pkgs.fetchNpmDeps {
-        name = "bitwarden-cli-${finalAttrs.version}-npm-deps";
-        inherit (finalAttrs) src;
-        inherit (previousAttrs) postPatch;
-        hash = finalAttrs.npmDepsHash;
+        name = "bitwarden-cli-${final.version}-npm-deps";
+        inherit (final) src;
+        inherit (previous) postPatch;
+        hash = final.npmDepsHash;
         fetcherVersion = 2;
       };
     }
   );
-
   inherit python3;
   python3Packages = python3.pkgs;
 }

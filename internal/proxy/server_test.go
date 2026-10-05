@@ -3,340 +3,268 @@ package proxy
 import (
 	"bufio"
 	"context"
-	"fmt"
+	"encoding/json"
 	"io"
-	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/hellodword/vaultwarden-less/internal/capture"
+
+	"github.com/hellodword/vaultwarden-less/internal/routes"
+	"github.com/hellodword/vaultwarden-less/internal/testutil"
 )
 
-func proxyServer(t *testing.T, upstream string, markDirty func()) *Server {
-	t.Helper()
-	parsed, err := url.Parse(upstream)
+func TestFailedAuthenticationAfterHashUpgradeTriggersNativeCapture(t *testing.T) {
+	data, cache := t.TempDir(), t.TempDir()
+	database := filepath.Join(data, "db.sqlite3")
+	sql := func(statement string) {
+		t.Helper()
+		if output, err := exec.Command("sqlite3", "-batch", "-bail", database, statement).CombinedOutput(); err != nil {
+			t.Fatalf("synthetic SQL: %v: %s", err, output)
+		}
+	}
+	sql("CREATE TABLE users(uuid PRIMARY KEY,password_hash,salt,password_iterations,security_stamp); INSERT INTO users VALUES('u','old','salt',1,'stamp');")
+	builder := capture.Builder{DataDir: data, CacheDir: cache}
+	baseline, err := builder.Build(context.Background(), nil, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return newServer(parsed, markDirty, slog.New(slog.NewJSONHandler(io.Discard, nil)))
-}
-
-func TestTransparentProxyPreservesResponseAndForwardingHeaders(t *testing.T) {
-	t.Parallel()
-	received := make(chan *http.Request, 1)
-	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		clone := request.Clone(request.Context())
-		clone.Header = request.Header.Clone()
-		received <- clone
-		writer.Header().Set("X-Upstream", "preserved")
-		writer.WriteHeader(http.StatusMultiStatus)
-		_, _ = writer.Write([]byte("exact upstream body"))
-	}))
-	defer upstream.Close()
-	var marked atomic.Int64
-	server := proxyServer(t, upstream.URL, func() { marked.Add(1) })
-	request := httptest.NewRequest(http.MethodPatch, "http://vault.example/api/ciphers/item?revision=7", strings.NewReader("request body"))
-	request.Host = "vault.example"
-	request.Header.Set("Forwarded", `for="203.0.113.7";proto=https;host="vault.example"`)
-	request.Header.Set("X-Real-IP", "203.0.113.7")
-	request.Header.Add("X-Forwarded-For", "203.0.113.7")
-	request.Header.Add("X-Forwarded-For", "198.51.100.9")
-	request.Header.Set("X-Forwarded-Host", "vault.example")
-	request.Header.Set("X-Forwarded-Proto", "https")
-	request.Header.Set("X-Forwarded-Port", "443")
-	response := httptest.NewRecorder()
-	server.ServeHTTP(response, request)
-	if response.Code != http.StatusMultiStatus || response.Body.String() != "exact upstream body" || response.Header().Get("X-Upstream") != "preserved" {
-		t.Fatalf("proxied response = %d/%q/%q", response.Code, response.Body.String(), response.Header().Get("X-Upstream"))
-	}
-	forwarded := <-received
-	if forwarded.Host != "vault.example" || forwarded.URL.RawQuery != "revision=7" {
-		t.Fatalf("host/query = %q/%q", forwarded.Host, forwarded.URL.RawQuery)
-	}
-	for _, name := range []string{"Forwarded", "X-Real-IP", "X-Forwarded-Host", "X-Forwarded-Proto", "X-Forwarded-Port"} {
-		if got, want := forwarded.Header.Values(name), request.Header.Values(name); strings.Join(got, "|") != strings.Join(want, "|") {
-			t.Errorf("%s = %#v, want %#v", name, got, want)
-		}
-	}
-	if got := strings.Join(forwarded.Header.Values("X-Forwarded-For"), "|"); got != "203.0.113.7|198.51.100.9" {
-		t.Fatalf("X-Forwarded-For = %q", got)
-	}
-	if marked.Load() != 1 {
-		t.Fatalf("backup marks = %d", marked.Load())
-	}
-}
-
-func TestProxyTriggerUsesPathNotQueryAndOnlyTwoXX(t *testing.T) {
-	t.Parallel()
-	var status atomic.Int64
-	status.Store(http.StatusOK)
-	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
-		writer.WriteHeader(int(status.Load()))
-	}))
-	defer upstream.Close()
-	var marked atomic.Int64
-	server := proxyServer(t, upstream.URL, func() { marked.Add(1) })
-	for _, test := range []struct {
-		method string
-		path   string
-		code   int
-		want   int64
-	}{
-		{http.MethodPost, "/api/ciphers?next=/api/accounts/prelogin", 200, 1},
-		{http.MethodPost, "/api/accounts/prelogin?write=true", 200, 1},
-		{http.MethodDelete, "/api/ciphers/item", 299, 2},
-		{http.MethodPost, "/api/ciphers", 300, 2},
-		{http.MethodPost, "/api/ciphers", 500, 2},
-		{http.MethodGet, "/api/ciphers", 200, 2},
-	} {
-		status.Store(int64(test.code))
-		response := httptest.NewRecorder()
-		server.ServeHTTP(response, httptest.NewRequest(test.method, "http://vault.example"+test.path, nil))
-		if marked.Load() != test.want {
-			t.Fatalf("%s %s/%d marks = %d, want %d", test.method, test.path, test.code, marked.Load(), test.want)
-		}
-	}
-}
-
-func TestProxyBodyLimitAndHealthAreLocal(t *testing.T) {
-	t.Parallel()
-	var upstreamCalls atomic.Int64
-	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
-		upstreamCalls.Add(1)
-		writer.WriteHeader(http.StatusOK)
-	}))
-	defer upstream.Close()
-	server := proxyServer(t, upstream.URL, nil)
-
-	request := httptest.NewRequest(http.MethodPost, "http://vault.example/api/ciphers", nil)
-	request.ContentLength = MaxRequestBytes + 1
-	response := httptest.NewRecorder()
-	server.ServeHTTP(response, request)
-	if response.Code != http.StatusRequestEntityTooLarge || upstreamCalls.Load() != 0 {
-		t.Fatalf("oversize response/calls = %d/%d", response.Code, upstreamCalls.Load())
-	}
-
-	response = httptest.NewRecorder()
-	server.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "http://vault.example"+HealthPath, nil))
-	if response.Code != http.StatusNoContent || upstreamCalls.Load() != 0 {
-		t.Fatalf("health response/calls = %d/%d", response.Code, upstreamCalls.Load())
-	}
-	response = httptest.NewRecorder()
-	server.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "http://vault.example"+HealthPath, nil))
-	if response.Code != http.StatusMethodNotAllowed || response.Header().Get("Allow") != "GET, HEAD" {
-		t.Fatalf("health method response = %d/%q", response.Code, response.Header().Get("Allow"))
-	}
-}
-
-func TestTransparentStreamingResponse(t *testing.T) {
-	firstWritten := make(chan struct{})
-	release := make(chan struct{})
-	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
-		writer.WriteHeader(http.StatusOK)
-		_, _ = writer.Write([]byte("first"))
-		writer.(http.Flusher).Flush()
-		close(firstWritten)
-		<-release
-		_, _ = writer.Write([]byte("second"))
-	}))
-	defer upstream.Close()
-	proxyHTTP := httptest.NewServer(proxyServer(t, upstream.URL, nil))
-	defer proxyHTTP.Close()
-
-	response, err := proxyHTTP.Client().Get(proxyHTTP.URL + "/api/stream")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = response.Body.Close() }()
-	<-firstWritten
-	first := make([]byte, 5)
-	if _, err := io.ReadFull(response.Body, first); err != nil || string(first) != "first" {
-		t.Fatalf("first streamed chunk = %q/%v", first, err)
-	}
-	close(release)
-	remainder, err := io.ReadAll(response.Body)
-	if err != nil || string(remainder) != "second" {
-		t.Fatalf("remaining stream = %q/%v", remainder, err)
-	}
-}
-
-func TestTransparentWebSocketUpgrade(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
-		connection, buffer, err := writer.(http.Hijacker).Hijack()
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// A handler may commit a hash upgrade, then reject a later authentication
+		// condition. Response success cannot decide whether to check persistence.
+		output, err := exec.Command("sqlite3", "-batch", "-bail", database, "UPDATE users SET password_hash='upgraded',password_iterations=2;").CombinedOutput()
 		if err != nil {
+			t.Errorf("synthetic SQL: %v: %s", err, output)
+			w.WriteHeader(500)
 			return
 		}
-		defer func() { _ = connection.Close() }()
-		_, _ = buffer.WriteString("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
-		_ = buffer.Flush()
-		line, _ := buffer.ReadString('\n')
-		_, _ = buffer.WriteString("echo:" + line)
-		_ = buffer.Flush()
+		w.WriteHeader(http.StatusUnauthorized)
 	}))
 	defer upstream.Close()
-	proxyHTTP := httptest.NewServer(proxyServer(t, upstream.URL, nil))
-	defer proxyHTTP.Close()
-	parsed, _ := url.Parse(proxyHTTP.URL)
-	connection, err := net.DialTimeout("tcp", parsed.Host, time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = connection.Close() }()
-	_ = connection.SetDeadline(time.Now().Add(2 * time.Second))
-	_, _ = fmt.Fprintf(connection, "GET /notifications/hub HTTP/1.1\r\nHost: vault.example\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
-	reader := bufio.NewReader(connection)
-	request := &http.Request{Method: http.MethodGet}
-	response, err := http.ReadResponse(reader, request)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if response.StatusCode != http.StatusSwitchingProtocols {
-		t.Fatalf("upgrade status = %d", response.StatusCode)
-	}
-	_, _ = connection.Write([]byte("ping\n"))
-	line, err := reader.ReadString('\n')
-	if err != nil || line != "echo:ping\n" {
-		t.Fatalf("upgrade echo = %q/%v", line, err)
-	}
-}
-
-func TestEventSenderRetriesStartupPendingUntilSuccess(t *testing.T) {
-	t.Parallel()
-	var count atomic.Int64
-	succeeded := make(chan struct{})
-	var once sync.Once
-	endpoint := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		attempt := count.Add(1)
-		body, _ := io.ReadAll(request.Body)
-		if request.Method != http.MethodPost || request.Header.Get("Content-Type") != "application/json" || string(body) != eventBody {
-			writer.WriteHeader(http.StatusBadRequest)
-			return
+	var events []bool
+	server := newServer(mustURL(upstream.URL), func(method, path string, start bool) {
+		if method != "POST" || path != "/identity/connect/token" {
+			t.Error("lost request classification")
 		}
-		if attempt < 3 {
-			writer.WriteHeader(http.StatusServiceUnavailable)
-			return
-		}
-		writer.WriteHeader(http.StatusNoContent)
-		once.Do(func() { close(succeeded) })
-	}))
-	defer endpoint.Close()
-	parsed, _ := url.Parse(endpoint.URL)
-	sender := newEventSender(parsed, time.Second, slog.New(slog.NewJSONHandler(io.Discard, nil)))
-	sender.retry = time.Millisecond
-	ctx, cancel := context.WithCancel(context.Background())
-	var wait sync.WaitGroup
-	wait.Go(func() { sender.Run(ctx) })
-	select {
-	case <-succeeded:
-	case <-time.After(2 * time.Second):
-		t.Fatal("pending startup signal was not delivered")
-	}
-	cancel()
-	wait.Wait()
-	if count.Load() != 3 {
-		t.Fatalf("event attempts = %d, want 3", count.Load())
-	}
-}
-
-func TestEventSenderRetainsSignalArrivingDuringSend(t *testing.T) {
-	t.Parallel()
-	started := make(chan struct{})
-	release := make(chan struct{})
-	second := make(chan struct{})
-	var count atomic.Int64
-	endpoint := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
-		attempt := count.Add(1)
-		if attempt == 1 {
-			close(started)
-			<-release
-		}
-		writer.WriteHeader(http.StatusNoContent)
-		if attempt == 2 {
-			close(second)
-		}
-	}))
-	defer endpoint.Close()
-	parsed, _ := url.Parse(endpoint.URL)
-	sender := newEventSender(parsed, time.Second, slog.New(slog.NewJSONHandler(io.Discard, nil)))
-	ctx, cancel := context.WithCancel(context.Background())
-	var wait sync.WaitGroup
-	wait.Go(func() { sender.Run(ctx) })
-	<-started
-	for range 1000 {
-		sender.MarkDirty()
-	}
-	close(release)
-	select {
-	case <-second:
-	case <-time.After(2 * time.Second):
-		t.Fatal("signal arriving during delivery was lost")
-	}
-	cancel()
-	wait.Wait()
-	if count.Load() != 2 {
-		t.Fatalf("coalesced event attempts = %d, want 2", count.Load())
-	}
-}
-
-func TestEventFailureCannotChangeUpstreamResponse(t *testing.T) {
-	t.Parallel()
-	events := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
-		writer.WriteHeader(http.StatusServiceUnavailable)
-	}))
-	defer events.Close()
-	eventsURL, _ := url.Parse(events.URL)
-	sender := newEventSender(eventsURL, 50*time.Millisecond, slog.New(slog.NewJSONHandler(io.Discard, nil)))
-	sender.retry = 10 * time.Millisecond
-	ctx, cancel := context.WithCancel(context.Background())
-	var wait sync.WaitGroup
-	wait.Go(func() { sender.Run(ctx) })
-
-	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
-		writer.Header().Set("X-Exact", "yes")
-		writer.WriteHeader(http.StatusAlreadyReported)
-		_, _ = writer.Write([]byte("unchanged"))
-	}))
-	defer upstream.Close()
+		events = append(events, start)
+	}, nil)
 	response := httptest.NewRecorder()
-	proxyServer(t, upstream.URL, sender.MarkDirty).ServeHTTP(response, httptest.NewRequest(http.MethodPatch, "http://vault.example/api/ciphers/item", nil))
-	cancel()
-	wait.Wait()
-	if response.Code != http.StatusAlreadyReported || response.Header().Get("X-Exact") != "yes" || response.Body.String() != "unchanged" {
-		t.Fatalf("event failure changed response = %d/%q/%q", response.Code, response.Header().Get("X-Exact"), response.Body.String())
+	server.ServeHTTP(response, httptest.NewRequest("POST", "/identity/connect/token", nil))
+	if response.Code != http.StatusUnauthorized || len(events) != 2 || !events[0] || events[1] {
+		t.Fatal("failed authentication did not report both boundaries")
+	}
+	captured, err := builder.Build(context.Background(), baseline, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if captured.Same(baseline, false) {
+		t.Fatal("committed password hash upgrade was ignored")
+	}
+	output, err := exec.Command("sqlite3", filepath.Join(captured.Directory, "db.sqlite3"), "SELECT password_hash FROM users;").CombinedOutput()
+	if err != nil || string(output) != "upgraded\n" {
+		t.Fatal("native backup lost the upgraded hash")
 	}
 }
 
-func TestBackupMarkRequiresCompleteResponseBody(t *testing.T) {
-	t.Parallel()
-	var marked atomic.Int64
-	incomplete := &completeResponseBody{ReadCloser: io.NopCloser(strings.NewReader("partial")), complete: func() { marked.Add(1) }}
-	buffer := make([]byte, 1)
-	if _, err := incomplete.Read(buffer); err != nil {
+func TestWebSocketTunnelSurvivesProxy(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		connection, buffer, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer connection.Close()
+		buffer.WriteString("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
+		buffer.Flush()
+		data := make([]byte, 3)
+		if _, err := io.ReadFull(buffer, data); err != nil {
+			t.Error(err)
+			return
+		}
+		connection.Write(data)
+	}))
+	defer upstream.Close()
+	marks := make(chan bool, 2)
+	proxy := httptest.NewServer(newServer(mustURL(upstream.URL), func(_, _ string, start bool) { marks <- start }, nil))
+	defer proxy.Close()
+	address, _ := url.Parse(proxy.URL)
+	connection, err := net.DialTimeout("tcp", address.Host, time.Second)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := incomplete.Close(); err != nil {
-		t.Fatal(err)
+	defer connection.Close()
+	connection.SetDeadline(time.Now().Add(3 * time.Second))
+	io.WriteString(connection, "GET /unknown-websocket HTTP/1.1\r\nHost: example.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
+	reader := bufio.NewReader(connection)
+	status, err := reader.ReadString('\n')
+	if err != nil || !strings.Contains(status, "101") {
+		t.Fatalf("upgrade failed: %v", err)
 	}
-	if marked.Load() != 0 {
-		t.Fatal("incomplete response triggered a backup mark")
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatal(err)
+		}
+		if line == "\r\n" {
+			break
+		}
 	}
+	io.WriteString(connection, "abc")
+	data := make([]byte, 3)
+	if _, err := io.ReadFull(reader, data); err != nil || string(data) != "abc" {
+		t.Fatal("duplex upgrade traffic failed")
+	}
+	connection.Close()
+	for _, want := range []bool{true, false} {
+		select {
+		case got := <-marks:
+			if got != want {
+				t.Fatal("upgrade trigger order")
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("upgrade end trigger absent")
+		}
+	}
+}
 
-	complete := &completeResponseBody{ReadCloser: io.NopCloser(strings.NewReader("complete")), complete: func() { marked.Add(1) }}
-	if _, err := io.ReadAll(complete); err != nil {
+func TestStartEndForErrorsUnknownAndInterruptedRequests(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/partial" {
+			conn, buf, _ := w.(http.Hijacker).Hijack()
+			buf.WriteString("HTTP/1.1 200 OK\r\nContent-Length: 999\r\n\r\npartial")
+			buf.Flush()
+			conn.Close()
+			return
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer upstream.Close()
+	var mu sync.Mutex
+	var starts, ends int
+	server := newServer(mustURL(upstream.URL), func(_, _ string, start bool) {
+		mu.Lock()
+		defer mu.Unlock()
+		if start {
+			starts++
+		} else {
+			ends++
+		}
+	}, nil)
+	for _, path := range []string{"/unknown", "/partial", "/healthz"} {
+		func() {
+			defer func() {
+				if value := recover(); value != nil && value != http.ErrAbortHandler {
+					panic(value)
+				}
+			}()
+			server.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, path, nil))
+		}()
+	}
+	if starts != 3 || ends != 3 {
+		t.Fatalf("start/end=%d/%d", starts, ends)
+	}
+	server.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/api/sync", nil))
+	if starts != 3 || ends != 3 {
+		t.Fatal("explicit exclusion triggered")
+	}
+	upstream.Close()
+	server.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/identity/connect/token", nil))
+	if starts != 4 || ends != 4 {
+		t.Fatal("connection failure not triggered")
+	}
+}
+
+func TestProxyDoesNotWaitForBackupAndPreservesStreaming(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("first\n"))
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	}))
+	defer upstream.Close()
+	sender := NewEventSender(nil)
+	server := httptest.NewServer(newServer(mustURL(upstream.URL), sender.Record, nil))
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, "GET", server.URL+"/stream", nil)
+	response, err := http.DefaultClient.Do(req)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := complete.Close(); err != nil {
-		t.Fatal(err)
+	defer response.Body.Close()
+	data := make([]byte, 6)
+	if _, err := io.ReadFull(response.Body, data); err != nil || string(data) != "first\n" {
+		t.Fatal("stream did not arrive before upstream completion")
 	}
-	if err := complete.Close(); err != nil {
-		t.Fatal(err)
+	cancel()
+}
+
+func TestEventFailuresRetainBoundedCounts(t *testing.T) {
+	var mu sync.Mutex
+	calls := 0
+	var accepted routes.Summary
+	endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		calls++
+		if calls == 1 {
+			w.WriteHeader(503)
+			return
+		}
+		json.NewDecoder(r.Body).Decode(&accepted)
+		w.WriteHeader(204)
+	}))
+	defer endpoint.Close()
+	clock := testutil.NewClock()
+	sender := NewEventSender(nil)
+	sender.endpoint = endpoint.URL
+	sender.clock = clock
+	for range 50 {
+		sender.Record("GET", "/unknown/private?secret", true)
 	}
-	if marked.Load() != 1 {
-		t.Fatalf("complete response marks = %d", marked.Load())
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { sender.Run(ctx); close(done) }()
+	defer func() { cancel(); <-done }()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		clock.Advance(time.Second)
+		time.Sleep(time.Millisecond)
+		mu.Lock()
+		n := calls
+		mu.Unlock()
+		if n >= 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("first submission absent")
+		}
+	}
+	sender.Record("CUSTOM", strings.Repeat("/x", 100), false)
+	for {
+		clock.Advance(time.Second)
+		time.Sleep(time.Millisecond)
+		mu.Lock()
+		n := calls
+		mu.Unlock()
+		if n >= 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("retry absent")
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if accepted.Unknown["GET"].Started != 50 || accepted.Unknown["OTHER"].Finished != 1 || len(accepted.Routes) != 0 {
+		t.Fatal("failed event counts lost or raw paths retained")
 	}
 }

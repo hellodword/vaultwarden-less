@@ -5,242 +5,241 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/x509"
-	"encoding/hex"
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
-	"regexp"
+	"os"
 	"strings"
 
-	"github.com/hellodword/vaultwarden-less/internal/privatefs"
+	"github.com/docker/cli/pkg/kvfile"
+	"github.com/goccy/go-yaml"
+	"github.com/goccy/go-yaml/parser"
 )
 
-var namePattern = regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`)
+const (
+	MaxConfigBytes          = 1 << 20
+	DefaultBackupConfigPath = "/config/backup.yaml"
+	WorkerURL               = "http://backup:9090"
+	DataDir                 = "/data"
+	CacheDir                = "/cache"
+)
 
-// Backup is the complete human-authored configuration. Scheduling, retry,
-// timeout, retention, filesystem, and HTTP behavior are product constants.
 type Backup struct {
-	Targets   []Target
-	Notifiers []Notifier
-}
-
-type backupDocument struct {
-	Targets   []Target           `yaml:"targets"`
-	Notifiers []notifierDocument `yaml:"notifiers"`
+	Targets   []Target   `json:"targets"`
+	Notifiers []Notifier `json:"notifiers"`
 }
 
 type Target struct {
-	Name       string   `yaml:"name"`
-	Repository string   `yaml:"repository"`
-	Options    []Option `yaml:"options"`
-}
-
-type Option struct {
-	Name  string `yaml:"name"`
-	Value string `yaml:"value"`
+	Name        string   `yaml:"name" json:"name"`
+	EnvFile     string   `yaml:"env_file" json:"-"`
+	Options     []string `yaml:"options" json:"-"`
+	Environment []string `yaml:"-" json:"-"`
+	Error       string   `yaml:"-" json:"error,omitempty"`
 }
 
 type Notifier struct {
-	Name string
-	Type string
-
-	WebhookURL string
-
-	DeviceToken string
-	AuthKey     string
-	KeyID       string
-	TeamID      string
-	Topic       string
-	Sound       string
+	Name        string            `yaml:"name" json:"name"`
+	Type        string            `yaml:"type" json:"type"`
+	WebhookURL  string            `yaml:"webhook_url" json:"-"`
+	Secret      string            `yaml:"secret" json:"-"`
+	DeviceToken string            `yaml:"device_token" json:"-"`
+	AuthKeyFile string            `yaml:"auth_key_file" json:"-"`
+	KeyID       string            `yaml:"key_id" json:"-"`
+	TeamID      string            `yaml:"team_id" json:"-"`
+	Topic       string            `yaml:"topic" json:"-"`
+	Sound       string            `yaml:"sound" json:"-"`
+	Key         *ecdsa.PrivateKey `yaml:"-" json:"-"`
+	Error       string            `yaml:"-" json:"error,omitempty"`
 }
 
-type notifierDocument struct {
-	Name string `yaml:"name"`
-	Type string `yaml:"type"`
-
-	WebhookURL *string `yaml:"webhook_url"`
-
-	DeviceToken *string `yaml:"device_token"`
-	AuthKey     *string `yaml:"auth_key"`
-	KeyID       *string `yaml:"key_id"`
-	TeamID      *string `yaml:"team_id"`
-	Topic       *string `yaml:"topic"`
-	Sound       *string `yaml:"sound"`
-}
-
-func LoadBackup(path string) (*Backup, error) {
-	data, err := privatefs.ReadBytes(path, MaxConfigBytes)
-	if err != nil {
-		return nil, fmt.Errorf("read backup config: %w", err)
-	}
-	return DecodeBackup(data)
-}
-
+// DecodeBackup rejects unknown root keys, while each invalid item remains a
+// disabled entry. An invalid destination never takes down the other workers.
 func DecodeBackup(data []byte) (*Backup, error) {
 	if len(data) > MaxConfigBytes {
-		return nil, fmt.Errorf("backup config exceeds %d bytes", MaxConfigBytes)
+		return nil, errors.New("configuration too large")
 	}
-	var document backupDocument
-	if err := decodeOneYAML(data, &document); err != nil {
-		if errors.Is(err, errUnknownYAMLField) {
-			return nil, fmt.Errorf("decode backup config: unknown field")
-		}
-		return nil, fmt.Errorf("decode backup config: invalid YAML")
+	file, err := parser.ParseBytes(data, 0)
+	if err != nil || len(file.Docs) != 1 || file.Docs[0].Body == nil {
+		return nil, errors.New("invalid YAML document")
 	}
-	if document.Targets == nil || len(document.Targets) > 32 {
-		return nil, fmt.Errorf("validate backup config: targets must be an array containing 0 to 32 entries")
+	var doc struct {
+		Targets   []any `yaml:"targets"`
+		Notifiers []any `yaml:"notifiers"`
 	}
-	if document.Notifiers == nil || len(document.Notifiers) > 16 {
-		return nil, fmt.Errorf("validate backup config: notifiers must be an array containing 0 to 16 entries")
+	if err := yaml.NewDecoder(bytes.NewReader(data), yaml.Strict()).Decode(&doc); err != nil {
+		return nil, errors.New("invalid configuration document or unknown root key")
 	}
-
-	result := &Backup{Targets: document.Targets, Notifiers: make([]Notifier, 0, len(document.Notifiers))}
-	targetNames := make(map[string]struct{}, len(result.Targets))
-	for index := range result.Targets {
-		if err := result.Targets[index].Validate(); err != nil {
-			return nil, fmt.Errorf("validate backup config: targets[%d]: %w", index, err)
+	result := &Backup{Targets: []Target{}, Notifiers: []Notifier{}}
+	for i, raw := range doc.Targets {
+		target := Target{}
+		encoded, err := yaml.Marshal(raw)
+		if err != nil || decodeOneYAML(encoded, &target) != nil {
+			target.Error = "invalid_target_config"
 		}
-		if _, duplicate := targetNames[result.Targets[index].Name]; duplicate {
-			return nil, fmt.Errorf("validate backup config: target names must be unique")
+		if strings.TrimSpace(target.Name) == "" {
+			target.Name = fmt.Sprintf("targets[%d]", i)
+			target.Error = "name_required"
 		}
-		targetNames[result.Targets[index].Name] = struct{}{}
+		if strings.TrimSpace(target.EnvFile) == "" {
+			target.Error = "env_file_required"
+		}
+		for _, option := range target.Options {
+			if option == "" || strings.ContainsRune(option, 0) {
+				target.Error = "invalid_restic_option"
+			}
+		}
+		result.Targets = append(result.Targets, target)
 	}
-
-	notifierNames := make(map[string]struct{}, len(document.Notifiers))
-	for index := range document.Notifiers {
-		notifier, err := document.Notifiers[index].resolve()
-		if err != nil {
-			return nil, fmt.Errorf("validate backup config: notifiers[%d]: %w", index, err)
+	for i, raw := range doc.Notifiers {
+		notifier := Notifier{Sound: "1107"}
+		encoded, err := yaml.Marshal(raw)
+		if err != nil || decodeOneYAML(encoded, &notifier) != nil {
+			notifier.Error = "invalid_notifier_config"
 		}
-		if _, duplicate := notifierNames[notifier.Name]; duplicate {
-			return nil, fmt.Errorf("validate backup config: notifier names must be unique")
+		if strings.TrimSpace(notifier.Name) == "" {
+			notifier.Name = fmt.Sprintf("notifiers[%d]", i)
+			notifier.Error = "name_required"
 		}
-		notifierNames[notifier.Name] = struct{}{}
+		var allowed map[string]bool
+		switch notifier.Type {
+		case "wecom", "feishu", "dingtalk":
+			allowed = map[string]bool{"name": true, "type": true, "webhook_url": true}
+			if notifier.Type != "wecom" {
+				allowed["secret"] = true
+			}
+			u, err := url.Parse(notifier.WebhookURL)
+			if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.Fragment != "" {
+				notifier.Error = "invalid_webhook_url"
+			}
+		case "bark":
+			allowed = map[string]bool{"name": true, "type": true, "device_token": true, "auth_key_file": true, "key_id": true, "team_id": true, "topic": true, "sound": true}
+			for _, value := range []string{notifier.DeviceToken, notifier.AuthKeyFile, notifier.KeyID, notifier.TeamID, notifier.Topic} {
+				if value == "" || strings.ContainsAny(value, "\r\n\x00") {
+					notifier.Error = "invalid_bark_config"
+				}
+			}
+			if strings.ContainsAny(notifier.DeviceToken, "/?#% ") {
+				notifier.Error = "invalid_device_token"
+			}
+		default:
+			notifier.Error = "unknown_notifier_type"
+		}
+		var keys map[string]any
+		if yaml.Unmarshal(encoded, &keys) != nil {
+			notifier.Error = "invalid_notifier_config"
+		}
+		for key := range keys {
+			if !allowed[key] {
+				notifier.Error = "invalid_notifier_field"
+			}
+		}
 		result.Notifiers = append(result.Notifiers, notifier)
+	}
+	for i := range result.Targets {
+		for j := 0; j < i; j++ {
+			if result.Targets[i].Name == result.Targets[j].Name {
+				result.Targets[i].Error = "duplicate_name"
+				result.Targets[j].Error = "duplicate_name"
+			}
+		}
+	}
+	for i := range result.Notifiers {
+		for j := 0; j < i; j++ {
+			if result.Notifiers[i].Name == result.Notifiers[j].Name {
+				result.Notifiers[i].Error = "duplicate_name"
+				result.Notifiers[j].Error = "duplicate_name"
+			}
+		}
 	}
 	return result, nil
 }
 
-func (c Backup) Target(name string) (Target, bool) {
-	for _, target := range c.Targets {
-		if target.Name == name {
-			return target, true
-		}
+func readLocal(path string) ([]byte, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, errors.New("local file unavailable")
 	}
-	return Target{}, false
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Size() > MaxConfigBytes {
+		return nil, errors.New("invalid local file")
+	}
+	data, err := io.ReadAll(io.LimitReader(file, MaxConfigBytes+1))
+	if err != nil || len(data) > MaxConfigBytes {
+		return nil, errors.New("local file read failed")
+	}
+	return data, nil
 }
 
-func (t Target) Validate() error {
-	if !namePattern.MatchString(t.Name) {
-		return fmt.Errorf("invalid name %q", t.Name)
+func LoadBackup(path string) (*Backup, error) {
+	data, err := readLocal(path)
+	if err != nil {
+		return nil, errors.New("configuration unavailable")
 	}
-	if len(t.Repository) < 1 || len(t.Repository) > 4096 || strings.ContainsAny(t.Repository, "\r\n\x00") {
-		return fmt.Errorf("repository must be a nonempty string of at most 4096 bytes")
+	cfg, err := DecodeBackup(data)
+	if err != nil {
+		return nil, err
 	}
-	if t.Options == nil || len(t.Options) > 64 {
-		return fmt.Errorf("options must be an array containing at most 64 entries")
-	}
-	optionNames := make(map[string]struct{}, len(t.Options))
-	for index, option := range t.Options {
-		if len(option.Name) < 1 || len(option.Name) > 256 || strings.ContainsAny(option.Name, "=\r\n\x00") {
-			return fmt.Errorf("options[%d] has an invalid name", index)
+	for i := range cfg.Targets {
+		target := &cfg.Targets[i]
+		if target.Error != "" {
+			continue
 		}
-		if _, duplicate := optionNames[option.Name]; duplicate {
-			return fmt.Errorf("option names must be unique")
+		data, err := readLocal(target.EnvFile)
+		if err != nil {
+			target.Error = "env_file_unavailable"
+			continue
 		}
-		optionNames[option.Name] = struct{}{}
-		if len(option.Value) > 4096 || strings.ContainsAny(option.Value, "\r\n\x00") {
-			return fmt.Errorf("options[%d] has an invalid value", index)
+		env, err := kvfile.ParseFromReader(bytes.NewReader(data), nil)
+		if err != nil {
+			target.Error = "invalid_env_file"
+			continue
 		}
+		for _, entry := range env {
+			if strings.ContainsRune(entry, 0) {
+				target.Error = "invalid_env_file"
+			}
+		}
+		target.Environment = env
 	}
-	return nil
+	for i := range cfg.Notifiers {
+		notifier := &cfg.Notifiers[i]
+		if notifier.Error != "" || notifier.Type != "bark" {
+			continue
+		}
+		data, err := readLocal(notifier.AuthKeyFile)
+		if err != nil {
+			notifier.Error = "auth_key_unavailable"
+			continue
+		}
+		block, rest := pem.Decode(data)
+		if block == nil || block.Type != "PRIVATE KEY" || len(bytes.TrimSpace(rest)) != 0 {
+			notifier.Error = "invalid_auth_key"
+			continue
+		}
+		parsed, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+		key, ok := parsed.(*ecdsa.PrivateKey)
+		if err != nil || !ok || key.Curve != elliptic.P256() {
+			notifier.Error = "invalid_auth_key"
+			continue
+		}
+		notifier.Key = key
+	}
+	return cfg, nil
 }
 
-func (document notifierDocument) resolve() (Notifier, error) {
-	if !namePattern.MatchString(document.Name) {
-		return Notifier{}, fmt.Errorf("invalid name %q", document.Name)
-	}
-	notifier := Notifier{Name: document.Name, Type: document.Type}
-	switch document.Type {
-	case "wechat":
-		if document.WebhookURL == nil || document.DeviceToken != nil || document.AuthKey != nil || document.KeyID != nil ||
-			document.TeamID != nil || document.Topic != nil || document.Sound != nil {
-			return Notifier{}, fmt.Errorf("fields are invalid for WeChat")
-		}
-		if _, err := parseHTTPSURL(*document.WebhookURL); err != nil {
-			return Notifier{}, fmt.Errorf("webhook_url must be an HTTPS URL without user info or fragment")
-		}
-		notifier.WebhookURL = *document.WebhookURL
-	case "bark":
-		if document.WebhookURL != nil || document.DeviceToken == nil || document.AuthKey == nil || document.KeyID == nil ||
-			document.TeamID == nil || document.Topic == nil {
-			return Notifier{}, fmt.Errorf("bark fields are incomplete or invalid")
-		}
-		notifier.DeviceToken = *document.DeviceToken
-		notifier.AuthKey = *document.AuthKey
-		notifier.KeyID = *document.KeyID
-		notifier.TeamID = *document.TeamID
-		notifier.Topic = *document.Topic
-		if document.Sound != nil {
-			notifier.Sound = *document.Sound
-		}
-		if notifier.Sound == "" {
-			notifier.Sound = "1107"
-		}
-		if err := validateBark(&notifier); err != nil {
-			return Notifier{}, err
-		}
-	default:
-		return Notifier{}, fmt.Errorf("unsupported type %q", document.Type)
-	}
-	return notifier, nil
-}
-
-func validateBark(notifier *Notifier) error {
-	if len(notifier.DeviceToken) != 64 || strings.ToLower(notifier.DeviceToken) != notifier.DeviceToken {
-		return fmt.Errorf("device_token must be 64 lowercase hexadecimal characters")
-	}
-	if _, err := hex.DecodeString(notifier.DeviceToken); err != nil {
-		return fmt.Errorf("device_token must be 64 lowercase hexadecimal characters")
-	}
-	if len(notifier.AuthKey) < 1 || len(notifier.AuthKey) > 16<<10 || strings.IndexByte(notifier.AuthKey, 0) >= 0 {
-		return fmt.Errorf("auth_key is invalid")
-	}
-	block, rest := pem.Decode([]byte(notifier.AuthKey))
-	if block == nil || block.Type != "PRIVATE KEY" || len(bytes.TrimSpace(rest)) != 0 {
-		return fmt.Errorf("auth_key must contain one PKCS#8 private key")
-	}
-	parsed, err := x509.ParsePKCS8PrivateKey(block.Bytes)
-	key, ok := parsed.(*ecdsa.PrivateKey)
-	if err != nil || !ok || key.Curve != elliptic.P256() {
-		return fmt.Errorf("auth_key must be a P-256 PKCS#8 private key")
-	}
-	if _, err := key.ECDH(); err != nil {
-		return fmt.Errorf("auth_key must be a P-256 PKCS#8 private key")
-	}
-	for _, field := range []struct {
-		name  string
-		value string
-	}{{"key_id", notifier.KeyID}, {"team_id", notifier.TeamID}, {"topic", notifier.Topic}} {
-		if len(field.value) < 2 || len(field.value) > 255 || strings.ContainsAny(field.value, "\r\n\x00") {
-			return fmt.Errorf("%s is invalid", field.name)
+func (b *Backup) Valid() bool {
+	for _, t := range b.Targets {
+		if t.Error != "" {
+			return false
 		}
 	}
-	if len(notifier.Sound) > 255 || strings.ContainsAny(notifier.Sound, "\r\n\x00") {
-		return fmt.Errorf("sound is invalid")
+	for _, n := range b.Notifiers {
+		if n.Error != "" {
+			return false
+		}
 	}
-	return nil
-}
-
-func parseHTTPSURL(raw string) (*url.URL, error) {
-	if len(raw) < 1 || len(raw) > 4096 || strings.ContainsAny(raw, "\r\n\x00") {
-		return nil, fmt.Errorf("URL is invalid")
-	}
-	parsed, err := url.Parse(raw)
-	if err != nil || !parsed.IsAbs() || parsed.Scheme != "https" || parsed.Host == "" || parsed.Path == "" ||
-		parsed.User != nil || parsed.Fragment != "" || parsed.Opaque != "" {
-		return nil, fmt.Errorf("URL is invalid")
-	}
-	return parsed, nil
+	return true
 }

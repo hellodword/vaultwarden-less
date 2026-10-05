@@ -19,7 +19,6 @@ import (
 )
 
 type proxyEnvironment struct {
-	ready     func() bool
 	healthURL string
 	serve     func(context.Context, io.Writer) error
 }
@@ -41,8 +40,7 @@ func main() {
 
 func execute(ctx context.Context, arguments []string, stdout, stderr io.Writer) int {
 	environment := proxyEnvironment{
-		ready:     buildinfo.Ready,
-		healthURL: "http://127.0.0.1:8080" + proxyserver.HealthPath,
+		healthURL: "http://" + proxyserver.HealthAddress + proxyserver.HealthPath,
 		serve:     serve,
 	}
 	return executeWithEnvironment(ctx, arguments, stdout, stderr, environment)
@@ -69,18 +67,7 @@ func executeWithEnvironment(ctx context.Context, arguments []string, stdout, std
 	}
 	switch command {
 	case "version":
-		result := struct {
-			ProjectCommit *string `json:"project_commit"`
-			Release       string  `json:"release"`
-			Clean         bool    `json:"clean"`
-		}{Release: "development", Clean: false}
-		if buildinfo.Ready() {
-			commit := buildinfo.ProjectCommit
-			result.ProjectCommit = &commit
-			result.Release = buildinfo.Release
-			result.Clean = true
-		}
-		_ = json.NewEncoder(stdout).Encode(result)
+		_ = json.NewEncoder(stdout).Encode(buildinfo.Current())
 		return 0
 	case "healthcheck":
 		if err := healthcheck(ctx, environment.healthURL); err != nil {
@@ -91,9 +78,6 @@ func executeWithEnvironment(ctx context.Context, arguments []string, stdout, std
 		}{true})
 		return 0
 	case "serve":
-		if environment.ready == nil || !environment.ready() {
-			return writeProxyError(stderr, &proxyCommandError{code: "not_ready", message: "A clean release identity is required for this command"})
-		}
 		if environment.serve == nil {
 			return writeProxyError(stderr, &proxyCommandError{code: "internal_error", message: "Proxy serving is unavailable"})
 		}
@@ -133,7 +117,7 @@ func serve(ctx context.Context, stderr io.Writer) error {
 	events := proxyserver.NewEventSender(logger)
 	var eventWait sync.WaitGroup
 	eventWait.Go(func() { events.Run(serveContext) })
-	server := proxyserver.NewServer(events.MarkDirty, logger)
+	server := proxyserver.NewServer(events.Record, logger)
 	serveError := make(chan error, 1)
 	go func() { serveError <- server.ListenAndServe() }()
 	logger.Info("proxy started", "listen_address", proxyserver.ListenAddress)
