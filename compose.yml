@@ -1,9 +1,15 @@
+# Copy this file beside compose.env, config/, credentials/, data/ and cache/.
+# Host paths are relative to this file. Create the bind sources before startup;
+# Compose must not create missing directories in place of configuration files.
 name: vaultwarden-less
 
 x-service-defaults: &service-defaults
   platform: linux/amd64
   restart: unless-stopped
-  user: "${RUNTIME_UID:?RUNTIME_UID is required}:${RUNTIME_GID:?RUNTIME_GID is required}"
+  # All services use these non-root numeric IDs. Edit them to match the owner
+  # of the deployment files: data/cache need read/write access; configuration
+  # and credentials need read access. Match existing data ownership on adoption.
+  user: "1000:1000"
   read_only: true
   tmpfs:
     - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
@@ -33,10 +39,10 @@ services:
       ATTACHMENTS_FOLDER: /data/attachments
       SENDS_FOLDER: /data/sends
     env_file:
-      - "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/config/vaultwarden.env"
+      - ./config/vaultwarden.env
     volumes:
       - type: bind
-        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/data"
+        source: ./data
         target: /data
         bind:
           create_host_path: false
@@ -55,30 +61,30 @@ services:
     command: [serve]
     volumes:
       - type: bind
-        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/config/backup.yaml"
+        source: ./config/backup.yaml
         target: /config/backup.yaml
         read_only: true
         bind:
           create_host_path: false
       - type: bind
-        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/credentials/backup"
+        source: ./credentials/backup
         target: /run/credentials/backup
         read_only: true
         bind:
           create_host_path: false
       - type: bind
-        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/credentials/restic"
+        source: ./credentials/restic
         target: /run/credentials/restic
         read_only: true
         bind:
           create_host_path: false
       - type: bind
-        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/cache"
+        source: ./cache
         target: /cache
         bind:
           create_host_path: false
       - type: bind
-        source: "${DEPLOYMENT_ROOT:?DEPLOYMENT_ROOT is required}/data"
+        source: ./data
         target: /data
         read_only: true
         bind:
@@ -99,7 +105,10 @@ services:
       vaultwarden:
         condition: service_healthy
     ports:
-      - "127.0.0.1:${LISTEN_PORT:?LISTEN_PORT is required}:8080"
+      # Edit the HOST port (middle value) here when needed. Container port 8080
+      # is fixed. TLS, public listeners and trusted forwarded headers belong
+      # to the external reverse proxy; this listener stays on host loopback.
+      - "127.0.0.1:8080:8080"
     healthcheck:
       test: [CMD, /bin/vaultwarden-less-proxy, healthcheck]
       interval: 10s

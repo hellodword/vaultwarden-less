@@ -46,6 +46,7 @@ type e2eHarness struct {
 	dockerPath, dockerConfig                             string
 	dockerEnv                                            []string
 	composeFile, overrideFile, environmentFile, imageTag string
+	runtimeOverrideFile                                  string
 	vaultwardenPort, proxyPort                           int
 	publicTLS, tlsCAFile                                 string
 	tlsServer                                            *httptest.Server
@@ -98,7 +99,8 @@ func newE2EHarness(t *testing.T, ctx context.Context) *e2eHarness {
 	}
 	writePrivateFile(t, filepath.Join(h.dockerConfig, "config.json"), `{"auths":{}}`)
 	h.dockerEnv = isolatedDockerEnvironment(h.dockerConfig)
-	h.composeFile = filepath.Join(h.releaseRoot, "compose.yml")
+	h.composeFile = filepath.Join(h.deploymentRoot, "compose.yml")
+	h.runtimeOverrideFile = filepath.Join(root, "compose.runtime.yml")
 	h.overrideFile = filepath.Join(root, "compose.e2e.json")
 	h.environmentFile = filepath.Join(h.deploymentRoot, "compose.env")
 	data, err := os.ReadFile(filepath.Join(h.releaseRoot, "templates", "compose.env"))
@@ -149,8 +151,13 @@ func parseComposeServices(data string) (map[string]composeService, error) {
 
 func (h *e2eHarness) identity() string { return fmt.Sprintf("%d:%d", os.Geteuid(), os.Getegid()) }
 func (h *e2eHarness) prepareDeployment() {
-	writePrivateFile(h.t, h.environmentFile, fmt.Sprintf("DEPLOYMENT_ROOT=%s\nVWLESS_IMAGE_TAG=%s\nRUNTIME_UID=%d\nRUNTIME_GID=%d\nLISTEN_PORT=%d\n", h.deploymentRoot, h.imageTag, os.Geteuid(), os.Getegid(), h.proxyPort))
-	data, err := os.ReadFile(filepath.Join(h.releaseRoot, "templates/config/vaultwarden.env"))
+	data, err := os.ReadFile(filepath.Join(h.releaseRoot, "compose.yml"))
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	writePrivateFile(h.t, h.composeFile, string(data))
+	writePrivateFile(h.t, h.environmentFile, fmt.Sprintf("VWLESS_IMAGE_TAG=%s\n", h.imageTag))
+	data, err = os.ReadFile(filepath.Join(h.releaseRoot, "templates/config/vaultwarden.env"))
 	if err != nil {
 		h.t.Fatal(err)
 	}
@@ -168,6 +175,18 @@ func (h *e2eHarness) prepareDeployment() {
 	writePrivateFile(h.t, filepath.Join(h.deploymentRoot, "config/backup.yaml"), configuration)
 }
 func (h *e2eHarness) writeOverride() {
+	// Compose normally merges ports. Replace the shipped mapping so acceptance
+	// publishes only its allocated proxy port, without changing the product file.
+	writePrivateFile(h.t, h.runtimeOverrideFile, fmt.Sprintf(`services:
+  vaultwarden:
+    user: %[1]q
+  backup:
+    user: %[1]q
+  proxy:
+    user: %[1]q
+    ports: !override
+      - "127.0.0.1:%[2]d:8080"
+`, h.identity(), h.proxyPort))
 	mount := func(source, target string, ro bool) map[string]any {
 		return map[string]any{"type": "bind", "source": source, "target": target, "read_only": ro, "bind": map[string]any{"create_host_path": false}}
 	}
@@ -224,6 +243,11 @@ func (h *e2eHarness) validateBoundaries() {
 				User string
 				Env  []string
 			}
+			HostConfig struct {
+				PortBindings map[string][]struct {
+					HostIP, HostPort string
+				}
+			}
 			Mounts []struct {
 				Source, Destination string
 				RW                  bool
@@ -236,6 +260,20 @@ func (h *e2eHarness) validateBoundaries() {
 		item := inspect[0]
 		if item.Config.User != h.identity() {
 			h.t.Fatal("product runtime is not the test user")
+		}
+		if name == "vaultwarden" || name == "backup" {
+			found := false
+			for _, m := range item.Mounts {
+				if m.Destination == "/data" {
+					found = true
+					if m.Source != filepath.Join(h.deploymentRoot, "data") || m.RW != (name == "vaultwarden") {
+						h.t.Fatal("product source mount has the wrong deployment path or access mode")
+					}
+				}
+			}
+			if !found {
+				h.t.Fatal("product source mount missing")
+			}
 		}
 		if name == "vaultwarden" {
 			values := map[string]string{}
@@ -256,23 +294,17 @@ func (h *e2eHarness) validateBoundaries() {
 			}
 		}
 		if name == "backup" {
-			found := false
 			for _, m := range item.Mounts {
-				if m.Destination == "/data" {
-					found = true
-					if m.RW {
-						h.t.Fatal("backup source mount is writable")
-					}
-				}
 				if strings.Contains(m.Source, "maintenance") {
 					h.t.Fatal("backup received maintenance credentials")
 				}
 			}
-			if !found {
-				h.t.Fatal("backup source mount missing")
-			}
 		}
 		if name == "proxy" {
+			ports := item.HostConfig.PortBindings["8080/tcp"]
+			if len(item.HostConfig.PortBindings) != 1 || len(ports) != 1 || ports[0].HostIP != "127.0.0.1" || ports[0].HostPort != strconv.Itoa(h.proxyPort) {
+				h.t.Fatal("proxy must publish only its allocated loopback port")
+			}
 			for _, m := range item.Mounts {
 				if strings.Contains(m.Source, "credentials") || m.Destination == "/data" {
 					h.t.Fatal("proxy received source data or credentials")
@@ -295,7 +327,7 @@ func (h *e2eHarness) compose(arguments ...string) string {
 	return output
 }
 func (h *e2eHarness) tryCompose(ctx context.Context, arguments ...string) (string, error) {
-	base := []string{"compose", "--env-file", h.environmentFile, "--project-directory", h.testRoot, "--project-name", h.project, "--file", h.composeFile, "--file", h.overrideFile}
+	base := []string{"compose", "--env-file", h.environmentFile, "--project-directory", h.deploymentRoot, "--project-name", h.project, "--file", h.composeFile, "--file", h.runtimeOverrideFile, "--file", h.overrideFile}
 	return h.dockerContext(ctx, append(base, arguments...)...)
 }
 func (h *e2eHarness) containerID(service string) string {

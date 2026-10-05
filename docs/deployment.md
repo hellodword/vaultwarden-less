@@ -26,12 +26,14 @@ it to another host, copy file contents rather than a Nix store symlink.
 Preserve the bundled image tag and notices. Keep each release in its own
 directory for rollback.
 
-Set these **host** paths to the unpacked release and a new deployment directory:
+Set these **host** paths to the unpacked release and a new deployment directory.
+They are ordinary shell variables used by the examples; do not export them or
+put them in `compose.env`:
 
 ```sh
 set -euo pipefail
-export RELEASE_DIR=/absolute/path/to/release
-export DEPLOYMENT_ROOT=/srv/vaultwarden-less
+RELEASE_DIR=/absolute/path/to/release
+DEPLOY_DIR=/srv/vaultwarden-less
 test -f "$RELEASE_DIR/compose.yml"
 for image in vaultwarden proxy backup; do
   docker load --input "$RELEASE_DIR/images/$image.tar.gz"
@@ -40,25 +42,30 @@ done
 
 ## Prepare configuration and credentials
 
-The following creates a new tree and refuses an existing destination. For an
-existing deployment, retain its configuration and follow the upgrade guide.
+The following creates a new tree and refuses an existing destination. It makes
+the copied files private and writable by the operator. For an existing
+deployment, retain its configuration and follow the upgrade guide.
 
 ```sh
 set -euo pipefail
 umask 077
-test ! -e "$DEPLOYMENT_ROOT"
-test ! -L "$DEPLOYMENT_ROOT"
-mkdir -m 0700 -- "$DEPLOYMENT_ROOT"
-cp -R -- "$RELEASE_DIR/templates/." "$DEPLOYMENT_ROOT/"
-mkdir -m 0700 -- "$DEPLOYMENT_ROOT/data" "$DEPLOYMENT_ROOT/cache" "$DEPLOYMENT_ROOT/restore"
+test ! -e "$DEPLOY_DIR"
+test ! -L "$DEPLOY_DIR"
+mkdir -m 0700 -- "$DEPLOY_DIR"
+cp -R -- "$RELEASE_DIR/templates/." "$DEPLOY_DIR/"
+cp -- "$RELEASE_DIR/compose.yml" "$DEPLOY_DIR/compose.yml"
+mkdir -m 0700 -- "$DEPLOY_DIR/data" "$DEPLOY_DIR/cache" "$DEPLOY_DIR/restore"
+chmod -R u+rwX,go-rwx -- "$DEPLOY_DIR"
 ```
 
 Edit the copies before starting containers:
 
-1. `compose.env`: set the same absolute `DEPLOYMENT_ROOT`, non-root numeric
-   `RUNTIME_UID`/`RUNTIME_GID` (normally `id -u`/`id -g`) and loopback port.
-   Keep the release's `VWLESS_IMAGE_TAG`. The selected identity needs access to
-   the private files and write access to `data/` and `cache/`.
+1. `compose.yml`: set the shared `x-service-defaults.user` to the non-root
+   numeric UID:GID that owns the deployment files (normally `id -u`/`id -g`).
+   The default is `1000:1000`. The selected identity needs access to the private
+   files and write access to `data/` and `cache/`. Adjust the proxy's host port
+   in `127.0.0.1:8080:8080` if needed; keep container port 8080.
+   `compose.env` contains only `VWLESS_IMAGE_TAG`; keep the release's value.
 2. `config/vaultwarden.env`: review the minimal-feature profile; set `DOMAIN`
    to your external HTTPS origin if needed, and configure upstream SMTP settings
    only when using mail. These are Vaultwarden settings, not backup settings.
@@ -84,7 +91,8 @@ Do not put real credentials into a source checkout or shell command history.
 For additional repositories, copy the matching provider's files under unique
 names and add a YAML entry with the new paths. Container paths such as
 `/run/credentials/restic/aws-s3-repository-password.txt` stay as container paths;
-the Compose file maps their host sources.
+the Compose file maps their host sources. Host paths such as `./data` and
+`./config/vaultwarden.env` resolve relative to the deployment's `compose.yml`.
 
 ## Empty installation or existing data
 
@@ -105,14 +113,15 @@ procedure in [operations](operations.md#upgrade-with-a-preserved-original).
 
 ## Validate and initialize repositories
 
-Define a helper for the supplied Compose file and render its configuration
-without printing sensitive environment values:
+Define a helper for the deployment's Compose file and render its configuration
+without printing sensitive environment values. The absolute file paths allow
+the helper to run from any working directory:
 
 ```sh
 set -euo pipefail
 compose() {
-  docker compose --env-file "$DEPLOYMENT_ROOT/compose.env" \
-    --file "$RELEASE_DIR/compose.yml" "$@"
+  docker compose --env-file "$DEPLOY_DIR/compose.env" \
+    --file "$DEPLOY_DIR/compose.yml" "$@"
 }
 compose config --quiet
 compose run --rm --no-deps backup validate

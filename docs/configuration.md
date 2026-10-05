@@ -17,6 +17,7 @@ host permissions or create missing bind mount sources.
 
 ```text
 deployment/
+  compose.yml
   compose.env
   config/
     vaultwarden.env
@@ -36,12 +37,23 @@ deployment/
   restore/
 ```
 
-Copy the files from `templates/`, keep the destinations and notifications you
-need, and replace their placeholders. Remove unused YAML entries and their
-credential files. The APNs private key is not included in the templates.
-`compose.env` selects the absolute deployment root, the image tag supplied by
-the bundle, a non-root runtime UID/GID and the loopback listener port. Compose
-owns interpolation of this file. A clean Git build uses the `git-<commit>` image
+Copy the bundle's `compose.yml` and the files from `templates/` into this
+directory, keep the destinations and notifications you need, and replace their
+placeholders. Remove unused YAML entries and their credential files. The APNs
+private key is not included in the templates. Host bind sources and the service
+`env_file` use paths relative to this Compose file, so moving the complete,
+stopped deployment tree does not require changing those paths.
+
+Edit `x-service-defaults.user` in `compose.yml` to select the non-root numeric
+runtime UID:GID (default `1000:1000`). Edit the proxy's `ports` entry to select
+its host loopback port (default `127.0.0.1:8080:8080`); container port 8080 is
+fixed. Recreate the affected containers after changing these settings.
+
+`compose.env` contains only `VWLESS_IMAGE_TAG`, selecting the same release tag
+for all three product images. Compose owns interpolation of this file. The
+`DEPLOY_DIR` variable in documentation is only a shell convenience for host
+commands; it is not read by Compose or the applications and does not belong in
+`compose.env`. A clean Git build uses the `git-<commit>` image
 tag; a dirty working-tree build uses `development`. All three product images
 record the full commit hash in the `org.opencontainers.image.revision` label,
 with `-dirty` appended for uncommitted tracked changes. The backup and proxy
@@ -92,8 +104,8 @@ settings; consult its `.env.template` when changing them.
 
 `compose.env` and `vaultwarden.env` use
 [Compose's interpolation and quoting rules](https://docs.docker.com/compose/how-tos/environment-variables/variable-interpolation/).
-Exported shell variables take precedence over `compose.env`, so keep any
-exported deployment values consistent with the file. Single-quote values
+An exported `VWLESS_IMAGE_TAG` takes precedence over `compose.env`; unset it
+when selecting the tag through that file. Single-quote values
 containing literal `$`, such as an Argon2 admin
 token hash. Restic credential env files use the different literal rules below.
 Never source any of these files. After changing a Compose env file, run

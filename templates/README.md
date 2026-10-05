@@ -1,12 +1,14 @@
 # Configuration templates
 
 Start with [the deployment guide](../docs/deployment.md). Copy these files into
-an operator-owned deployment directory, then edit the copies. Do not change
-the packaged originals or store real credentials in the source checkout.
+an operator-owned deployment directory alongside the bundle's `compose.yml`,
+then edit the copies. Do not change the packaged originals or store real
+credentials in the source checkout.
 
 | File | Reader and purpose | Apply changes |
 | --- | --- | --- |
-| `compose.env` | Compose interpolation: host root, image tag, UID/GID and loopback port | `docker compose up -d` |
+| `compose.yml` (from the bundle root) | Relative host paths, runtime UID/GID and loopback port | Recreate affected services |
+| `compose.env` | Compose interpolation: the shared image tag | Recreate affected services |
 | `config/vaultwarden.env` | Compose service `env_file`, then Vaultwarden; minimal-feature defaults | Recreate Vaultwarden |
 | `config/backup.yaml` | Backup worker: destinations and notifications | Restart backup |
 | `credentials/backup/<target>-backup.env` | Worker using Docker's env-file parser; native restic backend credentials | Restart backup |
@@ -50,7 +52,10 @@ Restic env files use literal values; Compose's env files instead support
 interpolation and quoting. None of these files should be sourced by a shell.
 
 Paths beginning `/data`, `/cache`, `/config` or `/run/credentials` refer to the
-container mount contract. `DEPLOYMENT_ROOT` and bind sources are host paths.
+container mount contract. Bind sources such as `./data` and the service
+`env_file` resolve relative to the deployment's `compose.yml`. Set the shared
+`user` and proxy's host port directly in that file; `compose.env` holds only
+`VWLESS_IMAGE_TAG`.
 Do not replace container paths with host paths inside `backup.yaml` or restic
 env files. See [configuration reference](../docs/configuration.md) for precedence,
 backend options and notifier fields.

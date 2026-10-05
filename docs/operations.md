@@ -1,6 +1,6 @@
 # Operations
 
-Complete [deployment](deployment.md) first. Use the bundle's `compose.yml` and
+Complete [deployment](deployment.md) first. Use your deployment's `compose.yml` and
 [configuration tree](configuration.md).
 Run examples with Bash as the non-root runtime user. Replace paths, image
 tags, IDs and provider inputs with reviewed values before running them.
@@ -8,14 +8,16 @@ Do not enable shell tracing around credentials.
 
 ## Checks and status
 
-Set `RELEASE_DIR` and `DEPLOYMENT_ROOT` to the existing release and deployment.
-In each new shell, define the Compose helper:
+In each new shell, set `DEPLOY_DIR` to the existing absolute deployment path
+and define the Compose helper. This is an ordinary shell variable; do not
+export it or add it to `compose.env`. The helper works from any working directory:
 
 ```sh
 set -euo pipefail
+DEPLOY_DIR=/srv/vaultwarden-less
 compose() {
-  docker compose --env-file "$DEPLOYMENT_ROOT/compose.env" \
-    --file "$RELEASE_DIR/compose.yml" "$@"
+  docker compose --env-file "$DEPLOY_DIR/compose.env" \
+    --file "$DEPLOY_DIR/compose.yml" "$@"
 }
 compose ps
 compose exec --no-TTY backup /bin/vaultwarden-less-backup status
@@ -104,7 +106,7 @@ from `compose config --images backup` using the helper above.
 
 Prepare a maintenance env file on the host when needed; the release does not
 ship maintenance credential templates. For example, create the private directory
-`$DEPLOYMENT_ROOT/credentials/maintenance/` with mode 0700 and save
+`$DEPLOY_DIR/credentials/maintenance/` with mode 0700 and save
 `aws-s3-maintenance.env` there with mode 0600, readable by the runtime user:
 
 ```dotenv
@@ -129,15 +131,15 @@ worker. Set `RESTIC_ENV_FILE` to the absolute host path for the selected file.
 
 ```sh
 set -euo pipefail
-: "${DEPLOYMENT_ROOT:?}" "${RESTIC_IMAGE:?}"
-RESTIC_ENV_FILE="$DEPLOYMENT_ROOT/credentials/maintenance/aws-s3-maintenance.env"
+: "${DEPLOY_DIR:?}" "${RESTIC_IMAGE:?}"
+RESTIC_ENV_FILE="$DEPLOY_DIR/credentials/maintenance/aws-s3-maintenance.env"
 restic_repository() {
   : "${RESTIC_ENV_FILE:?}"
   docker run --rm --read-only --user "$(id -u):$(id -g)" \
     --tmpfs /tmp:rw,nosuid,nodev,mode=1777 \
     --env-file "$RESTIC_ENV_FILE" \
     --env RESTIC_CACHE_DIR=/tmp/restic \
-    --mount "type=bind,source=$DEPLOYMENT_ROOT/credentials/restic,target=/run/credentials/restic,readonly" \
+    --mount "type=bind,source=$DEPLOY_DIR/credentials/restic,target=/run/credentials/restic,readonly" \
     --entrypoint /bin/restic "$RESTIC_IMAGE" "$@"
 }
 restic_repository snapshots --host vaultwarden-less --group-by host
@@ -185,7 +187,7 @@ different new path.
 <!-- native-restore-example -->
 ```sh
 set -euo pipefail
-: "${DEPLOYMENT_ROOT:?}" "${RESTIC_IMAGE:?}" "${RESTIC_ENV_FILE:?}" "${SNAPSHOT_ID:?}" "${RESTORE_DIR:?}"
+: "${DEPLOY_DIR:?}" "${RESTIC_IMAGE:?}" "${RESTIC_ENV_FILE:?}" "${SNAPSHOT_ID:?}" "${RESTORE_DIR:?}"
 [[ $SNAPSHOT_ID =~ ^[0-9a-f]{64}$ ]]
 [[ $RESTORE_DIR = /* ]]
 test "$(realpath -m -- "$RESTORE_DIR")" = "$RESTORE_DIR"
@@ -196,7 +198,7 @@ docker run --rm --read-only --user "$(id -u):$(id -g)" \
   --tmpfs /tmp:rw,nosuid,nodev,mode=1777 \
   --env-file "$RESTIC_ENV_FILE" \
   --env RESTIC_CACHE_DIR=/tmp/restic \
-  --mount "type=bind,source=$DEPLOYMENT_ROOT/credentials/restic,target=/run/credentials/restic,readonly" \
+  --mount "type=bind,source=$DEPLOY_DIR/credentials/restic,target=/run/credentials/restic,readonly" \
   --mount "type=bind,source=$RESTORE_DIR,target=/restore" \
   --entrypoint /bin/restic "$RESTIC_IMAGE" \
   restore "$SNAPSHOT_ID" --verify --target /restore
@@ -219,6 +221,21 @@ Restoring an incomplete tag does not repair missing data.
 
 ## Upgrade with a preserved original
 
+The deployment owns its `compose.yml`. Compare it with the new bundle's file
+and merge the required changes, preserving your runtime UID/GID and host port.
+Select the new bundle's `VWLESS_IMAGE_TAG` in the new deployment's `compose.env`.
+Keep the previous Compose file, image tag and other configuration for rollback;
+do not overwrite your local settings with the new templates wholesale.
+
+For an older layout that runs Compose directly from the release directory,
+place the reviewed Compose file alongside `compose.env` in the deployment.
+Transfer the previous runtime IDs and loopback port from the env file into
+`x-service-defaults.user` and the proxy's `ports` entry. Then keep only
+`VWLESS_IMAGE_TAG` in `compose.env` and use the helper above. This layout change
+does not require moving data: relative host paths resolve to the existing
+deployment tree. Apply the preserved-copy procedure below when upgrading
+Vaultwarden itself.
+
 Prepare and load the new bundle before stopping service. Disable incoming
 writes, stop the proxy, request a full check and wait until the selected
 destination reports success with no pending upload. Verify the corresponding
@@ -233,15 +250,15 @@ tree and never overwrites an existing working directory:
 <!-- upgrade-copy-example -->
 ```sh
 set -euo pipefail
-: "${DEPLOYMENT_ROOT:?}" "${UPGRADE_DATA:?}"
+: "${DEPLOY_DIR:?}" "${UPGRADE_DATA:?}"
 [[ $UPGRADE_DATA = /* ]]
 test "$(realpath -m -- "$UPGRADE_DATA")" = "$UPGRADE_DATA"
-case "$UPGRADE_DATA/" in "$DEPLOYMENT_ROOT/data/"*) exit 1 ;; esac
-test -d "$DEPLOYMENT_ROOT/data"
+case "$UPGRADE_DATA/" in "$DEPLOY_DIR/data/"*) exit 1 ;; esac
+test -d "$DEPLOY_DIR/data"
 test ! -e "$UPGRADE_DATA"
 test ! -L "$UPGRADE_DATA"
 mkdir -m 0700 -- "$UPGRADE_DATA"
-cp -a -- "$DEPLOYMENT_ROOT/data/." "$UPGRADE_DATA/"
+cp -a -- "$DEPLOY_DIR/data/." "$UPGRADE_DATA/"
 ```
 
 Point an explicitly reviewed new deployment at a copy of this working tree,

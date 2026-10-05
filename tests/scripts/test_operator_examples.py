@@ -35,7 +35,7 @@ class OperatorExamples(unittest.TestCase):
         self.calls = self.root / "calls"
         self.environment = os.environ | {
             "PATH": str(binary) + os.pathsep + os.environ["PATH"],
-            "DEPLOYMENT_ROOT": str(self.deployment),
+            "DEPLOY_DIR": str(self.deployment),
             "RESTIC_IMAGE": "synthetic-restic",
             "RESTIC_ENV_FILE": str(
                 self.deployment / "credentials/maintenance/aws-s3-maintenance.env"
