@@ -69,9 +69,9 @@ For example, a check followed by two target results can produce:
 
 **Target details**
 
-> primary: Up to date
+> aws-s3: Up to date
 
-> secondary: Upload failed; retry pending
+> cloudflare-r2: Upload failed; retry pending
 
 **Triggers**
 
@@ -100,30 +100,59 @@ channel's byte limit; the source, target totals and report counts remain.
 ## Native restic maintenance
 
 Use a dedicated repository/prefix for this installation. Obtain `RESTIC_IMAGE`
-from `compose config --images backup` using the helper above. The following
-invokes the native restic binary and uses the maintenance environment file, parsed by Docker.
-It mounts only the password directory. It works without a running worker.
+from `compose config --images backup` using the helper above.
+
+Prepare a maintenance env file on the host when needed; the release does not
+ship maintenance credential templates. For example, create the private directory
+`$DEPLOYMENT_ROOT/credentials/maintenance/` with mode 0700 and save
+`aws-s3-maintenance.env` there with mode 0600, readable by the runtime user:
+
+```dotenv
+RESTIC_REPOSITORY=s3:https://s3.us-east-1.amazonaws.com/REPLACE_WITH_AWS_S3_BUCKET/vaultwarden-less
+AWS_DEFAULT_REGION=us-east-1
+RESTIC_PASSWORD_FILE=/run/credentials/restic/aws-s3-repository-password.txt
+AWS_ACCESS_KEY_ID=REPLACE_WITH_AWS_S3_MAINTENANCE_ACCESS_KEY_ID
+AWS_SECRET_ACCESS_KEY=REPLACE_WITH_AWS_S3_MAINTENANCE_SECRET_ACCESS_KEY
+```
+
+Copy the actual repository URL, region and password path from the selected
+target's backup env file. Use a separate provider principal authorized for the
+intended maintenance operations, including deletions for `forget` and `prune`.
+For temporary AWS credentials, also supply the matching `AWS_SESSION_TOKEN`.
+The file uses literal Docker env-file values: do not quote, interpolate or
+source it. Keep it outside the backup service's credential mount. Changes take
+effect on the next maintenance invocation.
+
+The following invokes the native restic binary with this env file, parsed by
+Docker. It mounts only the password directory and works without a running
+worker. Set `RESTIC_ENV_FILE` to the absolute host path for the selected file.
 
 ```sh
 set -euo pipefail
 : "${DEPLOYMENT_ROOT:?}" "${RESTIC_IMAGE:?}"
-restic_primary() {
+RESTIC_ENV_FILE="$DEPLOYMENT_ROOT/credentials/maintenance/aws-s3-maintenance.env"
+restic_repository() {
+  : "${RESTIC_ENV_FILE:?}"
   docker run --rm --read-only --user "$(id -u):$(id -g)" \
     --tmpfs /tmp:rw,nosuid,nodev,mode=1777 \
-    --env-file "$DEPLOYMENT_ROOT/credentials/maintenance/primary.env" \
+    --env-file "$RESTIC_ENV_FILE" \
     --env RESTIC_CACHE_DIR=/tmp/restic \
     --mount "type=bind,source=$DEPLOYMENT_ROOT/credentials/restic,target=/run/credentials/restic,readonly" \
-    --entrypoint /bin/restic "$RESTIC_IMAGE" \
-    --option s3.bucket-lookup=path --option s3.region=us-east-1 "$@"
+    --entrypoint /bin/restic "$RESTIC_IMAGE" "$@"
 }
-restic_primary snapshots --host vaultwarden-less --group-by host
-restic_primary check
+restic_repository snapshots --host vaultwarden-less --group-by host
+restic_repository check
 ```
 
-Adjust backend options to match the destination. During first deployment,
-define the helper, then run `restic_primary init` once for a new empty repository
-before the `snapshots`/`check` examples above. Use separate credentials and
-invocations for each destination.
+For R2 or B2, prepare a `cloudflare-r2-maintenance.env` or
+`backblaze-b2-maintenance.env` in the same way, using that target's repository,
+region and password path and the provider's maintenance credentials. Their S3
+credential mappings are in [configuration](configuration.md#destinations).
+Change `RESTIC_ENV_FILE` to the absolute path of the file you prepared.
+If you added backend options in `backup.yaml`, pass the same native `--option`
+arguments here and during restore. During first deployment, define the helper,
+then run `restic_repository init` once for a new empty repository before the
+`snapshots`/`check` examples above. Repeat with each destination's env file.
 List and record explicit native snapshot IDs before recovery. Neither local
 status nor a notification replaces verification of remote snapshots.
 
@@ -133,20 +162,21 @@ dry run and review its selected snapshots:
 
 ```sh
 set -euo pipefail
-restic_primary forget --host vaultwarden-less --group-by host,tags \
+restic_repository forget --host vaultwarden-less --group-by host,tags \
   --keep-within 24h --keep-hourly 48 --keep-daily 14 --keep-weekly 8 \
   --keep-monthly 12 --keep-yearly 3 --keep-last 1 --dry-run
 ```
 
 When you approve that deletion set, run the same command without `--dry-run`,
-then `restic_primary prune` and `restic_primary check`. Keep maintenance
-separate from backup credentials. Use `restic_primary unlock` only after
+then `restic_repository prune` and `restic_repository check`. Keep maintenance
+separate from backup credentials. Use `restic_repository unlock` only after
 establishing that no relevant restic operation remains active. Object locks
 and provider policy may prevent maintenance; do not bypass them automatically.
 
 ## Restore to a new directory
 
-Choose one full snapshot ID from native `snapshots` output. Set `RESTORE_DIR`
+Select the source repository with `RESTIC_ENV_FILE` as above, then choose one
+full snapshot ID from its native `snapshots` output. Set `RESTORE_DIR`
 to a new absolute directory whose parent exists. The block fails before
 invoking restic if that destination exists, including a dangling symlink.
 A failed restore leaves its partial directory for inspection; retry with a
@@ -155,7 +185,7 @@ different new path.
 <!-- native-restore-example -->
 ```sh
 set -euo pipefail
-: "${DEPLOYMENT_ROOT:?}" "${RESTIC_IMAGE:?}" "${SNAPSHOT_ID:?}" "${RESTORE_DIR:?}"
+: "${DEPLOYMENT_ROOT:?}" "${RESTIC_IMAGE:?}" "${RESTIC_ENV_FILE:?}" "${SNAPSHOT_ID:?}" "${RESTORE_DIR:?}"
 [[ $SNAPSHOT_ID =~ ^[0-9a-f]{64}$ ]]
 [[ $RESTORE_DIR = /* ]]
 test "$(realpath -m -- "$RESTORE_DIR")" = "$RESTORE_DIR"
@@ -164,12 +194,11 @@ test ! -L "$RESTORE_DIR"
 mkdir -m 0700 -- "$RESTORE_DIR"
 docker run --rm --read-only --user "$(id -u):$(id -g)" \
   --tmpfs /tmp:rw,nosuid,nodev,mode=1777 \
-  --env-file "$DEPLOYMENT_ROOT/credentials/maintenance/primary.env" \
+  --env-file "$RESTIC_ENV_FILE" \
   --env RESTIC_CACHE_DIR=/tmp/restic \
   --mount "type=bind,source=$DEPLOYMENT_ROOT/credentials/restic,target=/run/credentials/restic,readonly" \
   --mount "type=bind,source=$RESTORE_DIR,target=/restore" \
   --entrypoint /bin/restic "$RESTIC_IMAGE" \
-  --option s3.bucket-lookup=path --option s3.region=us-east-1 \
   restore "$SNAPSHOT_ID" --verify --target /restore
 integrity=$(docker run --rm --read-only --user "$(id -u):$(id -g)" \
   --mount "type=bind,source=$RESTORE_DIR,target=/restore,readonly" \

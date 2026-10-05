@@ -62,23 +62,29 @@ Edit the copies before starting containers:
 2. `config/vaultwarden.env`: review the minimal-feature profile; set `DOMAIN`
    to your external HTTPS origin if needed, and configure upstream SMTP settings
    only when using mail. These are Vaultwarden settings, not backup settings.
-3. `config/backup.yaml`: select target names, container credential paths and
-   backend options. `notifiers: []` disables notifications; add complete entries
-   from the configuration reference when required.
-4. `credentials/backup/primary.env` and `credentials/maintenance/primary.env`:
-   replace the example repository and credentials. Use the same repository and
-   password, with separate principals for backup and maintenance. Adjust native
-   restic variables for non-S3 backends. Do not quote or interpolate their values.
-5. `credentials/restic/primary`: fill this empty file with only the restic
-   password, without a variable name, quotes or comments. For an existing
-   repository, use its existing password. Keep an independent secure recovery
-   copy; local cache cannot replace the repository password.
+3. `config/backup.yaml`: keep the intended AWS S3, Cloudflare R2 and Backblaze B2
+   target entries and remove the others. Review container credential paths and
+   backend options. The template also includes Enterprise WeChat and Bark APNs:
+   fill in the channels you keep and remove unused entries. `notifiers: []`
+   disables notifications. Bark requires the authorized app's private key at
+   `credentials/backup/bark-apns-auth-key.p8`; no key is shipped. Supply it or
+   remove the Bark entry before running `validate`.
+4. For each retained target, edit its backup env file, such as
+   `credentials/backup/aws-s3-backup.env`. Replace the example repository,
+   region and backup credentials. Adjust native restic variables for non-S3
+   backends. Do not quote or interpolate their values. Remove unused targets'
+   credential and password files.
+5. Fill each retained target's empty `credentials/restic/<target>-repository-password.txt`
+   with only its restic password, without a variable name, quotes or comments.
+   For an existing repository, use its existing password. Keep an independent
+   secure recovery copy; local cache cannot replace the repository password.
 
 Use 0600 for configuration and credential files and 0700 for private directories.
 Do not put real credentials into a source checkout or shell command history.
-Repeat the destination files and YAML entry for additional repositories.
-Container paths such as `/run/credentials/restic/primary` stay as container
-paths; the Compose file maps their host sources.
+For additional repositories, copy the matching provider's files under unique
+names and add a YAML entry with the new paths. Container paths such as
+`/run/credentials/restic/aws-s3-repository-password.txt` stay as container paths;
+the Compose file maps their host sources.
 
 ## Empty installation or existing data
 
@@ -115,13 +121,15 @@ RESTIC_IMAGE=$(compose config --images backup)
 
 `validate` checks local YAML, env files and APNs keys. It does not contact a
 repository or prove that provider credentials, password or permissions work.
-Set up the `restic_primary` helper from
-[native restic maintenance](operations.md#native-restic-maintenance), matching
-the target's backend options. **Before starting backup**, run
-`restic_primary init` once for a new empty repository. For an existing
-repository, use `restic_primary snapshots` and `restic_primary check` instead.
-Repeat for every target; never initialize over an existing repository as a
-troubleshooting shortcut.
+Prepare a maintenance env file and the `restic_repository` helper as described in
+[native restic maintenance](operations.md#native-restic-maintenance). Maintenance
+env files are prepared by the operator and are not included in the templates.
+Match the target's backend options and select its maintenance file with
+`RESTIC_ENV_FILE`. **Before starting backup**, run `restic_repository init`
+once for a new empty repository. For an existing repository, use
+`restic_repository snapshots` and `restic_repository check` instead.
+Repeat for every target by changing `RESTIC_ENV_FILE`; never initialize over
+an existing repository as a troubleshooting shortcut.
 
 ## Start and verify
 

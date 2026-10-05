@@ -37,6 +37,9 @@ class OperatorExamples(unittest.TestCase):
             "PATH": str(binary) + os.pathsep + os.environ["PATH"],
             "DEPLOYMENT_ROOT": str(self.deployment),
             "RESTIC_IMAGE": "synthetic-restic",
+            "RESTIC_ENV_FILE": str(
+                self.deployment / "credentials/maintenance/aws-s3-maintenance.env"
+            ),
             "SNAPSHOT_ID": "a" * 64,
             "CALLS": str(self.calls),
         }
@@ -51,17 +54,34 @@ class OperatorExamples(unittest.TestCase):
         )
 
     def test_restore_accepts_new_path_then_refuses_to_reuse_it(self) -> None:
-        target = self.root / "restore"
-        result = self.run_example("native-restore-example", RESTORE_DIR=str(target))
-        self.assertEqual(result.returncode, 0, result.stderr)
-        calls = self.calls.read_text()
-        self.assertIn("restore " + "a" * 64 + " --verify --target /restore", calls)
-        self.assertIn("PRAGMA integrity_check;", calls)
-        (target / "evidence").write_text("retained")
-        result = self.run_example("native-restore-example", RESTORE_DIR=str(target))
-        self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(self.calls.read_text(), calls)
-        self.assertEqual((target / "evidence").read_text(), "retained")
+        for provider in ("aws-s3", "cloudflare-r2", "backblaze-b2"):
+            with self.subTest(provider=provider):
+                target = self.root / f"restore-{provider}"
+                env_file = str(
+                    self.deployment
+                    / f"credentials/maintenance/{provider}-maintenance.env"
+                )
+                result = self.run_example(
+                    "native-restore-example",
+                    RESTORE_DIR=str(target),
+                    RESTIC_ENV_FILE=env_file,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                calls = self.calls.read_text()
+                self.assertIn(f"--env-file {env_file}", calls.splitlines()[-2])
+                self.assertIn(
+                    "restore " + "a" * 64 + " --verify --target /restore", calls
+                )
+                self.assertIn("PRAGMA integrity_check;", calls)
+                (target / "evidence").write_text("retained")
+                result = self.run_example(
+                    "native-restore-example",
+                    RESTORE_DIR=str(target),
+                    RESTIC_ENV_FILE=env_file,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.calls.read_text(), calls)
+                self.assertEqual((target / "evidence").read_text(), "retained")
 
     def test_restore_refuses_existing_files_and_dangling_links(self) -> None:
         for kind in ("file", "directory", "link"):

@@ -22,15 +22,23 @@ deployment/
     vaultwarden.env
     backup.yaml
   credentials/
-    backup/primary.env
-    maintenance/primary.env
-    restic/primary
+    backup/
+      aws-s3-backup.env
+      cloudflare-r2-backup.env
+      backblaze-b2-backup.env
+      bark-apns-auth-key.p8      # operator-supplied, only when using Bark
+    restic/
+      aws-s3-repository-password.txt
+      cloudflare-r2-repository-password.txt
+      backblaze-b2-repository-password.txt
   data/
   cache/
   restore/
 ```
 
-Copy the files from `templates/`, then replace their placeholders.
+Copy the files from `templates/`, keep the destinations and notifications you
+need, and replace their placeholders. Remove unused YAML entries and their
+credential files. The APNs private key is not included in the templates.
 `compose.env` selects the absolute deployment root, the image tag supplied by
 the bundle, a non-root runtime UID/GID and the loopback listener port. Compose
 owns interpolation of this file. A clean Git build uses the `git-<commit>` image
@@ -102,25 +110,52 @@ Configuration is read at process startup; restart backup after changes.
 
 ```yaml
 targets:
-  - name: primary
-    env_file: /run/credentials/backup/primary.env
-    options:
-      - s3.bucket-lookup=path
-      - s3.region=us-east-1
-notifiers: []
+  - name: aws-s3
+    env_file: /run/credentials/backup/aws-s3-backup.env
+    options: []
+  - name: cloudflare-r2
+    env_file: /run/credentials/backup/cloudflare-r2-backup.env
+    options: []
+  - name: backblaze-b2
+    env_file: /run/credentials/backup/backblaze-b2-backup.env
+    options: []
 ```
 
 `name` identifies a destination in status and notifications. `env_file` is a
-path inside the backup container. Each `options` string becomes one restic
-`--option` value. Repository, authentication, passwords and backend settings
-use restic's environment directly:
+path inside the backup container. All retained destinations operate independently;
+their order does not define a priority or failover sequence. Each `options`
+string becomes one restic `--option` value. Repository, authentication, passwords
+and backend settings use restic's environment directly. For example,
+`credentials/backup/aws-s3-backup.env` contains:
 
 ```dotenv
-RESTIC_REPOSITORY=s3:https://s3.example.net/bucket/vaultwarden
-RESTIC_PASSWORD_FILE=/run/credentials/restic/primary
-AWS_ACCESS_KEY_ID=replace-with-backup-key
-AWS_SECRET_ACCESS_KEY=replace-with-backup-secret
+RESTIC_REPOSITORY=s3:https://s3.us-east-1.amazonaws.com/REPLACE_WITH_AWS_S3_BUCKET/vaultwarden-less
+AWS_DEFAULT_REGION=us-east-1
+RESTIC_PASSWORD_FILE=/run/credentials/restic/aws-s3-repository-password.txt
+AWS_ACCESS_KEY_ID=REPLACE_WITH_AWS_S3_BACKUP_ACCESS_KEY_ID
+AWS_SECRET_ACCESS_KEY=REPLACE_WITH_AWS_S3_BACKUP_SECRET_ACCESS_KEY
 ```
+
+The three templates use [restic's S3 backend](https://restic.readthedocs.io/en/stable/030_preparing_a_new_repo.html#amazon-s3)
+with these provider-specific inputs:
+
+| Destination | S3 endpoint in the example | `AWS_DEFAULT_REGION` | Credential pair |
+| --- | --- | --- | --- |
+| AWS S3 | `s3.us-east-1.amazonaws.com` | `us-east-1`; match the bucket | Access key ID and secret access key; add `AWS_SESSION_TOKEN` for temporary credentials |
+| Cloudflare R2 | `<ACCOUNT_ID>.r2.cloudflarestorage.com` | `auto` | R2 S3 Access Key ID and Secret Access Key |
+| Backblaze B2 | `s3.us-west-002.backblazeb2.com` | `us-west-002`; match the bucket | S3-compatible application key's keyID and applicationKey |
+
+Use the actual bucket endpoint and region. R2's S3 credentials and signing region
+are described in its [token guide](https://developers.cloudflare.com/r2/api/tokens/)
+and [S3 API reference](https://developers.cloudflare.com/r2/api/s3/api/).
+B2 uses the S3-compatible API in these examples; see its
+[restic guide](https://www.backblaze.com/docs/cloud-storage-integrate-restic-with-backblaze-b2)
+and [credential mapping](https://www.backblaze.com/docs/cloud-storage-use-the-aws-cli-with-backblaze-b2).
+When preparing a maintenance env file, copy the selected target's repository,
+region and password path. Setting the region in each env file also applies it to
+operator-run restic commands. The examples use restic's automatic bucket lookup;
+add an option such as `s3.bucket-lookup=path` only when your backend needs it,
+and use the same option during maintenance and restore.
 
 The worker uses Docker CLI's environment-file parser, with literal values and
 no shell expansion, interpolation, or fallback to its process environment.
@@ -128,10 +163,13 @@ Do not quote values as shell strings or `source` this file. Put the restic
 password in the referenced private file. Backend-specific settings remain
 native restic inputs; there is no fixed set of backend names.
 
-Give each installation its own repository or object-store prefix. Keep
-maintenance credentials in `credentials/maintenance/`, outside the backup
-mount. Use provider permissions appropriate for each role, including the
-operations needed for restic's lock objects. Test those permissions against
+Give each installation its own repository or object-store prefix. Prepare
+maintenance credentials separately when needed, following
+[native restic maintenance](operations.md#native-restic-maintenance); these files
+are not included in `templates/`. Keep them outside the backup mount, for example
+in an operator-created `credentials/maintenance/` directory. Use provider
+permissions appropriate for each role, including the operations needed for
+restic's lock objects. Test those permissions against
 the actual provider; Moto acceptance does not prove IAM restrictions. Avoid
 provider lifecycle rules that independently expire live restic objects.
 
@@ -142,14 +180,16 @@ that the process responds.
 
 ## Notifications
 
-These entries may be added to `notifiers`. Webhooks require HTTPS. Keep URLs,
-signing secrets and the Apple private key private.
+The template includes Enterprise WeChat and Bark APNs entries. Keep only the
+channels you use and replace their placeholders; `notifiers: []` disables all
+notifications. Feishu and DingTalk are also supported, as shown below. Webhooks
+require HTTPS. Keep URLs, signing secrets and the Apple private key private.
 
 ```yaml
 notifiers:
-  - name: operations-wecom
+  - name: wecom-operations
     type: wecom
-    webhook_url: https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=replace-me
+    webhook_url: https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=REPLACE_WITH_WECOM_WEBHOOK_KEY
   - name: operations-feishu
     type: feishu
     webhook_url: https://open.feishu.cn/open-apis/bot/v2/hook/replace-me
@@ -158,20 +198,24 @@ notifiers:
     type: dingtalk
     webhook_url: https://oapi.dingtalk.com/robot/send?access_token=replace-me
     secret: replace-me
-  - name: operations-bark
+  - name: bark-apns-operations
     type: bark
-    device_token: replace-with-device-token
-    auth_key_file: /run/credentials/backup/AuthKey.p8
-    key_id: replace-me
-    team_id: replace-me
+    device_token: REPLACE_WITH_APNS_DEVICE_TOKEN
+    auth_key_file: /run/credentials/backup/bark-apns-auth-key.p8
+    key_id: REPLACE_WITH_APNS_KEY_ID
+    team_id: REPLACE_WITH_APPLE_TEAM_ID
     topic: me.fin.bark
     sound: "1107"
 ```
 
 Feishu and DingTalk `secret` are optional when the robot does not use signing.
 Bark sends directly to Apple's production APNs endpoint over HTTP/2 using a
-PKCS#8 P-256 key and ES256 provider token. The topic must match the authorized
-application. Device tokens have no fixed length restriction. Omitting `sound`
+PKCS#8 P-256 key and ES256 provider token. Supply the private key at the configured
+path; templates do not include one, and local `validate` rejects a retained Bark
+entry without a readable valid key. The key, device token and topic must be
+authorized for the same application. An unrelated Apple developer key cannot
+push to the official Bark app. Use an APNs device token, not a Bark HTTP API
+device key. Device tokens have no fixed length restriction. Omitting `sound`
 uses `1107`; explicit empty or other sound values are preserved.
 
 All four channels use English Markdown reports. WeCom and DingTalk use their

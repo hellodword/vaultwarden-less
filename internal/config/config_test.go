@@ -1,6 +1,11 @@
 package config
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"encoding/pem"
 	"os"
 	"path/filepath"
 	"strings"
@@ -109,31 +114,65 @@ notifiers:
 }
 
 func TestShippedBackupTemplatesUseConsumerSyntax(t *testing.T) {
-	root := filepath.Join("..", "..", "templates")
+	root, err := filepath.Abs(filepath.Join("..", "..", "templates"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	document, err := os.ReadFile(filepath.Join(root, "config", "backup.yaml"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, role := range []string{"backup", "maintenance"} {
-		envPath, err := filepath.Abs(filepath.Join(root, "credentials", role, "primary.env"))
-		if err != nil {
-			t.Fatal(err)
-		}
-		path := filepath.Join(t.TempDir(), "backup.yaml")
-		data := strings.ReplaceAll(string(document), "/run/credentials/backup/primary.env", envPath)
-		if err := os.WriteFile(path, []byte(data), 0600); err != nil {
-			t.Fatal(err)
-		}
-		cfg, err := LoadBackup(path)
-		if err != nil || !cfg.Valid() || len(cfg.Targets) != 1 || len(cfg.Notifiers) != 0 {
-			t.Fatalf("invalid %s template: %v", role, err)
-		}
-		if len(cfg.Targets[0].Environment) != 4 || cfg.Targets[0].Environment[1] != "RESTIC_PASSWORD_FILE=/run/credentials/restic/primary" {
-			t.Fatalf("comments or container paths changed the %s environment", role)
-		}
+	// The operator supplies this key; the templates must not ship a private key.
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
 	}
-	password, err := os.ReadFile(filepath.Join(root, "credentials", "restic", "primary"))
-	if err != nil || len(password) != 0 {
-		t.Fatal("raw password placeholder must be empty, with instructions outside the file")
+	der, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPath := filepath.Join(t.TempDir(), "bark-apns-auth-key.p8")
+	if err := os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	regions := map[string]string{
+		"aws-s3":        "us-east-1",
+		"cloudflare-r2": "auto",
+		"backblaze-b2":  "us-west-002",
+	}
+	data := strings.ReplaceAll(string(document), "/run/credentials/backup/bark-apns-auth-key.p8", keyPath)
+	for name := range regions {
+		envPath := filepath.Join(root, "credentials", "backup", name+"-backup.env")
+		data = strings.ReplaceAll(data, "/run/credentials/backup/"+name+"-backup.env", envPath)
+	}
+	path := filepath.Join(t.TempDir(), "backup.yaml")
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadBackup(path)
+	if err != nil || !cfg.Valid() || len(cfg.Targets) != len(regions) || len(cfg.Notifiers) != 2 {
+		t.Fatalf("invalid backup template: %v", err)
+	}
+	if cfg.Notifiers[0].Type != "wecom" || cfg.Notifiers[1].Type != "bark" || cfg.Notifiers[1].Key == nil {
+		t.Fatal("expected working WeCom and Bark APNs examples after supplying a key")
+	}
+	for _, target := range cfg.Targets {
+		env := make(map[string]string)
+		for _, entry := range target.Environment {
+			name, value, _ := strings.Cut(entry, "=")
+			env[name] = value
+		}
+		region, ok := regions[target.Name]
+		passwordFile := target.Name + "-repository-password.txt"
+		if !ok || len(env) != 5 || env["AWS_DEFAULT_REGION"] != region ||
+			env["RESTIC_PASSWORD_FILE"] != "/run/credentials/restic/"+passwordFile ||
+			!strings.HasPrefix(env["RESTIC_REPOSITORY"], "s3:https://") ||
+			env["AWS_ACCESS_KEY_ID"] == "" || env["AWS_SECRET_ACCESS_KEY"] == "" {
+			t.Fatalf("incorrect native restic inputs for %s", target.Name)
+		}
+		password, err := os.ReadFile(filepath.Join(root, "credentials", "restic", passwordFile))
+		if err != nil || len(password) != 0 {
+			t.Fatalf("%s must be an empty raw password placeholder", passwordFile)
+		}
 	}
 }
