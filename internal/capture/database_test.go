@@ -55,103 +55,71 @@ func TestTypedComparisonAndSchema(t *testing.T) {
 	}
 }
 
-func TestOrdinaryExclusionsPreserveFullDatabase(t *testing.T) {
+// Table-driven transitions cover the explicit policy and conservative defaults.
+func TestEffectiveContentProjection(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "db")
-	sqlExec(t, path, `CREATE TABLE users(uuid TEXT PRIMARY KEY,password_hash,salt,password_iterations,updated_at,security_stamp,stamp_exception);
-INSERT INTO users VALUES('u','hash','salt',1,'one','stamp',NULL);
-CREATE TABLE devices(uuid TEXT PRIMARY KEY,name); INSERT INTO devices VALUES('d','a');
-CREATE TABLE sso_auth(state TEXT PRIMARY KEY,auth_response,code_response_error);`)
-	before := digests(t, path)
-	sqlExec(t, path, `UPDATE users SET updated_at='two',security_stamp='other',stamp_exception='{"security_stamp":"a","expire":1,"routes":["/a","/b"]}';
-DELETE FROM devices; INSERT INTO devices VALUES('new','b');
-INSERT INTO sso_auth VALUES('s','{"email":"a","expires_in":{"secs":2,"nanos":0}}','{"error":"bad","error_description":"x"}');`)
-	after := digests(t, path)
-	if before.Business != after.Business || before.Full == after.Full {
-		t.Fatal("authentication state was not excluded only from ordinary comparison")
-	}
-	if got := sqlExec(t, path, `SELECT password_hash||':'||security_stamp FROM users;`); got != "hash:other\n" {
-		t.Fatal("comparison modified database")
-	}
-	sqlExec(t, path, `UPDATE users SET password_hash='upgraded';`)
-	if next := digests(t, path); next.Business == after.Business {
-		t.Fatal("password hash upgrade ignored")
-	}
-	sqlExec(t, path, `ALTER TABLE devices ADD COLUMN future;`)
-	before = digests(t, path)
-	sqlExec(t, path, `DELETE FROM devices; INSERT INTO devices VALUES('another','b',NULL);`)
-	if digests(t, path).Business == before.Business {
-		t.Fatal("new column lost primary key context")
-	}
-}
-
-func TestJSONExclusionsAreStructural(t *testing.T) {
-	for _, tc := range []struct {
-		name    string
-		rule    *jsonRule
-		known   string
-		unknown []string
+	sqlExec(t, path, `CREATE TABLE users(uuid PRIMARY KEY,password_hash,updated_at,security_stamp,stamp_exception);
+ INSERT INTO users VALUES('u','hash','old','stamp',NULL);
+ CREATE TABLE devices(uuid PRIMARY KEY,updated_at,refresh_token,twofactor_remember,future);
+ INSERT INTO devices VALUES('d','old','token','remember',NULL);
+ CREATE TABLE twofactor(uuid PRIMARY KEY,user_uuid,atype INTEGER,enabled,last_used,data);
+ INSERT INTO twofactor VALUES('totp','u',0,1,0,'secret'),('email','u',1,1,0,'{"email":"a","attempts":0}'),('key','u',7,1,0,'[{"counter":1,"backup_state":false}]');
+ CREATE TABLE sends(uuid, max_access_count, access_count, revision_date); INSERT INTO sends VALUES('s',NULL,0,'old');
+ CREATE TABLE emergency_access(status,updated_at,last_notification_at,recovery_initiated_at); INSERT INTO emergency_access VALUES(0,'old',NULL,NULL);
+ CREATE TABLE auth_requests(data); CREATE TABLE sso_auth(data); CREATE TABLE twofactor_incomplete(data); CREATE TABLE twofactor_duo_ctx(data); CREATE TABLE event(data);`)
+	cases := []struct {
+		sql     string
+		changed bool
 	}{
-		{"stamp", stampRule(), `{"security_stamp":"x","expire":1,"routes":["a"]}`, []string{`{"routes":[{}]}`, `{"routes":{"future":{}}}`, `{"future":{}}`, `{"expire":{"future":null}}`}},
-		{"sso", ssoRule("auth_response"), `{"access_token":"x","expires_in":{"secs":1,"nanos":2}}`, []string{`{"expires_in":{"future":{}}}`, `{"expires_in":[]}`, `{"future":[]}`}},
-		{"register", factorRule(1003), `{"rs":{"policy":"x","challenge":"y","exclude_credentials":["a"],"credential_algorithms":[1],"extensions":{}}}`, []string{`{"rs":{"extensions":{"future":{}}}}`, `{"rs":{"credential_algorithms":[{}]}}`, `{"rs":{"future":{}}}`}},
-		{"login", factorRule(1004), `{"ast":{"credentials":[{"cred_id":"x","transports":["usb"],"cred":{"type_":"EC2","key":{"EC_EC2":{"curve":1,"x":"x","y":"y"}}},"attestation":{"data":"None","metadata":"None"},"extensions":{"cred_protect":"Ignored","cred_props":{"Set":{"rk":true}}}}]}}`, []string{`{"ast":{"credentials":[{"cred":{"key":{"EC_EC2":{"future":{}}}}}]}}`, `{"ast":{"credentials":[{"extensions":{"cred_props":{"Set":{"future":{}}}}}]}}`, `{"ast":{"credentials":[{"attestation":{"data":"Future"}}]}}`, `{"ast":{"credentials":[{"attestation":{"data":{"Basic":[{}]}}}]}}`}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			path := filepath.Join(t.TempDir(), "db")
-			sqlExec(t, path, "CREATE TABLE input(data); INSERT INTO input VALUES("+literal(tc.known)+");")
-			expression := filteredJSON("data", tc.rule)
-			if got := sqlExec(t, path, "SELECT ("+expression+") IS NULL FROM input;"); got != "1\n" {
-				t.Fatalf("known content remained: %s", got)
-			}
-			for _, value := range tc.unknown {
-				sqlExec(t, path, "UPDATE input SET data="+literal(value)+";")
-				if got := sqlExec(t, path, "SELECT ("+expression+") IS NULL FROM input;"); got != "0\n" {
-					t.Fatalf("unknown content disappeared: %s", value)
-				}
-			}
-			for _, value := range []string{"bad json", `"unexpected scalar"`, `42`, `null`} {
-				sqlExec(t, path, "UPDATE input SET data="+literal(value)+";")
-				if got := sqlExec(t, path, "SELECT ("+expression+") IS NULL FROM input;"); got != "0\n" {
-					t.Fatalf("unexpected value disappeared: %s", value)
-				}
-			}
-		})
+		{`UPDATE users SET updated_at='new',stamp_exception='anything';`, false},
+		{`UPDATE users SET security_stamp='revoked';`, true},
+		{`UPDATE users SET password_hash='upgraded';`, true},
+		{`UPDATE devices SET updated_at='new';`, false},
+		{`UPDATE devices SET refresh_token='rotated';`, true},
+		{`UPDATE devices SET twofactor_remember='revoked';`, true},
+		{`UPDATE devices SET future='durable';`, true},
+		{`DELETE FROM devices;`, true},
+		{`UPDATE twofactor SET last_used=1 WHERE atype=0;`, false},
+		{`UPDATE twofactor SET data='new-secret' WHERE atype=0;`, true},
+		{`UPDATE twofactor SET data='{"email":"a","last_token":"temp","token_sent":42,"attempts":2}' WHERE atype=1;`, false},
+		{`UPDATE twofactor SET data='{"email":"b","attempts":3}' WHERE atype=1;`, true},
+		{`UPDATE twofactor SET data='{"email":"b","future":{}}' WHERE atype=1;`, true},
+		{`UPDATE twofactor SET uuid='new-key' WHERE atype=7;`, false},
+		{`UPDATE twofactor SET data='[{"counter":2,"backup_state":true}]' WHERE atype=7;`, true},
+		{`INSERT INTO twofactor SELECT 'duplicate',user_uuid,atype,enabled,last_used,data FROM twofactor WHERE atype=7;`, true},
+		{`UPDATE sends SET access_count=1,revision_date='new';`, false},
+		{`UPDATE sends SET max_access_count=5;`, true},
+		{`UPDATE sends SET access_count=2;`, true},
+		{`UPDATE sends SET max_access_count=10;`, true},
+		{`UPDATE sends SET max_access_count=NULL;`, true},
+		{`UPDATE sends SET access_count=3;`, false},
+		{`UPDATE emergency_access SET updated_at='new',last_notification_at='now';`, false},
+		{`UPDATE emergency_access SET recovery_initiated_at='now';`, true},
+		{`UPDATE emergency_access SET status=1;`, true},
+		{`INSERT INTO twofactor VALUES('future','u',9001,1,0,'{}');`, true},
 	}
-}
-
-func TestFactorTypesAndDuplicateRows(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "db")
-	sqlExec(t, path, `CREATE TABLE twofactor(uuid TEXT PRIMARY KEY,user_uuid,atype INTEGER,enabled,last_used,data);
-INSERT INTO twofactor VALUES('p','u',7,1,0,'[{"credential":{"cred":{"counter":1,"backup_state":false,"key":"persistent"}}}]');
-INSERT INTO twofactor VALUES('e','u',1,1,0,'{"email":"a","attempts":0}');
-INSERT INTO twofactor VALUES('o','u',0,1,0,'secret');`)
-	before := digests(t, path)
-	sqlExec(t, path, `UPDATE twofactor SET uuid='new-p',data='[{"credential":{"cred":{"counter":9,"backup_state":true,"key":"persistent"}}}]' WHERE atype=7;
-UPDATE twofactor SET data='{"email":"a","attempts":8}' WHERE atype=1;
-UPDATE twofactor SET last_used=5 WHERE atype=0;`)
-	if got := digests(t, path); got.Business != before.Business || got.Full == before.Full {
-		t.Fatal("persistent factor exclusions incorrect")
+	for _, table := range []string{"auth_requests", "sso_auth", "twofactor_incomplete", "twofactor_duo_ctx", "event"} {
+		cases = append(cases, struct {
+			sql     string
+			changed bool
+		}{"INSERT INTO " + table + " VALUES('temporary');", false})
 	}
-	for _, kind := range []int{1002, 1003, 1004, 2000} {
-		before = digests(t, path)
-		sqlExec(t, path, fmt.Sprintf("INSERT INTO twofactor VALUES('temp%d','u',%d,1,3,'{}');", kind, kind))
-		if digests(t, path).Business != before.Business {
-			t.Fatalf("temporary factor %d row included", kind)
+	for _, kind := range []int{1000, 1001, 1002, 1003, 1004, 2000} {
+		cases = append(cases, struct {
+			sql     string
+			changed bool
+		}{fmt.Sprintf("INSERT INTO twofactor VALUES('temp%d','u',%d,1,0,'{\"future\":{}}');", kind, kind), false})
+	}
+	for _, tc := range cases {
+		before := digests(t, path)
+		sqlExec(t, path, tc.sql)
+		after := digests(t, path)
+		if (before.Business != after.Business) != tc.changed {
+			t.Fatalf("effective change=%v for %s", !tc.changed, tc.sql)
 		}
-		sqlExec(t, path, fmt.Sprintf("UPDATE twofactor SET data='{\"future\":{}}' WHERE atype=%d;", kind))
-		if digests(t, path).Business == before.Business {
-			t.Fatalf("temporary factor %d unknown key ignored", kind)
+		if before.Full == after.Full {
+			t.Fatalf("full content not retained: %s", tc.sql)
 		}
-	}
-	before = digests(t, path)
-	sqlExec(t, path, `INSERT INTO twofactor SELECT 'duplicate',user_uuid,atype,enabled,last_used,data FROM twofactor WHERE atype=7;`)
-	if digests(t, path).Business == before.Business {
-		t.Fatal("duplicate credential row was deduplicated")
-	}
-	before = digests(t, path)
-	sqlExec(t, path, `INSERT INTO twofactor VALUES('future','u',9001,1,0,'{}');`)
-	if digests(t, path).Business == before.Business {
-		t.Fatal("unknown factor type ignored")
 	}
 }
 

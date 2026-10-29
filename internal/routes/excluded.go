@@ -74,7 +74,6 @@ GET /api/organizations/{org_id}/users/{member_id}/reset-password-details
 GET /api/organizations/{org_id}/export
 GET /api/sends
 GET /api/sends/{send_id}
-GET /api/sends/{send_id}/{file_id}
 GET /api/two-factor
 GET /api/two-factor/get-device-verification-settings
 GET /icons/{host}/icon.png
@@ -102,8 +101,6 @@ POST /api/accounts/delete-recover
 POST /api/accounts/password-hint
 POST /api/accounts/request-otp
 POST /api/accounts/verify-otp
-POST /api/devices/identifier/{device_id}/token
-POST /api/devices/identifier/{device_id}/clear-token
 POST /api/auth-requests
 POST /api/two-factor/get-recover
 POST /api/two-factor/get-authenticator
@@ -115,19 +112,11 @@ POST /api/two-factor/get-webauthn
 POST /api/two-factor/get-webauthn-challenge
 POST /api/organizations/domain/sso/verified
 POST /api/organizations/{org_id}/users/public-keys
-POST /api/sends/access
-POST /api/sends/access/{access_id}
-POST /api/sends/access/file/{file_id}
-POST /api/sends/{send_id}/access/file/{file_id}
-POST /api/emergency-access/{emer_id}/view
-POST /api/emergency-access/{emer_id}/takeover
 POST /events/collect
 POST /admin/
 POST /admin/test/smtp
 POST /admin/users/{user_id}/invite/resend
 POST /admin/users/update_revision
 POST /admin/config/backup_db
-PUT /api/devices/identifier/{device_id}/token
-PUT /api/devices/identifier/{device_id}/clear-token
 PUT /api/auth-requests/{auth_request_id}
 `

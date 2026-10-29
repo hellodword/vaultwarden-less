@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/hellodword/vaultwarden-less/internal/routes"
@@ -13,7 +14,8 @@ const (
 	ListenAddress = "0.0.0.0:9090"
 	HealthPath    = "/healthz"
 	EventsPath    = "/events"
-	CheckPath     = "/checks"
+	BackupPath    = "/backups"
+	VerifyPath    = "/verifications"
 	StatusPath    = "/status"
 )
 
@@ -32,16 +34,46 @@ func Handler(worker *Worker) http.Handler {
 			}
 			worker.Events(events)
 			w.WriteHeader(http.StatusNoContent)
-		case r.Method == http.MethodPost && r.URL.Path == CheckPath:
-			var check struct {
-				Full *bool `json:"full"`
+		case r.Method == http.MethodPost && r.URL.Path == BackupPath:
+			var body struct {
+				Force *bool `json:"force"`
 			}
-			if !decode(w, r, &check) || check.Full == nil {
-				writeError(w, http.StatusBadRequest, "invalid_check")
+			if !decode(w, r, &body) || body.Force == nil {
+				writeError(w, http.StatusBadRequest, "invalid_backup")
 				return
 			}
-			worker.Request(*check.Full)
-			writeJSON(w, http.StatusAccepted, map[string]bool{"accepted": true})
+			op, err := worker.Backup(*body.Force)
+			if err != nil {
+				writeError(w, http.StatusServiceUnavailable, "operations_busy")
+				return
+			}
+			writeJSON(w, http.StatusAccepted, op)
+		case r.Method == http.MethodPost && r.URL.Path == VerifyPath:
+			var body struct {
+				Target   string `json:"target"`
+				ReadData *bool  `json:"read_data"`
+			}
+			if !decode(w, r, &body) || body.ReadData == nil || body.Target == "" {
+				writeError(w, http.StatusBadRequest, "invalid_verification")
+				return
+			}
+			op, err := worker.Verify(body.Target, *body.ReadData)
+			if err != nil {
+				status := http.StatusBadRequest
+				if err.Error() == "operations_busy" {
+					status = http.StatusServiceUnavailable
+				}
+				writeError(w, status, err.Error())
+				return
+			}
+			writeJSON(w, http.StatusAccepted, op)
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/operations/"):
+			op, ok := worker.Operation(strings.TrimPrefix(r.URL.Path, "/operations/"))
+			if !ok {
+				writeError(w, http.StatusNotFound, "operation_unknown")
+				return
+			}
+			writeJSON(w, http.StatusOK, op)
 		default:
 			writeError(w, http.StatusNotFound, "not_found")
 		}

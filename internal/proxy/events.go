@@ -83,3 +83,30 @@ func (s *EventSender) send(ctx context.Context, event routes.Summary) error {
 	}
 	return nil
 }
+
+// Flush runs after request draining and after the periodic sender has stopped.
+// Its caller supplies the separate, bounded shutdown delivery deadline.
+func (s *EventSender) Flush(ctx context.Context) error {
+	for {
+		s.mu.Lock()
+		event := s.pending
+		s.pending = routes.Summary{}
+		s.mu.Unlock()
+		if event.Empty() {
+			return nil
+		}
+		if err := s.send(ctx, event); err == nil {
+			continue
+		}
+		s.mu.Lock()
+		s.pending.Merge(event)
+		s.mu.Unlock()
+		timer := time.NewTimer(EventRetry)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}

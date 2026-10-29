@@ -1,31 +1,28 @@
 package worker
 
 import (
-	"time"
-
 	"github.com/hellodword/vaultwarden-less/internal/routes"
+	"time"
 )
 
 const (
 	quietWindow      = 30 * time.Second
 	maximumWait      = 2 * time.Minute
 	ordinaryInterval = 6 * time.Hour
-	fullInterval     = 7 * 24 * time.Hour
 	sourceRetry      = 5 * time.Minute
 )
 
 type task struct {
-	Full, ReadAll bool
-	Reasons       map[string]uint64
-	Events        routes.Summary
+	Generation uint64
+	Reasons    map[string]uint64
+	Events     routes.Summary
+	Operations []string
 }
 type schedule struct {
-	pending                task
-	first, last            time.Time
-	urgent                 bool
-	nextOrdinary, nextFull time.Time
-	retryAt                time.Time
-	retryFull              bool
+	pending               task
+	first, last           time.Time
+	urgent                bool
+	nextOrdinary, retryAt time.Time
 }
 
 func (s *schedule) reason(reason string) {
@@ -35,17 +32,13 @@ func (s *schedule) reason(reason string) {
 	s.pending.Reasons[reason]++
 }
 func (s *schedule) start(now time.Time) {
-	s.nextOrdinary = now.Add(ordinaryInterval)
-	s.nextFull = now.Add(fullInterval)
-	s.manual(true)
-	s.pending.Reasons = map[string]uint64{"startup": 1}
-}
-func (s *schedule) manual(full bool) {
+	if s.nextOrdinary.IsZero() {
+		s.nextOrdinary = now.Add(ordinaryInterval)
+	}
 	s.urgent = true
-	s.pending.Full = s.pending.Full || full
-	s.pending.ReadAll = s.pending.ReadAll || full
-	s.reason("manual")
+	s.reason("startup")
 }
+func (s *schedule) manual() { s.urgent = true; s.reason("manual") }
 func (s *schedule) event(now time.Time, events routes.Summary) {
 	if s.first.IsZero() {
 		s.first = now
@@ -55,23 +48,13 @@ func (s *schedule) event(now time.Time, events routes.Summary) {
 	s.reason("request")
 }
 func (s *schedule) tick(now time.Time) {
-	for !s.nextOrdinary.IsZero() && !s.nextOrdinary.After(now) {
+	if !s.nextOrdinary.IsZero() && !s.nextOrdinary.After(now) {
 		s.reason("scheduled")
-		s.pending.ReadAll = true
 		s.urgent = true
-		s.nextOrdinary = s.nextOrdinary.Add(ordinaryInterval)
-	}
-	for !s.nextFull.IsZero() && !s.nextFull.After(now) {
-		s.reason("scheduled_full")
-		s.pending.Full = true
-		s.pending.ReadAll = true
-		s.urgent = true
-		s.nextFull = s.nextFull.Add(fullInterval)
+		s.nextOrdinary = now.Add(ordinaryInterval)
 	}
 	if !s.retryAt.IsZero() && !s.retryAt.After(now) {
 		s.reason("source_retry")
-		s.pending.Full = s.pending.Full || s.retryFull
-		s.pending.ReadAll = true
 		s.urgent = true
 		s.retryAt = time.Time{}
 	}
@@ -86,21 +69,14 @@ func (s *schedule) sourceDue(now time.Time) time.Time {
 	return earlier(s.last.Add(quietWindow), s.first.Add(maximumWait))
 }
 func (s *schedule) take() task {
-	value := s.pending
-	value.Full = value.Full || s.retryFull
-	value.ReadAll = value.ReadAll || value.Full
+	t := s.pending
 	s.pending = task{}
 	s.first = time.Time{}
 	s.last = time.Time{}
 	s.urgent = false
-	return value
+	return t
 }
-func (s *schedule) complete(now time.Time, full, compared, retry bool) {
-	if full && !compared {
-		s.retryFull = true
-	} else if full && compared {
-		s.retryFull = false
-	}
+func (s *schedule) complete(now time.Time, retry bool) {
 	if retry {
 		s.retryAt = now.Add(sourceRetry)
 	} else {

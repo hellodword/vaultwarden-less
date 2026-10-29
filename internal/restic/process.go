@@ -73,7 +73,18 @@ func (r Runner) run(
 		return nil, &OperationError{Code: "output_limit", ExitCode: exitCode}
 	}
 	if waitError != nil {
-		return nil, &OperationError{Code: "command_failed", ExitCode: exitCode}
+		code := "command_failed"
+		switch exitCode {
+		case 3:
+			code = "source_read_failed"
+		case 10:
+			code = "repository_missing"
+		case 11:
+			code = "repository_locked"
+		case 12:
+			code = "password_incorrect"
+		}
+		return nil, &OperationError{Code: code, ExitCode: exitCode}
 	}
 	return stdout.data, nil
 }

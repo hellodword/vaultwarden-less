@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestIndependentConfigurationErrors(t *testing.T) {
@@ -19,7 +20,8 @@ func TestIndependentConfigurationErrors(t *testing.T) {
     typo: secret-do-not-log
   - name: healthy
     env_file: /run/primary.env
-notifiers:
+notifications:
+ channels:
   - name: bad
     type: wecom
     webhook_url: https://example.test/send
@@ -32,15 +34,15 @@ notifiers:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Targets[0].Error == "" || cfg.Targets[1].Error != "" || cfg.Notifiers[0].Error == "" || cfg.Notifiers[1].Error != "" {
+	if cfg.Targets[0].Error == "" || cfg.Targets[1].Error != "" || cfg.Notifications.Channels[0].Error == "" || cfg.Notifications.Channels[1].Error != "" {
 		t.Fatalf("configuration isolation failed")
 	}
-	for _, data := range []string{"targets: []\nnotifiers: []\ntypo: 1", "[invalid", "targets: []\n---\ntargets: []"} {
+	for _, data := range []string{"targets: []\nnotifications: {channels: []}\ntypo: 1", "[invalid", "targets: []\n---\ntargets: []"} {
 		if _, err := DecodeBackup([]byte(data)); err == nil {
 			t.Fatal("accepted invalid document")
 		}
 	}
-	if cfg, err := DecodeBackup([]byte("targets: []\nnotifiers: []\n")); err != nil || !cfg.Valid() {
+	if cfg, err := DecodeBackup([]byte("targets: []\nnotifications: {channels: []}\n")); err != nil || !cfg.Valid() {
 		t.Fatal("empty configuration invalid")
 	}
 }
@@ -55,7 +57,7 @@ func TestDockerLiteralEnvironmentAndNoInheritance(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "second.env"), []byte("RESTIC_REPOSITORY=/second\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	document := "targets:\n  - name: first\n    env_file: " + filepath.Join(dir, "primary.env") + "\n  - name: second\n    env_file: " + filepath.Join(dir, "second.env") + "\nnotifiers: []\n"
+	document := "targets:\n  - name: first\n    env_file: " + filepath.Join(dir, "primary.env") + "\n  - name: second\n    env_file: " + filepath.Join(dir, "second.env") + "\nnotifications: {channels: []}\n"
 	path := filepath.Join(dir, "backup.yaml")
 	if err := os.WriteFile(path, []byte(document), 0o600); err != nil {
 		t.Fatal(err)
@@ -92,7 +94,8 @@ func TestNamesAndSound(t *testing.T) {
     env_file: /one
   - name: 同名
     env_file: /two
-notifiers:
+notifications:
+ channels:
   - name: bark
     type: bark
     device_token: varying-length
@@ -108,7 +111,7 @@ notifiers:
 	if cfg.Targets[0].Error != "duplicate_name" || cfg.Targets[1].Error != "duplicate_name" {
 		t.Fatal("duplicate targets accepted")
 	}
-	if cfg.Notifiers[0].Error != "" || cfg.Notifiers[0].Sound != "" {
+	if cfg.Notifications.Channels[0].Error != "" || cfg.Notifications.Channels[0].Sound != "" {
 		t.Fatal("explicit sound or varying token length changed")
 	}
 }
@@ -142,7 +145,15 @@ func TestShippedBackupTemplatesUseConsumerSyntax(t *testing.T) {
 	}
 	data := strings.ReplaceAll(string(document), "/run/credentials/backup/bark-apns-auth-key.p8", keyPath)
 	for name := range regions {
-		envPath := filepath.Join(root, "credentials", "backup", name+"-backup.env")
+		original := filepath.Join(root, "credentials", "backup", name+"-backup.env")
+		contents, err := os.ReadFile(original)
+		if err != nil {
+			t.Fatal(err)
+		}
+		passwordPath := filepath.Join(t.TempDir(), name+"-repository-password.txt")
+		os.WriteFile(passwordPath, []byte("synthetic-only"), 0o600)
+		envPath := filepath.Join(t.TempDir(), name+"-backup.env")
+		os.WriteFile(envPath, []byte(strings.ReplaceAll(string(contents), "/run/credentials/restic/"+name+"-repository-password.txt", passwordPath)), 0o600)
 		data = strings.ReplaceAll(data, "/run/credentials/backup/"+name+"-backup.env", envPath)
 	}
 	path := filepath.Join(t.TempDir(), "backup.yaml")
@@ -150,11 +161,8 @@ func TestShippedBackupTemplatesUseConsumerSyntax(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg, err := LoadBackup(path)
-	if err != nil || !cfg.Valid() || len(cfg.Targets) != len(regions) || len(cfg.Notifiers) != 2 {
+	if err != nil || !cfg.Valid() || len(cfg.Targets) != len(regions) || len(cfg.Notifications.Channels) != 0 {
 		t.Fatalf("invalid backup template: %v", err)
-	}
-	if cfg.Notifiers[0].Type != "wecom" || cfg.Notifiers[1].Type != "bark" || cfg.Notifiers[1].Key == nil {
-		t.Fatal("expected working WeCom and Bark APNs examples after supplying a key")
 	}
 	for _, target := range cfg.Targets {
 		env := make(map[string]string)
@@ -165,7 +173,7 @@ func TestShippedBackupTemplatesUseConsumerSyntax(t *testing.T) {
 		region, ok := regions[target.Name]
 		passwordFile := target.Name + "-repository-password.txt"
 		if !ok || len(env) != 5 || env["AWS_DEFAULT_REGION"] != region ||
-			env["RESTIC_PASSWORD_FILE"] != "/run/credentials/restic/"+passwordFile ||
+			!strings.HasSuffix(env["RESTIC_PASSWORD_FILE"], "/"+passwordFile) ||
 			!strings.HasPrefix(env["RESTIC_REPOSITORY"], "s3:https://") ||
 			env["AWS_ACCESS_KEY_ID"] == "" || env["AWS_SECRET_ACCESS_KEY"] == "" {
 			t.Fatalf("incorrect native restic inputs for %s", target.Name)
@@ -173,6 +181,42 @@ func TestShippedBackupTemplatesUseConsumerSyntax(t *testing.T) {
 		password, err := os.ReadFile(filepath.Join(root, "credentials", "restic", passwordFile))
 		if err != nil || len(password) != 0 {
 			t.Fatalf("%s must be an empty raw password placeholder", passwordFile)
+		}
+	}
+}
+
+func TestVerificationOptInAndNotificationSchedule(t *testing.T) {
+	cfg, err := DecodeBackup([]byte(`targets:
+ - name: both
+   env_file: /both
+   verify:
+     structure_interval: 24h
+     read_data_interval: 720h
+ - name: structure
+   env_file: /structure
+   verify:
+     structure_interval: 24h
+ - name: manual
+   env_file: /manual
+ - name: invalid
+   env_file: /invalid
+   verify:
+     read_data_interval: -1h
+notifications:
+ timezone: Asia/Shanghai
+ daily_at: "21:00"
+ reminder_interval: 6h
+ channels: []
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Targets[0].Verify.ReadDataEvery != 720*time.Hour || cfg.Targets[1].Verify.ReadDataEvery != 0 || cfg.Targets[2].Verify.StructureEvery != 0 || cfg.Targets[3].Error != "invalid_verify_config" {
+		t.Fatal("verification defaults or isolation wrong")
+	}
+	for _, body := range []string{"timezone: Missing/Zone", "daily_at: '25:00'", "reminder_interval: 0h", "typo: value"} {
+		if _, err := DecodeBackup([]byte("targets: []\nnotifications:\n  " + body + "\n")); err == nil {
+			t.Fatal("invalid notification root accepted")
 		}
 	}
 }

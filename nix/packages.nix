@@ -56,6 +56,7 @@ let
     ];
     config = {
       WorkingDir = "/";
+      User = "1000:1000";
       Entrypoint = [ "/bin/vaultwarden-less-backup" ];
       Cmd = [ "serve" ];
       Labels = labels "Vaultwarden native backup";
@@ -68,6 +69,7 @@ let
     contents = [ proxy ];
     config = {
       WorkingDir = "/";
+      User = "1000:1000";
       Entrypoint = [ "/bin/vaultwarden-less-proxy" ];
       Cmd = [ "serve" ];
       Labels = labels "Vaultwarden request proxy";
@@ -91,6 +93,7 @@ let
     extraCommands = "ln -s ${vaultwardenHealthcheck}/bin/healthcheck.sh healthcheck.sh";
     config = {
       WorkingDir = "/";
+      User = "1000:1000";
       Entrypoint = [ "/bin/vaultwarden" ];
       Env = [
         "ROCKET_ADDRESS=0.0.0.0"

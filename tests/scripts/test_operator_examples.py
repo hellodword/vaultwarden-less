@@ -3,6 +3,7 @@
 import os
 import shutil
 import subprocess
+import tarfile
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,7 +12,8 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def example(name: str) -> str:
-    document = (ROOT / "docs/operations.md").read_text()
+    filename = "deployment.md" if name == "native-import-example" else "operations.md"
+    document = (ROOT / "docs" / filename).read_text()
     return document.split(f"<!-- {name} -->\n```sh\n", 1)[1].split("\n```", 1)[0]
 
 
@@ -82,6 +84,53 @@ class OperatorExamples(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(self.calls.read_text(), calls)
                 self.assertEqual((target / "evidence").read_text(), "retained")
+
+    def test_native_import_preserves_archive_and_sidecars_and_refuses_nonempty_data(
+        self,
+    ) -> None:
+        source = self.root / "synthetic"
+        source.mkdir()
+        for name in (
+            "db.sqlite3",
+            "db.sqlite3-wal",
+            "db.sqlite3-shm",
+            "config.json",
+            "rsa_key.pem",
+        ):
+            (source / name).write_text("synthetic " + name)
+        (source / "empty").mkdir()
+        (source / "link").symlink_to("config.json")
+        archive = self.root / "native.tar"
+        with tarfile.open(archive, "w") as stream:
+            stream.add(source, arcname="export/data")
+        original = archive.read_bytes()
+        stage = self.root / "stage-rejected"
+        result = self.run_example(
+            "native-import-example",
+            ARCHIVE=str(archive),
+            IMPORT_STAGE=str(stage),
+            IMPORT_DATA_ROOT=str(stage / "export/data"),
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual((self.deployment / "data/keep").read_text(), "original")
+        destination = self.root / "empty-deployment"
+        (destination / "data").mkdir(parents=True)
+        stage = self.root / "stage-accepted"
+        result = self.run_example(
+            "native-import-example",
+            ARCHIVE=str(archive),
+            IMPORT_STAGE=str(stage),
+            IMPORT_DATA_ROOT=str(stage / "export/data"),
+            DEPLOY_DIR=str(destination),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(archive.read_bytes(), original)
+        self.assertEqual(
+            (destination / "data/db.sqlite3-wal").read_text(),
+            "synthetic db.sqlite3-wal",
+        )
+        self.assertTrue((destination / "data/empty").is_dir())
+        self.assertEqual((destination / "data/link").readlink(), Path("config.json"))
 
     def test_restore_refuses_existing_files_and_dangling_links(self) -> None:
         for kind in ("file", "directory", "link"):

@@ -10,6 +10,7 @@ credentials in the source checkout.
 | `compose.yml` (from the bundle root) | Relative host paths, runtime UID/GID and loopback port | Recreate affected services |
 | `compose.env` | Compose interpolation: the shared image tag | Recreate affected services |
 | `config/vaultwarden.env` | Compose service `env_file`, then Vaultwarden; minimal-feature defaults | Recreate Vaultwarden |
+| `config/vaultwarden-runtime.json` | Read-only `{}` selected by CONFIG_FILE; imported data/config.json stays inactive | Keep empty |
 | `config/backup.yaml` | Backup worker: destinations and notifications | Restart backup |
 | `credentials/backup/<target>-backup.env` | Worker using Docker's env-file parser; native restic backend credentials | Restart backup |
 | `credentials/restic/<target>-repository-password.txt` | Native restic password file, shared by both roles for that repository | Next restic command; changing this file alone does not change a repository key |
@@ -36,22 +37,18 @@ before `restic init`, or the existing password when adopting a repository. It is
 for the password. Keep an independent secure copy along with the repository location and recovery
 access. Changing a repository password requires native restic key management.
 
-Two notifier examples are included in `config/backup.yaml`: `wecom-operations`
-for an Enterprise WeChat group robot, and `bark-apns-operations` for direct Apple
-APNs delivery to Bark. Replace the webhook and APNs placeholders for the channels
-you keep. For Bark, supply the authorized app's P-256 PKCS#8 private key as
-`credentials/backup/bark-apns-auth-key.p8`; no key file is shipped. The device
-token, key and topic must be authorized for the same app. An unrelated Apple
-developer key cannot push to the official Bark app. Local `validate` fails
-until that key is supplied or the Bark entry is removed. Remove other unused
-notifier entries too; `notifiers: []` disables notifications.
+Notification delivery defaults to disabled (`notifications.channels: []`).
+Commented examples cover WeCom, DingTalk, Feishu and Bark/APNs. Enable only your
+own endpoints. Bark requires an authorized P-256 PKCS#8 key, device token and
+topic; no private key is shipped. Verification intervals are per-target examples;
+an omitted type is never enabled implicitly. See the configuration reference.
 
 Use private directory permissions (0700) and file permissions (0600), readable
 by the selected non-root runtime UID/GID. Replace every example URL and key.
 Restic env files use literal values; Compose's env files instead support
 interpolation and quoting. None of these files should be sourced by a shell.
 
-Paths beginning `/data`, `/cache`, `/config` or `/run/credentials` refer to the
+Paths beginning `/data`, `/state`, `/cache`, `/config` or `/run/credentials` refer to the
 container mount contract. Bind sources such as `./data` and the service
 `env_file` resolve relative to the deployment's `compose.yml`. Set the shared
 `user` and proxy's host port directly in that file; `compose.env` holds only

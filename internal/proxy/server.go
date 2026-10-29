@@ -82,11 +82,42 @@ func newServer(upstream *url.URL, record func(string, string, bool), log *slog.L
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if s.record != nil && routes.Trigger(r.Method, r.URL.EscapedPath()) {
+	trigger := routes.Trigger(r.Method, r.URL.EscapedPath())
+	if s.record != nil && trigger {
 		s.record(r.Method, r.URL.EscapedPath(), true)
 		defer s.record(r.Method, r.URL.EscapedPath(), false)
 	}
-	s.proxy.ServeHTTP(w, r)
+	response := &responseStatus{ResponseWriter: w}
+	completed := false
+	defer func() {
+		// Errors and interrupted responses remain conservative clues, including
+		// handlers normally excluded as reads or temporary authentication work.
+		if s.record != nil && !trigger && (!completed || response.code >= 400 || r.Context().Err() != nil) {
+			s.record(r.Method, r.URL.EscapedPath(), true)
+			s.record(r.Method, r.URL.EscapedPath(), false)
+		}
+	}()
+	s.proxy.ServeHTTP(response, r)
+	completed = true
+}
+
+type responseStatus struct {
+	http.ResponseWriter
+	code int
+}
+
+func (w *responseStatus) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+func (w *responseStatus) WriteHeader(code int) {
+	if code >= 200 && w.code == 0 {
+		w.code = code
+	}
+	w.ResponseWriter.WriteHeader(code)
+}
+func (w *responseStatus) Write(data []byte) (int, error) {
+	if w.code == 0 {
+		w.code = http.StatusOK
+	}
+	return w.ResponseWriter.Write(data)
 }
 
 func (s *Server) ListenAndServe() error {
@@ -111,7 +142,12 @@ func (s *Server) ListenAndServe() error {
 }
 
 func (s *Server) Shutdown(ctx context.Context) error {
-	return errors.Join(s.http.Shutdown(ctx), s.health.Shutdown(ctx))
+	err := errors.Join(s.http.Shutdown(ctx), s.health.Shutdown(ctx))
+	if err != nil {
+		s.http.Close()
+		s.health.Close()
+	}
+	return err
 }
 
 func (s *Server) rewrite(pr *httputil.ProxyRequest) {

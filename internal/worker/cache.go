@@ -1,17 +1,11 @@
 package worker
 
 import (
-	"context"
 	"encoding/hex"
-	"errors"
-	"os"
-	"path/filepath"
-	"slices"
 	"strings"
+	"time"
 
-	"github.com/hellodword/vaultwarden-less/internal/capture"
-	"github.com/hellodword/vaultwarden-less/internal/config"
-	"github.com/hellodword/vaultwarden-less/internal/restic"
+	"github.com/hellodword/vaultwarden-less/internal/state"
 )
 
 func nativeID(value string) bool {
@@ -22,11 +16,8 @@ func nativeID(value string) bool {
 	return err == nil
 }
 func payloadName(value string) bool {
-	if !strings.HasPrefix(value, "payload-") {
-		return false
-	}
-	suffix := strings.TrimPrefix(value, "payload-")
-	if suffix == "" {
+	suffix, ok := strings.CutPrefix(value, "payload-")
+	if !ok || suffix == "" {
 		return false
 	}
 	for _, r := range suffix {
@@ -36,49 +27,46 @@ func payloadName(value string) bool {
 	}
 	return true
 }
-func loadBaseline(ctx context.Context, cache string, target config.Target, latest *restic.Snapshot) (*capture.Payload, error) {
-	if latest == nil || !nativeID(latest.ID) {
-		return nil, nil
-	}
-	link, err := os.Readlink(filepath.Join(cache, "baselines", restic.CacheKey(target), latest.ID))
-	if err != nil {
-		return nil, err
-	}
-	name := filepath.Base(link)
-	if link != filepath.Join("..", "..", "payloads", name) || !payloadName(name) {
-		return nil, errors.New("invalid baseline reference")
-	}
-	tag := ""
-	if slices.Contains(latest.Tags, "complete") {
-		tag = "complete"
-	}
-	if slices.Contains(latest.Tags, "incomplete") {
-		tag = "incomplete"
-	}
-	return capture.Load(ctx, filepath.Join(cache, "payloads", name), tag)
+
+type durable struct {
+	Source       Status                  `json:"source"`
+	Targets      map[string]TargetStatus `json:"targets"`
+	NextOrdinary time.Time               `json:"next_ordinary"`
+	SourceRetry  time.Time               `json:"source_retry"`
+	Reports      reportState             `json:"reports"`
 }
-func saveBaseline(cache string, target config.Target, id string, p *capture.Payload) error {
-	if !nativeID(id) || !payloadName(filepath.Base(p.Directory)) {
-		return errors.New("invalid baseline association")
-	}
-	dir := filepath.Join(cache, "baselines", restic.CacheKey(target))
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+
+func (w *Worker) Restore(store state.Store) error {
+	w.store = store
+	var saved durable
+	if err := store.Load("worker.json", &saved); err != nil {
 		return err
 	}
-	link := filepath.Join(dir, id)
-	if err := os.Symlink(filepath.Join("..", "..", "payloads", filepath.Base(p.Directory)), link); err != nil && !errors.Is(err, os.ErrExist) {
-		return err
+	if saved.Source.Source != "" {
+		w.status = saved.Source
 	}
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return err
+	w.schedule.nextOrdinary = saved.NextOrdinary
+	w.schedule.retryAt = saved.SourceRetry
+	if saved.Reports.Faults != nil {
+		w.reportState = saved.Reports
 	}
-	for _, entry := range entries {
-		if entry.Name() != id && nativeID(entry.Name()) && entry.Type()&os.ModeSymlink != 0 {
-			if err := os.Remove(filepath.Join(dir, entry.Name())); err != nil {
-				return err
-			}
+	for _, t := range w.targets {
+		if t.config.Error != "" {
+			continue
+		}
+		if previous, ok := saved.Targets[t.config.Name]; ok {
+			t.status = previous
+			t.status.Operation = ""
+			t.status.Uploading = false
+			t.status.State = "initializing"
 		}
 	}
 	return nil
+}
+func (w *Worker) persist() error {
+	saved := durable{Source: w.status, Targets: map[string]TargetStatus{}, NextOrdinary: w.schedule.nextOrdinary, SourceRetry: w.schedule.retryAt, Reports: w.reportState}
+	for _, t := range w.targets {
+		saved.Targets[t.config.Name] = t.status
+	}
+	return w.store.Save("worker.json", saved)
 }

@@ -23,81 +23,92 @@ compose ps
 compose exec --no-TTY backup /bin/vaultwarden-less-backup status
 ```
 
-Request a check and then inspect completion separately:
+Run a backup or verification and wait for the actual job result:
 
 ```sh
-compose exec --no-TTY backup /bin/vaultwarden-less-backup check
-compose exec --no-TTY backup /bin/vaultwarden-less-backup check --full
+compose exec --no-TTY backup /bin/vaultwarden-less-backup backup
+compose exec --no-TTY backup /bin/vaultwarden-less-backup backup --force
+compose exec --no-TTY backup /bin/vaultwarden-less-backup verify --target aws-s3
+compose exec --no-TTY backup /bin/vaultwarden-less-backup verify --target aws-s3 --read-data
 compose exec --no-TTY backup /bin/vaultwarden-less-backup status
 ```
 
-An accepted check is asynchronous. `last_result`, `source`, `issues`,
-target `success_id`, `success_at`, `waiting`, `uploading`, `error` and `retry_at`
-explain progress. Timestamps are absent until a success, check or schedule
-exists; cleared retry times are absent too. This also applies to notifier
-`last_success` and `next_attempt`. Health checks only prove process responsiveness. Restart backup to
-reload configuration or credentials. Client traffic continues during backup
-failure. Empty targets keep the service usable but do not protect data.
+Ordinary backup captures immediately and uploads only effective changes. Force
+creates a recovery point even without change and grants each target one attempt
+past backoff; it does not reset consecutive failure counts. Partial failure,
+incomplete source or deferred necessary uploads exit 1 with per-target results.
+Input errors exit 2. Ctrl+C exits 130 and only stops CLI waiting: the service
+continues the accepted job. Status retains current and recent operation results.
+A service restart loses these receipts, so the CLI reports completion unknown.
 
-An incomplete snapshot is useful recovery material, but its missing files
-remain missing. Repair source problems and require a later complete snapshot.
-For database or cache failures, retain the diagnostics and repair the cause;
-the worker retries without rewriting source data.
+Read `last_check`, `last_result`, source completeness/issues and `last_change`
+together. Old snapshot age is not lag if a recent source check confirmed no
+change. Each target reports current coverage, success_id/success_at, the
+separate complete_id/complete_at, upload errors, backoff and active operation.
+Structure and read_data report last attempt/success, result and enabled next
+period. Unscheduled verification still shows its last known result.
+
+Source faults clear only after a complete capture; upload/coverage faults after
+a confirmed upload; structure faults after successful structure/full verification;
+full-read faults only after a successful full read through this service.
+Uploads continue during verification failures. An external restic check does
+not update this state. Generic errors are not a diagnosis of network failure
+or proven corruption. No automatic repair, unlock or deletion is performed.
+
+Health means process responsiveness. Configuration reloads on worker restart.
+An empty target list is `unconfigured` and does not capture data. For source
+issues, repair the source and request another backup. Incomplete snapshots keep
+the database and available files without substituting older attachments.
 
 ## Reading notifications
 
-All channels show the same English report. Titles use the following priority,
-so an uploaded incomplete capture remains an **Incomplete capture** report.
+Reports are English with local time and UTC offset. Only first/expanded faults,
+recoveries, sustained-fault reminders and the daily summary generate delivery.
+A healthy check, unchanged result, upload or verification updates status and
+daily counts. The defaults are 21:00 daily and reminders every six hours.
+Missed daily periods are combined into one catch-up report.
 
-| Title | Meaning |
-| --- | --- |
-| Backup not configured | No valid backup target is configured. |
-| Capture failed | The source could not be captured; target states describe the previous capture. |
-| Incomplete capture | The native database and available files were kept, but source issues remain; retry is pending. |
-| Backup target error | At least one target has invalid configuration or a repository failure. |
-| Backup warning | Capture comparison, reference diagnostics or local baseline caching reported a warning. |
-| Backup pending | Capture or target work remains, including a newer capture waiting after an older upload. |
-| Backup updated | At least one target uploaded the current capture, with no higher-priority condition. |
-| No changes | All targets are up to date with the current capture. |
-
-For example, a check followed by two target results can produce:
-
-```markdown
-**vaultwarden-less · Backup target error**
-
-**Source:** Complete
-
-**Targets:** 1 error · 1 up to date
-
-**Target details**
-
-> aws-s3: Up to date
-
-> cloudflare-r2: Upload failed; retry pending
-
-**Triggers**
-
-> Scheduled check: 1
-
-> Target result: 2
-
-**Request activity**
-
-> Unknown GET: started 1, finished 1
-
-**Summary:** 1 check · 3 reports
+```text
+Vaultwarden backup — Fault / Recovery / Reminder / Daily
+Time: 2026-10-29 21:00:00 +08:00
+Period: ...                         # daily only
+Source: ...
+Targets: ...
+Verification: ...
+Faults / Recoveries: ...
+Next actions: ...
 ```
 
-Triggers distinguish startup, manual, scheduled ordinary/full, request activity,
-source retry and target results. A trigger count describes merged trigger
-reports; request counts appear separately as `started` and `finished`. A request
-that crosses two checks can have its start and finish in different reports.
+Fault details identify the object, category, first occurrence, safe code,
+latest complete recovery point and next action. A recovery lists the recovered
+item and retains other unresolved faults. An incident recovered before its
+first successful delivery remains as “occurred then recovered”, with duration.
+Daily reports include source checks/changes, per-target snapshots, recent
+uploads/complete points, verification results and unresolved faults/retries.
 
-After notification delivery recovers, `undelivered reports` counts the pending
-reports included in the recovery summary. Source diagnostics and target states
-describe the latest observation, rather than a history of every intermediate
-failure. `Omitted details: N` means whole detail entries were left out to fit the
-channel's byte limit; the source, target totals and report counts remain.
+Each channel persists its independent merged summary and three-attempt budget.
+Retries wait one minute after the first failure and five after the second;
+Retry-After and APNs server minimum delays also apply. Exhausted content waits
+for a new fault, recovery, reminder or daily report to reopen a round. Ordinary
+checks do not reopen it. Correct permanent authentication/configuration errors
+and restart to revalidate. Pending delivery survives restarts. Platform acceptance
+may be delivered twice if the process dies before recording success locally.
+`Omitted details: N` means whole entries were omitted to meet platform limits.
+
+## Local disk and shutdown
+
+Keep `state/` across restarts. It holds deadlines, faults, backoff and notification
+summaries. `cache/` is rebuildable; stop backup before clearing it. Loss of this
+cache does not force a new snapshot because native tags restore comparison
+baselines. Data-sized temporary content uses disk under `cache/work/`, not tmpfs.
+After acquiring its instance lock the worker removes abandoned work directories.
+Running uploads retain immutable versions; waiting versions merge to the latest.
+
+Normal shutdown is gateway, worker, Vaultwarden (`compose stop` follows the
+configured dependencies). The gateway drains for up to 120 seconds and flushes
+for ten; Compose grants 150 seconds. `restart: "on-failure:5"` requires host
+boot/startup and stopped-service supervision. Sudden termination is recovered
+by startup and six-hour source captures.
 
 ## Native restic maintenance
 
@@ -135,10 +146,12 @@ set -euo pipefail
 RESTIC_ENV_FILE="$DEPLOY_DIR/credentials/maintenance/aws-s3-maintenance.env"
 restic_repository() {
   : "${RESTIC_ENV_FILE:?}"
+  mkdir -p -- "$DEPLOY_DIR/cache/maintenance"
   docker run --rm --read-only --user "$(id -u):$(id -g)" \
-    --tmpfs /tmp:rw,nosuid,nodev,mode=1777 \
+    --mount "type=bind,source=$DEPLOY_DIR/cache/maintenance,target=/cache" \
+    --env TMPDIR=/cache \
     --env-file "$RESTIC_ENV_FILE" \
-    --env RESTIC_CACHE_DIR=/tmp/restic \
+    --env RESTIC_CACHE_DIR=/cache/restic \
     --mount "type=bind,source=$DEPLOY_DIR/credentials/restic,target=/run/credentials/restic,readonly" \
     --entrypoint /bin/restic "$RESTIC_IMAGE" "$@"
 }
@@ -158,16 +171,23 @@ then run `restic_repository init` once for a new empty repository before the
 List and record explicit native snapshot IDs before recovery. Neither local
 status nor a notification replaces verification of remote snapshots.
 
-Retention groups by host **and tags**, so incomplete snapshots cannot crowd
-complete recovery material out of the same retention group. Start with this
-dry run and review its selected snapshots:
+Select complete and incomplete snapshots separately and group by host. Never
+include the changing fingerprint tag in retention groups: it would give every
+version its own group. Review these dry-run deletion sets before applying them:
 
 ```sh
 set -euo pipefail
-restic_repository forget --host vaultwarden-less --group-by host,tags \
+restic_repository forget --host vaultwarden-less --tag complete --group-by host \
   --keep-within 24h --keep-hourly 48 --keep-daily 14 --keep-weekly 8 \
   --keep-monthly 12 --keep-yearly 3 --keep-last 1 --dry-run
+restic_repository forget --host vaultwarden-less --tag incomplete --group-by host \
+  --keep-within 7d --keep-last 3 --dry-run
+restic_repository snapshots --host vaultwarden-less --tag vwless-pending
 ```
+
+`vwless-pending` identifies an upload whose successful finalization was not
+confirmed. It never establishes worker coverage. Inspect such native snapshots
+before deciding whether to remove them; do not mistake them for complete points.
 
 When you approve that deletion set, run the same command without `--dry-run`,
 then `restic_repository prune` and `restic_repository check`. Keep maintenance
@@ -194,25 +214,28 @@ test "$(realpath -m -- "$RESTORE_DIR")" = "$RESTORE_DIR"
 test ! -e "$RESTORE_DIR"
 test ! -L "$RESTORE_DIR"
 mkdir -m 0700 -- "$RESTORE_DIR"
+mkdir -p -- "$DEPLOY_DIR/cache/maintenance"
 docker run --rm --read-only --user "$(id -u):$(id -g)" \
-  --tmpfs /tmp:rw,nosuid,nodev,mode=1777 \
+  --mount "type=bind,source=$DEPLOY_DIR/cache/maintenance,target=/cache" \
+  --env TMPDIR=/cache \
   --env-file "$RESTIC_ENV_FILE" \
-  --env RESTIC_CACHE_DIR=/tmp/restic \
+  --env RESTIC_CACHE_DIR=/cache/restic \
   --mount "type=bind,source=$DEPLOY_DIR/credentials/restic,target=/run/credentials/restic,readonly" \
   --mount "type=bind,source=$RESTORE_DIR,target=/restore" \
   --entrypoint /bin/restic "$RESTIC_IMAGE" \
   restore "$SNAPSHOT_ID" --verify --target /restore
 integrity=$(docker run --rm --read-only --user "$(id -u):$(id -g)" \
-  --mount "type=bind,source=$RESTORE_DIR,target=/restore,readonly" \
+  --mount "type=bind,source=$RESTORE_DIR,target=/restore" \
   --entrypoint /bin/sqlite3 "$RESTIC_IMAGE" \
-  -readonly 'file:/restore/db.sqlite3?immutable=1' 'PRAGMA integrity_check;')
+  '/restore/db.sqlite3' 'PRAGMA integrity_check;')
 test "$integrity" = ok
 printf '%s\n' "$integrity"
 ```
 
-The `immutable=1` connection is for this completed, stopped restore only; it
-allows checking a WAL-mode database without creating sidecar files on the
-read-only mount. Never use it against the live source database.
+The integrity check opens this independent restored copy normally. The selected
+SQLite skips CHECK-constraint validation on read-only connections; do not use
+`immutable=1` as a shortcut for this verification. Never run these commands
+against the live source directory.
 Require the integrity result `ok`. The restored root contains `db.sqlite3`
 and the native tree, including RSA files. Preserve that restored evidence and
 start an isolated Vaultwarden against a separate copy, with its own port.
@@ -227,17 +250,8 @@ Select the new bundle's `VWLESS_IMAGE_TAG` in the new deployment's `compose.env`
 Keep the previous Compose file, image tag and other configuration for rollback;
 do not overwrite your local settings with the new templates wholesale.
 
-For an older layout that runs Compose directly from the release directory,
-place the reviewed Compose file alongside `compose.env` in the deployment.
-Transfer the previous runtime IDs and loopback port from the env file into
-`x-service-defaults.user` and the proxy's `ports` entry. Then keep only
-`VWLESS_IMAGE_TAG` in `compose.env` and use the helper above. This layout change
-does not require moving data: relative host paths resolve to the existing
-deployment tree. Apply the preserved-copy procedure below when upgrading
-Vaultwarden itself.
-
 Prepare and load the new bundle before stopping service. Disable incoming
-writes, stop the proxy, request a full check and wait until the selected
+writes, stop the proxy, run `backup --force` and wait until the selected
 destination reports success with no pending upload. Verify the corresponding
 native snapshot ID and its completeness. Keep the old release, its
 configuration and the original directory available for rollback.

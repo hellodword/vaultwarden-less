@@ -89,7 +89,7 @@ func newE2EHarness(t *testing.T, ctx context.Context) *e2eHarness {
 		project: fmt.Sprintf("vwless-%d", time.Now().UnixNano()), dockerPath: dockerPath, dockerConfig: filepath.Join(root, "docker-config"),
 		vaultwardenPort: unusedLoopbackPort(t), proxyPort: unusedLoopbackPort(t)}
 	t.Logf("retained acceptance artifacts: %s", root)
-	for _, relative := range []string{"config", "credentials/backup", "credentials/maintenance", "credentials/restic", "data", "cache", "restore", "maintenance-cache"} {
+	for _, relative := range []string{"config", "credentials/backup", "credentials/maintenance", "credentials/restic", "data", "state", "cache", "restore", "maintenance-cache"} {
 		if err := os.MkdirAll(filepath.Join(h.deploymentRoot, relative), 0700); err != nil {
 			t.Fatal(err)
 		}
@@ -162,6 +162,7 @@ func (h *e2eHarness) prepareDeployment() {
 		h.t.Fatal(err)
 	}
 	writePrivateFile(h.t, filepath.Join(h.deploymentRoot, "config/vaultwarden.env"), string(data))
+	writePrivateFile(h.t, filepath.Join(h.deploymentRoot, "config/vaultwarden-runtime.json"), "{}\n")
 	configuration := "targets:\n"
 	for _, name := range []string{"primary", "secondary"} {
 		configuration += fmt.Sprintf("  - name: %s\n    env_file: /run/credentials/backup/%s.env\n    options: [s3.bucket-lookup=path, s3.region=us-east-1]\n", name, name)
@@ -200,7 +201,13 @@ func (h *e2eHarness) writeOverride() {
 		"notify-stub": map[string]any{"image": *runnerImage, "pull_policy": "never", "user": h.identity(), "read_only": true, "cap_drop": []string{"ALL"}, "security_opt": []string{"no-new-privileges:true"}, "entrypoint": []string{"/bin/vaultwarden-less-tests"}, "environment": map[string]string{"VWLESS_E2E_STUB": "/stub"}, "volumes": []any{mount(filepath.Join(h.testRoot, "stub"), "/stub", false)}, "networks": map[string]any{"default": map[string]any{"aliases": []string{"api.push.apple.com"}}}},
 	}
 	for _, name := range []string{"primary", "secondary"} {
-		services["moto-"+name] = map[string]any{"image": *motoImage, "pull_policy": "never", "user": h.identity(), "read_only": true, "tmpfs": []string{"/tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777"}, "cap_drop": []string{"ALL"}, "security_opt": []string{"no-new-privileges:true"}}
+		// Moto spills stored S3 objects to temporary files. Its workspace must
+		// scale with the same large synthetic data as the actual backup worker.
+		workspace := filepath.Join(h.testRoot, "moto-"+name+"-work")
+		if err := os.MkdirAll(workspace, 0700); err != nil {
+			h.t.Fatal(err)
+		}
+		services["moto-"+name] = map[string]any{"image": *motoImage, "pull_policy": "never", "user": h.identity(), "read_only": true, "volumes": []any{mount(workspace, "/tmp", false)}, "cap_drop": []string{"ALL"}, "security_opt": []string{"no-new-privileges:true"}}
 	}
 	data, err := json.Marshal(map[string]any{"services": services})
 	if err != nil {
@@ -286,7 +293,7 @@ func (h *e2eHarness) validateBoundaries() {
 				"SIGNUPS_ALLOWED": "false", "SIGNUPS_DOMAINS_WHITELIST": "", "INVITATIONS_ALLOWED": "false",
 				"DISABLE_ICON_DOWNLOAD": "true", "HTTP_REQUEST_BLOCK_NON_GLOBAL_IPS": "true",
 				"PASSWORD_HINTS_ALLOWED": "false", "SHOW_PASSWORD_HINT": "false",
-				"SENDS_ALLOWED": "false", "EMERGENCY_ACCESS_ALLOWED": "false", "ORG_CREATION_USERS": "none",
+				"CONFIG_FILE": "/config/vaultwarden-runtime.json", "SENDS_ALLOWED": "false", "EMERGENCY_ACCESS_ALLOWED": "false", "ORG_CREATION_USERS": "none",
 			} {
 				if got, exists := values[key]; !exists || got != want {
 					h.t.Fatalf("shipped Vaultwarden profile: %s=%q, want %q", key, got, want)

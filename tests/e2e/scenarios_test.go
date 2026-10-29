@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"math/rand"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -13,7 +14,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hellodword/vaultwarden-less/internal/capture"
 	productworker "github.com/hellodword/vaultwarden-less/internal/worker"
 )
 
@@ -53,7 +53,7 @@ func TestNativeReleaseAcceptance(t *testing.T) {
 	assertVaultFixture(t, ctx, filepath.Join(h.testRoot, "verify-source"), client, fixture)
 	h.waitNewRequestCheck(beforeRequests)
 
-	t.Log("burst requests merge; unknown GET and authentication-only changes cause no upload")
+	t.Log("burst requests merge; unknown GET requests cause no upload")
 	before := h.check(false)
 	requestStart := time.Now()
 	for i := 0; i < 8; i++ {
@@ -75,18 +75,53 @@ func TestNativeReleaseAcceptance(t *testing.T) {
 	if after.LastCheck.Sub(requestStart) < 29*time.Second {
 		t.Fatal("request quiet window too short")
 	}
-	h.assertNotifications()
 	before = after
 	second := newBitwardenCLI(t, filepath.Join(h.testRoot, "bw-auth"), h.publicTLS, h.tlsCAFile, email)
 	authStart := time.Now()
 	second.login(ctx)
 	after = h.waitNewRequestCheck(authStart)
-	h.assertUnchangedIDs(before, after)
+	h.assertNewIDs(before, after)
 	full := h.check(true)
 	h.assertNewIDs(after, full)
 	if full.Source != "complete" {
 		t.Fatalf("native fixture captured as %s: %v", full.Source, full.Issues)
 	}
+
+	t.Log("unlimited Send consumption is ignored; limited consumption persists")
+	sendURL := client.fileSendURL(ctx, fixture.sendID)
+	receiver := newBitwardenSendReceiver(t, ctx, client.server, client.caFile)
+	before = h.check(false)
+	if _, _, err := receiver.tryReceive(ctx, sendURL, filepath.Join(h.testRoot, "unlimited-consumption"), false); err != nil {
+		t.Fatal("unlimited Send receive failed")
+	}
+	after = h.check(false)
+	h.assertUnchangedIDs(before, after)
+	limitedID := client.createFileSendWithLimit(ctx, privateTestPath(t, h.testRoot, "limited-send", []byte("limited synthetic send")), "Limited Send", 2)
+	limitedURL := client.fileSendURL(ctx, limitedID)
+	before = h.check(false)
+	if _, _, err := receiver.tryReceive(ctx, limitedURL, filepath.Join(h.testRoot, "limited-consumption"), false); err != nil {
+		t.Fatal("limited Send receive failed")
+	}
+	after = h.check(false)
+	h.assertNewIDs(before, after)
+	full = after
+
+	t.Log("192 MiB incompressible attachment is captured using disk workspace")
+	large := make([]byte, 192<<20)
+	random := rand.New(rand.NewSource(42))
+	if _, err := random.Read(large); err != nil {
+		t.Fatal(err)
+	}
+	largePath := privateTestPath(t, h.testRoot, "large-attachment", large)
+	largeID := client.createAttachment(ctx, fixture.itemID, largePath)
+	large = nil
+	before = full
+	full = h.check(false)
+	h.assertNewIDs(before, full)
+	if full.Source != "complete" {
+		t.Fatal("large native capture failed")
+	}
+	t.Logf("large encrypted attachment: %s", largeID)
 
 	t.Log("file-only changes include orphan files, RSA identity, links and empty directories")
 	rsa := fileDigest(t, filepath.Join(dataRoot, "rsa_key.pem"))
@@ -197,30 +232,20 @@ raise SystemExit(1)
 	h.mustDocker("rm", "--force", rejector)
 	h.mustDocker("network", "connect", "--alias", "moto-secondary", h.project+"_default", secondaryContainer)
 	client.sync(ctx)
-	h.waitStatus(7*time.Minute, func(s productworker.Status) bool {
+	h.check(true)
+	h.waitStatus(time.Minute, func(s productworker.Status) bool {
 		return settled(s) && s.Targets[1].Error == "" && s.Targets[1].SuccessID != failedID
 	})
 
 	t.Log("backup outage leaves client service usable; restart reuses native baseline")
 	before = h.check(true)
-	beforeOutage := h.restore("primary", before.Targets[0].SuccessID, "before-outage")
 	h.compose("stop", "backup")
 	client.sync(ctx)
+	writePrivateFile(t, filepath.Join(dataRoot, "during-outage"), "fresh source after restart")
 	h.compose("start", "backup")
 	h.waitHealthy("backup", time.Minute)
 	after = h.waitStatus(3*time.Minute, settled)
-	// Official CLI sync refreshes the token and updates devices.updated_at.
-	// Startup is a full check, so it must preserve that authentication change.
 	h.assertNewIDs(before, after)
-	afterOutage := h.restore("primary", after.Targets[0].SuccessID, "after-outage")
-	beforeDigest, err := capture.CompareDigest(ctx, filepath.Join(beforeOutage, "db.sqlite3"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	afterDigest, err := capture.CompareDigest(ctx, filepath.Join(afterOutage, "db.sqlite3"))
-	if err != nil || beforeDigest.Business != afterDigest.Business || beforeDigest.Full == afterDigest.Full {
-		t.Fatalf("outage sync did not preserve an authentication-only change: %v", err)
-	}
 	// Restart again without traffic to independently verify cache reuse.
 	before = after
 	counts := map[string]int{"primary": len(h.snapshots("primary")), "secondary": len(h.snapshots("secondary"))}
@@ -234,7 +259,7 @@ raise SystemExit(1)
 		}
 	}
 
-	t.Log("cache loss establishes a deduplicated native baseline")
+	t.Log("cache loss reconstructs the native comparison baseline without uploading")
 	h.compose("stop", "backup")
 	cache := filepath.Join(h.deploymentRoot, "cache")
 	// Move only this harness's synthetic cache; retain it for investigation.
@@ -247,20 +272,50 @@ raise SystemExit(1)
 	h.compose("up", "--detach", "--force-recreate", "backup")
 	h.waitHealthy("backup", time.Minute)
 	after = h.waitStatus(3*time.Minute, settled)
-	h.assertNewIDs(before, after)
+	h.assertUnchangedIDs(before, after)
 	for name, count := range counts {
-		list := h.snapshots(name)
-		if len(list) != count+1 {
-			t.Fatalf("cache loss snapshot count for %s: %d", name, len(list))
+		if got := len(h.snapshots(name)); got != count {
+			t.Fatalf("cache loss duplicated snapshot for %s: %d", name, got)
 		}
-		latest := list[len(list)-1]
-		if latest.Parent == "" || latest.Summary.DataAdded > 65536 {
-			t.Fatalf("cache loss did not reuse native parent/deduplication for %s", name)
+	}
+	h.assertNotifications()
+
+	t.Log("native snapshot deletion clears coverage and schedules a replacement")
+	removed := h.status().Targets[0].SuccessID
+	h.nativeRestic("primary", nil, "forget", removed)
+	op := h.operation("verify", "--target", "primary")
+	if op.State != "succeeded" {
+		t.Fatal("structure check after snapshot deletion failed")
+	}
+	h.waitStatus(3*time.Minute, func(s productworker.Status) bool {
+		return settled(s) && s.Targets[0].SuccessID != "" && s.Targets[0].SuccessID != removed
+	})
+	for _, name := range []string{"primary", "secondary"} {
+		if op := h.operation("verify", "--target", name, "--read-data"); op.State != "succeeded" {
+			t.Fatalf("full read failed: %s", name)
+		}
+	}
+	for _, damage := range []string{"delete", "corrupt"} {
+		t.Log("remote object " + damage + " is detected; upload cannot clear the verification fault")
+		h.damageRemoteObject("primary", damage)
+		if op := h.operation("verify", "--target", "primary", "--read-data"); op.State != "failed" {
+			t.Fatal("damaged object passed full repository verification")
+		}
+		after = h.check(true)
+		if after.Targets[0].ReadData.Error == "" || after.Targets[1].Error != "" {
+			t.Fatal("upload cleared verification failure or stalled the other destination")
+		}
+		h.damageRemoteObject("primary", "restore")
+		if op := h.operation("verify", "--target", "primary", "--read-data"); op.State != "succeeded" {
+			t.Fatal("restored remote object did not pass full verification")
+		}
+		if h.status().Targets[0].ReadData.Error != "" {
+			t.Fatal("successful full verification retained fault")
 		}
 	}
 
 	t.Log("restore each destination into a new root and read it through official clients")
-	h.compose("stop", "backup", "vaultwarden")
+	h.compose("stop", "proxy", "backup", "vaultwarden")
 	for _, name := range []string{"primary", "secondary"} {
 		latest := h.latest(name)
 		root := h.restore(name, latest.ID, name)

@@ -37,7 +37,12 @@ func runSQLite(ctx context.Context, path, input string, immutable bool) ([]byte,
 	if immutable {
 		u.RawQuery = "immutable=1"
 	}
-	cmd := exec.CommandContext(ctx, "sqlite3", "-batch", "-bail", "-readonly", "-init", "/dev/null", u.String())
+	args := []string{"-batch", "-bail", "-init", "/dev/null"}
+	if immutable {
+		args = append(args, "-readonly")
+	}
+	args = append(args, u.String())
+	cmd := exec.CommandContext(ctx, "sqlite3", args...)
 	cmd.Stdin = strings.NewReader(input)
 	var out limitedBuffer
 	cmd.Stdout = &out
@@ -149,7 +154,7 @@ SELECT user_version FROM pragma_user_version; SELECT application_id FROM pragma_
 		}
 		tableCols := cols[start:end]
 		if business && cols[start].Table == "twofactor" && hasColumn(tableCols, "atype") {
-			for _, kind := range []int{0, 1, 7, 1002, 1003, 1004, 2000} {
+			for _, kind := range []int{0, 1, 7} {
 				query += tableQuery(tableCols, true, &kind)
 			}
 			unknown := -1
@@ -179,58 +184,40 @@ func tableQuery(cols []column, business bool, factor *int) string {
 				excluded = []string{"last_used"}
 			case 7:
 				excluded = []string{"uuid"}
-			case 1002, 1003, 1004, 2000:
-				excluded = strings.Fields(temporaryFactorColumns)
+			case 1000, 1001, 1002, 1003, 1004, 2000:
 				temporary = true
 			}
 		}
 	}
-	var expressions, aliases, meaningful, contextColumns []string
-	hasNewColumn := false
+	if temporary {
+		return ""
+	}
+	var expressions, aliases []string
 	for _, col := range cols {
-		name := identifier(col.Name)
 		if slices.Contains(excluded, col.Name) {
-			if col.PK > 0 || col.Name == "uuid" || col.Name == "user_uuid" || col.Name == "atype" {
-				contextColumns = append(contextColumns, name)
-			}
 			continue
 		}
+		name := identifier(col.Name)
 		expr := name
-		var rule *jsonRule
 		if business {
-			switch {
-			case table == "users" && col.Name == "stamp_exception":
-				rule = stampRule()
-			case table == "sso_auth" && (col.Name == "auth_response" || col.Name == "code_response_error"):
-				rule = ssoRule(col.Name)
-			case factor != nil && col.Name == "data":
-				rule = factorRule(*factor)
+			if table == "sends" && col.Name == "access_count" && hasColumn(cols, "max_access_count") {
+				expr = "CASE WHEN max_access_count IS NULL THEN NULL ELSE access_count END"
 			}
-		}
-		if rule != nil {
-			expr = filteredJSON(name, rule)
-		} else {
-			hasNewColumn = true
+			if factor != nil && *factor == 1 && col.Name == "data" {
+				expr = emailFactorData(name)
+			}
 		}
 		alias := fmt.Sprintf("c%d", len(aliases))
 		expressions = append(expressions, expr+" AS "+alias)
 		aliases = append(aliases, alias)
-		meaningful = append(meaningful, alias+" IS NOT NULL")
 	}
 	if len(expressions) == 0 {
 		return ""
 	}
-	if temporary {
-		for _, name := range contextColumns {
-			alias := fmt.Sprintf("c%d", len(aliases))
-			expressions = append(expressions, name+" AS "+alias)
-			aliases = append(aliases, alias)
-		}
-	}
 	predicate := ""
 	if factor != nil {
 		if *factor < 0 {
-			predicate = " WHERE typeof(atype)!='integer' OR atype NOT IN (0,1,7,1002,1003,1004,2000)"
+			predicate = " WHERE typeof(atype)!='integer' OR atype NOT IN (0,1,7,1000,1001,1002,1003,1004,2000)"
 		} else {
 			predicate = fmt.Sprintf(" WHERE typeof(atype)='integer' AND atype=%d", *factor)
 		}
@@ -240,8 +227,16 @@ func tableQuery(cols []column, business bool, factor *int) string {
 		ordering = append(ordering, "typeof("+alias+")", alias+" COLLATE BINARY")
 	}
 	result := "SELECT " + strings.Join(aliases, ",") + " FROM (SELECT " + strings.Join(expressions, ",") + " FROM " + identifier(table) + predicate + ")"
-	if temporary && !hasNewColumn {
-		result += " WHERE " + strings.Join(meaningful, " OR ")
-	}
 	return result + " ORDER BY " + strings.Join(ordering, ",") + ";"
+}
+
+// IntegrityCheck inspects the standalone copy, never the live source. The
+// pinned SQLite omits CHECK constraint validation on read-only connections;
+// open this disposable copy normally to get the complete integrity result.
+func IntegrityCheck(ctx context.Context, path string) error {
+	data, err := runSQLite(ctx, path, "PRAGMA integrity_check;\n", false)
+	if err != nil || strings.TrimSpace(string(data)) != "ok" {
+		return errors.New("database integrity check failed")
+	}
+	return nil
 }

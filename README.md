@@ -6,11 +6,13 @@ more restic repositories. Backups include RSA keys, attachments, Sends,
 configuration, orphan files, empty directories and symbolic links.
 
 The worker uses SQLite's online backup command against a read-only source
-mount. Ordinary checks ignore explicitly identified authentication noise when
+mount. All captures ignore explicitly identified temporary authentication noise when
 deciding whether to upload; the saved database always contains every table
-and row. Full checks compare all database content. Missing source files produce
+and row. Persistent security state participates in comparison. Missing source files produce
 an explicitly incomplete backup containing the full database and available
-files. Each destination has its own successful baseline and retry schedule.
+files. Each destination has its own successful baseline, retry schedule and optional
+repository verification plan. Fault/recovery reports and daily summaries persist
+across worker restarts.
 
 Restic owns snapshot IDs, storage, deduplication, retention and restore. A
 native `restic restore ID --verify --target NEW_DIRECTORY` produces

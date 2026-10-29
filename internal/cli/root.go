@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/hellodword/vaultwarden-less/internal/buildinfo"
 	"github.com/hellodword/vaultwarden-less/internal/config"
+	"github.com/hellodword/vaultwarden-less/internal/worker"
 )
 
 type commandError struct {
@@ -22,6 +24,9 @@ type commandError struct {
 
 func (e *commandError) Error() string { return e.message }
 func ExitCode(err error) int {
+	if errors.Is(err, context.Canceled) {
+		return 130
+	}
 	if err == nil {
 		return 0
 	}
@@ -73,15 +78,19 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, env e
 	}
 	flags := flag.NewFlagSet(command, flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
-	var help, full bool
+	var help, force, readData bool
+	var target string
 	path := config.DefaultBackupConfigPath
 	flags.BoolVar(&help, "help", false, "show command help")
 	flags.BoolVar(&help, "h", false, "show command help")
 	switch command {
 	case "serve", "validate":
 		flags.StringVar(&path, "config", path, "backup configuration path")
-	case "check":
-		flags.BoolVar(&full, "full", false, "compare all database content")
+	case "backup":
+		flags.BoolVar(&force, "force", false, "create a recovery point even when unchanged")
+	case "verify":
+		flags.StringVar(&target, "target", "", "repository target name")
+		flags.BoolVar(&readData, "read-data", false, "read all repository data")
 	}
 	if err := flags.Parse(args); err != nil {
 		return inputError("Invalid command flags")
@@ -107,8 +116,13 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, env e
 			return inputError("One or more configuration entries are invalid")
 		}
 		return nil
-	case "check":
-		return call(ctx, env, http.MethodPost, "/checks", map[string]bool{"full": full}, http.StatusAccepted, stdout)
+	case "backup":
+		return operation(ctx, env, "/backups", map[string]bool{"force": force}, stdout, stderr)
+	case "verify":
+		if target == "" {
+			return inputError("--target is required")
+		}
+		return operation(ctx, env, "/verifications", map[string]any{"target": target, "read_data": readData}, stdout, stderr)
 	case "status":
 		return call(ctx, env, http.MethodGet, "/status", nil, http.StatusOK, stdout)
 	case "healthcheck":
@@ -124,7 +138,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, env e
 
 func knownCommand(command string) bool {
 	switch command {
-	case "serve", "validate", "check", "status", "healthcheck", "version":
+	case "serve", "validate", "backup", "verify", "status", "healthcheck", "version":
 		return true
 	}
 	return false
@@ -132,14 +146,15 @@ func knownCommand(command string) bool {
 
 func writeHelp(out io.Writer, command string) error {
 	if command == "" {
-		_, err := io.WriteString(out, `Check and back up native Vaultwarden data.
+		_, err := io.WriteString(out, `Back up and verify native Vaultwarden data.
 
 Usage: vaultwarden-less-backup <command> [flags]
 
 Commands:
   serve        Run the backup worker
   validate     Validate local configuration without contacting the worker
-  check        Request a backup check
+  backup       Capture, compare and wait for target results
+  verify       Verify one repository and wait for the result
   status       Show worker status
   healthcheck  Check worker liveness
   version      Show build information
@@ -155,8 +170,10 @@ Use "vaultwarden-less-backup help <command>" for command flags.
 	switch command {
 	case "serve", "validate":
 		usage = fmt.Sprintf("  --config PATH  Backup configuration path (default %s)\n", config.DefaultBackupConfigPath)
-	case "check":
-		usage = "  --full         Compare all database content (default false)\n"
+	case "backup":
+		usage = "  --force        Create a snapshot and allow one attempt past backoff\n"
+	case "verify":
+		usage = "  --target NAME  Target repository (required)\n  --read-data    Read all repository data\n"
 	}
 	_, err := fmt.Fprintf(out, "Usage: vaultwarden-less-backup %s [flags]\n\nFlags:\n%s  -h, --help     Show command help\n", command, usage)
 	return err
@@ -180,11 +197,17 @@ func call(ctx context.Context, env environment, method, path string, body any, s
 	}
 	response, err := env.client.Do(req)
 	if err != nil {
-		return &commandError{message: "Backup process unavailable"}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return &commandError{message: "Backup process unavailable; operation completion cannot be confirmed"}
 	}
 	defer response.Body.Close()
 	if response.StatusCode != status {
-		return &commandError{message: "Backup process did not accept the request"}
+		if response.StatusCode == http.StatusBadRequest {
+			return inputError("Worker rejected the operation input")
+		}
+		return &commandError{message: "Worker response unavailable; operation completion cannot be confirmed"}
 	}
 	data, err := io.ReadAll(io.LimitReader(response.Body, (1<<20)+1))
 	if err != nil || len(data) > 1<<20 {
@@ -195,4 +218,46 @@ func call(ctx context.Context, env environment, method, path string, body any, s
 	}
 	_, err = out.Write(data)
 	return err
+}
+
+func operation(ctx context.Context, env environment, path string, body any, stdout, stderr io.Writer) error {
+	var out bytes.Buffer
+	if err := call(ctx, env, http.MethodPost, path, body, http.StatusAccepted, &out); err != nil {
+		return err
+	}
+	var op worker.Operation
+	if json.Unmarshal(out.Bytes(), &op) != nil || len(op.ID) != 32 {
+		return &commandError{message: "Invalid operation receipt; completion cannot be confirmed"}
+	}
+	if _, err := hex.DecodeString(op.ID); err != nil {
+		return &commandError{message: "Invalid operation receipt"}
+	}
+	fmt.Fprintln(stderr, "Accepted operation", op.ID)
+	for {
+		if op.Done() {
+			if err := json.NewEncoder(stdout).Encode(op); err != nil {
+				return err
+			}
+			if op.State != "succeeded" {
+				return &commandError{message: "Operation failed or was deferred; inspect target results"}
+			}
+			return nil
+		}
+		timer := time.NewTimer(250 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+		out.Reset()
+		if err := call(ctx, env, http.MethodGet, "/operations/"+op.ID, nil, http.StatusOK, &out); err != nil {
+			return err
+		}
+		var next worker.Operation
+		if json.Unmarshal(out.Bytes(), &next) != nil || next.ID != op.ID {
+			return &commandError{message: "Invalid operation result; completion cannot be confirmed"}
+		}
+		op = next
+	}
 }

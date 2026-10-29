@@ -1,55 +1,51 @@
-# Read by the backup worker at startup from /config/backup.yaml. Restart backup
-# after editing this mounted file. YAML scalars are parsed as data: no shell or
-# environment-variable expansion. Unknown fields are rejected. Keep this file
-# private if notifier URLs or signing secrets are configured below.
-# Empty targets/notifiers lists are valid. Invalid entries are disabled and
-# reported independently; malformed root YAML prevents the worker from starting.
-# These are examples: keep the entries you need and replace every REPLACE_WITH_*
-# value in this file and the matching credential files before starting backup.
-# All retained targets are independent destinations; none is a preferred target.
+# Read at startup. Restart backup after changes. Values are literal data;
+# unknown fields are rejected. Invalid targets/channels are isolated.
+# Use targets: [] for an intentionally unconfigured worker.
+# Keep only your targets, and fill their separate restic credential files.
 targets:
-  # Required unique names appear in status and notifications. They are labels,
-  # not backend selectors: RESTIC_REPOSITORY in each env file chooses the backend.
   - name: aws-s3
-    # Absolute CONTAINER path. Maintenance files are not mounted into the worker.
     env_file: /run/credentials/backup/aws-s3-backup.env
-    # Optional native restic backend options, one --option argument per string.
-    # These examples use restic's automatic bucket lookup; the matching env file
-    # supplies AWS_DEFAULT_REGION so backup and maintenance use the same region.
-    # For a backend that needs it: options: [s3.bucket-lookup=path]
     options: []
-
+    # Example schedules, not implicit defaults for other targets.
+    verify:
+      structure_interval: 24h
+      read_data_interval: 720h
+      timeout: 2h
   - name: cloudflare-r2
-    # Uses the account's R2 S3 endpoint and region auto, not a public bucket URL.
     env_file: /run/credentials/backup/cloudflare-r2-backup.env
     options: []
-
+    verify:
+      structure_interval: 24h
   - name: backblaze-b2
-    # This example uses B2's S3-compatible API with an application key.
     env_file: /run/credentials/backup/backblaze-b2-backup.env
     options: []
+    # No verify section: manual verification only.
 
-# Optional independent channels. Remove unused entries; notifiers: [] disables
-# all notifications. Each name must be unique. The reference documentation also
-# covers Feishu and DingTalk. Keep webhook URLs and signing credentials private.
-notifiers:
-  - name: wecom-operations
-    type: wecom
-    # Enterprise WeChat group robot webhook, copied in full from the robot setup.
-    webhook_url: https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=REPLACE_WITH_WECOM_WEBHOOK_KEY
-
-  - name: bark-apns-operations
-    type: bark
-    # Pushes directly to Apple APNs for display in Bark; no Bark server is used.
-    # Supply the APNs device token, not a Bark HTTP API device key or server URL.
-    device_token: REPLACE_WITH_APNS_DEVICE_TOKEN
-    # Absolute CONTAINER path. Copy the authorized P-256 PKCS#8 .p8 private key
-    # to credentials/backup/bark-apns-auth-key.p8 on the host (not shipped here).
-    auth_key_file: /run/credentials/backup/bark-apns-auth-key.p8
-    key_id: REPLACE_WITH_APNS_KEY_ID
-    team_id: REPLACE_WITH_APPLE_TEAM_ID
-    # The key, device token and topic must belong to the same authorized app.
-    # An unrelated Apple developer key cannot push to the official Bark app.
-    topic: me.fin.bark
-    # Optional Bark sound name; omission also defaults to 1107.
-    sound: "1107"
+notifications:
+  timezone: Asia/Shanghai
+  daily_at: "21:00"
+  reminder_interval: 6h
+  # Omitted or empty channels disable delivery. Enable only your own endpoints.
+  channels: []
+  # channels:
+  #   - name: wecom-operations
+  #     type: wecom
+  #     webhook_url: https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=REPLACE_WITH_KEY
+  #   - name: dingtalk-operations
+  #     type: dingtalk
+  #     webhook_url: https://oapi.dingtalk.com/robot/send?access_token=REPLACE_WITH_TOKEN
+  #     secret: REPLACE_WITH_SIGNING_SECRET
+  #   - name: feishu-operations
+  #     type: feishu
+  #     webhook_url: https://open.feishu.cn/open-apis/bot/v2/hook/REPLACE_WITH_TOKEN
+  #     secret: REPLACE_WITH_SIGNING_SECRET
+  #   - name: bark-apns-operations
+  #     type: bark
+  #     device_token: REPLACE_WITH_APNS_DEVICE_TOKEN
+  #     auth_key_file: /run/credentials/backup/bark-apns-auth-key.p8
+  #     key_id: REPLACE_WITH_APNS_KEY_ID
+  #     team_id: REPLACE_WITH_APPLE_TEAM_ID
+  #     topic: me.fin.bark
+  #     sound: "1107"
+# Bark goes directly to production APNs over HTTP/2, without BarkServer.
+# Supply a P-256 PKCS#8 .p8 key authorized for the device token and topic.

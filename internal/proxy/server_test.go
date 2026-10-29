@@ -172,12 +172,12 @@ func TestStartEndForErrorsUnknownAndInterruptedRequests(t *testing.T) {
 		t.Fatalf("start/end=%d/%d", starts, ends)
 	}
 	server.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/api/sync", nil))
-	if starts != 3 || ends != 3 {
-		t.Fatal("explicit exclusion triggered")
+	if starts != 4 || ends != 4 {
+		t.Fatal("failed read request did not trigger conservative check")
 	}
 	upstream.Close()
 	server.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/identity/connect/token", nil))
-	if starts != 4 || ends != 4 {
+	if starts != 5 || ends != 5 {
 		t.Fatal("connection failure not triggered")
 	}
 }
@@ -266,5 +266,67 @@ func TestEventFailuresRetainBoundedCounts(t *testing.T) {
 	defer mu.Unlock()
 	if accepted.Unknown["GET"].Started != 50 || accepted.Unknown["OTHER"].Finished != 1 || len(accepted.Routes) != 0 {
 		t.Fatal("failed event counts lost or raw paths retained")
+	}
+}
+
+func TestShutdownDrainsWriteThenFlushesItsEndEvent(t *testing.T) {
+	entered, release := make(chan struct{}), make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(entered)
+		<-release
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+	var accepted routes.Summary
+	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&accepted); err != nil {
+			t.Error(err)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer peer.Close()
+	sender := NewEventSender(nil)
+	sender.endpoint = peer.URL
+	server := newServer(mustURL(upstream.URL), sender.Record, nil)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	go server.http.Serve(listener)
+	requestDone := make(chan error, 1)
+	go func() {
+		response, err := http.Post("http://"+listener.Addr().String()+"/api/ciphers", "application/json", strings.NewReader("{}"))
+		if err == nil {
+			response.Body.Close()
+		}
+		requestDone <- err
+	}()
+	<-entered
+	shutdownDone := make(chan error, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	go func() { shutdownDone <- server.Shutdown(ctx) }()
+	close(release)
+	if err := <-requestDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-shutdownDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := sender.Flush(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var started, finished uint64
+	for _, counts := range accepted.Routes {
+		started += counts.Started
+		finished += counts.Finished
+	}
+	for _, counts := range accepted.Unknown {
+		started += counts.Started
+		finished += counts.Finished
+	}
+	if started != 1 || finished != 1 {
+		t.Fatalf("shutdown event boundaries %d/%d", started, finished)
 	}
 }

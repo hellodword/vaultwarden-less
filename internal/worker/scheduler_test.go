@@ -26,8 +26,8 @@ func TestScheduleQuietMaximumAndIndependentTimers(t *testing.T) {
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	s := schedule{}
 	s.start(now)
-	if got := s.take(); !got.Full || !got.ReadAll || got.Reasons["startup"] != 1 {
-		t.Fatal("startup must be full")
+	if got := s.take(); got.Reasons["startup"] != 1 {
+		t.Fatal("startup must capture")
 	}
 	s.event(now, routes.Summary{})
 	if due := s.sourceDue(now); !due.Equal(now.Add(30 * time.Second)) {
@@ -40,31 +40,22 @@ func TestScheduleQuietMaximumAndIndependentTimers(t *testing.T) {
 		t.Fatal("maximum wait")
 	}
 	s.take()
-	s.complete(now.Add(2*time.Minute), false, true, false)
-	if !s.nextOrdinary.Equal(now.Add(6*time.Hour)) || !s.nextFull.Equal(now.Add(7*24*time.Hour)) {
+	s.complete(now.Add(2*time.Minute), false)
+	if !s.nextOrdinary.Equal(now.Add(6 * time.Hour)) {
 		t.Fatal("traffic reset independent timers")
 	}
 	s.tick(now.Add(6 * time.Hour))
-	if got := s.take(); !got.ReadAll || got.Full {
-		t.Fatal("ordinary scheduled read scope")
+	if got := s.take(); got.Reasons["scheduled"] != 1 {
+		t.Fatal("ordinary timer lost")
 	}
-	s.tick(now.Add(7 * 24 * time.Hour))
-	if got := s.take(); !got.Full || !got.ReadAll {
-		t.Fatal("full timer lost")
-	}
-	s.complete(now, true, false, true)
-	s.manual(false)
-	if got := s.take(); !got.Full || !got.ReadAll {
-		t.Fatal("failed full requirement consumed")
-	}
-	s.complete(now, true, true, true)
-	if s.retryFull || !s.retryAt.Equal(now.Add(5*time.Minute)) {
-		t.Fatal("incomplete file capture retry policy")
+	s.complete(now, true)
+	if !s.retryAt.Equal(now.Add(5 * time.Minute)) {
+		t.Fatal("source retry")
 	}
 	s.event(now, routes.Summary{})
-	s.manual(true)
+	s.manual()
 	if !s.sourceDue(now).Equal(now) {
-		t.Fatal("manual check waited for quiet window")
+		t.Fatal("manual capture waited")
 	}
 	for i, want := range []time.Duration{5, 10, 20, 40, 60, 60, 60} {
 		if targetBackoff(i+1) != want*time.Minute {
@@ -81,9 +72,13 @@ type fakeRepo struct {
 	blocks        map[string]<-chan struct{}
 	initialBlocks map[string]<-chan struct{}
 	tags          map[string][]string
+	snapshots     map[string][]restic.Snapshot
+	checks        map[string][]bool
+	checkFail     map[string]bool
+	checkBlocks   map[string]<-chan struct{}
 }
 
-func (r *fakeRepo) Latest(ctx context.Context, t config.Target) (*restic.Snapshot, error) {
+func (r *fakeRepo) Inspect(ctx context.Context, t config.Target) (restic.Metadata, error) {
 	r.mu.Lock()
 	r.latest[t.Name]++
 	block := r.initialBlocks[t.Name]
@@ -91,13 +86,16 @@ func (r *fakeRepo) Latest(ctx context.Context, t config.Target) (*restic.Snapsho
 	if block != nil {
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return restic.Metadata{}, ctx.Err()
 		case <-block:
 		}
 	}
-	return nil, nil
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	digest := sha256.Sum256([]byte(t.Name))
+	return restic.Metadata{ID: hex.EncodeToString(digest[:]), Snapshots: append([]restic.Snapshot(nil), r.snapshots[t.Name]...)}, nil
 }
-func (r *fakeRepo) Backup(ctx context.Context, t config.Target, path, tag string) (string, error) {
+func (r *fakeRepo) Backup(ctx context.Context, t config.Target, path, tag, fingerprint string) (string, error) {
 	r.mu.Lock()
 	r.uploads[t.Name]++
 	if r.tags == nil {
@@ -118,7 +116,35 @@ func (r *fakeRepo) Backup(ctx context.Context, t config.Target, path, tag string
 		return "", errors.New("synthetic repository failure")
 	}
 	digest := sha256.Sum256([]byte(path + tag + t.Name))
-	return hex.EncodeToString(digest[:]), nil
+	id := hex.EncodeToString(digest[:])
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.snapshots == nil {
+		r.snapshots = map[string][]restic.Snapshot{}
+	}
+	r.snapshots[t.Name] = append(r.snapshots[t.Name], restic.Snapshot{ID: id, Time: time.Now().UTC(), Tags: []string{tag, restic.FingerprintPrefix + fingerprint}, Hostname: restic.SnapshotHost})
+	return id, nil
+}
+func (r *fakeRepo) Check(ctx context.Context, t config.Target, readData bool) error {
+	r.mu.Lock()
+	if r.checks == nil {
+		r.checks = map[string][]bool{}
+	}
+	r.checks[t.Name] = append(r.checks[t.Name], readData)
+	block := r.checkBlocks[t.Name]
+	fail := r.checkFail[t.Name]
+	r.mu.Unlock()
+	if block != nil {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-block:
+		}
+	}
+	if fail {
+		return errors.New("synthetic check failure")
+	}
+	return nil
 }
 func (r *fakeRepo) count(name string) (int, int) {
 	r.mu.Lock()
@@ -207,7 +233,7 @@ func settled(w *Worker) bool {
 	return true
 }
 
-func TestNoChangeAuthenticationAndFullCheck(t *testing.T) {
+func TestUnifiedComparisonAndForcedBackup(t *testing.T) {
 	w, repo, source, clock := setupWorker(t, "one")
 	runWorker(t, w)
 	waitFor(t, func() bool { return settled(w) })
@@ -223,13 +249,19 @@ func TestNoChangeAuthenticationAndFullCheck(t *testing.T) {
 	if queries != 1 || uploads != 1 {
 		t.Fatalf("no-change contacted storage: %d %d", queries, uploads)
 	}
-	w.Request(true)
-	waitFor(t, func() bool { _, uploads := repo.count("one"); return uploads == 2 && settled(w) })
-	w.Request(true)
+	op, err := w.Backup(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { result, _ := w.Operation(op.ID); return result.Done() && settled(w) })
+	if result, _ := w.Operation(op.ID); result.State != "succeeded" {
+		t.Fatalf("force: %+v", result)
+	}
+	w.Request()
 	waitFor(t, func() bool { return source.count() == 4 && settled(w) })
 	_, uploads = repo.count("one")
 	if uploads != 2 {
-		t.Fatal("full check forced unchanged upload")
+		t.Fatal("ordinary backup repeated unchanged content")
 	}
 }
 
@@ -238,10 +270,11 @@ type recordedNotifications struct {
 	events []notify.Event
 }
 
-func (n *recordedNotifications) Enqueue(event notify.Event) {
+func (n *recordedNotifications) Enqueue(event notify.Event) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.events = append(n.events, event)
+	return nil
 }
 func (n *recordedNotifications) Status() []notify.Status { return nil }
 func (n *recordedNotifications) summary() notify.Event {
@@ -254,33 +287,22 @@ func (n *recordedNotifications) summary() notify.Event {
 	return summary
 }
 
-func TestReportsPreserveRequestPhasesAcrossChecks(t *testing.T) {
+func TestHealthyChecksOnlyEnterDaily(t *testing.T) {
 	w, _, source, clock := setupWorker(t, "one")
 	reports := &recordedNotifications{}
 	w.notifications = reports
 	runWorker(t, w)
 	waitFor(t, func() bool { return settled(w) })
-	events := routes.Summary{}
-	events.Record("POST", "/api/ciphers", true)
-	events.Record("POST", "/api/ciphers", false)
-	events.Record("GET", "/private-unknown-request", true)
-	w.Events(events)
-	clock.Advance(30 * time.Second)
-	w.signal()
-	waitFor(t, func() bool { return source.count() == 2 && settled(w) && reports.summary().Checks == 2 })
-	summary := reports.summary()
-	if summary.Routes["POST /api/ciphers"] != (routes.Counts{Started: 1, Finished: 1}) || summary.Unknown["GET"] != (routes.Counts{Started: 1}) {
-		t.Fatal("worker double-counted a completed request or invented its finish")
+	w.Request()
+	waitFor(t, func() bool { return source.count() == 2 && settled(w) })
+	if reports.summary().Count != 0 {
+		t.Fatal("healthy activity sent a notification")
 	}
-	events = routes.Summary{}
-	events.Record("GET", "/private-unknown-request", false)
-	w.Events(events)
-	clock.Advance(30 * time.Second)
+	clock.Advance(21 * time.Hour)
 	w.signal()
-	waitFor(t, func() bool { return source.count() == 3 && settled(w) && reports.summary().Checks == 3 })
-	summary = reports.summary()
-	if summary.Unknown["GET"] != (routes.Counts{Started: 1, Finished: 1}) || strings.Contains(summary.Message(4096), "private-unknown-request") {
-		t.Fatal("cross-check request phases lost or raw request path disclosed")
+	waitFor(t, func() bool { return reports.summary().Count == 1 })
+	if reports.summary().Kind != "Daily" || reports.summary().Checks < 2 {
+		t.Fatal("daily checks missing")
 	}
 }
 
@@ -328,11 +350,11 @@ func TestStatusOmitsUnsetTimes(t *testing.T) {
 	}
 	now := time.Date(2026, 10, 5, 0, 0, 0, 0, time.UTC)
 	w.status.LastCheck = now
-	w.schedule.nextOrdinary, w.schedule.nextFull, w.schedule.retryAt = now, now, now
+	w.schedule.nextOrdinary, w.schedule.retryAt = now, now
 	w.targets[0].status.SuccessAt, w.targets[0].status.RetryAt = now, now
 	data, err = json.Marshal(w.Status())
 	var decoded Status
-	if err != nil || json.Unmarshal(data, &decoded) != nil || !decoded.LastCheck.Equal(now) || !decoded.NextOrdinary.Equal(now) || !decoded.NextFull.Equal(now) || !decoded.SourceRetryAt.Equal(now) || !decoded.Targets[0].SuccessAt.Equal(now) || !decoded.Targets[0].RetryAt.Equal(now) {
+	if err != nil || json.Unmarshal(data, &decoded) != nil || !decoded.LastCheck.Equal(now) || !decoded.NextOrdinary.Equal(now) || !decoded.SourceRetryAt.Equal(now) || !decoded.Targets[0].SuccessAt.Equal(now) || !decoded.Targets[0].RetryAt.Equal(now) {
 		t.Fatalf("populated status timestamps lost: %s (%v)", data, err)
 	}
 }
@@ -346,7 +368,7 @@ func TestIndependentTargetsLatestReplacementAndBackoff(t *testing.T) {
 	for _, value := range []string{"b", "c"} {
 		source.set(value, value)
 		want := source.count() + 1
-		w.Request(false)
+		w.Request()
 		waitFor(t, func() bool {
 			return source.count() >= want && !w.Status().Targets[0].Uploading && !w.Status().Targets[0].Waiting
 		})
@@ -378,7 +400,7 @@ func TestIndependentTargetsLatestReplacementAndBackoff(t *testing.T) {
 	}
 }
 
-func TestTriggersDuringCaptureAndFailedFullRequirement(t *testing.T) {
+func TestTriggersDuringCaptureAndFailureRecovery(t *testing.T) {
 	w, _, source, _ := setupWorker(t, "one")
 	started, release := make(chan struct{}), make(chan struct{})
 	var once sync.Once
@@ -395,24 +417,24 @@ func TestTriggersDuringCaptureAndFailedFullRequirement(t *testing.T) {
 	}
 	runWorker(t, w)
 	<-started
-	w.Request(true)
+	w.Request()
 	close(release)
 	waitFor(t, func() bool { return source.count() == 2 && settled(w) })
 	source.mu.Lock()
 	source.fail = true
 	source.mu.Unlock()
-	w.Request(true)
+	w.Request()
 	waitFor(t, func() bool { return w.Status().LastResult == "capture_failed" })
-	if !w.Status().FullPending {
-		t.Fatal("failed full check lost its requirement")
+	if w.Status().SourceRetryAt.IsZero() {
+		t.Fatal("failed capture lost retry")
 	}
 	source.mu.Lock()
 	source.fail = false
 	source.mu.Unlock()
-	w.Request(false)
+	w.Request()
 	waitFor(t, func() bool { return source.count() == 4 && settled(w) })
-	if w.Status().Mode != "full" || w.Status().FullPending {
-		t.Fatal("retry did not complete full comparison")
+	if !w.Status().SourceRetryAt.IsZero() {
+		t.Fatal("recovery did not clear source retry")
 	}
 }
 
@@ -425,10 +447,10 @@ func TestRevertDuringUploadIsComparedAgain(t *testing.T) {
 	repo.blocks["one"] = blocked
 	repo.mu.Unlock()
 	source.set("b", "b")
-	w.Request(false)
+	w.Request()
 	waitFor(t, func() bool { return w.Status().Targets[0].Uploading })
 	source.set("a", "a")
-	w.Request(false)
+	w.Request()
 	waitFor(t, func() bool { return source.count() == 3 && !w.Status().Checking })
 	close(blocked)
 	waitFor(t, func() bool { _, n := repo.count("one"); return n == 3 && settled(w) })
@@ -453,7 +475,7 @@ func TestSlowStartupTargetDoesNotRetainEveryCapture(t *testing.T) {
 		value := time.Duration(index).String()
 		source.set(value, value)
 		want := source.count() + 1
-		w.Request(false)
+		w.Request()
 		waitFor(t, func() bool {
 			s := w.Status()
 			return source.count() >= want && !s.Checking && !s.Targets[0].Waiting && !s.Targets[0].Uploading

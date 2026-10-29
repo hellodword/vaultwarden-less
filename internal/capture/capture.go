@@ -5,10 +5,14 @@ package capture
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -34,27 +38,25 @@ func (p *Payload) Tag() string {
 	return "incomplete"
 }
 
-func (p *Payload) Same(other *Payload, full bool) bool {
-	if other == nil || p.Complete() != other.Complete() || len(p.Files) != len(other.Files) {
-		return false
+// Fingerprint is a comparison key, not a restore manifest. JSON map keys are
+// sorted by the encoder; local paths and filesystem metadata are excluded.
+func (p *Payload) Fingerprint() string {
+	database := p.Database.Business
+	if !p.Reliable {
+		database = p.DatabaseBytes
 	}
-	if !p.Reliable || !other.Reliable {
-		if p.DatabaseBytes == "" || p.DatabaseBytes != other.DatabaseBytes {
-			return false
-		}
-	} else if full {
-		if p.Database.Full != other.Database.Full {
-			return false
-		}
-	} else if p.Database.Business != other.Database.Business {
-		return false
-	}
-	for path, entry := range p.Files {
-		if candidate, ok := other.Files[path]; !ok || !entry.equal(candidate) {
-			return false
-		}
-	}
-	return true
+	encoded, _ := json.Marshal(struct {
+		Database string
+		Reliable bool
+		Files    map[string]Entry
+		Issues   map[string]int
+		Warnings []string
+	}{database, p.Reliable, p.Files, p.Issues, p.Warnings})
+	digest := sha256.Sum256(encoded)
+	return hex.EncodeToString(digest[:])
+}
+func (p *Payload) Same(other *Payload, _ bool) bool {
+	return other != nil && p.Fingerprint() == other.Fingerprint()
 }
 
 type Builder struct {
@@ -98,8 +100,11 @@ func (b Builder) Build(ctx context.Context, previous *Payload, readAll bool) (pa
 	}
 	payload = &Payload{Directory: directory, Files: map[string]Entry{}, Issues: map[string]int{}}
 	payload.DatabaseBytes, err = hashDatabase(ctx, db)
-	if err != nil && ctx.Err() == nil {
+	if err != nil {
 		return nil, err
+	}
+	if IntegrityCheck(ctx, db) != nil {
+		payload.Issues["database_integrity_failed"] = 1
 	}
 	digest, digestErr := CompareDigest(ctx, db)
 	if digestErr != nil {
@@ -133,7 +138,7 @@ func (b Builder) Build(ctx context.Context, previous *Payload, readAll bool) (pa
 			check = func(ctx context.Context, p *Payload) error { return p.checkReferences(ctx) }
 		}
 		if diagnosticErr := check(ctx, payload); diagnosticErr != nil {
-			payload.Warnings = append(payload.Warnings, "file_reference_diagnostics_unavailable")
+			payload.Issues["file_reference_diagnostics_unavailable"] = 1
 		}
 	}
 	// Reference diagnostics share the capture deadline and may consume its
@@ -157,23 +162,34 @@ func (p *Payload) checkReferences(ctx context.Context) error {
 		}
 		tables[col.Table][col.Name] = true
 	}
-	var queries []string
-	if cols := tables["attachments"]; cols != nil {
-		if !cols["cipher_uuid"] || !cols["id"] || !cols["file_size"] {
-			return errors.New("unknown attachment reference shape")
+	// Read each class independently: malformed Send JSON must not hide a
+	// missing attachment (or vice versa).
+	var failed bool
+	for _, kind := range []string{"attachments", "sends"} {
+		cols := tables[kind]
+		if cols == nil {
+			continue
 		}
-		queries = append(queries, `SELECT 'attachments/'||cipher_uuid||'/'||id AS path,file_size AS size FROM attachments`)
-	}
-	if cols := tables["sends"]; cols != nil && cols["atype"] {
-		if !cols["uuid"] || !cols["data"] {
-			return errors.New("unknown Send reference shape")
+		query := ""
+		if kind == "attachments" && cols["cipher_uuid"] && cols["id"] && cols["file_size"] {
+			query = `SELECT 'attachments/'||cipher_uuid||'/'||id AS path,file_size AS size FROM attachments`
 		}
-		queries = append(queries, `SELECT 'sends/'||uuid||'/'||json_extract(data,'$.id') AS path,CAST(json_extract(data,'$.size') AS INTEGER) AS size FROM sends WHERE atype=1`)
+		if kind == "sends" && cols["atype"] && cols["uuid"] && cols["data"] {
+			query = `SELECT 'sends/'||uuid||'/'||json_extract(data,'$.id') AS path,json_extract(data,'$.size') AS size FROM sends WHERE atype=1`
+		}
+		if query == "" || p.readReferences(ctx, db, query) != nil {
+			p.Issues[kind+"_references_unavailable"] = 1
+			failed = true
+		}
 	}
-	if len(queries) == 0 {
-		return nil
+	if failed {
+		return errors.New("file reference check failed")
 	}
-	data, err := runSQLite(ctx, db, ".mode json\n"+strings.Join(queries, " UNION ALL ")+";\n", true)
+	return nil
+}
+
+func (p *Payload) readReferences(ctx context.Context, db, query string) error {
+	data, err := runSQLite(ctx, db, ".mode json\n"+query+";\n", true)
 	if err != nil {
 		return err
 	}
@@ -181,21 +197,25 @@ func (p *Payload) checkReferences(ctx context.Context) error {
 		return nil
 	}
 	var refs []struct {
-		Path string `json:"path"`
-		Size *int64 `json:"size"`
+		Path string          `json:"path"`
+		Size json.RawMessage `json:"size"`
 	}
-	if err := json.Unmarshal(data, &refs); err != nil {
-		return errors.New("invalid file reference result")
+	if json.Unmarshal(data, &refs) != nil {
+		return errors.New("invalid references")
 	}
 	for _, ref := range refs {
-		if !filepath.IsLocal(ref.Path) || filepath.Clean(ref.Path) != ref.Path || len(strings.Split(ref.Path, "/")) != 3 || ref.Size == nil || *ref.Size < 0 {
+		// Vaultwarden Send JSON stores sizes as either strings or numbers.
+		var size int64
+		sizeText := strings.Trim(string(ref.Size), `"`)
+		_, sizeErr := fmt.Sscan(sizeText, &size)
+		if !filepath.IsLocal(ref.Path) || filepath.Clean(ref.Path) != ref.Path || len(strings.Split(ref.Path, "/")) != 3 || sizeErr != nil || size < 0 || strconv.FormatInt(size, 10) != sizeText {
 			p.Issues["invalid_file_reference"]++
 			continue
 		}
 		entry, ok := p.Files[ref.Path]
 		if !ok || entry.Kind != "file" {
 			p.Issues["referenced_file_missing"]++
-		} else if entry.Size != *ref.Size {
+		} else if entry.Size != size {
 			p.Issues["referenced_file_size_mismatch"]++
 		}
 	}

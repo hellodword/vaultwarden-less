@@ -112,7 +112,7 @@ func writeHelp(writer io.Writer) {
 
 func serve(ctx context.Context, stderr io.Writer) error {
 	logger := slog.New(slog.NewJSONHandler(stderr, nil))
-	serveContext, stop := context.WithCancel(ctx)
+	serveContext, stop := context.WithCancel(context.WithoutCancel(ctx))
 	defer stop()
 	events := proxyserver.NewEventSender(logger)
 	var eventWait sync.WaitGroup
@@ -130,14 +130,20 @@ func serve(ctx context.Context, stderr io.Writer) error {
 			result = errors.New("listen failed")
 		}
 	}
-	stop()
 	shutdownContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), proxyserver.ShutdownTimeout)
 	defer cancel()
 	if err := server.Shutdown(shutdownContext); err != nil {
 		logger.Error("proxy shutdown did not complete", "error_code", "shutdown_timeout")
 		result = errors.New("shutdown failed")
 	}
+	stop()
 	eventWait.Wait()
+	flushContext, flushCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer flushCancel()
+	if err := events.Flush(flushContext); err != nil {
+		logger.Warn("remaining event delivery failed", "error_code", "event_flush_failed")
+	}
+
 	logger.Info("proxy stopped")
 	return result
 }

@@ -84,7 +84,7 @@ and check that a second generation is identical. The exclusion list and content
 policy are
 reviewed code, not generated database schema or recovery definitions.
 
-For restic, review native backup/snapshot JSON, parent selection, S3 behavior,
+For restic, review native backup/snapshot/tag JSON, forced content reads, S3 behavior,
 restore and maintenance flags, output bounds and cancellation. For Go, review
 networking, TLS/HTTP2, cryptography, filesystem behavior, subprocesses and race
 tests. Consult official sources for changing external facts and security
@@ -156,6 +156,15 @@ loss, and native restore from both repositories followed by client reads.
 Four notification peers verify payloads, signing, explicit failures and retry
 recovery. Docker DNS and a test CA route Apple's production hostname to the
 HTTP/2 peer without a production endpoint setting.
+
+The real-image suite also captures a 192 MiB incompressible attachment, removes
+native snapshots, deletes and corrupts synthetic object-store packs, verifies
+fault persistence across successful uploads, and imports a native archive with
+WAL/SHM, keys, attachments, Sends and inactive config.json. It executes the
+documented import commands and restores both repositories with native restic.
+Persistent deadlines, the six-hour fallback, 24-hour single verification retry,
+30-day full-read interval, daily catch-up and reminder policies use a controlled
+clock in the ordinary checks; acceptance uses manual jobs for actual I/O.
 
 Acceptance does not establish real provider durability/IAM or delivery to
 external robot groups and Apple devices. Report those boundaries explicitly.

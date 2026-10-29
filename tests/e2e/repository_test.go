@@ -23,12 +23,40 @@ type nativeSnapshot struct {
 	} `json:"summary"`
 }
 
+// Damage only this test's synthetic object. Save its exact bytes inside the
+// disposable peer so restoration does not invoke automatic restic repair.
+func (h *e2eHarness) damageRemoteObject(target, action string) {
+	h.t.Helper()
+	h.mustDocker("exec", h.containerID("moto-"+target), "/bin/python3", "-c", `import boto3,pathlib,sys
+target,action=sys.argv[1:]
+s3=boto3.client('s3',endpoint_url='http://127.0.0.1:5000',aws_access_key_id='test',aws_secret_access_key='test',region_name='us-east-1')
+bucket='vaultwarden-less-'+target
+saved=pathlib.Path('/tmp/e2e-object-recovery')
+key_file=pathlib.Path('/tmp/e2e-object-recovery-key')
+if action=='restore':
+    s3.put_object(Bucket=bucket,Key=key_file.read_text(),Body=saved.read_bytes())
+    saved.unlink()
+    key_file.unlink()
+else:
+    assert not saved.exists()
+    objects=s3.list_objects_v2(Bucket=bucket,Prefix='repository/data/')['Contents']
+    key=min(objects,key=lambda item:item['Size'])['Key']
+    data=s3.get_object(Bucket=bucket,Key=key)['Body'].read()
+    saved.write_bytes(data)
+    key_file.write_text(key)
+    if action=='delete':
+        s3.delete_object(Bucket=bucket,Key=key)
+    else:
+        s3.put_object(Bucket=bucket,Key=key,Body=bytes([data[0]^255])+data[1:])
+`, target, action)
+}
+
 func (h *e2eHarness) nativeRestic(target string, mounts []string, arguments ...string) string {
 	h.t.Helper()
 	command := []string{"run", "--rm", "--pull", "never", "--network", h.project + "_default", "--user", h.identity(), "--read-only",
-		"--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777", "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
+		"--mount", "type=bind,source=" + filepath.Join(h.deploymentRoot, "maintenance-cache") + ",target=/cache", "--env", "TMPDIR=/cache", "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
 		"--env-file", filepath.Join(h.deploymentRoot, "credentials/maintenance", target+".env"),
-		"--env", "RESTIC_CACHE_DIR=/tmp/restic", "--mount", "type=bind,source=" + filepath.Join(h.deploymentRoot, "credentials/restic") + ",target=/run/credentials/restic,readonly"}
+		"--env", "RESTIC_CACHE_DIR=/cache/restic", "--mount", "type=bind,source=" + filepath.Join(h.deploymentRoot, "credentials/restic") + ",target=/run/credentials/restic,readonly"}
 	for _, mount := range mounts {
 		command = append(command, "--mount", mount)
 	}
@@ -85,19 +113,30 @@ func settled(s productworker.Status) bool {
 	}
 	return true
 }
-func (h *e2eHarness) check(full bool) productworker.Status {
+func (h *e2eHarness) operation(arguments ...string) productworker.Operation {
 	h.t.Helper()
-	before := h.status().LastCheck
-	args := []string{"exec", "--no-TTY", "backup", "/bin/vaultwarden-less-backup", "check"}
-	if full {
-		args = append(args, "--full")
+	output, err := h.tryCompose(h.ctx, append([]string{"exec", "--no-TTY", "backup", "/bin/vaultwarden-less-backup"}, arguments...)...)
+	var op productworker.Operation
+	for _, line := range strings.Split(output, "\n") {
+		var candidate productworker.Operation
+		if json.Unmarshal([]byte(line), &candidate) == nil && candidate.ID != "" {
+			op = candidate
+			break
+		}
 	}
-	output := h.compose(args...)
-	var accepted map[string]any
-	if json.Unmarshal([]byte(output), &accepted) != nil || accepted["accepted"] != true {
-		h.t.Fatal("manual check not accepted")
+	if !op.Done() || (op.State == "succeeded") != (err == nil) {
+		h.t.Fatalf("manual operation did not report its actual outcome: %v: %s", err, harnessDiagnostics(output))
 	}
-	return h.waitStatus(3*time.Minute, func(s productworker.Status) bool { return s.LastCheck.After(before) && settled(s) })
+	return op
+}
+func (h *e2eHarness) check(force bool) productworker.Status {
+	h.t.Helper()
+	args := []string{"backup"}
+	if force {
+		args = append(args, "--force")
+	}
+	h.operation(args...)
+	return h.waitStatus(3*time.Minute, settled)
 }
 func (h *e2eHarness) waitNewRequestCheck(after time.Time) productworker.Status {
 	return h.waitStatus(3*time.Minute, func(s productworker.Status) bool { return s.LastCheck.After(after) && settled(s) })
@@ -134,7 +173,7 @@ func (h *e2eHarness) restore(target, id, name string) string {
 	if _, err := os.Stat(filepath.Join(path, "db.sqlite3")); err != nil {
 		h.t.Fatal("native restore did not produce a root database")
 	}
-	if result := h.sqliteReadOnly(path, "PRAGMA integrity_check;"); strings.TrimSpace(result) != "ok" {
+	if result := h.sqlite(path, "PRAGMA integrity_check;"); strings.TrimSpace(result) != "ok" {
 		h.t.Fatal("restored SQLite integrity failed")
 	}
 	return path
@@ -154,6 +193,7 @@ func (h *e2eHarness) startRestored(root, name string) {
 	command := []string{"run", "--detach", "--pull", "never", "--name", container, "--label", "vaultwarden-less.e2e.project=" + h.project,
 		"--user", h.identity(), "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
 		"--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777", "--mount", "type=bind,source=" + root + ",target=/data",
+		"--mount", "type=bind,source=" + filepath.Join(h.deploymentRoot, "config/vaultwarden-runtime.json") + ",target=/config/vaultwarden-runtime.json,readonly",
 		"--publish", fmt.Sprintf("127.0.0.1:%d:80", port)}
 	// Use the rendered product configuration before any test-only overrides.
 	// Sends stay disabled here: existing Sends must still be readable on restore.

@@ -68,7 +68,7 @@ func build(t *testing.T, b Builder, previous *Payload, readAll bool) *Payload {
 	return p
 }
 
-func TestNativeTreeAndMetadataCaching(t *testing.T) {
+func TestNativeTreeAndFreshReads(t *testing.T) {
 	b := fixtureBuilder(t)
 	for _, path := range []string{"rsa_key.pem", "rsa_key.pub.pem", "orphan/file", "templates/mail", "unknown.sqlite3-wal", "sub/db.sqlite3-wal"} {
 		writeFile(t, b.DataDir, path, "content")
@@ -120,8 +120,8 @@ func TestNativeTreeAndMetadataCaching(t *testing.T) {
 	if os.SameFile(sourceInfo, firstInfo) {
 		t.Fatal("hard linked live data")
 	}
-	if !os.SameFile(firstInfo, secondInfo) {
-		t.Fatal("did not reuse completed file")
+	if os.SameFile(firstInfo, secondInfo) {
+		t.Fatal("reused old content instead of reading source")
 	}
 	third := build(t, b, second, true)
 	thirdInfo, _ := os.Stat(filepath.Join(third.Directory, "rsa_key.pem"))
@@ -270,7 +270,7 @@ func TestTimeoutDuringReferencesKeepsNativePayloadAndRecovers(t *testing.T) {
 	if err != nil || !called {
 		t.Fatalf("capture failed before diagnostics: %v", err)
 	}
-	if p.Tag() != "incomplete" || p.Issues["capture_timeout"] != 1 || !slices.Contains(p.Warnings, "file_reference_diagnostics_unavailable") {
+	if p.Tag() != "incomplete" || p.Issues["capture_timeout"] != 1 || p.Issues["file_reference_diagnostics_unavailable"] != 1 {
 		t.Fatalf("diagnostic timeout mislabeled: issues=%v warnings=%v", p.Issues, p.Warnings)
 	}
 	if got := sqlExec(t, filepath.Join(p.Directory, "db.sqlite3"), "PRAGMA integrity_check; SELECT id FROM attachments;"); got != "ok\nfile\n" {
@@ -284,10 +284,38 @@ func TestTimeoutDuringReferencesKeepsNativePayloadAndRecovers(t *testing.T) {
 	if recovered.Tag() != "complete" || recovered.Same(p, false) {
 		t.Fatal("completed retry did not replace incomplete capture")
 	}
-	// An unsupported diagnostic shape is only a warning when time remains.
+	// Unavailable reference checks are incomplete even when time remains.
 	sqlExec(t, filepath.Join(b.DataDir, "db.sqlite3"), "ALTER TABLE attachments RENAME COLUMN file_size TO future_size;")
 	warning := build(t, b, recovered, true)
-	if !warning.Complete() || !slices.Contains(warning.Warnings, "file_reference_diagnostics_unavailable") {
-		t.Fatal("diagnostic failure without timeout made the native capture incomplete")
+	if warning.Complete() || warning.Issues["attachments_references_unavailable"] != 1 {
+		t.Fatal("diagnostic failure was not incomplete")
+	}
+}
+
+func TestReferenceClassesFailIndependently(t *testing.T) {
+	b := fixtureBuilder(t)
+	sqlExec(t, filepath.Join(b.DataDir, "db.sqlite3"), `INSERT INTO attachments VALUES('c','missing',7); INSERT INTO sends VALUES('s',1,'not JSON');`)
+	p := build(t, b, nil, true)
+	if p.Complete() || p.Issues["referenced_file_missing"] != 1 || p.Issues["sends_references_unavailable"] != 1 {
+		t.Fatalf("issues: %v", p.Issues)
+	}
+	before := p.Fingerprint()
+	p.Issues["referenced_file_missing"]++
+	if p.Fingerprint() == before {
+		t.Fatal("changed problem counts were ignored")
+	}
+}
+
+func TestCopiedDatabaseIntegrityFailure(t *testing.T) {
+	b := fixtureBuilder(t)
+	// A structurally readable database with a violated CHECK constraint can be
+	// copied by SQLite, but must never be declared complete.
+	sqlExec(t, filepath.Join(b.DataDir, "db.sqlite3"), `CREATE TABLE broken(v CHECK(v>0)); PRAGMA ignore_check_constraints=ON; INSERT INTO broken VALUES(-1);`)
+	p := build(t, b, nil, true)
+	if p.Complete() || p.Issues["database_integrity_failed"] != 1 {
+		t.Fatalf("integrity not checked: %v", p.Issues)
+	}
+	if got := sqlExec(t, filepath.Join(p.Directory, "db.sqlite3"), "SELECT v FROM broken;"); got != "-1\n" {
+		t.Fatal("native content lost")
 	}
 }

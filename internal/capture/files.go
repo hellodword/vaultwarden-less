@@ -159,23 +159,10 @@ func (c *fileCapture) walk(dir *os.File, prefix string) error {
 	return nil
 }
 
-// Only completed payload files are linked. Source files are always read into a
-// new file. File metadata merely controls reads; it never enters equality.
+// Every capture reads source bytes into a new immutable file. Metadata checks
+// detect concurrent changes; metadata never substitutes for a content read.
 func (c *fileCapture) copy(dir *os.File, name, relative string, info os.FileInfo) (Entry, string, error) {
 	destination := filepath.Join(c.destination, relative)
-	if !c.readAll && c.previous != nil {
-		if old, ok := c.previous.Files[relative]; ok && old.Kind == "file" && old.stamp != nil && sameVersion(info, old.stamp) {
-			if err := os.Link(filepath.Join(c.previous.Directory, relative), destination); err != nil {
-				return Entry{}, "", errors.New("link completed payload file")
-			}
-			after, err := os.Lstat(descriptorPath(dir, name))
-			if err != nil || !sameVersion(info, after) {
-				os.Remove(destination)
-				return Entry{}, "file_changed", nil
-			}
-			return old, "", nil
-		}
-	}
 	source, err := openAt(dir, name, false)
 	if err != nil {
 		return Entry{}, "file_unreadable", nil

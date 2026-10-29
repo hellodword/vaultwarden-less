@@ -12,6 +12,8 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"time"
+	_ "time/tzdata"
 
 	"github.com/docker/cli/pkg/kvfile"
 	"github.com/goccy/go-yaml"
@@ -24,19 +26,46 @@ const (
 	WorkerURL               = "http://backup:9090"
 	DataDir                 = "/data"
 	CacheDir                = "/cache"
+	StateDir                = "/state"
 )
 
 type Backup struct {
-	Targets   []Target   `json:"targets"`
-	Notifiers []Notifier `json:"notifiers"`
+	Targets       []Target      `json:"targets"`
+	Notifications Notifications `json:"notifications"`
+}
+
+type Verification struct {
+	StructureInterval string        `yaml:"structure_interval" json:"structure_interval,omitempty"`
+	ReadDataInterval  string        `yaml:"read_data_interval" json:"read_data_interval,omitempty"`
+	Timeout           string        `yaml:"timeout" json:"timeout"`
+	StructureEvery    time.Duration `yaml:"-" json:"-"`
+	ReadDataEvery     time.Duration `yaml:"-" json:"-"`
+	Limit             time.Duration `yaml:"-" json:"-"`
+}
+type Notifications struct {
+	Timezone         string         `yaml:"timezone" json:"timezone"`
+	DailyAt          string         `yaml:"daily_at" json:"daily_at"`
+	ReminderInterval string         `yaml:"reminder_interval" json:"reminder_interval"`
+	Channels         []Notifier     `yaml:"channels" json:"channels"`
+	Location         *time.Location `yaml:"-" json:"-"`
+	ReminderEvery    time.Duration  `yaml:"-" json:"-"`
+}
+
+func positiveDuration(value string) (time.Duration, error) {
+	d, err := time.ParseDuration(value)
+	if err != nil || d <= 0 {
+		return 0, errors.New("invalid positive duration")
+	}
+	return d, nil
 }
 
 type Target struct {
-	Name        string   `yaml:"name" json:"name"`
-	EnvFile     string   `yaml:"env_file" json:"-"`
-	Options     []string `yaml:"options" json:"-"`
-	Environment []string `yaml:"-" json:"-"`
-	Error       string   `yaml:"-" json:"error,omitempty"`
+	Name        string       `yaml:"name" json:"name"`
+	Verify      Verification `yaml:"verify" json:"verify"`
+	EnvFile     string       `yaml:"env_file" json:"-"`
+	Options     []string     `yaml:"options" json:"-"`
+	Environment []string     `yaml:"-" json:"-"`
+	Error       string       `yaml:"-" json:"error,omitempty"`
 }
 
 type Notifier struct {
@@ -65,15 +94,44 @@ func DecodeBackup(data []byte) (*Backup, error) {
 		return nil, errors.New("invalid YAML document")
 	}
 	var doc struct {
-		Targets   []any `yaml:"targets"`
-		Notifiers []any `yaml:"notifiers"`
+		Targets       []any `yaml:"targets"`
+		Notifications struct {
+			Timezone         string `yaml:"timezone"`
+			DailyAt          string `yaml:"daily_at"`
+			ReminderInterval string `yaml:"reminder_interval"`
+			Channels         []any  `yaml:"channels"`
+		} `yaml:"notifications"`
 	}
 	if err := yaml.NewDecoder(bytes.NewReader(data), yaml.Strict()).Decode(&doc); err != nil {
 		return nil, errors.New("invalid configuration document or unknown root key")
 	}
-	result := &Backup{Targets: []Target{}, Notifiers: []Notifier{}}
+	if doc.Targets == nil {
+		return nil, errors.New("targets list required")
+	}
+	result := &Backup{Targets: []Target{}, Notifications: Notifications{Timezone: "Asia/Shanghai", DailyAt: "21:00", ReminderInterval: "6h", Channels: []Notifier{}}}
+	n := &result.Notifications
+	if doc.Notifications.Timezone != "" {
+		n.Timezone = doc.Notifications.Timezone
+	}
+	if doc.Notifications.DailyAt != "" {
+		n.DailyAt = doc.Notifications.DailyAt
+	}
+	if doc.Notifications.ReminderInterval != "" {
+		n.ReminderInterval = doc.Notifications.ReminderInterval
+	}
+	n.Location, err = time.LoadLocation(n.Timezone)
+	if err != nil {
+		return nil, errors.New("invalid notification timezone")
+	}
+	if parsed, e := time.Parse("15:04", n.DailyAt); e != nil || parsed.Format("15:04") != n.DailyAt {
+		return nil, errors.New("invalid daily time")
+	}
+	n.ReminderEvery, err = positiveDuration(n.ReminderInterval)
+	if err != nil {
+		return nil, errors.New("invalid reminder interval")
+	}
 	for i, raw := range doc.Targets {
-		target := Target{}
+		target := Target{Verify: Verification{Timeout: "2h", Limit: 2 * time.Hour}}
 		encoded, err := yaml.Marshal(raw)
 		if err != nil || decodeOneYAML(encoded, &target) != nil {
 			target.Error = "invalid_target_config"
@@ -90,9 +148,23 @@ func DecodeBackup(data []byte) (*Backup, error) {
 				target.Error = "invalid_restic_option"
 			}
 		}
+		for _, item := range []struct {
+			value       string
+			destination *time.Duration
+		}{{target.Verify.StructureInterval, &target.Verify.StructureEvery}, {target.Verify.ReadDataInterval, &target.Verify.ReadDataEvery}, {target.Verify.Timeout, &target.Verify.Limit}} {
+			if item.value == "" {
+				continue
+			}
+			value, err := positiveDuration(item.value)
+			if err != nil {
+				target.Error = "invalid_verify_config"
+			} else {
+				*item.destination = value
+			}
+		}
 		result.Targets = append(result.Targets, target)
 	}
-	for i, raw := range doc.Notifiers {
+	for i, raw := range doc.Notifications.Channels {
 		notifier := Notifier{Sound: "1107"}
 		encoded, err := yaml.Marshal(raw)
 		if err != nil || decodeOneYAML(encoded, &notifier) != nil {
@@ -135,7 +207,7 @@ func DecodeBackup(data []byte) (*Backup, error) {
 				notifier.Error = "invalid_notifier_field"
 			}
 		}
-		result.Notifiers = append(result.Notifiers, notifier)
+		result.Notifications.Channels = append(result.Notifications.Channels, notifier)
 	}
 	for i := range result.Targets {
 		for j := 0; j < i; j++ {
@@ -145,11 +217,11 @@ func DecodeBackup(data []byte) (*Backup, error) {
 			}
 		}
 	}
-	for i := range result.Notifiers {
+	for i := range result.Notifications.Channels {
 		for j := 0; j < i; j++ {
-			if result.Notifiers[i].Name == result.Notifiers[j].Name {
-				result.Notifiers[i].Error = "duplicate_name"
-				result.Notifiers[j].Error = "duplicate_name"
+			if result.Notifications.Channels[i].Name == result.Notifications.Channels[j].Name {
+				result.Notifications.Channels[i].Error = "duplicate_name"
+				result.Notifications.Channels[j].Error = "duplicate_name"
 			}
 		}
 	}
@@ -202,10 +274,23 @@ func LoadBackup(path string) (*Backup, error) {
 				target.Error = "invalid_env_file"
 			}
 		}
+		values := map[string]string{}
+		for _, entry := range env {
+			key, value, _ := strings.Cut(entry, "=")
+			values[key] = value
+		}
+		for _, key := range []string{"RESTIC_PASSWORD_FILE", "RESTIC_REPOSITORY_FILE", "RESTIC_CACERT"} {
+			if path := values[key]; path != "" {
+				data, err := readLocal(path)
+				if err != nil || len(bytes.TrimSpace(data)) == 0 {
+					target.Error = "credential_file_unavailable"
+				}
+			}
+		}
 		target.Environment = env
 	}
-	for i := range cfg.Notifiers {
-		notifier := &cfg.Notifiers[i]
+	for i := range cfg.Notifications.Channels {
+		notifier := &cfg.Notifications.Channels[i]
 		if notifier.Error != "" || notifier.Type != "bark" {
 			continue
 		}
@@ -236,7 +321,7 @@ func (b *Backup) Valid() bool {
 			return false
 		}
 	}
-	for _, n := range b.Notifiers {
+	for _, n := range b.Notifications.Channels {
 		if n.Error != "" {
 			return false
 		}

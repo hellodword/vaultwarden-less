@@ -53,6 +53,8 @@ pkgs.dockerTools.buildLayeredImage {
     pkgs.restic
     pkgs.sqlite
     pkgs.cacert
+    pkgs.gnutar
+    pkgs.findutils
     pkgs.coreutils
     pkgs.bash
   ];

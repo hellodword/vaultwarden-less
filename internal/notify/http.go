@@ -117,6 +117,9 @@ func (s *webhookSender) Send(ctx context.Context, event Event) error {
 		return err
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
+			return &DeliveryError{Code: "webhook_authentication_failed", Permanent: true, After: retryAfter(response, now)}
+		}
 		return &DeliveryError{Code: "webhook_http_failure", After: retryAfter(response, now)}
 	}
 	var result map[string]json.RawMessage

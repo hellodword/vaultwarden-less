@@ -26,7 +26,11 @@ import (
 
 const stubSecret = "e2e-notification-signing-secret"
 const stubDevice = "synthetic-device-token-with-no-fixed-length"
-const notificationConfiguration = `notifiers:
+const notificationConfiguration = `notifications:
+ timezone: Asia/Shanghai
+ daily_at: "21:00"
+ reminder_interval: 6h
+ channels:
   - name: wecom
     type: wecom
     webhook_url: https://api.push.apple.com/wecom
@@ -193,7 +197,7 @@ func runNotificationStub(root string) error {
 		default:
 			valid = false
 		}
-		valid = valid && strings.HasPrefix(content, "**vaultwarden-less · ") && strings.Contains(content, "**Source:** ") && strings.Contains(content, "**Summary:** ") && !strings.Contains(content, "e2e-private-path")
+		valid = valid && strings.HasPrefix(content, "**Vaultwarden backup — ") && strings.Contains(content, "Source: ") && strings.Contains(content, "Time: ") && strings.Contains(content, "Source checks:") && !strings.Contains(content, "e2e-private-path")
 		mu.Lock()
 		defer mu.Unlock()
 		state := stats[channel]
@@ -286,7 +290,7 @@ func (h *e2eHarness) assertNotifications() {
 			if state.Invalid > 0 || state.Markdown != state.Attempts {
 				h.t.Fatalf("notification %s failed protocol verification", name)
 			}
-			if state.Successes == 0 || state.Failures != 1 || !state.UnknownSummary {
+			if state.Successes == 0 || state.Failures != 1 {
 				return false
 			}
 			if state.FirstSuccess.Sub(state.FirstAttempt) < 59*time.Second {
