@@ -29,9 +29,9 @@ func serve(ctx context.Context, path string, stderr io.Writer) error {
 		logger.Warn("No backup targets configured; data is not being backed up")
 	}
 	store := state.Store{Directory: config.StateDir}
-	lock, err := store.Lock()
+	lock, err := (state.Store{Directory: config.CacheDir}).Lock()
 	if err != nil {
-		return &commandError{message: "Worker state unavailable or another instance is running"}
+		return &commandError{message: "Worker cache unavailable or another instance is running"}
 	}
 	defer lock.Close()
 	work := filepath.Join(config.CacheDir, "work")
@@ -41,7 +41,7 @@ func serve(ctx context.Context, path string, stderr io.Writer) error {
 	if err := os.MkdirAll(work, 0o700); err != nil {
 		return &commandError{message: "Work directory unavailable"}
 	}
-	notifications := notify.NewManager(cfg.Notifications.Channels)
+	notifications := notify.NewManager(cfg.Notifications.Channels, logger)
 	repo := restic.NewRunner("restic", config.CacheDir)
 	rule, err := capture.LoadRule(capture.RulePath)
 	if err != nil {
@@ -50,37 +50,26 @@ func serve(ctx context.Context, path string, stderr io.Writer) error {
 	var reports worker.Notifications
 	if len(cfg.Notifications.Channels) > 0 {
 		if err := notifications.Restore(store); err != nil {
-			return &commandError{message: "Notification state unavailable"}
+			notifications.Pause("notifications.json", err)
 		}
 		reports = notifications
 	}
 	backupWorker := worker.New(cfg, capture.Builder{DataDir: config.DataDir, CacheDir: work, Rule: rule}, repo, reports)
 	if err := backupWorker.Restore(store); err != nil {
-		return &commandError{message: "Worker state unavailable"}
+		notifications.Pause("reports.json", err)
 	}
 	server := worker.NewHTTPServer(backupWorker)
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	var background sync.WaitGroup
-	failed := make(chan error, 2)
-	background.Go(func() {
-		if err := notifications.Run(runCtx); err != nil {
-			failed <- err
-		}
-	})
-	background.Go(func() {
-		if err := backupWorker.Run(runCtx); err != nil {
-			failed <- err
-		}
-	})
+	background.Go(func() { notifications.Run(runCtx) })
+	background.Go(func() { backupWorker.Run(runCtx) })
 	done := make(chan error, 1)
 	go func() { done <- server.ListenAndServe() }()
 	logger.Info("backup process started")
 	var result error
 	select {
 	case <-ctx.Done():
-	case <-failed:
-		result = &commandError{message: "Worker persistent state could not be saved"}
 	case err := <-done:
 		if !errors.Is(err, http.ErrServerClosed) {
 			result = &commandError{message: "Backup HTTP service stopped"}

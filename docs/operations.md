@@ -12,9 +12,11 @@ native snapshots
 
 `source=ready` 表示取得了通过检查的源库副本。`protected` 表示该仓库已保存对应内容或已确认两者相同。`checked_at` 是这次检查的时间，`snapshot_at` 是最近快照的时间，两者可以相隔数月。`checking` 表示比较或上传正在进行。`failed`、`error` 和 `retry_at` 用于定位故障。在 `source=failed` 时，以各仓库最后一次确认时间判断保护进度。通知渠道投递失败时，`notification_errors` 列出渠道名和错误。查看单个仓库的实际快照使用原生 `snapshots`。
 
+若各渠道同时报告 `state_invalid`、`state_read_failed` 或 `state_write_failed`，查看 `dc logs backup` 中的文件名和原因。两个仓库仍会接收新写入。停下 backup，保留现场，检查空间、文件权限和记录内容，修复问题后重新启动 backup。它会从可读记录继续投递。
+
 ## 从任一仓库恢复
 
-在有 Docker 的独立主机准备发行包、维护凭据和仓库密码，加载镜像并填写环境文件。原 VPS、备份服务的状态目录和其他仓库都不参与恢复。先用 `native snapshots` 选择时间，再从 `native snapshots --json` 取得完整 ID，用 `native ls "$SNAPSHOT_ID"` 确认包含 `/db.sqlite3`。以下 Bash 示例在一个全新的绝对路径内恢复。执行命令的用户须能读取仓库密码并能写入恢复目录；如目标配置了额外后端选项，请一并传给 restic。
+在有 Docker 的独立主机准备发行包、维护凭据和仓库密码，加载镜像并填写环境文件。原 VPS、备份服务的状态目录和其他仓库都不参与恢复。先用 `native snapshots` 选择时间，再从 `native snapshots --json` 取得完整 ID，用 `native ls "$SNAPSHOT_ID"` 确认包含 `/db.sqlite3`。以下 Bash 示例在一个全新的绝对路径内恢复。恢复目录和缓存按固定属主准备。如目标配置了额外后端选项，请一并传给 restic。
 
 <!-- native-restore-example -->
 ```sh
@@ -26,8 +28,9 @@ test "$(realpath -m -- "$RESTORE_DIR")" = "$RESTORE_DIR"
 test ! -e "$RESTORE_DIR"
 test ! -L "$RESTORE_DIR"
 mkdir -m 0700 -- "$RESTORE_DIR"
-mkdir -p -- "$DEPLOY_DIR/cache/maintenance"
-docker run --rm --read-only --user "$(id -u):$(id -g)" \
+mkdir -p -m 0700 -- "$DEPLOY_DIR/cache/maintenance"
+chown 1000:1000 -- "$RESTORE_DIR" "$DEPLOY_DIR/cache/maintenance"
+docker run --rm --read-only \
   --mount "type=bind,source=$DEPLOY_DIR/cache/maintenance,target=/cache" \
   --env TMPDIR=/cache \
   --env-file "$RESTIC_ENV_FILE" \
@@ -37,7 +40,8 @@ docker run --rm --read-only --user "$(id -u):$(id -g)" \
   --entrypoint /bin/restic "$RESTIC_IMAGE" \
   restore "$SNAPSHOT_ID" --verify --target /restore
 test -s "$RESTORE_DIR/db.sqlite3" && test ! -L "$RESTORE_DIR/db.sqlite3" || exit 1
-integrity=$(docker run --rm --read-only --user "$(id -u):$(id -g)" \
+chmod 0600 -- "$RESTORE_DIR/db.sqlite3"
+integrity=$(docker run --rm --read-only \
   --mount "type=bind,source=$RESTORE_DIR,target=/restore" \
   --entrypoint /bin/sqlite3 "$RESTIC_IMAGE" \
   '/restore/db.sqlite3' 'PRAGMA integrity_check;')
@@ -45,7 +49,7 @@ test "$integrity" = ok
 printf '%s\n' "$integrity"
 ```
 
-保留这份校验通过的文件。把 `db.sqlite3` 复制到新实例的空 `data/` 并设置对应的 UID:GID，使用与快照兼容的 Vaultwarden 版本和自己的环境文件，在隔离 HTTPS 地址启动。空目录让 Vaultwarden 自行生成服务器 RSA 密钥，避免混入另一个数据库的 WAL。
+保留这份校验通过的文件。确认新实例的 `data/` 为空后，用 `install -o 1000 -g 1000 -m 0600 -- "$RESTORE_DIR/db.sqlite3" "$DEPLOY_DIR/data/db.sqlite3"` 放置已校验的库，使用与快照兼容的 Vaultwarden 版本和自己的环境文件，在隔离 HTTPS 地址启动。空目录让 Vaultwarden 自行生成服务器 RSA 密钥，避免混入另一个数据库的 WAL。
 
 恢复会把所有账号带回同一个快照时间点。每位使用者用全新配置的官方客户端登录恢复实例，完成自己账号的验证和解锁，同步后核对本人的条目、密码、文件夹和收藏。在确认内容与预期一致后再切换正式入口。对第二个仓库独立做一次相同演练。
 
@@ -69,16 +73,18 @@ native forget --group-by '' --keep-daily 7 --keep-weekly 5 --keep-monthly 12 --d
 set -euo pipefail
 dc stop proxy backup vaultwarden
 stage=$(mktemp -d "$DEPLOY_DIR/cache/manual.XXXXXXXX")
-docker run --rm --read-only --user "$(id -u):$(id -g)" \
+chown 1000:1000 -- "$stage"
+docker run --rm --read-only \
   --mount "type=bind,source=$DEPLOY_DIR/data,target=/source,readonly" \
   --mount "type=bind,source=$stage,target=/stage" \
   --entrypoint /bin/sqlite3 "$RESTIC_IMAGE" -batch -bail -readonly /source/db.sqlite3 '.backup /stage/db.sqlite3'
-check=$(docker run --rm --read-only --user "$(id -u):$(id -g)" \
+chmod 0600 -- "$stage/db.sqlite3"
+check=$(docker run --rm --read-only \
   --mount "type=bind,source=$stage,target=/stage" \
   --entrypoint /bin/sqlite3 "$RESTIC_IMAGE" /stage/db.sqlite3 'PRAGMA integrity_check;')
 test "$check" = ok
 for target in aws-s3 backblaze-b2; do
-  docker run --rm --read-only --user "$(id -u):$(id -g)" --tmpfs /tmp:mode=1777 \
+  docker run --rm --read-only --tmpfs /tmp:mode=1777 \
     --env-file "$DEPLOY_DIR/credentials/maintenance/$target-maintenance.env" \
     --mount "type=bind,source=$DEPLOY_DIR/credentials/restic,target=/run/credentials/restic,readonly" \
     --mount "type=bind,source=$stage,target=/stage,readonly" --entrypoint /bin/restic "$RESTIC_IMAGE" \

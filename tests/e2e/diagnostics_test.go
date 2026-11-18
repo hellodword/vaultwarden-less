@@ -14,15 +14,6 @@ func redactDiagnostics(value string, secrets ...string) string {
 	return truncateDiagnostic(value, 6000)
 }
 
-func containsSecret(value string, secrets ...string) bool {
-	for _, secret := range secrets {
-		if secret != "" && strings.Contains(value, secret) {
-			return true
-		}
-	}
-	return false
-}
-
 func truncateDiagnostic(value string, limit int) string {
 	if len(value) <= limit {
 		return value
@@ -32,7 +23,7 @@ func truncateDiagnostic(value string, limit int) string {
 
 func TestRedactDiagnosticsRemovesEverySecretAndBoundsOutput(t *testing.T) {
 	t.Parallel()
-	value := strings.Repeat("prefix-", 1000) + "password/session"
+	value := "password/session " + strings.Repeat("prefix-", 1000)
 	redacted := redactDiagnostics(value, "password", "session")
 	if strings.Contains(redacted, "password") || strings.Contains(redacted, "session") {
 		t.Fatal("diagnostic redaction retained a secret")

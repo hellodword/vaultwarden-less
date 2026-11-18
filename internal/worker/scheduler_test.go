@@ -59,13 +59,11 @@ func TestIndependentCatchupAndPeriodicCapture(t *testing.T) {
 		return path, os.WriteFile(path, fmt.Appendf(nil, "%d", version.Load()), 0600)
 	}
 	ctx, cancel := context.WithCancel(t.Context())
-	done := make(chan error, 1)
-	go func() { done <- w.Run(ctx) }()
+	done := make(chan struct{})
+	go func() { w.Run(ctx); close(done) }()
 	t.Cleanup(func() {
 		cancel()
-		if err := <-done; err != nil {
-			t.Error(err)
-		}
+		<-done
 	})
 	wait := func(a, b string) {
 		t.Helper()

@@ -16,7 +16,7 @@ import (
 // registerAccount is a narrow protocol fixture because the official
 // Bitwarden CLI deliberately does not expose account registration.
 // Every ordinary vault operation uses the Nix-provided official bw.
-func registerAccount(ctx context.Context, t *testing.T, server, email, password string) register.Registration {
+func registerAccount(ctx context.Context, t *testing.T, server, email, password string) {
 	t.Helper()
 	verification, err := json.Marshal(map[string]string{"email": email, "name": "Vaultwarden-less E2E"})
 	if err != nil {
@@ -34,7 +34,8 @@ func registerAccount(ctx context.Context, t *testing.T, server, email, password 
 	if err != nil {
 		t.Fatal(err)
 	}
-	data, err := registration.WithEmailVerificationToken(token).JSON()
+	registration.EmailVerificationToken = token
+	data, err := json.Marshal(registration)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -42,7 +43,6 @@ func registerAccount(ctx context.Context, t *testing.T, server, email, password 
 	if status != http.StatusOK {
 		t.Fatalf("registration finish returned %d", status)
 	}
-	return registration
 }
 
 func expectRegistrationRejected(ctx context.Context, t *testing.T, server, email, password string) {
@@ -66,7 +66,8 @@ func expectRegistrationRejected(ctx context.Context, t *testing.T, server, email
 	if err != nil {
 		t.Fatal(err)
 	}
-	data, err := registration.WithEmailVerificationToken(token).JSON()
+	registration.EmailVerificationToken = token
+	data, err := json.Marshal(registration)
 	if err != nil {
 		t.Fatal(err)
 	}

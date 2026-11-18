@@ -5,11 +5,8 @@ name: vaultwarden-less
 
 x-service-defaults: &service-defaults
   platform: linux/amd64
-  restart: "on-failure:5"
-  # All services use these non-root numeric IDs. Edit them to match the owner
-  # of the deployment files: data/state/cache need read/write access; configuration
-  # and credentials need read access. Match existing data ownership on adoption.
-  user: "65532:65532"
+  restart: unless-stopped
+  user: "1000:1000"
   read_only: true
   tmpfs:
     - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777

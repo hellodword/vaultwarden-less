@@ -5,6 +5,7 @@ The host and runner must see each bind source at the same absolute path.
 """
 
 import argparse
+import errno
 import json
 import os
 import stat
@@ -43,61 +44,90 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("runner-image must be an image reference")
     if not socket.exists() or not stat.S_ISSOCK(socket.stat().st_mode):
         parser.error(f"docker-socket must be a local Unix socket: {socket}")
-    if os.geteuid() == 0 or os.getegid() == 0:
-        parser.error("acceptance requires a non-root user and group with Docker access")
     # Docker --mount uses comma-separated fields. Spaces are supported; commas
     # would otherwise silently change the meaning of a mount specification.
     if any("," in str(path) for path in (release, base, socket)):
         parser.error("shared bind paths must not contain commas")
     base.mkdir(parents=True, exist_ok=True)
     work = Path(tempfile.mkdtemp(prefix="release-", dir=base))
-    docker_config = work / "docker-config"
-    docker_config.mkdir(mode=0o700)
-    (docker_config / "config.json").write_text(json.dumps({"auths": {}}))
-    env = docker_environment(docker_config)
-    docker = ["docker", "--config", str(docker_config), "--host", f"unix://{socket}"]
-    subprocess.run(docker + ["load", "--input", str(runner)], env=env, check=True)
-    command = docker + [
-        "run",
-        "--rm",
-        "--pull",
-        "never",
-        "--network",
-        "host",
-        "--user",
-        f"{os.geteuid()}:{os.getegid()}",
-        "--group-add",
-        str(socket.stat().st_gid),
-        "--mount",
-        f"type=bind,source={socket},target={socket}",
-        "--mount",
-        f"type=bind,source={release},target={release},readonly",
-        "--mount",
-        f"type=bind,source={work},target={work}",
-        "--env",
-        f"DOCKER_CONFIG={docker_config}",
-        args.runner_image,
-        "--release-dir",
-        str(release),
-        "--work-dir",
-        str(work),
-        "--docker-socket",
-        str(socket),
-    ]
-    print(f"Acceptance results: {work / 'results.log'}", flush=True)
-    with (work / "results.log").open("w") as log:
-        process = subprocess.Popen(
-            command,
-            env=env,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-        )
-        for line in process.stdout:
-            print(line, end="", flush=True)
-            log.write(line)
-            log.flush()
-        return process.wait()
+    runtime = work / "runtime"
+    runtime.mkdir(mode=0o700)
+    try:
+        with tempfile.TemporaryDirectory(dir=work) as config:
+            docker_config = Path(config)
+            (docker_config / "config.json").write_text(json.dumps({"auths": {}}))
+            env = docker_environment(docker_config)
+            docker = ["docker", "--config", config, "--host", f"unix://{socket}"]
+            subprocess.run(
+                docker + ["load", "--input", str(runner)], env=env, check=True
+            )
+            # Prepare only this run's empty bind mount for the packaged runner.
+            subprocess.run(
+                docker
+                + [
+                    "run",
+                    "--rm",
+                    "--pull",
+                    "never",
+                    "--network",
+                    "none",
+                    "--read-only",
+                    "--user",
+                    "0:0",
+                    "--entrypoint",
+                    "/bin/chown",
+                    "--mount",
+                    f"type=bind,source={runtime},target=/work",
+                    args.runner_image,
+                    "1000:1000",
+                    "/work",
+                ],
+                env=env,
+                check=True,
+            )
+            command = docker + [
+                "run",
+                "--rm",
+                "--pull",
+                "never",
+                "--network",
+                "host",
+                "--group-add",
+                str(socket.stat().st_gid),
+                "--mount",
+                f"type=bind,source={socket},target={socket}",
+                "--mount",
+                f"type=bind,source={release},target={release},readonly",
+                "--mount",
+                f"type=bind,source={runtime},target={runtime}",
+                args.runner_image,
+                "--release-dir",
+                str(release),
+                "--work-dir",
+                str(runtime),
+                "--docker-socket",
+                str(socket),
+            ]
+            print(f"Acceptance results: {work / 'results.log'}", flush=True)
+            with (work / "results.log").open("w") as log:
+                process = subprocess.Popen(
+                    command,
+                    env=env,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                )
+                for line in process.stdout:
+                    print(line, end="", flush=True)
+                    log.write(line)
+                    log.flush()
+                return process.wait()
+    finally:
+        try:
+            runtime.rmdir()
+        except OSError as error:
+            if error.errno != errno.ENOTEMPTY:
+                raise
 
 
 if __name__ == "__main__":

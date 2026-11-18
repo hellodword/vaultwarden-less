@@ -15,7 +15,8 @@ ROOT = Path(__file__).resolve().parents[2]
 
 def example(name: str) -> str:
     filename = {
-        "native-import-example": "migration-41d0e92.md",
+        "native-import-example": "deployment.md",
+        "native-archive-example": "deployment.md",
         "native-restore-example": "operations.md",
         "upgrade-copy-example": "maintenance.md",
     }[name]
@@ -32,8 +33,13 @@ class OperatorExamples(unittest.TestCase):
         (self.deployment / "data").mkdir(parents=True)
         (self.deployment / "data/keep").write_text("original")
         (self.deployment / "data/link").symlink_to("keep")
+        (self.deployment / "data/db.sqlite3").write_bytes(b"synthetic source")
         binary = self.root / "bin"
         binary.mkdir()
+        # The Compose acceptance exercises ownership. These checks run in an unprivileged build.
+        chown = binary / "chown"
+        chown.write_text(f"#!{shutil.which('sh')}\nexit 0\n")
+        chown.chmod(0o700)
         docker = binary / "docker"
         docker.write_text(
             f"#!{shutil.which('bash')}\n"
@@ -108,9 +114,26 @@ class OperatorExamples(unittest.TestCase):
             with tarfile.open(archive, "w:gz") as stream:
                 stream.add(source, arcname="vaultwarden-less/data")
         original = archive.read_bytes()
+        extraction = subprocess.run(
+            [
+                "bash",
+                "-c",
+                example("native-archive-example") + '\nprintf "%s" "$SOURCE_DATA"',
+            ],
+            env=self.environment
+            | {
+                "ARCHIVE": str(archive),
+                "DB_MEMBER": "vaultwarden-less/data/db.sqlite3",
+                "TMPDIR": str(self.root),
+            },
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        source_data = extraction.stdout
         rejected = self.run_example(
             "native-import-example",
-            ARCHIVE=str(archive),
+            SOURCE_DATA=source_data,
             IMPORT_STAGE=str(self.root / "rejected"),
         )
         self.assertNotEqual(rejected.returncode, 0)
@@ -120,7 +143,7 @@ class OperatorExamples(unittest.TestCase):
         data.mkdir(parents=True)
         result = self.run_example(
             "native-import-example",
-            ARCHIVE=str(archive),
+            SOURCE_DATA=source_data,
             IMPORT_STAGE=str(self.root / "stage"),
             DEPLOY_DIR=str(destination),
         )

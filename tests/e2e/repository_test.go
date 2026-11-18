@@ -19,7 +19,7 @@ type nativeSnapshot struct {
 
 func (h *e2eHarness) nativeRestic(target string, mounts []string, arguments ...string) string {
 	h.t.Helper()
-	command := []string{"run", "--rm", "--pull", "never", "--network", h.project + "_default", "--user", h.identity(), "--read-only",
+	command := []string{"run", "--rm", "--pull", "never", "--network", h.project + "_default", "--read-only",
 		"--mount", "type=bind,source=" + filepath.Join(h.deploymentRoot, "maintenance-cache") + ",target=/cache", "--env", "TMPDIR=/cache", "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
 		"--env-file", filepath.Join(h.deploymentRoot, "credentials/maintenance", target+".env"),
 		"--env", "RESTIC_CACHE_DIR=/cache/restic", "--mount", "type=bind,source=" + filepath.Join(h.deploymentRoot, "credentials/restic") + ",target=/run/credentials/restic,readonly"}
@@ -92,14 +92,14 @@ func (h *e2eHarness) restore(target, id, name string) string {
 }
 func (h *e2eHarness) sqlite(root, sql string) string {
 	h.t.Helper()
-	return h.mustDocker("run", "--rm", "--pull", "never", "--user", h.identity(), "--read-only", "--mount", "type=bind,source="+root+",target=/data", "--entrypoint", "/bin/sqlite3", h.services["backup"].Image, "-batch", "-bail", "/data/db.sqlite3", sql)
+	return h.mustDocker("run", "--rm", "--pull", "never", "--read-only", "--mount", "type=bind,source="+root+",target=/data", "--entrypoint", "/bin/sqlite3", h.services["backup"].Image, "-batch", "-bail", "/data/db.sqlite3", sql)
 }
 func (h *e2eHarness) startRestored(root, name string) {
 	h.t.Helper()
 	port := unusedLoopbackPort(h.t)
 	container := h.project + "-" + name
 	command := []string{"run", "--detach", "--pull", "never", "--name", container, "--label", "vaultwarden-less.e2e.project=" + h.project,
-		"--user", h.identity(), "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
+		"--user", "1000:1000", "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
 		"--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777", "--mount", "type=bind,source=" + root + ",target=/data",
 		"--publish", fmt.Sprintf("127.0.0.1:%d:80", port)}
 	// Use the rendered product configuration before any test-only overrides.

@@ -38,9 +38,6 @@ func (w *Worker) nextDaily(now time.Time) time.Time {
 	return next.UTC()
 }
 func (w *Worker) report(now time.Time) error {
-	if w.notifications == nil {
-		return nil
-	}
 	r := &w.reports
 	dirty := false
 	if r.NextDaily.IsZero() {

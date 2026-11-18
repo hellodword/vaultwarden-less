@@ -30,8 +30,6 @@ type proxyCommandError struct {
 	usage   bool
 }
 
-func (err *proxyCommandError) Error() string { return err.message }
-
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	code := execute(ctx, os.Args[1:], os.Stdout, os.Stderr)

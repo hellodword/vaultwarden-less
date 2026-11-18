@@ -15,9 +15,9 @@ func (r Runner) run(
 ) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
-			return nil, &OperationError{Code: "timeout", ExitCode: -1}
+			return nil, &OperationError{Code: "timeout"}
 		}
-		return nil, &OperationError{Code: "cancelled", ExitCode: -1}
+		return nil, &OperationError{Code: "cancelled"}
 	}
 	command := exec.Command(r.binary, arguments...)
 	command.Env = environment
@@ -27,7 +27,7 @@ func (r Runner) run(
 	command.Stdout = &stdout
 	command.Stderr = &stderr
 	if err := command.Start(); err != nil {
-		return nil, &OperationError{Code: "command_failed", ExitCode: -1}
+		return nil, &OperationError{Code: "command_failed"}
 	}
 
 	waited := make(chan error, 1)
@@ -53,9 +53,9 @@ func (r Runner) run(
 	}
 	if cancelled {
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			return nil, &OperationError{Code: "timeout", ExitCode: -1}
+			return nil, &OperationError{Code: "timeout"}
 		}
-		return nil, &OperationError{Code: "cancelled", ExitCode: -1}
+		return nil, &OperationError{Code: "cancelled"}
 	}
 	exitCode := -1
 	var exitError *exec.ExitError
@@ -63,7 +63,7 @@ func (r Runner) run(
 		exitCode = exitError.ExitCode()
 	}
 	if stdout.exceeded || stderr.exceeded {
-		return nil, &OperationError{Code: "output_limit", ExitCode: exitCode}
+		return nil, &OperationError{Code: "output_limit"}
 	}
 	if waitError != nil {
 		code := "command_failed"
@@ -77,7 +77,7 @@ func (r Runner) run(
 		case 12:
 			code = "password_incorrect"
 		}
-		return nil, &OperationError{Code: code, ExitCode: exitCode}
+		return nil, &OperationError{Code: code}
 	}
 	return stdout.data, nil
 }

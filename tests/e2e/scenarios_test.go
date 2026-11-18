@@ -1,7 +1,9 @@
 package e2e_test
 
 import (
+	"bytes"
 	"context"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -57,6 +59,22 @@ func TestNativeReleaseAcceptance(t *testing.T) {
 	h.waitStatus(3*time.Minute, func(s worker.Status) bool {
 		return len(s.Targets) == 2 && s.Targets[0].State == "protected" && s.Targets[0].Snapshot != saved.Targets[0].Snapshot && s.Targets[1].Error == "password_incorrect"
 	})
+	// Each channel now has a durable failed attempt and a pending Fault.
+	h.waitStatus(time.Minute, func(s worker.Status) bool { return len(s.NotificationErrors) == 4 })
+	stateDir := filepath.Join(h.deploymentRoot, "state")
+	pendingPath := filepath.Join(stateDir, "notifications.json")
+	pending, err := os.ReadFile(pendingPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(stateDir, 0500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chmod(stateDir, 0700); err != nil {
+			t.Error(err)
+		}
+	})
 	client.sync(ctx)
 	item = client.getItem(ctx, id)
 	setItemPassword(t, item, "latest content")
@@ -66,7 +84,7 @@ func TestNativeReleaseAcceptance(t *testing.T) {
 		return s.Targets[0].CheckedAt.After(edit) && s.Targets[0].State == "protected"
 	})
 	writePrivateFile(t, passwordPath, "e2e-secondary-restic-password\n")
-	h.assertNotifications()
+	h.waitNotificationError("state_write_failed")
 	latest := h.waitStatus(7*time.Minute, func(s worker.Status) bool {
 		return s.Targets[1].State == "protected" && s.Targets[1].Snapshot != saved.Targets[1].Snapshot
 	})
@@ -74,13 +92,55 @@ func TestNativeReleaseAcceptance(t *testing.T) {
 	if before != beforeOutage+1 {
 		t.Fatal("secondary did not catch up in one recovery point")
 	}
+	editWhilePaused := func(password string, previous worker.Status) worker.Status {
+		t.Helper()
+		client.sync(ctx)
+		item := client.getItem(ctx, id)
+		setItemPassword(t, item, password)
+		client.editItem(ctx, id, item)
+		updated := h.waitPass(time.Now())
+		for i, target := range updated.Targets {
+			if target.Snapshot == previous.Targets[i].Snapshot {
+				t.Fatalf("%s missed edit while notifications were paused", target.Name)
+			}
+		}
+		return updated
+	}
+	t.Log("both repositories keep edited passwords during notification state failures")
+	latest = editWhilePaused("saved during write failure", latest)
+	h.compose("stop", "backup")
+	if err := os.Chmod(stateDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	reportPath := filepath.Join(stateDir, "reports.json")
+	reports, err := os.ReadFile(reportPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writePrivateFile(t, reportPath, "{")
+	h.compose("start", "backup")
+	h.waitHealthy("backup", 3*time.Minute)
+	h.waitNotificationError("state_invalid")
+	latest = editWhilePaused("latest content", latest)
+	for path, want := range map[string][]byte{pendingPath: pending, reportPath: []byte("{")} {
+		if got, err := os.ReadFile(path); err != nil || !bytes.Equal(got, want) {
+			t.Fatal("paused worker changed a notification record")
+		}
+	}
+
+	t.Log("repair resumes persisted delivery and a cold comparison keeps both snapshot IDs")
+	h.compose("stop", "backup")
+	writePrivateFile(t, reportPath, string(reports))
 	restarted := time.Now()
-	h.compose("restart", "backup")
+	h.compose("start", "backup")
 	h.waitHealthy("backup", 3*time.Minute)
 	cold := h.waitPass(restarted)
-	if cold.Targets[1].Snapshot != latest.Targets[1].Snapshot || len(h.snapshots("secondary")) != before {
-		t.Fatal("cold cache created a duplicate recovery point")
+	for i, target := range cold.Targets {
+		if target.Snapshot != latest.Targets[i].Snapshot {
+			t.Fatal("cold cache created a duplicate recovery point")
+		}
 	}
+	h.assertNotifications()
 
 	t.Log("recover and decrypt the same personal item independently from each repository")
 	h.compose("stop", "proxy", "backup", "vaultwarden")
@@ -96,4 +156,19 @@ func TestNativeReleaseAcceptance(t *testing.T) {
 			t.Fatalf("%s did not recover the personal vault", s.Name)
 		}
 	}
+}
+
+func (h *e2eHarness) waitNotificationError(code string) {
+	h.t.Helper()
+	h.waitStatus(2*time.Minute, func(s worker.Status) bool {
+		if len(s.NotificationErrors) != 4 {
+			return false
+		}
+		for _, value := range s.NotificationErrors {
+			if value != code {
+				return false
+			}
+		}
+		return true
+	})
 }

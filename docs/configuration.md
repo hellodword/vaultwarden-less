@@ -2,7 +2,7 @@
 
 | 部署文件 | 内容 | 应用方式 |
 | --- | --- | --- |
-| `compose.yml`、`compose.env` | 镜像、共享 UID:GID、宿主回环端口和路径 | `docker compose --env-file compose.env up -d` |
+| `compose.yml`、`compose.env` | 镜像、回环端口和挂载路径 | `docker compose --env-file compose.env up -d` |
 | `config/vaultwarden.env` | Vaultwarden 的环境变量，含外部 HTTPS DOMAIN、注册及邮件设置 | `docker compose --env-file compose.env up -d --force-recreate vaultwarden` |
 | `config/backup.yaml` | 目标名称、凭据路径、后端选项、通知 | 重建 backup，确保文件替换后重新绑定 |
 | `credentials/backup/*.env` | 每个目标单独的 restic 运行环境 | 重启 backup |
@@ -32,4 +32,4 @@ Vaultwarden 读取 `config/vaultwarden.env`，网页 vault 和管理面板默认
 
 在 `backup.yaml` 的 `notifications.channels` 中启用模板所示的渠道。企业微信使用 webhook，钉钉和飞书支持签名密钥，Bark 使用 APNs 设备 token、P-256 PKCS#8 密钥、Key ID、Team ID 和 topic 发往 Apple。所有通道默认关闭。每个通道只接收目标名称、结果、时间和错误类别。
 
-首次故障发送 Fault，确认恢复发送 Recovery。未恢复的问题默认每 6 小时发送 Reminder，每日当地时间 21:00 发送 Daily，默认时区 Asia/Shanghai。每个目标分别显示最近比较时间与快照时间，长期未更改的个人库可以持续受保护。每个通道独立合并待发消息，一轮最多三次尝试，遵循服务商的重试时间。通知报告与待投递内容保存在 `state/`，重启后继续。整个 VPS 停机时，机内进程无法发送通知；缺失日报可以从接收端发现。
+首次故障发送 Fault，确认恢复发送 Recovery。未恢复的问题默认每 6 小时发送 Reminder，每日当地时间 21:00 发送 Daily，默认时区 Asia/Shanghai。每个目标分别显示最近比较时间与快照时间，长期未更改的个人库可以持续受保护。每个通道独立合并待发消息，一轮最多三次尝试，遵循服务商的重试时间。`state/reports.json` 记录故障与下次提醒时间，`state/notifications.json` 记录待发消息和投递进度。重启后续发。两份记录任一读写失败时，通知暂停，备份继续，处理步骤见[日常与恢复](operations.md)。整个 VPS 停机时，机内进程无法发送通知；缺失日报可以从接收端发现。

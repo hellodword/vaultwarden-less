@@ -1,7 +1,6 @@
 import contextlib
 import importlib.util
 import io
-import json
 import os
 import socket
 import subprocess
@@ -43,10 +42,6 @@ class ReleaseTests(unittest.TestCase):
             "--docker-socket",
             str(self.socket_path),
         ]
-        for name in ("geteuid", "getegid"):
-            patcher = mock.patch.object(release.os, name, return_value=1000)
-            patcher.start()
-            self.addCleanup(patcher.stop)
 
     def test_explicit_artifacts_socket_and_child_failure(self):
         ambient = {
@@ -68,7 +63,9 @@ class ReleaseTests(unittest.TestCase):
             popen.return_value.stdout = io.StringIO("synthetic test failure\n")
             popen.return_value.wait.return_value = 23
             self.assertEqual(release.main(self.args), 23)
-        load = run.call_args.args[0]
+        load = run.call_args_list[0].args[0]
+        setup = run.call_args_list[1].args[0]
+        self.assertEqual(setup[-3:], ["test-runner:explicit", "1000:1000", "/work"])
         command = popen.call_args.args[0]
         self.assertEqual(load[:2], ["docker", "--config"])
         self.assertEqual(
@@ -97,16 +94,12 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(env, {"PATH": ambient["PATH"], "DOCKER_CONFIG": load[2]})
         self.assertEqual(run.call_args.kwargs["env"], env)
         config = Path(load[2])
-        self.assertEqual(config.stat().st_mode & 0o777, 0o700)
-        self.assertEqual(
-            json.loads((config / "config.json").read_text()), {"auths": {}}
-        )
+        self.assertFalse(config.exists())
         self.assertEqual(
             (config.parent / "results.log").read_text(), "synthetic test failure\n"
         )
         self.assertIn(str(config.parent / "results.log"), stdout.getvalue())
         self.assertIn("synthetic test failure", stdout.getvalue())
-        run.assert_called_once()
 
     def test_invalid_inputs_do_not_invoke_docker_or_create_work(self):
         for extra in (

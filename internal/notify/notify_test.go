@@ -346,7 +346,7 @@ func TestMergedRetriesIsolationAndRecovery(t *testing.T) {
 	bad.failure = nil
 	bad.mu.Unlock()
 	m.Enqueue(Event{Kind: "Recovery", Source: "ready"})
-	eventually(t, func() bool { return bad.count() == 4 && m.Status()[0].Pending == 0 })
+	eventually(t, func() bool { return bad.count() == 4 && m.Status()[0].Error == "" })
 	bad.mu.Lock()
 	recovery := bad.events[3]
 	bad.mu.Unlock()
@@ -358,21 +358,6 @@ func TestMergedRetriesIsolationAndRecovery(t *testing.T) {
 	}
 	cancel()
 	<-done
-}
-
-func TestNotifierStatusOmitsUnsetTimes(t *testing.T) {
-	status := Status{Name: "bark"}
-	data, err := json.Marshal(status)
-	if err != nil || strings.Contains(string(data), "last_success") || strings.Contains(string(data), "next_attempt") {
-		t.Fatalf("status invented a timestamp: %s (%v)", data, err)
-	}
-	status.LastSuccess = time.Date(2026, 10, 5, 0, 0, 0, 0, time.UTC)
-	status.NextAttempt = status.LastSuccess.Add(time.Minute)
-	data, err = json.Marshal(status)
-	var decoded Status
-	if err != nil || json.Unmarshal(data, &decoded) != nil || !decoded.LastSuccess.Equal(status.LastSuccess) || !decoded.NextAttempt.Equal(status.NextAttempt) {
-		t.Fatal("nonzero timestamps did not survive status JSON")
-	}
 }
 
 func TestAPNsMinimumRetryAndPermanentFailure(t *testing.T) {
@@ -418,10 +403,10 @@ func TestDurableBudgetAndRecoveryBeforeDelivery(t *testing.T) {
 		}
 		return m
 	}
-	start := func(m *Manager) (context.CancelFunc, <-chan error) {
+	start := func(m *Manager) (context.CancelFunc, <-chan struct{}) {
 		ctx, cancel := context.WithCancel(context.Background())
-		done := make(chan error, 1)
-		go func() { done <- m.Run(ctx) }()
+		done := make(chan struct{})
+		go func() { m.Run(ctx); close(done) }()
 		return cancel, done
 	}
 	m := makeManager()
@@ -432,9 +417,7 @@ func TestDurableBudgetAndRecoveryBeforeDelivery(t *testing.T) {
 	}
 	eventually(t, func() bool { return m.Status()[0].Error != "" })
 	cancel()
-	if err := <-done; err != nil {
-		t.Fatal(err)
-	}
+	<-done
 	m = makeManager()
 	if m.Status()[0].Attempts != 1 {
 		t.Fatal("restart reset budget")
@@ -461,7 +444,7 @@ func TestDurableBudgetAndRecoveryBeforeDelivery(t *testing.T) {
 	sender.mu.Unlock()
 	recovered := clock.Now()
 	m.Enqueue(Event{Kind: "Recovery", At: recovered, Source: "ready", Faults: map[string]Fault{"source": {Object: "Source", Code: "capture failed", First: first, Recovered: recovered}}})
-	eventually(t, func() bool { return m.Status()[0].Pending == 0 })
+	eventually(t, func() bool { return sender.count() == 4 && m.Status()[0].Error == "" })
 	sender.mu.Lock()
 	last := sender.events[len(sender.events)-1]
 	sender.mu.Unlock()

@@ -50,11 +50,7 @@ pkgs.dockerTools.buildLayeredImage {
     pkgs.bitwarden-cli
     pkgs.docker
     pkgs.docker-compose
-    pkgs.restic
-    pkgs.sqlite
     pkgs.cacert
-    pkgs.gnutar
-    pkgs.findutils
     pkgs.coreutils
     pkgs.bash
   ];
@@ -64,6 +60,7 @@ pkgs.dockerTools.buildLayeredImage {
   '';
   config = {
     WorkingDir = "/";
+    User = "1000:1000";
     Entrypoint = [ "/bin/test-runner" ];
   };
 }

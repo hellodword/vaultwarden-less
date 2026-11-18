@@ -24,6 +24,8 @@ type Repository interface {
 type Notifications interface {
 	Enqueue(notify.Event) error
 	Status() []notify.Status
+	Paused() bool
+	Pause(string, error)
 }
 type TargetStatus struct {
 	Name       string    `json:"name"`
@@ -123,7 +125,7 @@ func (w *Worker) Status() Status {
 	return s
 }
 
-func (w *Worker) Run(ctx context.Context) error {
+func (w *Worker) Run(ctx context.Context) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer func() { cancel(); w.wait.Wait() }()
 	w.mu.Lock()
@@ -133,11 +135,13 @@ func (w *Worker) Run(ctx context.Context) error {
 		w.mu.Lock()
 		now := w.clock.Now()
 		due := w.advance(ctx, now)
-		if err := w.report(now); err != nil {
-			w.mu.Unlock()
-			return err
+		if w.notifications != nil && !w.notifications.Paused() {
+			if err := w.report(now); err != nil {
+				w.notifications.Pause("reports.json", err)
+			} else {
+				due = earlier(due, w.reportDue())
+			}
 		}
-		due = earlier(due, w.reportDue())
 		w.mu.Unlock()
 		if due.IsZero() {
 			due = now.Add(ordinaryInterval)
@@ -146,7 +150,7 @@ func (w *Worker) Run(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return nil
+			return
 		case <-w.wake:
 			timer.Stop()
 		case <-timer.C():

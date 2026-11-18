@@ -3,6 +3,7 @@ package notify
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -13,8 +14,6 @@ import (
 
 type Status struct {
 	Name        string    `json:"name"`
-	Pending     uint64    `json:"pending"`
-	LastSuccess time.Time `json:"last_success,omitzero"`
 	LastAttempt time.Time `json:"last_attempt,omitzero"`
 	NextAttempt time.Time `json:"next_attempt,omitzero"`
 	Attempts    int       `json:"attempts"`
@@ -38,10 +37,13 @@ type Manager struct {
 	channels []*channel
 	clock    timing.Clock
 	store    state.Store
+	failure  error
+	cancel   context.CancelFunc
+	logger   *slog.Logger
 }
 
-func NewManager(configs []config.Notifier) *Manager {
-	m := &Manager{clock: timing.Real{}}
+func NewManager(configs []config.Notifier, logger *slog.Logger) *Manager {
+	m := &Manager{clock: timing.Real{}, logger: logger}
 	for _, cfg := range configs {
 		sender, err := senderForConfig(cfg)
 		c := &channel{sender: sender, wake: make(chan struct{}, 1), status: Status{Name: cfg.Name}}
@@ -53,6 +55,31 @@ func NewManager(configs []config.Notifier) *Manager {
 	}
 	return m
 }
+
+// Pause preserves the last durable records until an operator repairs them and restarts.
+func (m *Manager) Pause(file string, err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.pauseLocked(file, err)
+}
+
+func (m *Manager) pauseLocked(file string, err error) {
+	if m.failure != nil {
+		return
+	}
+	m.failure = err
+	m.logger.Error("Notification delivery paused", "file", file, "reason", err)
+	if m.cancel != nil {
+		m.cancel()
+	}
+}
+
+func (m *Manager) Paused() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.failure != nil
+}
+
 func (m *Manager) Restore(store state.Store) error {
 	m.store = store
 	var saved map[string]savedChannel
@@ -67,7 +94,6 @@ func (m *Manager) Restore(store state.Store) error {
 		previous.Inflight.Merge(previous.Pending)
 		c.pending = previous.Inflight
 		if c.status.Permanent {
-			c.status.Pending = c.pending.Count
 			continue
 		}
 		c.status = previous.Status
@@ -82,7 +108,6 @@ func (m *Manager) Restore(store state.Store) error {
 		if previous.Inflight.Count > 0 && c.status.Attempts >= 3 {
 			c.status.Exhausted = true
 		}
-		c.status.Pending = c.pending.Count
 	}
 	return nil
 }
@@ -91,17 +116,23 @@ func (m *Manager) persist() error {
 	for _, c := range m.channels {
 		saved[c.status.Name] = savedChannel{c.pending, c.inflight, c.status}
 	}
-	return m.store.Save("notifications.json", saved)
+	if err := m.store.Save("notifications.json", saved); err != nil {
+		m.pauseLocked("notifications.json", err)
+		return err
+	}
+	return nil
 }
 func (m *Manager) Enqueue(event Event) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.failure != nil {
+		return m.failure
+	}
 	if event.Count == 0 {
 		event.Count = 1
 	}
 	for _, c := range m.channels {
 		c.pending.Merge(event)
-		c.status.Pending = Add(c.pending.Count, c.inflight.Count)
 		// Only a new report opens a new round. Merging into a running round never
 		// resets attempts or the platform's retry deadline.
 		if c.status.Exhausted {
@@ -120,38 +151,40 @@ func (m *Manager) Status() []Status {
 	defer m.mu.Unlock()
 	result := make([]Status, 0, len(m.channels))
 	for _, c := range m.channels {
-		result = append(result, c.status)
+		status := c.status
+		if m.failure != nil {
+			status.Error = m.failure.Error()
+		}
+		result = append(result, status)
 	}
 	return result
 }
-func (m *Manager) Run(ctx context.Context) error {
+func (m *Manager) Run(ctx context.Context) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	done := make(chan error, len(m.channels))
+	m.mu.Lock()
+	if m.failure != nil {
+		m.mu.Unlock()
+		return
+	}
+	m.cancel = cancel
+	m.mu.Unlock()
 	var wait sync.WaitGroup
 	for _, c := range m.channels {
 		if c.sender != nil {
-			wait.Go(func() { done <- m.run(ctx, c) })
+			wait.Go(func() { m.run(ctx, c) })
 		}
 	}
-	allDone := make(chan struct{})
-	go func() { wait.Wait(); close(allDone) }()
-	select {
-	case <-ctx.Done():
-		cancel()
-		<-allDone
-		return nil
-	case err := <-done:
-		cancel()
-		<-allDone
-		return err
-	case <-allDone:
-		return nil
-	}
+	wait.Wait()
 }
-func (m *Manager) run(ctx context.Context, c *channel) error {
+
+func (m *Manager) run(ctx context.Context, c *channel) {
 	for {
 		m.mu.Lock()
+		if ctx.Err() != nil || m.failure != nil {
+			m.mu.Unlock()
+			return
+		}
 		now := m.clock.Now()
 		ready := !c.status.Permanent && !c.status.Exhausted && c.pending.Count > 0
 		due := c.status.NextAttempt
@@ -175,16 +208,19 @@ func (m *Manager) run(ctx context.Context, c *channel) error {
 			c.status.NextAttempt = now.Add(delay)
 			if err := m.persist(); err != nil {
 				m.mu.Unlock()
-				return err
+				return
 			}
 			m.mu.Unlock()
 			sendCtx, cancel := context.WithTimeout(ctx, notifierTimeout)
 			err := c.sender.Send(sendCtx, event)
 			cancel()
 			m.mu.Lock()
+			if m.failure != nil {
+				m.mu.Unlock()
+				return
+			}
 			if err == nil {
 				c.inflight = Event{}
-				c.status.LastSuccess = m.clock.Now()
 				c.status.Error = ""
 				c.status.Attempts = 0
 				c.status.Exhausted = false
@@ -215,14 +251,13 @@ func (m *Manager) run(ctx context.Context, c *channel) error {
 					c.status.Exhausted = true
 				}
 			}
-			c.status.Pending = c.pending.Count
 			saveErr := m.persist()
 			m.mu.Unlock()
 			if saveErr != nil {
-				return saveErr
+				return
 			}
 			if ctx.Err() != nil {
-				return nil
+				return
 			}
 			continue
 		}
@@ -230,7 +265,7 @@ func (m *Manager) run(ctx context.Context, c *channel) error {
 		if !ready {
 			select {
 			case <-ctx.Done():
-				return nil
+				return
 			case <-c.wake:
 			}
 			continue
@@ -239,7 +274,7 @@ func (m *Manager) run(ctx context.Context, c *channel) error {
 		select {
 		case <-ctx.Done():
 			timer.Stop()
-			return nil
+			return
 		case <-c.wake:
 			timer.Stop()
 		case <-timer.C():

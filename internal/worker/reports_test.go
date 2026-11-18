@@ -11,6 +11,8 @@ import (
 
 type recorder []notify.Event
 
+func (*recorder) Paused() bool            { return false }
+func (*recorder) Pause(string, error)     { panic("unexpected state failure") }
 func (*recorder) Status() []notify.Status { return nil }
 
 func (r *recorder) Enqueue(e notify.Event) error { *r = append(*r, e); return nil }

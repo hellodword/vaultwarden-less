@@ -24,8 +24,7 @@ const (
 )
 
 type OperationError struct {
-	Code     string
-	ExitCode int
+	Code string
 }
 
 func (e *OperationError) Error() string { return "restic operation failed: " + e.Code }
@@ -44,7 +43,7 @@ func NewRunner(binary, cacheDir string) Runner { return Runner{binary: binary, c
 func (r Runner) command(ctx context.Context, target config.Target, args ...string) ([]byte, error) {
 	cache := filepath.Join(r.cacheDir, "restic")
 	if err := os.MkdirAll(cache, 0o700); err != nil {
-		return nil, &OperationError{Code: "cache_unavailable", ExitCode: -1}
+		return nil, &OperationError{Code: "cache_unavailable"}
 	}
 	base := []string{"--cache-dir", cache}
 	for _, option := range target.Options {
@@ -52,11 +51,11 @@ func (r Runner) command(ctx context.Context, target config.Target, args ...strin
 	}
 	workRoot := filepath.Join(r.cacheDir, "work")
 	if err := os.MkdirAll(workRoot, 0o700); err != nil {
-		return nil, &OperationError{Code: "work_unavailable", ExitCode: -1}
+		return nil, &OperationError{Code: "work_unavailable"}
 	}
 	work, err := os.MkdirTemp(workRoot, "restic-")
 	if err != nil {
-		return nil, &OperationError{Code: "work_unavailable", ExitCode: -1}
+		return nil, &OperationError{Code: "work_unavailable"}
 	}
 	defer os.RemoveAll(work)
 	environment := append([]string{"PATH=" + os.Getenv("PATH")}, target.Environment...)
@@ -161,17 +160,17 @@ func (r Runner) backup(ctx context.Context, target config.Target, path string) (
 			break
 		}
 		if err != nil || id != "" || record.Type == "error" {
-			return "", time.Time{}, &OperationError{Code: "invalid_backup_result", ExitCode: -1}
+			return "", time.Time{}, &OperationError{Code: "invalid_backup_result"}
 		}
 		if record.Type == "summary" {
 			if !validSnapshotID(record.ID) {
-				return "", time.Time{}, &OperationError{Code: "invalid_backup_result", ExitCode: -1}
+				return "", time.Time{}, &OperationError{Code: "invalid_backup_result"}
 			}
 			id, at = record.ID, record.At
 		}
 	}
 	if id == "" || at.IsZero() {
-		return "", time.Time{}, &OperationError{Code: "snapshot_id_missing", ExitCode: -1}
+		return "", time.Time{}, &OperationError{Code: "snapshot_id_missing"}
 	}
 	return id, at, nil
 }
