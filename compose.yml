@@ -9,7 +9,7 @@ x-service-defaults: &service-defaults
   # All services use these non-root numeric IDs. Edit them to match the owner
   # of the deployment files: data/state/cache need read/write access; configuration
   # and credentials need read access. Match existing data ownership on adoption.
-  user: "1000:1000"
+  user: "65532:65532"
   read_only: true
   tmpfs:
     - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
@@ -27,29 +27,20 @@ x-service-defaults: &service-defaults
 services:
   vaultwarden:
     <<: *service-defaults
-    image: "vaultwarden-less-vaultwarden:${VWLESS_IMAGE_TAG:?VWLESS_IMAGE_TAG is required}"
+    image: "vaultwarden/server:1.37.5"
     pull_policy: never
     hostname: vaultwarden
     environment:
       ROCKET_ADDRESS: "0.0.0.0"
       ROCKET_PORT: "80"
-      CONFIG_FILE: /config/vaultwarden-runtime.json
+      CONFIG_FILE: /etc/vaultwarden/config.json
       ADMIN_TOKEN: ""
       DISABLE_ADMIN_TOKEN: "false"
       DATA_FOLDER: /data
       DATABASE_URL: sqlite:///data/db.sqlite3
-      RSA_KEY_FILENAME: /data/rsa_key
-      ATTACHMENTS_FOLDER: /data/attachments
-      SENDS_FOLDER: /data/sends
     env_file:
       - ./config/vaultwarden.env
     volumes:
-      - type: bind
-        source: ./config/vaultwarden-runtime.json
-        target: /config/vaultwarden-runtime.json
-        read_only: true
-        bind:
-          create_host_path: false
       - type: bind
         source: ./data
         target: /data
@@ -76,6 +67,12 @@ services:
       vaultwarden:
         condition: service_healthy
     volumes:
+      - type: bind
+        source: ./rules
+        target: /rules
+        read_only: true
+        bind:
+          create_host_path: false
       - type: bind
         source: ./config/backup.yaml
         target: /config/backup.yaml
@@ -123,8 +120,15 @@ services:
     hostname: proxy
     command: [serve]
     depends_on:
-      backup:
+      vaultwarden:
         condition: service_healthy
+    volumes:
+      - type: bind
+        source: ./rules
+        target: /rules
+        read_only: true
+        bind:
+          create_host_path: false
     ports:
       # Edit the HOST port (middle value) here when needed. Container port 8080
       # is fixed. TLS, public listeners and trusted forwarded headers belong

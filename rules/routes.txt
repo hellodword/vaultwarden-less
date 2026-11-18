@@ -1,0 +1,27 @@
+# Vaultwarden 1.37.5. Successful requests on these routes can skip SQLite comparison.
+# src/api/core/ciphers.rs, folders.rs and accounts.rs: personal client reads.
+GET /api/sync
+GET /api/ciphers
+GET /api/ciphers/{id}
+GET /api/ciphers/{id}/details
+GET /api/folders
+GET /api/folders/{id}
+GET /api/accounts/profile
+GET /api/accounts/revision-date
+GET /api/settings/domains
+
+# src/api/core/mod.rs and src/api/web.rs: health and server discovery.
+GET /alive
+HEAD /alive
+GET /api/alive
+GET /api/now
+GET /api/version
+GET /api/config
+
+# src/api/identity.rs: prelogin returns KDF parameters.
+POST /identity/accounts/prelogin
+POST /identity/accounts/prelogin/password
+
+# src/api/notifications.rs: long-lived notification subscriptions.
+GET /notifications/hub
+GET /notifications/anonymous-hub

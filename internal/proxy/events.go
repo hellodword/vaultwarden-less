@@ -1,9 +1,8 @@
 package proxy
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
+
 	"errors"
 	"io"
 	"log/slog"
@@ -11,13 +10,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hellodword/vaultwarden-less/internal/routes"
 	"github.com/hellodword/vaultwarden-less/internal/timing"
 )
 
 type EventSender struct {
 	mu       sync.Mutex
-	pending  routes.Summary
+	pending  bool
 	endpoint string
 	client   *http.Client
 	clock    timing.Clock
@@ -29,15 +27,15 @@ func NewEventSender(log *slog.Logger) *EventSender {
 	transport.Proxy = nil
 	return &EventSender{endpoint: EventsURL, client: &http.Client{Transport: transport, Timeout: EventTimeout, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}, clock: timing.Real{}, log: log}
 }
-func (s *EventSender) Record(method, path string, start bool) {
+func (s *EventSender) Record() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.pending.Record(method, path, start)
+	s.pending = true
 }
 func (s *EventSender) Run(ctx context.Context) {
 	var lastFailure time.Time
 	for {
-		timer := s.clock.NewTimer(EventRetry)
+		timer := s.clock.NewTimerAt(s.clock.Now().Add(EventRetry))
 		select {
 		case <-ctx.Done():
 			timer.Stop()
@@ -46,14 +44,14 @@ func (s *EventSender) Run(ctx context.Context) {
 		}
 		s.mu.Lock()
 		event := s.pending
-		s.pending = routes.Summary{}
+		s.pending = false
 		s.mu.Unlock()
-		if event.Empty() {
+		if !event {
 			continue
 		}
-		if err := s.send(ctx, event); err != nil {
+		if err := s.send(ctx); err != nil {
 			s.mu.Lock()
-			s.pending.Merge(event)
+			s.pending = true
 			s.mu.Unlock()
 			if s.log != nil && (lastFailure.IsZero() || s.clock.Now().Sub(lastFailure) >= 5*time.Minute) {
 				s.log.Warn("backup event delivery failed; merged signal retained")
@@ -62,16 +60,12 @@ func (s *EventSender) Run(ctx context.Context) {
 		}
 	}
 }
-func (s *EventSender) send(ctx context.Context, event routes.Summary) error {
-	body, err := json.Marshal(event)
-	if err != nil {
-		return err
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.endpoint, bytes.NewReader(body))
+func (s *EventSender) send(ctx context.Context) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.endpoint, nil)
 	if err != nil {
 		return errors.New("event request failed")
 	}
-	req.Header.Set("Content-Type", "application/json")
+
 	response, err := s.client.Do(req)
 	if err != nil {
 		return errors.New("event delivery failed")
@@ -90,16 +84,16 @@ func (s *EventSender) Flush(ctx context.Context) error {
 	for {
 		s.mu.Lock()
 		event := s.pending
-		s.pending = routes.Summary{}
+		s.pending = false
 		s.mu.Unlock()
-		if event.Empty() {
+		if !event {
 			return nil
 		}
-		if err := s.send(ctx, event); err == nil {
+		if err := s.send(ctx); err == nil {
 			continue
 		}
 		s.mu.Lock()
-		s.pending.Merge(event)
+		s.pending = true
 		s.mu.Unlock()
 		timer := time.NewTimer(EventRetry)
 		select {

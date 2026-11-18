@@ -34,14 +34,6 @@ type Backup struct {
 	Notifications Notifications `json:"notifications"`
 }
 
-type Verification struct {
-	StructureInterval string        `yaml:"structure_interval" json:"structure_interval,omitempty"`
-	ReadDataInterval  string        `yaml:"read_data_interval" json:"read_data_interval,omitempty"`
-	Timeout           string        `yaml:"timeout" json:"timeout"`
-	StructureEvery    time.Duration `yaml:"-" json:"-"`
-	ReadDataEvery     time.Duration `yaml:"-" json:"-"`
-	Limit             time.Duration `yaml:"-" json:"-"`
-}
 type Notifications struct {
 	Timezone         string         `yaml:"timezone" json:"timezone"`
 	DailyAt          string         `yaml:"daily_at" json:"daily_at"`
@@ -60,12 +52,11 @@ func positiveDuration(value string) (time.Duration, error) {
 }
 
 type Target struct {
-	Name        string       `yaml:"name" json:"name"`
-	Verify      Verification `yaml:"verify" json:"verify"`
-	EnvFile     string       `yaml:"env_file" json:"-"`
-	Options     []string     `yaml:"options" json:"-"`
-	Environment []string     `yaml:"-" json:"-"`
-	Error       string       `yaml:"-" json:"error,omitempty"`
+	Name        string   `yaml:"name" json:"name"`
+	EnvFile     string   `yaml:"env_file" json:"-"`
+	Options     []string `yaml:"options" json:"-"`
+	Environment []string `yaml:"-" json:"-"`
+	Error       string   `yaml:"-" json:"error,omitempty"`
 }
 
 type Notifier struct {
@@ -131,7 +122,7 @@ func DecodeBackup(data []byte) (*Backup, error) {
 		return nil, errors.New("invalid reminder interval")
 	}
 	for i, raw := range doc.Targets {
-		target := Target{Verify: Verification{Timeout: "2h", Limit: 2 * time.Hour}}
+		var target Target
 		encoded, err := yaml.Marshal(raw)
 		if err != nil || decodeOneYAML(encoded, &target) != nil {
 			target.Error = "invalid_target_config"
@@ -146,20 +137,6 @@ func DecodeBackup(data []byte) (*Backup, error) {
 		for _, option := range target.Options {
 			if option == "" || strings.ContainsRune(option, 0) {
 				target.Error = "invalid_restic_option"
-			}
-		}
-		for _, item := range []struct {
-			value       string
-			destination *time.Duration
-		}{{target.Verify.StructureInterval, &target.Verify.StructureEvery}, {target.Verify.ReadDataInterval, &target.Verify.ReadDataEvery}, {target.Verify.Timeout, &target.Verify.Limit}} {
-			if item.value == "" {
-				continue
-			}
-			value, err := positiveDuration(item.value)
-			if err != nil {
-				target.Error = "invalid_verify_config"
-			} else {
-				*item.destination = value
 			}
 		}
 		result.Targets = append(result.Targets, target)
@@ -278,6 +255,12 @@ func LoadBackup(path string) (*Backup, error) {
 		for _, entry := range env {
 			key, value, _ := strings.Cut(entry, "=")
 			values[key] = value
+		}
+		if values["RESTIC_REPOSITORY"] == "" && values["RESTIC_REPOSITORY_FILE"] == "" {
+			target.Error = "repository_required"
+		}
+		if values["RESTIC_PASSWORD"] == "" && values["RESTIC_PASSWORD_FILE"] == "" && values["RESTIC_PASSWORD_COMMAND"] == "" {
+			target.Error = "password_required"
 		}
 		for _, key := range []string{"RESTIC_PASSWORD_FILE", "RESTIC_REPOSITORY_FILE", "RESTIC_CACERT"} {
 			if path := values[key]; path != "" {

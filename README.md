@@ -1,52 +1,23 @@
 # vaultwarden-less
 
-Run the upstream SQLite Vaultwarden behind a transparent request proxy, with
-an independent Go worker that saves the complete native data tree to one or
-more restic repositories. Backups include RSA keys, attachments, Sends,
-configuration, orphan files, empty directories and symbolic links.
+一台 VPS 可供 1–3 人各自使用独立的 Vaultwarden 账号和个人密码库。restic 将数据库分别备份到不同供应商、不同地域的对象存储，每个仓库都能独立恢复这些个人密码库。发布包包含 Linux amd64 的官方 Vaultwarden 1.37.5 镜像、请求代理和备份镜像，VPS 使用 Docker Compose 离线安装。
 
-The worker uses SQLite's online backup command against a read-only source
-mount. All captures ignore explicitly identified temporary authentication noise when
-deciding whether to upload; the saved database always contains every table
-and row. Persistent security state participates in comparison. Missing source files produce
-an explicitly incomplete backup containing the full database and available
-files. Each destination has its own successful baseline, retry schedule and optional
-repository verification plan. Fault/recovery reports and daily summaries persist
-across worker restarts.
-
-Restic owns snapshot IDs, storage, deduplication, retention and restore. A
-native `restic restore ID --verify --target NEW_DIRECTORY` produces
-`db.sqlite3` and the native file tree at its root.
-
-The deployment bundle contains three Linux/amd64 images, Compose, configuration
-templates and operator documentation. It needs Docker Engine and Compose on
-the deployment host. TLS and public access control belong to the operator;
-the shipped proxy port binds to loopback.
-
-For deployment, read these in order:
-
-- [Deployment](docs/deployment.md): prerequisites, bundle, configuration,
-  existing data, repository initialization and first startup.
-- [Configuration](docs/configuration.md): file readers, security defaults,
-  precedence, destinations and notification channels. Inline comments in
-  [templates](templates/README.md) explain what to fill in.
-- [Operations](docs/operations.md): status, checks, native repository
-  maintenance, restore and upgrade after deployment.
-- [Product contracts](docs/contracts.md): trigger, comparison, scheduling and
-  failure behavior.
-
-For source development, start with [Maintenance](docs/maintenance.md). Just
-selects Nix outputs; Nix supplies tools and inputs; scripts perform the work:
-
-```sh
-just check
-just release
-just check-release
+```text
+官方 Bitwarden 客户端 → HTTPS 入口 → 本机代理 → Vaultwarden → SQLite
+                                      ↓ 请求提示              ↓ 一致副本
+                                      备份进程 ──────────┬─ restic 仓库 A
+                                                         └─ restic 仓库 B
 ```
 
-`check` runs ordinary checks without a Docker daemon. `release` builds the
-deployment bundle. `check-release` runs the packaged Docker acceptance suite
-and reports retained results. Target deployment hosts need Docker and Compose;
-they do not need Just, Nix or the source scripts.
+任一账号的个人条目、文件夹、收藏、归档或解密材料发生变化时，每个可用仓库写入一个原生快照。每份快照保存实例在该时刻的完整原生数据库 `/db.sqlite3`。恢复后，每位使用者用自己的主密码解锁并核对自己的条目。仓库密码和对象存储恢复凭据由管理员单独保管。
 
-- [NOTICE](NOTICE.md): distribution and corresponding-source obligations.
+默认配置关闭组织创建、附件上传和 Send 的创建与编辑。已有条目附件和文件型 Send 的文件存放在数据库之外，单独恢复数据库无法取回这些文件。[备份范围](docs/contracts.md#什么算个人-vault-变化)
+
+| 要做的事 | 入口 |
+| --- | --- |
+| 在新主机部署，准备两个独立仓库 | [部署](docs/deployment.md) |
+| 配置凭据、直发通知和规则 | [配置](docs/configuration.md) |
+| 看保护情况、恢复、校验和保留快照 | [日常与恢复](docs/operations.md) |
+| 审计哪些请求和数据会触发备份 | [备份规则](docs/contracts.md) |
+| 升级 Vaultwarden、restic 或项目本身 | [维护与升级](docs/maintenance.md) |
+| 从 1.37.3 的旧部署归档首次迁移 | [一次性迁移](docs/migration-41d0e92.md) |

@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 )
 
 func TestIndependentConfigurationErrors(t *testing.T) {
@@ -54,7 +53,7 @@ func TestDockerLiteralEnvironmentAndNoInheritance(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "primary.env"), []byte(secret), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "second.env"), []byte("RESTIC_REPOSITORY=/second\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "second.env"), []byte("RESTIC_REPOSITORY=/second\nRESTIC_PASSWORD=test\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	document := "targets:\n  - name: first\n    env_file: " + filepath.Join(dir, "primary.env") + "\n  - name: second\n    env_file: " + filepath.Join(dir, "second.env") + "\nnotifications: {channels: []}\n"
@@ -73,7 +72,7 @@ func TestDockerLiteralEnvironmentAndNoInheritance(t *testing.T) {
 	if !strings.Contains(got, "RESTIC_PASSWORD='literal $HOME # quote'") || strings.Contains(got, "INHERITED_SECRET") {
 		t.Fatal("environment semantics changed")
 	}
-	if len(cfg.Targets[1].Environment) != 1 {
+	if len(cfg.Targets[1].Environment) != 2 {
 		t.Fatal("target inherited credentials")
 	}
 	if err := os.WriteFile(filepath.Join(dir, "primary.env"), []byte("=sensitive-value"), 0o600); err != nil {
@@ -139,9 +138,8 @@ func TestShippedBackupTemplatesUseConsumerSyntax(t *testing.T) {
 		t.Fatal(err)
 	}
 	regions := map[string]string{
-		"aws-s3":        "us-east-1",
-		"cloudflare-r2": "auto",
-		"backblaze-b2":  "us-west-002",
+		"aws-s3":       "us-east-1",
+		"backblaze-b2": "us-west-002",
 	}
 	data := strings.ReplaceAll(string(document), "/run/credentials/backup/bark-apns-auth-key.p8", keyPath)
 	for name := range regions {
@@ -185,35 +183,7 @@ func TestShippedBackupTemplatesUseConsumerSyntax(t *testing.T) {
 	}
 }
 
-func TestVerificationOptInAndNotificationSchedule(t *testing.T) {
-	cfg, err := DecodeBackup([]byte(`targets:
- - name: both
-   env_file: /both
-   verify:
-     structure_interval: 24h
-     read_data_interval: 720h
- - name: structure
-   env_file: /structure
-   verify:
-     structure_interval: 24h
- - name: manual
-   env_file: /manual
- - name: invalid
-   env_file: /invalid
-   verify:
-     read_data_interval: -1h
-notifications:
- timezone: Asia/Shanghai
- daily_at: "21:00"
- reminder_interval: 6h
- channels: []
-`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.Targets[0].Verify.ReadDataEvery != 720*time.Hour || cfg.Targets[1].Verify.ReadDataEvery != 0 || cfg.Targets[2].Verify.StructureEvery != 0 || cfg.Targets[3].Error != "invalid_verify_config" {
-		t.Fatal("verification defaults or isolation wrong")
-	}
+func TestNotificationSchedule(t *testing.T) {
 	for _, body := range []string{"timezone: Missing/Zone", "daily_at: '25:00'", "reminder_interval: 0h", "typo: value"} {
 		if _, err := DecodeBackup([]byte("targets: []\nnotifications:\n  " + body + "\n")); err == nil {
 			t.Fatal("invalid notification root accepted")

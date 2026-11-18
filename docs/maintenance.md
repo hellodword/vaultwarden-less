@@ -1,96 +1,6 @@
-# Maintenance
+# 维护与升级
 
-This page is for source maintainers. Target-machine setup is covered by
-[deployment](deployment.md); operators use native Docker/Compose and restic.
-
-## Source workflow
-
-Run Just from the checkout root. The recipes call Nix, which selects pinned
-tools, source inputs and build artifacts before invoking a script. Scripts
-never build or query Nix outputs themselves. If Just is not already available,
-enter `nix develop` once to get the repository tools, then use the same recipes.
-
-| Just command | Nix boundary | Work performed |
-| --- | --- | --- |
-| `just check` | `nix flake check` | Formatting, unit/integration tests, vet, race and script tests |
-| `just release` | `nix build .#release` | Three product images and deployment files in `result` |
-| `just check-release [args]` | `nix run .#check-release` | Build release/runner inputs, then run `scripts/check_release.py` |
-| `just routes [args]` | `nix run .#routes` | Generate the catalog from the selected Vaultwarden source |
-| `just upstream-diff COMPONENT REF [args]` | `nix run .#upstream-diff-COMPONENT` | Compare that component's selected source against a Git ref |
-
-Optional arguments are forwarded as individual arguments, including paths with
-spaces. For example, select another local socket and shared work directory with:
-
-```sh
-just check-release --work-dir /absolute/shared/work \
-  --docker-socket /run/user/1000/docker.sock
-```
-
-The default work directories are ignored paths under
-`tmp/agent/`, relative to the invoking checkout. Docker bind paths containing
-commas are rejected because Docker uses commas as mount-field separators.
-
-Nix wrappers live in [nix/apps.nix](../nix/apps.nix). Each upstream audit app
-references only its own baseline, so auditing Go does not fetch Vaultwarden or
-Moto sources. Container paths such as `/data`, `/cache`, `/config` and
-`/run/credentials` are product mount contracts; host source, work and socket
-paths are explicit inputs. The acceptance harness reads product image references
-and restored service environment from rendered Compose. Test image references
-are injected by Nix, where those images are built.
-
-## Dependencies
-
-`flake.lock` owns the selected nixpkgs and formatting inputs.
-[nix/upstreams.nix](../nix/upstreams.nix) owns the compatible Bitwarden CLI,
-Moto and AWS SDK pins and their fetch hashes. Vaultwarden, restic and SQLite
-come directly from the selected package set. `go.mod` and tool-generated
-`go.sum` own the Go module graph. Use dependency tools to update their
-lockfiles, then inspect the generated differences.
-
-The official Bitwarden CLI is acceptance tooling. Its pin preserves the login
-protocol supported by the selected Vaultwarden. Moto and its aligned AWS SDK
-are test-only dependencies. Their upstream tests remain enabled.
-
-## Upstream review
-
-Run a candidate audit from the checkout:
-
-```sh
-just upstream-diff vaultwarden <candidate-git-ref>
-```
-
-The supported components are `vaultwarden`, `bitwarden-cli`, `restic`,
-`moto` and `go`. The baseline comes from the source actually selected by the
-flake. The candidate is fetched by Git ref. The command prints a source diff
-for the component's relevant paths and does not change dependencies or
-introduce an upgrade or runtime admission check.
-
-For Vaultwarden, review routes and handlers, models and SQLite migrations,
-`src/config.rs`, `.env.template` and `.env.example`. Revisit request
-exclusions and business comparison policy using the relevant handler/model
-semantics. An unknown route, table, column or JSON shape is conservatively
-included at runtime.
-
-The route catalog is the one generated classification asset:
-
-```sh
-just routes
-# Optional review copy, without changing the tracked catalog:
-just routes --output tmp/agent/routes-candidate.txt
-```
-
-Nix supplies the source path selected by the flake. Review the generated diff
-and check that a second generation is identical. The exclusion list and content
-policy are
-reviewed code, not generated database schema or recovery definitions.
-
-For restic, review native backup/snapshot/tag JSON, forced content reads, S3 behavior,
-restore and maintenance flags, output bounds and cancellation. For Go, review
-networking, TLS/HTTP2, cryptography, filesystem behavior, subprocesses and race
-tests. Consult official sources for changing external facts and security
-notices.
-
-## Validation and acceptance
+## 在构建机准备发布包
 
 ```sh
 just check
@@ -98,75 +8,33 @@ just release
 just check-release
 ```
 
-`check` is `nix flake check`: formatting, Go tests, vet, race tests and
-Python script tests. Ordinary checks have no Docker tool or daemon dependency.
-Product builds disable CGO; race checking uses the
-development toolchain. Native SQLite/restic integration tests run in ordinary
-checks. Tests use a fake clock for long scheduling and notification retry
-policies.
+`just check` 运行锁定工具链的格式检查、Go 测试、竞态检测、vet 和运维示例测试。`just release` 的 `result/` 包含三个可由 Docker 加载的镜像、Compose、规则、配置模板和文档。`just check-release` 在具备本地 Docker socket 的非 root 构建机上运行。验收使用合成账号、官方 Bitwarden CLI、两个独立 S3 测试端和本地通知接收端，覆盖设备登录、个人条目写入、单仓故障追平、冷启动及逐仓解密恢复。凭据和运行目录只在部署端或临时测试路径出现。
 
-`release` builds the three images, Compose, templates and documentation.
-`check-release` builds that bundle and `test-runner-image`, then runs the
-packaged suite on the current local Docker socket. It requires a non-root
-runtime user with Docker access. The wrapper supplies artifact paths and the
-runner image reference to the script; there is no nested Nix invocation. A
-private Docker config and explicit Unix socket isolate the run from ambient
-Docker contexts, TLS settings and Compose configuration. It reports a work directory containing
-results and synthetic diagnostic data. Keep useful failed-run artifacts for
-reproduction.
+## 更新上游
 
-To use a Docker-only isolated host, transfer the deployment bundle and the
-test-runner image archive, load the runner, and run it with host networking:
+1. **Vaultwarden**。选定官方版本，查发布说明、数据库迁移、`src/db/schema.rs`、个人数据模型、`src/api/core` 和 `src/api/identity.rs`。逐条审阅 `rules/routes.txt` 跳过的成功请求是否仍只读，以及 `rules/personal-vault.sql` 是否需要覆盖新字段、表或关联。用普通 `git diff 旧标签 新标签 -- src/api src/db migrations` 即可。在干净的合成库上验证新增、编辑、删除、登录与恢复。[Vaultwarden 发布](https://github.com/dani-garcia/vaultwarden/releases)
+2. **官方镜像**。在 `nix/packages.nix` 更新 `finalImageTag`、Linux amd64 manifest digest 和 Nix 归档哈希，在 `compose.yml` 更新官方标签。用 `docker buildx imagetools inspect vaultwarden/server:版本` 查对应平台 manifest，再用 `docker buildx imagetools inspect --raw vaultwarden/server@sha256:平台摘要` 读取其 `config.digest`。先以 `lib.fakeHash` 构建 `nix build .#vaultwarden-image`，用 Nix 报出的归档哈希替换后重建。运行 `just release` 后，将官方配置摘要去掉 `sha256:` 前缀赋给 `CONFIG_SHA`，执行 `tar -xOzf result/images/vaultwarden.tar.gz "$CONFIG_SHA.json" | sha256sum`，结果应与 `CONFIG_SHA` 一致。同步部署手册中的版本，并在两份规则上记录最后审核的版本。
+3. **restic 和 SQLite**。版本由 `flake.lock` 固定的 nixpkgs 决定。选择更新后使用 `nix flake update nixpkgs` 生成新锁，记录实际版本，审阅 restic 的快照 JSON、dump、stdin 读取、仓库格式和 restore 变动，以及 SQLite 的在线备份和查询行为。对旧快照执行新版本的读取、比较和恢复。仓库格式迁移属于单独的手工维护操作，先在专用副本上验证。[restic 发布说明](https://github.com/restic/restic/releases)
+4. **工具与规则**。Go 模块由 `go.mod` 和 `go.sum` 固定，使用 Go 工具更新，再以 Nix 实际计算的 `vendorHash` 构建。验收客户端的兼容版本在 `nix/upstreams.nix`。仅编辑运行规则时，更新部署目录的规则文件，分别重启 proxy 或 backup 即可。SQL 变更后，旧快照也会按新规则重新比较。
 
+## 切换与回退
+
+先确认两仓各有一份可恢复快照，保留旧镜像、Compose、规则、配置和访问凭据。停止旧实例写入，在新目录准备可写工作副本。以下 Bash 示例要求 `DEPLOY_DIR` 和 `UPGRADE_DATA` 是已核对的绝对路径。
+
+<!-- upgrade-copy-example -->
 ```sh
 set -euo pipefail
-: "${RUNNER_ARCHIVE:?}" "${RUNNER_IMAGE:?}" "${RELEASE_DIR:?}" "${WORK_DIR:?}"
-DOCKER_SOCKET=${DOCKER_SOCKET:-/var/run/docker.sock}
-mkdir -m 0700 -- "$WORK_DIR/docker-config"
-printf '%s\n' '{"auths":{}}' > "$WORK_DIR/docker-config/config.json"
-unset DOCKER_HOST DOCKER_CONTEXT DOCKER_TLS_VERIFY DOCKER_CERT_PATH DOCKER_AUTH_CONFIG
-export DOCKER_CONFIG="$WORK_DIR/docker-config"
-docker --host "unix://$DOCKER_SOCKET" load --input "$RUNNER_ARCHIVE"
-docker --host "unix://$DOCKER_SOCKET" run --rm --pull never --network host --user "$(id -u):$(id -g)" \
-  --group-add "$(stat -c %g "$DOCKER_SOCKET")" \
-  --mount "type=bind,source=$DOCKER_SOCKET,target=$DOCKER_SOCKET" \
-  --mount "type=bind,source=$RELEASE_DIR,target=$RELEASE_DIR,readonly" \
-  --mount "type=bind,source=$WORK_DIR,target=$WORK_DIR" \
-  "$RUNNER_IMAGE" \
-  --release-dir "$RELEASE_DIR" --work-dir "$WORK_DIR" --docker-socket "$DOCKER_SOCKET"
+: "${DEPLOY_DIR:?}" "${UPGRADE_DATA:?}"
+[[ $UPGRADE_DATA = /* ]]
+test "$(realpath -m -- "$UPGRADE_DATA")" = "$UPGRADE_DATA"
+case "$UPGRADE_DATA/" in "$DEPLOY_DIR/data/"*) exit 1 ;; esac
+test -d "$DEPLOY_DIR/data"
+test ! -e "$UPGRADE_DATA"
+test ! -L "$UPGRADE_DATA"
+mkdir -m 0700 -- "$UPGRADE_DATA"
+cp -a -- "$DEPLOY_DIR/data/." "$UPGRADE_DATA/"
 ```
 
-Set `RUNNER_IMAGE` to the reference reported by `docker load` for the transferred
-runner archive. Create the private `WORK_DIR` beforehand. Use absolute paths.
-The runner and host must see the work directory and socket at the
-same path; a bind canary verifies that boundary before product startup.
-The runner includes compiled tests, official Bitwarden CLI, Docker CLI, native
-restic/SQLite tools and its Moto archive. The host needs no Nix installation.
-The suite timeout is 75 minutes.
+让新 Vaultwarden 在工作副本上运行自己的迁移，先从隔离地址用官方客户端读出预期条目。再启动使用新规则的备份进程，与现有原生快照比较。如果上一版本的快照与新 SQL 模型不兼容，保留旧快照，在确认新版本可解密后按[手工建立恢复点](operations.md#手工建立原生恢复点)把新库分别写入两个仓库。启动自动备份，确认状态并逐仓恢复。维护窗口内只启用一个正式写入口。
 
-The suite first verifies the shipped security environment and rejection of
-registration and Send creation. It uses explicit Compose overrides only for
-test enrollment and subsequent Send coverage; it leaves the template unchanged.
-Restored services use the original profile, including disabled Send creation,
-while verifying existing Sends remain readable.
-
-The suite exercises client login, sync, editing, attachments, Sends, request
-merging, two destinations, incomplete capture and repair, restart and cache
-loss, and native restore from both repositories followed by client reads.
-Four notification peers verify payloads, signing, explicit failures and retry
-recovery. Docker DNS and a test CA route Apple's production hostname to the
-HTTP/2 peer without a production endpoint setting.
-
-The real-image suite also captures a 192 MiB incompressible attachment, removes
-native snapshots, deletes and corrupts synthetic object-store packs, verifies
-fault persistence across successful uploads, and imports a native archive with
-WAL/SHM, keys, attachments, Sends and inactive config.json. It executes the
-documented import commands and restores both repositories with native restic.
-Persistent deadlines, the six-hour fallback, 24-hour single verification retry,
-30-day full-read interval, daily catch-up and reminder policies use a controlled
-clock in the ordinary checks; acceptance uses manual jobs for actual I/O.
-
-Acceptance does not establish real provider durability/IAM or delivery to
-external robot groups and Apple devices. Report those boundaries explicitly.
-Before any authorized commit, review the complete status and diff, retain
-needed diagnostics outside tracked inputs, and stage only explicit task paths.
+回退使用保留的旧镜像、旧配置和升级前未写入的原始数据目录。已经在新版产生的写入须先单独保存并核对，再决定如何带回。切换正式入口前验证客户端能解密，两个仓库仍可独立读出数据。

@@ -1,25 +1,9 @@
-# Read at startup. Restart backup after changes. Values are literal data;
-# unknown fields are rejected. Invalid targets/channels are isolated.
-# Use targets: [] for an intentionally unconfigured worker.
-# Keep only your targets, and fill their separate restic credential files.
+# Separate initialized repositories at independent providers and regions.
 targets:
   - name: aws-s3
     env_file: /run/credentials/backup/aws-s3-backup.env
-    options: []
-    # Example schedules, not implicit defaults for other targets.
-    verify:
-      structure_interval: 24h
-      read_data_interval: 720h
-      timeout: 2h
-  - name: cloudflare-r2
-    env_file: /run/credentials/backup/cloudflare-r2-backup.env
-    options: []
-    verify:
-      structure_interval: 24h
   - name: backblaze-b2
     env_file: /run/credentials/backup/backblaze-b2-backup.env
-    options: []
-    # No verify section: manual verification only.
 
 notifications:
   timezone: Asia/Shanghai

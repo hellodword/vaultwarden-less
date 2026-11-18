@@ -5,16 +5,13 @@ import (
 	"errors"
 	"os"
 	"os/exec"
-	"slices"
 	"syscall"
 	"time"
 )
 
 func (r Runner) run(
 	ctx context.Context,
-	binary string,
 	arguments, environment []string,
-	directory string,
 ) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
@@ -22,12 +19,8 @@ func (r Runner) run(
 		}
 		return nil, &OperationError{Code: "cancelled", ExitCode: -1}
 	}
-	if r.execute != nil {
-		return r.execute(ctx, binary, slices.Clone(arguments), slices.Clone(environment), directory)
-	}
-	command := exec.Command(binary, arguments...)
-	command.Dir = directory
-	command.Env = slices.Clone(environment)
+	command := exec.Command(r.binary, arguments...)
+	command.Env = environment
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	stdout := newBoundedWriter(maxCommandOutput)
 	stderr := newBoundedWriter(maxStderrOutput)

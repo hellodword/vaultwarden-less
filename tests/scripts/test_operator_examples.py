@@ -2,17 +2,23 @@
 
 import os
 import shutil
+import sqlite3
 import subprocess
 import tarfile
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 
 
 def example(name: str) -> str:
-    filename = "deployment.md" if name == "native-import-example" else "operations.md"
+    filename = {
+        "native-import-example": "migration-41d0e92.md",
+        "native-restore-example": "operations.md",
+        "upgrade-copy-example": "maintenance.md",
+    }[name]
     document = (ROOT / "docs" / filename).read_text()
     return document.split(f"<!-- {name} -->\n```sh\n", 1)[1].split("\n```", 1)[0]
 
@@ -32,6 +38,9 @@ class OperatorExamples(unittest.TestCase):
         docker.write_text(
             f"#!{shutil.which('bash')}\n"
             'printf "%s\\n" "$*" >> "$CALLS"\nprintf "ok\\n"\n'
+            'for arg in "$@"; do case "$arg" in type=bind,source=*,target=/restore) '
+            "restore=${arg#type=bind,source=}; restore=${restore%,target=/restore}; "
+            'test -e "$restore/db.sqlite3" || printf "fixture" > "$restore/db.sqlite3";; esac; done\n'
         )
         docker.chmod(0o700)
         self.calls = self.root / "calls"
@@ -56,7 +65,7 @@ class OperatorExamples(unittest.TestCase):
         )
 
     def test_restore_accepts_new_path_then_refuses_to_reuse_it(self) -> None:
-        for provider in ("aws-s3", "cloudflare-r2", "backblaze-b2"):
+        for provider in ("aws-s3", "backblaze-b2"):
             with self.subTest(provider=provider):
                 target = self.root / f"restore-{provider}"
                 env_file = str(
@@ -85,52 +94,44 @@ class OperatorExamples(unittest.TestCase):
                 self.assertEqual(self.calls.read_text(), calls)
                 self.assertEqual((target / "evidence").read_text(), "retained")
 
-    def test_native_import_preserves_archive_and_sidecars_and_refuses_nonempty_data(
-        self,
-    ) -> None:
+    def test_migrate_committed_wal_to_an_independent_database(self):
         source = self.root / "synthetic"
         source.mkdir()
-        for name in (
-            "db.sqlite3",
-            "db.sqlite3-wal",
-            "db.sqlite3-shm",
-            "config.json",
-            "rsa_key.pem",
-        ):
-            (source / name).write_text("synthetic " + name)
-        (source / "empty").mkdir()
-        (source / "link").symlink_to("config.json")
-        archive = self.root / "native.tar"
-        with tarfile.open(archive, "w") as stream:
-            stream.add(source, arcname="export/data")
+        archive = self.root / "legacy.tar.gz"
+        with closing(sqlite3.connect(source / "db.sqlite3")) as db:
+            db.execute("PRAGMA journal_mode=WAL")
+            db.execute("PRAGMA wal_autocheckpoint=0")
+            db.execute("CREATE TABLE vault(item)")
+            db.execute("INSERT INTO vault VALUES ('synthetic personal item')")
+            db.commit()
+            self.assertGreater((source / "db.sqlite3-wal").stat().st_size, 32)
+            with tarfile.open(archive, "w:gz") as stream:
+                stream.add(source, arcname="vaultwarden-less/data")
         original = archive.read_bytes()
-        stage = self.root / "stage-rejected"
-        result = self.run_example(
+        rejected = self.run_example(
             "native-import-example",
             ARCHIVE=str(archive),
-            IMPORT_STAGE=str(stage),
-            IMPORT_DATA_ROOT=str(stage / "export/data"),
+            IMPORT_STAGE=str(self.root / "rejected"),
         )
-        self.assertNotEqual(result.returncode, 0)
+        self.assertNotEqual(rejected.returncode, 0)
         self.assertEqual((self.deployment / "data/keep").read_text(), "original")
         destination = self.root / "empty-deployment"
-        (destination / "data").mkdir(parents=True)
-        stage = self.root / "stage-accepted"
+        data = destination / "data"
+        data.mkdir(parents=True)
         result = self.run_example(
             "native-import-example",
             ARCHIVE=str(archive),
-            IMPORT_STAGE=str(stage),
-            IMPORT_DATA_ROOT=str(stage / "export/data"),
+            IMPORT_STAGE=str(self.root / "stage"),
             DEPLOY_DIR=str(destination),
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(archive.read_bytes(), original)
-        self.assertEqual(
-            (destination / "data/db.sqlite3-wal").read_text(),
-            "synthetic db.sqlite3-wal",
-        )
-        self.assertTrue((destination / "data/empty").is_dir())
-        self.assertEqual((destination / "data/link").readlink(), Path("config.json"))
+        self.assertEqual([file.name for file in data.iterdir()], ["db.sqlite3"])
+        with closing(sqlite3.connect(data / "db.sqlite3")) as db:
+            self.assertEqual(
+                db.execute("SELECT item FROM vault").fetchone()[0],
+                "synthetic personal item",
+            )
 
     def test_restore_refuses_existing_files_and_dangling_links(self) -> None:
         for kind in ("file", "directory", "link"):

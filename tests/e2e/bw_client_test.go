@@ -26,10 +26,7 @@ type bitwardenCLI struct {
 }
 
 func newBitwardenCLI(t *testing.T, appdata, server, caFile, email string) *bitwardenCLI {
-	return newBitwardenCLIWithPassword(t, appdata, server, caFile, email, testPassword)
-}
-
-func newBitwardenCLIWithPassword(t *testing.T, appdata, server, caFile, email, password string) *bitwardenCLI {
+	password := testPassword
 	t.Helper()
 	path, err := exec.LookPath("bw")
 	if err != nil {
@@ -160,26 +157,6 @@ func (client *bitwardenCLI) editItem(ctx context.Context, id string, item map[st
 	client.run(ctx, nil, "--raw", "edit", "item", id, encoded)
 }
 
-func (client *bitwardenCLI) createAttachment(ctx context.Context, itemID, path string) string {
-	object := decodeJSONObject(client.t, client.run(ctx, nil, "--raw", "create", "attachment", "--file", path, "--itemid", itemID), "attachment result")
-	attachments, ok := object["attachments"].([]any)
-	if !ok {
-		client.t.Fatal("created item has no attachment list")
-	}
-	for _, candidate := range attachments {
-		attachment, ok := candidate.(map[string]any)
-		if ok && stringValue(attachment["id"]) != "" {
-			return stringValue(attachment["id"])
-		}
-	}
-	client.t.Fatal("created attachment has no ID")
-	return ""
-}
-
-func (client *bitwardenCLI) getAttachment(ctx context.Context, attachmentID, itemID, output string) {
-	client.run(ctx, nil, "--raw", "get", "attachment", attachmentID, "--itemid", itemID, "--output", output)
-}
-
 func decodeJSONObject(t *testing.T, data []byte, label string) map[string]any {
 	t.Helper()
 	var object map[string]any
@@ -212,14 +189,6 @@ func stringValue(value any) string {
 	return result
 }
 
-func integerValue(value any) int {
-	number, ok := value.(float64)
-	if !ok || number < 0 || number != float64(int(number)) {
-		return -1
-	}
-	return int(number)
-}
-
 func cliEnvironment(home, temp, appdata, caFile, session string) []string {
 	environment := []string{
 		"HOME=" + home,
@@ -235,13 +204,4 @@ func cliEnvironment(home, temp, appdata, caFile, session string) []string {
 
 func (client *bitwardenCLI) redact(value string) string {
 	return redactDiagnostics(value, client.password, client.session)
-}
-
-func privateTestPath(t *testing.T, parent, name string, data []byte) string {
-	t.Helper()
-	path := filepath.Join(parent, name)
-	if err := os.WriteFile(path, data, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	return path
 }

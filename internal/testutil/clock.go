@@ -22,10 +22,10 @@ type timer struct {
 
 func NewClock() *Clock          { return &Clock{now: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)} }
 func (c *Clock) Now() time.Time { c.mu.Lock(); defer c.mu.Unlock(); return c.now }
-func (c *Clock) NewTimer(d time.Duration) timing.Timer {
+func (c *Clock) NewTimerAt(at time.Time) timing.Timer {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	t := &timer{clock: c, at: c.now.Add(d), ch: make(chan time.Time, 1)}
+	t := &timer{clock: c, at: at, ch: make(chan time.Time, 1)}
 	if !t.at.After(c.now) {
 		t.ch <- c.now
 		t.stopped = true
@@ -33,6 +33,18 @@ func (c *Clock) NewTimer(d time.Duration) timing.Timer {
 		c.timers = append(c.timers, t)
 	}
 	return t
+}
+
+// HasTimer lets a test advance only after the worker has scheduled a deadline.
+func (c *Clock) HasTimer(at time.Time) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, timer := range c.timers {
+		if !timer.stopped && timer.at.Equal(at) {
+			return true
+		}
+	}
+	return false
 }
 func (c *Clock) Advance(d time.Duration) {
 	c.mu.Lock()

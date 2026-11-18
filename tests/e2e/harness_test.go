@@ -162,7 +162,9 @@ func (h *e2eHarness) prepareDeployment() {
 		h.t.Fatal(err)
 	}
 	writePrivateFile(h.t, filepath.Join(h.deploymentRoot, "config/vaultwarden.env"), string(data))
-	writePrivateFile(h.t, filepath.Join(h.deploymentRoot, "config/vaultwarden-runtime.json"), "{}\n")
+	if err := os.CopyFS(filepath.Join(h.deploymentRoot, "rules"), os.DirFS(filepath.Join(h.releaseRoot, "rules"))); err != nil {
+		h.t.Fatal(err)
+	}
 	configuration := "targets:\n"
 	for _, name := range []string{"primary", "secondary"} {
 		configuration += fmt.Sprintf("  - name: %s\n    env_file: /run/credentials/backup/%s.env\n    options: [s3.bucket-lookup=path, s3.region=us-east-1]\n", name, name)
@@ -217,7 +219,7 @@ func (h *e2eHarness) writeOverride() {
 }
 
 func (h *e2eHarness) overrideVaultwarden(values map[string]string) {
-	// Test-only provisioning and Send coverage must not modify the shipped profile.
+	// Enable account enrollment only while creating the synthetic account.
 	h.vaultwardenOverrides = values
 	h.writeOverride()
 	h.compose("up", "--detach", "--no-deps", "vaultwarden")
@@ -293,7 +295,7 @@ func (h *e2eHarness) validateBoundaries() {
 				"SIGNUPS_ALLOWED": "false", "SIGNUPS_DOMAINS_WHITELIST": "", "INVITATIONS_ALLOWED": "false",
 				"DISABLE_ICON_DOWNLOAD": "true", "HTTP_REQUEST_BLOCK_NON_GLOBAL_IPS": "true",
 				"PASSWORD_HINTS_ALLOWED": "false", "SHOW_PASSWORD_HINT": "false",
-				"CONFIG_FILE": "/config/vaultwarden-runtime.json", "SENDS_ALLOWED": "false", "EMERGENCY_ACCESS_ALLOWED": "false", "ORG_CREATION_USERS": "none",
+				"CONFIG_FILE": "/etc/vaultwarden/config.json", "SENDS_ALLOWED": "false", "EMERGENCY_ACCESS_ALLOWED": "false", "ORG_CREATION_USERS": "none",
 			} {
 				if got, exists := values[key]; !exists || got != want {
 					h.t.Fatalf("shipped Vaultwarden profile: %s=%q, want %q", key, got, want)

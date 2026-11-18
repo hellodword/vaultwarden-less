@@ -33,21 +33,6 @@ class JustTests(unittest.TestCase):
                     ["check-release", "--work-dir", literal],
                     ["run", ".#check-release", "--", "--work-dir", literal],
                 ),
-                (
-                    ["routes", "--output", literal],
-                    ["run", ".#routes", "--", "--output", literal],
-                ),
-                (
-                    ["upstream-diff", "go", "candidate-ref", "--work-dir", literal],
-                    [
-                        "run",
-                        ".#upstream-diff-go",
-                        "--",
-                        "candidate-ref",
-                        "--work-dir",
-                        literal,
-                    ],
-                ),
             ]
             for args, expected in cases:
                 with self.subTest(recipe=args[0]):

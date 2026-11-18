@@ -5,6 +5,7 @@
 /credentials/maintenance/
 /credentials/restic/*
 /data/
+/state/
 /staging/
 /cache/
 /restore/

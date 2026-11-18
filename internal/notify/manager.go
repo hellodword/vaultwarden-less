@@ -2,9 +2,6 @@ package notify
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"sync"
 	"time"
@@ -31,10 +28,8 @@ type channel struct {
 	inflight Event
 	wake     chan struct{}
 	status   Status
-	identity string
 }
 type savedChannel struct {
-	Identity          string
 	Pending, Inflight Event
 	Status            Status
 }
@@ -49,15 +44,7 @@ func NewManager(configs []config.Notifier) *Manager {
 	m := &Manager{clock: timing.Real{}}
 	for _, cfg := range configs {
 		sender, err := senderForConfig(cfg)
-		// Hash routing/configuration, never persist secrets. A corrected permanent
-		// rejection is revalidated on restart; unchanged exhausted budgets persist.
-		encoded, _ := json.Marshal([]string{cfg.Name, cfg.Type, cfg.WebhookURL, cfg.Secret, cfg.DeviceToken, cfg.AuthKeyFile, cfg.KeyID, cfg.TeamID, cfg.Topic, cfg.Sound})
-		if cfg.Key != nil {
-			encoded = append(encoded, cfg.Key.PublicKey.X.Bytes()...)
-			encoded = append(encoded, cfg.Key.PublicKey.Y.Bytes()...)
-		}
-		hash := sha256.Sum256(encoded)
-		c := &channel{sender: sender, wake: make(chan struct{}, 1), status: Status{Name: cfg.Name}, identity: hex.EncodeToString(hash[:])}
+		c := &channel{sender: sender, wake: make(chan struct{}, 1), status: Status{Name: cfg.Name}}
 		if err != nil {
 			c.status.Error = "invalid_notifier_config"
 			c.status.Permanent = true
@@ -83,15 +70,17 @@ func (m *Manager) Restore(store state.Store) error {
 			c.status.Pending = c.pending.Count
 			continue
 		}
-		if previous.Identity == c.identity {
-			c.status = previous.Status
-			// An interrupted last attempt has already spent its budget. Its outcome
-			// is unknown, so retain the content and allow only the remaining attempts.
-			if previous.Inflight.Count > 0 && c.status.Attempts >= 3 {
-				c.status.Exhausted = true
-			}
-		} else {
-			c.status.LastSuccess = previous.Status.LastSuccess
+		c.status = previous.Status
+		// Re-read credentials on restart. A permanent rejection gets one new
+		// delivery round; transient failures keep their remaining retry budget.
+		if c.status.Permanent {
+			c.status.Permanent = false
+			c.status.Exhausted = false
+			c.status.Error = ""
+			c.status.Attempts = 0
+		}
+		if previous.Inflight.Count > 0 && c.status.Attempts >= 3 {
+			c.status.Exhausted = true
 		}
 		c.status.Pending = c.pending.Count
 	}
@@ -100,7 +89,7 @@ func (m *Manager) Restore(store state.Store) error {
 func (m *Manager) persist() error {
 	saved := map[string]savedChannel{}
 	for _, c := range m.channels {
-		saved[c.status.Name] = savedChannel{c.identity, c.pending, c.inflight, c.status}
+		saved[c.status.Name] = savedChannel{c.pending, c.inflight, c.status}
 	}
 	return m.store.Save("notifications.json", saved)
 }
@@ -246,7 +235,7 @@ func (m *Manager) run(ctx context.Context, c *channel) error {
 			}
 			continue
 		}
-		timer := m.clock.NewTimer(due.Sub(now))
+		timer := m.clock.NewTimerAt(due)
 		select {
 		case <-ctx.Done():
 			timer.Stop()

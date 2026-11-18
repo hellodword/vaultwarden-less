@@ -42,11 +42,19 @@ func serve(ctx context.Context, path string, stderr io.Writer) error {
 		return &commandError{message: "Work directory unavailable"}
 	}
 	notifications := notify.NewManager(cfg.Notifications.Channels)
-	if err := notifications.Restore(store); err != nil {
-		return &commandError{message: "Notification state unavailable"}
-	}
 	repo := restic.NewRunner("restic", config.CacheDir)
-	backupWorker := worker.New(cfg, capture.Builder{DataDir: config.DataDir, CacheDir: work}, repo, notifications, logger)
+	rule, err := capture.LoadRule(capture.RulePath)
+	if err != nil {
+		return &commandError{message: err.Error()}
+	}
+	var reports worker.Notifications
+	if len(cfg.Notifications.Channels) > 0 {
+		if err := notifications.Restore(store); err != nil {
+			return &commandError{message: "Notification state unavailable"}
+		}
+		reports = notifications
+	}
+	backupWorker := worker.New(cfg, capture.Builder{DataDir: config.DataDir, CacheDir: work, Rule: rule}, repo, reports)
 	if err := backupWorker.Restore(store); err != nil {
 		return &commandError{message: "Worker state unavailable"}
 	}

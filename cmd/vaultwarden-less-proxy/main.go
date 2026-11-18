@@ -16,6 +16,7 @@ import (
 
 	"github.com/hellodword/vaultwarden-less/internal/buildinfo"
 	proxyserver "github.com/hellodword/vaultwarden-less/internal/proxy"
+	"github.com/hellodword/vaultwarden-less/internal/routes"
 )
 
 type proxyEnvironment struct {
@@ -114,10 +115,15 @@ func serve(ctx context.Context, stderr io.Writer) error {
 	logger := slog.New(slog.NewJSONHandler(stderr, nil))
 	serveContext, stop := context.WithCancel(context.WithoutCancel(ctx))
 	defer stop()
+	rules, err := routes.Load(routes.Path)
+	if err != nil {
+		logger.Error("load route rules", "error", err)
+		return err
+	}
 	events := proxyserver.NewEventSender(logger)
 	var eventWait sync.WaitGroup
 	eventWait.Go(func() { events.Run(serveContext) })
-	server := proxyserver.NewServer(events.Record, logger)
+	server := proxyserver.NewServer(rules, events.Record, logger)
 	serveError := make(chan error, 1)
 	go func() { serveError <- server.ListenAndServe() }()
 	logger.Info("proxy started", "listen_address", proxyserver.ListenAddress)

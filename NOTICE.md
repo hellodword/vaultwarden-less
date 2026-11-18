@@ -3,7 +3,7 @@
 Vaultwarden-less is distributed under the MIT license in `LICENSE`. The
 authoritative project and Go dependency versions are recorded in `go.mod`,
 `go.sum`, the owning Nix definitions, and `flake.lock`. Nix builds the project binaries
-and assembles the runtime images from the closures selected by that lock.
+and assembles the two helper images from the closures selected by that lock.
 
 This project does not claim that its deployment bundle is a complete
 software bill of materials, license archive, or source archive. Every linked
@@ -29,15 +29,11 @@ project, source, and license are available at:
 
 ## Vaultwarden
 
-The Vaultwarden production image is assembled from `pkgs.vaultwarden` at the
-source selected by the locked nixpkgs input. Vaultwarden is licensed
-under AGPL-3.0-only. Anyone distributing the resulting Vaultwarden image must
-satisfy the AGPL's corresponding-source and notice obligations; the
-vaultwarden-less deployment bundle does not itself contain that source. The
-audited upstream source and license are available at:
-
-- https://github.com/dani-garcia/vaultwarden
-- https://github.com/dani-garcia/vaultwarden/blob/main/LICENSE.txt
+The release includes the official Linux amd64 `vaultwarden/server:1.37.5`
+image. The platform manifest and archive hash are pinned in `nix/packages.nix`.
+Vaultwarden is licensed under AGPL-3.0-only. Retain the relevant notices and
+corresponding-source obligations when redistributing the upstream image.
+[Versioned source and license](https://github.com/dani-garcia/vaultwarden/tree/1.37.5)
 
 ## Test-only tools
 

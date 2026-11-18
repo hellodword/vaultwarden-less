@@ -1,205 +1,64 @@
-# Deployment
+# 部署与首次备份
 
-This guide prepares a new deployment from the release bundle. Read the
-[configuration reference](configuration.md) while filling in the commented
-[templates](../templates/README.md). After first startup, use
-[operations](operations.md) for routine checks, maintenance, restore and upgrade.
+## 选择三个存放位置
 
-## Prerequisites and bundle
+保留 VPS 上的工作库，在两家提供 SLA 的对象存储分别开通 bucket，选取不同地理区域、独立账号或访问主体，为每处生成独立的 restic 仓库密码。模板给出 AWS S3 和 Backblaze B2 的 S3 接口。按所选区域、存储类别和账户条款核对 SLA。供应商的可用性承诺与能恢复出哪一个时间点是两件事，恢复时间点以各仓库实际快照为准。[Amazon S3 SLA](https://aws.amazon.com/s3/sla/) · [Backblaze SLA](https://www.backblaze.com/company/policy/sla)
 
-The target host needs Linux/amd64, Docker Engine and the Docker Compose plugin.
-It does not need Nix, Just, Go or repository scripts. Run the examples in Bash
-as the selected non-root runtime user with Docker access. Provision an
-operator-owned parent directory before creating the private deployment tree.
+每个仓库独占一个空前缀。在线备份主体需要列举、读取、写入仓库对象并创建和删除 restic 锁。按供应商能力限制删除快照和数据包的权限。维护主体单独保管，可执行保留和清理。管理员在 VPS 之外保管 bucket、区域、端点、仓库密码和维护访问凭据。每位使用者自行保管主密码及已启用的账号验证恢复手段。
 
-Provide external HTTPS for official Bitwarden clients. The bundle publishes
-only the request proxy on host loopback. Public listening addresses, TLS,
-access control and trusted forwarding headers belong to your external reverse
-proxy. Keep the backup listener private. Size the data disk and cache for the
-native database and files; [cache retention](contracts.md#repository-state)
-can keep approximately `N + 2` payload versions for `N` destinations.
+## 离线安装
 
-Obtain the complete bundle from your build/distribution process. A maintainer
-builds it with `just release`; the `result` output contains `images/`,
-`compose.yml`, `templates/`, `docs/`, README and license notices. When copying
-it to another host, copy file contents rather than a Nix store symlink.
-Preserve the bundled image tag and notices. Keep each release in its own
-directory for rollback.
-
-Set these **host** paths to the unpacked release and a new deployment directory.
-They are ordinary shell variables used by the examples; do not export them or
-put them in `compose.env`:
+在构建机运行 `just release`，把 `result/` 的实际内容复制到 VPS 上的只读发布目录。VPS 需要 Linux amd64、Docker 和 Compose v2。以下命令在 Bash 中运行。示例由能够访问 Docker 的部署用户执行，受限目录中的文件须可由对应运行身份读取。
 
 ```sh
-set -euo pipefail
-RELEASE_DIR=/absolute/path/to/release
-DEPLOY_DIR=/srv/vaultwarden-less
-test -f "$RELEASE_DIR/compose.yml"
-for image in vaultwarden proxy backup; do
-  docker load --input "$RELEASE_DIR/images/$image.tar.gz"
-done
-```
-
-## Prepare configuration and credentials
-
-The following creates a new tree and refuses an existing destination. It makes
-the copied files private and writable by the operator. For an existing
-deployment, retain its configuration and follow the upgrade guide.
-
-```sh
-set -euo pipefail
+export BUNDLE=/srv/releases/vaultwarden-less
+export DEPLOY_DIR=/srv/vaultwarden-less
 umask 077
-test ! -e "$DEPLOY_DIR"
-test ! -L "$DEPLOY_DIR"
-mkdir -m 0700 -- "$DEPLOY_DIR"
-cp -R -- "$RELEASE_DIR/templates/." "$DEPLOY_DIR/"
-cp -- "$RELEASE_DIR/compose.yml" "$DEPLOY_DIR/compose.yml"
-mkdir -m 0700 -- "$DEPLOY_DIR/data" "$DEPLOY_DIR/cache" "$DEPLOY_DIR/state" "$DEPLOY_DIR/restore"
-chmod -R u+rwX,go-rwx -- "$DEPLOY_DIR"
+mkdir -m 0700 "$DEPLOY_DIR"
+cd "$DEPLOY_DIR"
+cp "$BUNDLE/compose.yml" "$BUNDLE/templates/compose.env" .
+cp -R "$BUNDLE/templates/config" "$BUNDLE/templates/credentials" "$BUNDLE/rules" .
+chmod -R u+rwX,go-rwx config credentials rules
+chmod u+rw compose.yml compose.env
+mkdir -m 0700 data cache state credentials/maintenance
+for image in vaultwarden backup proxy; do docker load -i "$BUNDLE/images/$image.tar.gz"; done
+docker image inspect --format '{{.Os}}/{{.Architecture}} {{index .Config.Labels "org.opencontainers.image.version"}}' vaultwarden/server:1.37.5
 ```
 
-Edit the copies before starting containers:
+最后一条命令应输出 `linux/amd64 1.37.5`。构建时使用的官方平台 manifest 摘要固定在 `nix/packages.nix`。[升级手册](maintenance.md#更新上游)说明如何用上游配置摘要复核发布包。
 
-1. `compose.yml`: set the shared `x-service-defaults.user` to the non-root
-   numeric UID:GID that owns the deployment files (normally `id -u`/`id -g`).
-   The default is `1000:1000`. The selected identity needs access to the private
-   files and write access to `data/`, `state/` and `cache/`. Adjust the proxy's host port
-   in `127.0.0.1:8080:8080` if needed; keep container port 8080.
-   `compose.env` contains only `VWLESS_IMAGE_TAG`; keep the release's value.
-2. `config/vaultwarden.env`: review the minimal-feature profile; set `DOMAIN`
-   to your external HTTPS origin if needed, and configure upstream SMTP settings
-   only when using mail. These are Vaultwarden settings, not backup settings.
-3. `config/backup.yaml`: keep the intended AWS S3, Cloudflare R2 and Backblaze B2
-   target entries and remove the others. Review container credential paths and
-   backend options. The template disables notifications by default and comments examples for
-   all four adapters. Enable the channels you need under `notifications.channels`. Bark requires the authorized app's private key at
-   `credentials/backup/bark-apns-auth-key.p8`; no key is shipped. Supply it or
-   remove the Bark entry before running `validate`.
-4. For each retained target, edit its backup env file, such as
-   `credentials/backup/aws-s3-backup.env`. Replace the example repository,
-   region and backup credentials. Adjust native restic variables for non-S3
-   backends. Do not quote or interpolate their values. Remove unused targets'
-   credential and password files.
-5. Fill each retained target's empty `credentials/restic/<target>-repository-password.txt`
-   with only its restic password, without a variable name, quotes or comments.
-   For an existing repository, use its existing password. Keep an independent
-   secure recovery copy; local cache cannot replace the repository password.
+Compose 默认以 `65532:65532` 运行。可以在 `compose.yml` 的共享 `user` 中填部署用户的非 root UID:GID，使上面创建的文件直接可用。保留 65532 时，将新部署的 `data`、`cache`、`state`、`rules`、`config`、在线凭据和仓库密码文件的所有权设给该身份。宿主上的维护凭据由实际执行维护命令的管理员读取。
 
-Use 0600 for configuration and credential files and 0700 for private directories.
-Do not put real credentials into a source checkout or shell command history.
-For additional repositories, copy the matching provider's files under unique
-names and add a YAML entry with the new paths. Container paths such as
-`/run/credentials/restic/aws-s3-repository-password.txt` stay as container paths;
-the Compose file maps their host sources. Host paths such as `./data` and
-`./config/vaultwarden.env` resolve relative to the deployment's `compose.yml`.
+填写 `config/vaultwarden.env` 的 `DOMAIN=https://你的域名`、所需邮件设置、两个目标的凭据及原始仓库密码。TLS 入口只向 `127.0.0.1:8080` 转发，覆盖来自客户端的转发头。Vaultwarden 和备份进程的端口只在 Compose 网络内可见。配置说明见[配置](configuration.md)。
 
-## Empty installation or existing data
+## 初始化与验收
 
-For a new installation, leave `data/` empty. For adoption, use a **complete,
-stopped SQLite Vaultwarden data directory**. Preserve the entire database and
-any WAL/SHM sidecars, RSA keys, `config.json`, attachments, Sends, directories
-and links. Stop every source writer before copying; never copy only a live
-`db.sqlite3`. Keep the original directory or archive unchanged and copy into
-the new destination with ownership readable/writable by the runtime identity.
-
-For a native archive, extract into a separate new staging directory with standard
-tools. Select the data root explicitly; it may be nested inside the archive.
-The original archive remains untouched. Do not start the source instance again
-while making its consistent archive.
-
-<!-- native-import-example -->
-```sh
-set -euo pipefail
-: "${ARCHIVE:?}" "${IMPORT_STAGE:?}" "${IMPORT_DATA_ROOT:?}" "${DEPLOY_DIR:?}"
-[[ $IMPORT_STAGE = /* && $IMPORT_DATA_ROOT = /* ]]
-test ! -e "$IMPORT_STAGE"
-test ! -L "$IMPORT_STAGE"
-mkdir -m 0700 -- "$IMPORT_STAGE"
-tar --extract --file "$ARCHIVE" --directory "$IMPORT_STAGE" --no-same-owner
-case "$(realpath -- "$IMPORT_DATA_ROOT")/" in
-  "$(realpath -- "$IMPORT_STAGE")/"*) ;;
-  *) exit 1 ;;
-esac
-test -f "$IMPORT_DATA_ROOT/db.sqlite3"
-test -d "$DEPLOY_DIR/data"
-test -z "$(find "$DEPLOY_DIR/data" -mindepth 1 -maxdepth 1 -print -quit)"
-cp -a -- "$IMPORT_DATA_ROOT/." "$DEPLOY_DIR/data/"
-chmod -R u+rwX,go-rwx -- "$DEPLOY_DIR/data"
-```
-
-Set IMPORT_DATA_ROOT to the selected path **inside** IMPORT_STAGE (for example
-`/srv/import-staging/export/data`). Run the copy as the selected runtime user;
-if the archive retains different ownership, adjust only the working copy to
-that UID:GID. The images declare `1000:1000`; align Compose's user with the
-owner as described above. Preserve WAL/SHM, keys, attachments, Sends, config.json
-and all other native files. Never copy only a live database.
-
-`config/vaultwarden-runtime.json` stays `{}` and read-only. Imported config.json
-is retained as native data but cannot override deployment settings. Vaultwarden
-performs its own database upgrades after startup. Keep the archive/staging copy
-until client and restore validation pass; no project importer or migration
-framework is involved.
-
-## Validate and initialize repositories
-
-Define a helper for the deployment's Compose file and render its configuration
-without printing sensitive environment values. The absolute file paths allow
-the helper to run from any working directory:
+在部署目录定义以下函数。维护凭据文件使用对应模板的仓库地址、区域、容器内密码路径和单独的维护访问密钥。模板的两个示例直接使用环境变量，若配置额外的 restic 后端选项，手工命令也要传入对应的 `-o key=value`。
 
 ```sh
-set -euo pipefail
-compose() {
-  docker compose --env-file "$DEPLOY_DIR/compose.env" \
-    --file "$DEPLOY_DIR/compose.yml" "$@"
+dc() { docker compose --env-file "$DEPLOY_DIR/compose.env" -f "$DEPLOY_DIR/compose.yml" "$@"; }
+dc config --quiet
+dc run --rm --no-deps backup validate
+export RESTIC_IMAGE="$(dc config --images backup)"
+native() {
+  docker run --rm --read-only --tmpfs /tmp:rw,nosuid,nodev,mode=1777 \
+    --user "$(id -u):$(id -g)" --env-file "$RESTIC_ENV_FILE" \
+    --mount "type=bind,source=$DEPLOY_DIR/credentials/restic,target=/run/credentials/restic,readonly" \
+    --entrypoint /bin/restic "$RESTIC_IMAGE" --no-cache "$@"
 }
-compose config --quiet
-compose run --rm --no-deps backup validate
-RESTIC_IMAGE=$(compose config --images backup)
+for target in aws-s3 backblaze-b2; do
+  export RESTIC_ENV_FILE="$DEPLOY_DIR/credentials/maintenance/$target-maintenance.env"
+  native init
+  native cat config
+done
+dc up -d
+dc exec -T backup /bin/vaultwarden-less-backup status
 ```
 
-`validate` checks local YAML, env files and APNs keys. It does not contact a
-repository or prove that provider credentials, password or permissions work.
-Prepare a maintenance env file and the `restic_repository` helper as described in
-[native restic maintenance](operations.md#native-restic-maintenance). Maintenance
-env files are prepared by the operator and are not included in the templates.
-Match the target's backend options and select its maintenance file with
-`RESTIC_ENV_FILE`. **Before starting backup**, run `restic_repository init`
-once for a new empty repository. For an existing repository, use
-`restic_repository snapshots` and `restic_repository check` instead.
-Repeat for every target by changing `RESTIC_ENV_FILE`; never initialize over
-an existing repository as a troubleshooting shortcut.
+只对已核对为空的新前缀执行 `init`。记录两个不同的原生仓库 ID，重复运行日常启动命令时直接使用原仓库。两个目标应分别显示 `protected` 和自己的完整快照 ID。
 
-## Start and verify
+## 开通个人账号
 
-```sh
-compose up --detach
-compose ps
-compose exec --no-TTY backup /bin/vaultwarden-less-backup status
-compose exec --no-TTY backup /bin/vaultwarden-less-backup backup
-```
+开户期间，仅向需要注册的人开放入口。在部署目录的 `config/vaultwarden.env` 中临时设置 `SIGNUPS_ALLOWED=true`，执行 `dc up -d --force-recreate vaultwarden`。每人用自己的邮箱注册并设置主密码。注册完成后，将 `SIGNUPS_ALLOWED` 设回 `false`，保持 `SIGNUPS_DOMAINS_WHITELIST` 为空，再执行同一条命令。以后开通账号可以重复此流程。
 
-The manual backup waits for this operation and returns per-target JSON results.
-A failure or deferred target exits nonzero; inspect status for its next action.
-Require complete source and successful coverage for each intended target. Confirm the snapshot remotely with native
-restic. Health means process responsiveness, not successful data protection.
-See [status interpretation](operations.md#checks-and-status) for failures.
-
-Registration, invitations, Sends, emergency access and organization creation
-are disabled by default. Existing accounts can log in through official clients;
-Web Vault is disabled. For first enrollment, temporarily enable only the
-necessary upstream setting through a controlled HTTPS endpoint, recreate
-Vaultwarden with `compose up --detach vaultwarden`, enroll, then restore the
-closed setting and recreate it again. Keep the active runtime JSON empty.
-Disabling Sends prevents creation/modification but does not revoke existing
-Sends or remove their data.
-
-Verify representative client reads and writes through the external reverse
-proxy and complete a restore rehearsal to a new directory. Provider IAM,
-offsite durability and actual notification delivery to your devices/groups
-remain operator checks.
-
-All three services use `restart: "on-failure:5"`. Configure the host to start the
-stack on boot and alert/restart services that have stopped; this policy does
-not itself start containers after a host reboot. Normal Compose shutdown uses
-dependency order: proxy, backup, Vaultwarden. The 150-second grace period allows
-the gateway 120 seconds to drain requests and ten seconds to flush hints.
+每人在自己的 vault 中创建一个能识别的条目。等两个仓库各有一份包含此次写入的快照，再按[恢复步骤](operations.md)逐仓核对。

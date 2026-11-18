@@ -3,75 +3,27 @@ package proxy
 import (
 	"bufio"
 	"context"
-	"encoding/json"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"os/exec"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/hellodword/vaultwarden-less/internal/capture"
-
 	"github.com/hellodword/vaultwarden-less/internal/routes"
 	"github.com/hellodword/vaultwarden-less/internal/testutil"
 )
 
-func TestFailedAuthenticationAfterHashUpgradeTriggersNativeCapture(t *testing.T) {
-	data, cache := t.TempDir(), t.TempDir()
-	database := filepath.Join(data, "db.sqlite3")
-	sql := func(statement string) {
-		t.Helper()
-		if output, err := exec.Command("sqlite3", "-batch", "-bail", database, statement).CombinedOutput(); err != nil {
-			t.Fatalf("synthetic SQL: %v: %s", err, output)
-		}
-	}
-	sql("CREATE TABLE users(uuid PRIMARY KEY,password_hash,salt,password_iterations,security_stamp); INSERT INTO users VALUES('u','old','salt',1,'stamp');")
-	builder := capture.Builder{DataDir: data, CacheDir: cache}
-	baseline, err := builder.Build(context.Background(), nil, true)
+func testedRules(t *testing.T) routes.Rules {
+	t.Helper()
+	rules, err := routes.Load("../../rules/routes.txt")
 	if err != nil {
 		t.Fatal(err)
 	}
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// A handler may commit a hash upgrade, then reject a later authentication
-		// condition. Response success cannot decide whether to check persistence.
-		output, err := exec.Command("sqlite3", "-batch", "-bail", database, "UPDATE users SET password_hash='upgraded',password_iterations=2;").CombinedOutput()
-		if err != nil {
-			t.Errorf("synthetic SQL: %v: %s", err, output)
-			w.WriteHeader(500)
-			return
-		}
-		w.WriteHeader(http.StatusUnauthorized)
-	}))
-	defer upstream.Close()
-	var events []bool
-	server := newServer(mustURL(upstream.URL), func(method, path string, start bool) {
-		if method != "POST" || path != "/identity/connect/token" {
-			t.Error("lost request classification")
-		}
-		events = append(events, start)
-	}, nil)
-	response := httptest.NewRecorder()
-	server.ServeHTTP(response, httptest.NewRequest("POST", "/identity/connect/token", nil))
-	if response.Code != http.StatusUnauthorized || len(events) != 2 || !events[0] || events[1] {
-		t.Fatal("failed authentication did not report both boundaries")
-	}
-	captured, err := builder.Build(context.Background(), baseline, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if captured.Same(baseline, false) {
-		t.Fatal("committed password hash upgrade was ignored")
-	}
-	output, err := exec.Command("sqlite3", filepath.Join(captured.Directory, "db.sqlite3"), "SELECT password_hash FROM users;").CombinedOutput()
-	if err != nil || string(output) != "upgraded\n" {
-		t.Fatal("native backup lost the upgraded hash")
-	}
+	return rules
 }
 
 func TestWebSocketTunnelSurvivesProxy(t *testing.T) {
@@ -93,7 +45,7 @@ func TestWebSocketTunnelSurvivesProxy(t *testing.T) {
 	}))
 	defer upstream.Close()
 	marks := make(chan bool, 2)
-	proxy := httptest.NewServer(newServer(mustURL(upstream.URL), func(_, _ string, start bool) { marks <- start }, nil))
+	proxy := httptest.NewServer(newServer(mustURL(upstream.URL), testedRules(t), func() { marks <- true }, nil))
 	defer proxy.Close()
 	address, _ := url.Parse(proxy.URL)
 	connection, err := net.DialTimeout("tcp", address.Host, time.Second)
@@ -123,7 +75,7 @@ func TestWebSocketTunnelSurvivesProxy(t *testing.T) {
 		t.Fatal("duplex upgrade traffic failed")
 	}
 	connection.Close()
-	for _, want := range []bool{true, false} {
+	for _, want := range []bool{true, true} {
 		select {
 		case got := <-marks:
 			if got != want {
@@ -148,16 +100,8 @@ func TestStartEndForErrorsUnknownAndInterruptedRequests(t *testing.T) {
 	}))
 	defer upstream.Close()
 	var mu sync.Mutex
-	var starts, ends int
-	server := newServer(mustURL(upstream.URL), func(_, _ string, start bool) {
-		mu.Lock()
-		defer mu.Unlock()
-		if start {
-			starts++
-		} else {
-			ends++
-		}
-	}, nil)
+	var signals int
+	server := newServer(mustURL(upstream.URL), testedRules(t), func() { mu.Lock(); defer mu.Unlock(); signals++ }, nil)
 	for _, path := range []string{"/unknown", "/partial", "/healthz"} {
 		func() {
 			defer func() {
@@ -168,16 +112,16 @@ func TestStartEndForErrorsUnknownAndInterruptedRequests(t *testing.T) {
 			server.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, path, nil))
 		}()
 	}
-	if starts != 3 || ends != 3 {
-		t.Fatalf("start/end=%d/%d", starts, ends)
+	if signals != 6 {
+		t.Fatalf("got %d write signals", signals)
 	}
 	server.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/api/sync", nil))
-	if starts != 4 || ends != 4 {
+	if signals != 7 {
 		t.Fatal("failed read request did not trigger conservative check")
 	}
 	upstream.Close()
 	server.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/identity/connect/token", nil))
-	if starts != 5 || ends != 5 {
+	if signals != 9 {
 		t.Fatal("connection failure not triggered")
 	}
 }
@@ -190,7 +134,7 @@ func TestProxyDoesNotWaitForBackupAndPreservesStreaming(t *testing.T) {
 	}))
 	defer upstream.Close()
 	sender := NewEventSender(nil)
-	server := httptest.NewServer(newServer(mustURL(upstream.URL), sender.Record, nil))
+	server := httptest.NewServer(newServer(mustURL(upstream.URL), testedRules(t), sender.Record, nil))
 	defer server.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -210,7 +154,7 @@ func TestProxyDoesNotWaitForBackupAndPreservesStreaming(t *testing.T) {
 func TestEventFailuresRetainBoundedCounts(t *testing.T) {
 	var mu sync.Mutex
 	calls := 0
-	var accepted routes.Summary
+	var accepted bool
 	endpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		defer mu.Unlock()
@@ -219,7 +163,7 @@ func TestEventFailuresRetainBoundedCounts(t *testing.T) {
 			w.WriteHeader(503)
 			return
 		}
-		json.NewDecoder(r.Body).Decode(&accepted)
+		accepted = r.ContentLength == 0
 		w.WriteHeader(204)
 	}))
 	defer endpoint.Close()
@@ -228,7 +172,7 @@ func TestEventFailuresRetainBoundedCounts(t *testing.T) {
 	sender.endpoint = endpoint.URL
 	sender.clock = clock
 	for range 50 {
-		sender.Record("GET", "/unknown/private?secret", true)
+		sender.Record()
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -248,7 +192,7 @@ func TestEventFailuresRetainBoundedCounts(t *testing.T) {
 			t.Fatal("first submission absent")
 		}
 	}
-	sender.Record("CUSTOM", strings.Repeat("/x", 100), false)
+	sender.Record()
 	for {
 		clock.Advance(time.Second)
 		time.Sleep(time.Millisecond)
@@ -264,7 +208,7 @@ func TestEventFailuresRetainBoundedCounts(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if accepted.Unknown["GET"].Started != 50 || accepted.Unknown["OTHER"].Finished != 1 || len(accepted.Routes) != 0 {
+	if !accepted {
 		t.Fatal("failed event counts lost or raw paths retained")
 	}
 }
@@ -277,17 +221,15 @@ func TestShutdownDrainsWriteThenFlushesItsEndEvent(t *testing.T) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer upstream.Close()
-	var accepted routes.Summary
+	var accepted bool
 	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if err := json.NewDecoder(r.Body).Decode(&accepted); err != nil {
-			t.Error(err)
-		}
+		accepted = r.ContentLength == 0
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer peer.Close()
 	sender := NewEventSender(nil)
 	sender.endpoint = peer.URL
-	server := newServer(mustURL(upstream.URL), sender.Record, nil)
+	server := newServer(mustURL(upstream.URL), testedRules(t), sender.Record, nil)
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -317,16 +259,7 @@ func TestShutdownDrainsWriteThenFlushesItsEndEvent(t *testing.T) {
 	if err := sender.Flush(ctx); err != nil {
 		t.Fatal(err)
 	}
-	var started, finished uint64
-	for _, counts := range accepted.Routes {
-		started += counts.Started
-		finished += counts.Finished
-	}
-	for _, counts := range accepted.Unknown {
-		started += counts.Started
-		finished += counts.Finished
-	}
-	if started != 1 || finished != 1 {
-		t.Fatalf("shutdown event boundaries %d/%d", started, finished)
+	if !accepted {
+		t.Fatal("shutdown signal was not delivered")
 	}
 }

@@ -50,6 +50,7 @@ let
     contents = [
       backup
       pkgs.restic
+      pkgs.coreutils
       pkgs.sqlite
       pkgs.cacert
       pkgs.tzdata
@@ -75,41 +76,22 @@ let
       Labels = labels "Vaultwarden request proxy";
     };
   };
-  vaultwardenHealthcheck = pkgs.writeShellApplication {
-    name = "healthcheck.sh";
-    runtimeInputs = [ pkgs.curl ];
-    text = "exec curl --fail --silent --show-error --max-time 3 http://127.0.0.1/alive";
-  };
-  vaultwardenImage = pkgs.dockerTools.buildLayeredImage {
-    name = "vaultwarden-less-vaultwarden";
-    tag = identity.release;
-    created = identity.created;
-    contents = [
-      pkgs.vaultwarden
-      vaultwardenHealthcheck
-      pkgs.cacert
-      pkgs.tzdata
-    ];
-    extraCommands = "ln -s ${vaultwardenHealthcheck}/bin/healthcheck.sh healthcheck.sh";
-    config = {
-      WorkingDir = "/";
-      User = "1000:1000";
-      Entrypoint = [ "/bin/vaultwarden" ];
-      Env = [
-        "ROCKET_ADDRESS=0.0.0.0"
-        "ROCKET_PORT=80"
-      ];
-      ExposedPorts."80/tcp" = { };
-      Labels = labels "Vaultwarden";
-    };
+  vaultwardenImage = pkgs.dockerTools.pullImage {
+    imageName = "vaultwarden/server";
+    finalImageTag = "1.37.5";
+    imageDigest = "sha256:f8863ab2519364bfc657144006682a830784e0bb501606d5e34516ee76b60b5c";
+    hash = "sha256-dBh6VRIA2QVo8thC/g52Lh33Hl4VhZqrw4uG6RHYTno=";
+    os = "linux";
+    arch = "amd64";
   };
   releaseBundle = pkgs.runCommand "vaultwarden-less-release-${identity.release}" { } ''
     mkdir -p "$out/images" "$out/templates" "$out/docs"
     cp ${backupImage} "$out/images/backup.tar.gz"
     cp ${proxyImage} "$out/images/proxy.tar.gz"
-    cp ${vaultwardenImage} "$out/images/vaultwarden.tar.gz"
+    gzip -n -c ${vaultwardenImage} > "$out/images/vaultwarden.tar.gz"
     cp ${source}/compose.yml ${source}/LICENSE ${source}/NOTICE.md ${source}/README.md "$out/"
     cp -R ${source}/templates/. "$out/templates/"
+    cp -R ${source}/rules "$out/rules"
     cp -R ${source}/docs/. "$out/docs/"
     substituteInPlace "$out/templates/compose.env" --replace-fail 'VWLESS_IMAGE_TAG=development' 'VWLESS_IMAGE_TAG=${identity.release}'
   '';

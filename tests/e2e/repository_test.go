@@ -13,42 +13,8 @@ import (
 )
 
 type nativeSnapshot struct {
-	ID       string    `json:"id"`
-	Time     time.Time `json:"time"`
-	Hostname string    `json:"hostname"`
-	Tags     []string  `json:"tags"`
-	Parent   string    `json:"parent"`
-	Summary  struct {
-		DataAdded int64 `json:"data_added"`
-	} `json:"summary"`
-}
-
-// Damage only this test's synthetic object. Save its exact bytes inside the
-// disposable peer so restoration does not invoke automatic restic repair.
-func (h *e2eHarness) damageRemoteObject(target, action string) {
-	h.t.Helper()
-	h.mustDocker("exec", h.containerID("moto-"+target), "/bin/python3", "-c", `import boto3,pathlib,sys
-target,action=sys.argv[1:]
-s3=boto3.client('s3',endpoint_url='http://127.0.0.1:5000',aws_access_key_id='test',aws_secret_access_key='test',region_name='us-east-1')
-bucket='vaultwarden-less-'+target
-saved=pathlib.Path('/tmp/e2e-object-recovery')
-key_file=pathlib.Path('/tmp/e2e-object-recovery-key')
-if action=='restore':
-    s3.put_object(Bucket=bucket,Key=key_file.read_text(),Body=saved.read_bytes())
-    saved.unlink()
-    key_file.unlink()
-else:
-    assert not saved.exists()
-    objects=s3.list_objects_v2(Bucket=bucket,Prefix='repository/data/')['Contents']
-    key=min(objects,key=lambda item:item['Size'])['Key']
-    data=s3.get_object(Bucket=bucket,Key=key)['Body'].read()
-    saved.write_bytes(data)
-    key_file.write_text(key)
-    if action=='delete':
-        s3.delete_object(Bucket=bucket,Key=key)
-    else:
-        s3.put_object(Bucket=bucket,Key=key,Body=bytes([data[0]^255])+data[1:])
-`, target, action)
+	ID          string
+	Paths, Tags []string
 }
 
 func (h *e2eHarness) nativeRestic(target string, mounts []string, arguments ...string) string {
@@ -65,26 +31,17 @@ func (h *e2eHarness) nativeRestic(target string, mounts []string, arguments ...s
 }
 func (h *e2eHarness) snapshots(target string) []nativeSnapshot {
 	h.t.Helper()
-	output := h.nativeRestic(target, nil, "snapshots", "--host", "vaultwarden-less", "--json")
+	output := h.nativeRestic(target, nil, "snapshots", "--json")
 	var result []nativeSnapshot
 	if err := json.Unmarshal([]byte(output), &result); err != nil {
 		h.t.Fatal("invalid native snapshots response")
 	}
 	for _, s := range result {
-		if !lowerHex64Pattern.MatchString(s.ID) || s.Hostname != "vaultwarden-less" || (!slices.Contains(s.Tags, "complete") && !slices.Contains(s.Tags, "incomplete")) {
-			h.t.Fatal("native snapshot identity or tag missing")
+		if !lowerHex64Pattern.MatchString(s.ID) || !slices.Equal(s.Paths, []string{"/db.sqlite3"}) || len(s.Tags) != 0 {
+			h.t.Fatal("unexpected native snapshot")
 		}
 	}
-	slices.SortFunc(result, func(a, b nativeSnapshot) int { return a.Time.Compare(b.Time) })
 	return result
-}
-func (h *e2eHarness) latest(target string) nativeSnapshot {
-	h.t.Helper()
-	all := h.snapshots(target)
-	if len(all) == 0 {
-		h.t.Fatal("no native snapshots")
-	}
-	return all[len(all)-1]
 }
 func (h *e2eHarness) status() productworker.Status {
 	h.t.Helper()
@@ -102,63 +59,18 @@ func (h *e2eHarness) waitStatus(timeout time.Duration, accept func(productworker
 	h.wait(timeout, "backup status condition", func() bool { state = h.status(); return accept(state) })
 	return state
 }
-func settled(s productworker.Status) bool {
-	if s.Checking || s.LastCheck.IsZero() {
-		return false
-	}
-	for _, t := range s.Targets {
-		if t.Uploading || t.State == "initializing" || (t.Waiting && t.Error == "") {
+func (h *e2eHarness) waitPass(since time.Time) productworker.Status {
+	return h.waitStatus(3*time.Minute, func(s productworker.Status) bool {
+		if s.Source != "ready" || !s.CheckedAt.After(since) || len(s.Targets) != 2 {
 			return false
 		}
-	}
-	return true
-}
-func (h *e2eHarness) operation(arguments ...string) productworker.Operation {
-	h.t.Helper()
-	output, err := h.tryCompose(h.ctx, append([]string{"exec", "--no-TTY", "backup", "/bin/vaultwarden-less-backup"}, arguments...)...)
-	var op productworker.Operation
-	for _, line := range strings.Split(output, "\n") {
-		var candidate productworker.Operation
-		if json.Unmarshal([]byte(line), &candidate) == nil && candidate.ID != "" {
-			op = candidate
-			break
+		for _, t := range s.Targets {
+			if t.State != "protected" || t.CheckedAt.Before(s.CheckedAt) {
+				return false
+			}
 		}
-	}
-	if !op.Done() || (op.State == "succeeded") != (err == nil) {
-		h.t.Fatalf("manual operation did not report its actual outcome: %v: %s", err, harnessDiagnostics(output))
-	}
-	return op
-}
-func (h *e2eHarness) check(force bool) productworker.Status {
-	h.t.Helper()
-	args := []string{"backup"}
-	if force {
-		args = append(args, "--force")
-	}
-	h.operation(args...)
-	return h.waitStatus(3*time.Minute, settled)
-}
-func (h *e2eHarness) waitNewRequestCheck(after time.Time) productworker.Status {
-	return h.waitStatus(3*time.Minute, func(s productworker.Status) bool { return s.LastCheck.After(after) && settled(s) })
-}
-func (h *e2eHarness) assertUnchangedIDs(before productworker.Status, after productworker.Status) {
-	h.t.Helper()
-	if len(before.Targets) != len(after.Targets) {
-		h.t.Fatal("target count changed")
-	}
-	for i := range before.Targets {
-		if before.Targets[i].SuccessID != after.Targets[i].SuccessID {
-			h.t.Fatalf("unchanged content created a snapshot for %s", after.Targets[i].Name)
-		}
-	}
-}
-func (h *e2eHarness) assertNewIDs(before productworker.Status, after productworker.Status) {
-	h.t.Helper()
-	for i := range before.Targets {
-		if before.Targets[i].SuccessID == after.Targets[i].SuccessID || after.Targets[i].SuccessID == "" {
-			h.t.Fatalf("changed content was not saved to %s", after.Targets[i].Name)
-		}
-	}
+		return true
+	})
 }
 func (h *e2eHarness) restore(target, id, name string) string {
 	h.t.Helper()
@@ -170,7 +82,7 @@ func (h *e2eHarness) restore(target, id, name string) string {
 		h.t.Fatal(err)
 	}
 	h.nativeRestic(target, []string{"type=bind,source=" + path + ",target=/restore"}, "restore", id, "--verify", "--target", "/restore")
-	if _, err := os.Stat(filepath.Join(path, "db.sqlite3")); err != nil {
+	if files, err := os.ReadDir(path); err != nil || len(files) != 1 || files[0].Name() != "db.sqlite3" {
 		h.t.Fatal("native restore did not produce a root database")
 	}
 	if result := h.sqlite(path, "PRAGMA integrity_check;"); strings.TrimSpace(result) != "ok" {
@@ -182,10 +94,6 @@ func (h *e2eHarness) sqlite(root, sql string) string {
 	h.t.Helper()
 	return h.mustDocker("run", "--rm", "--pull", "never", "--user", h.identity(), "--read-only", "--mount", "type=bind,source="+root+",target=/data", "--entrypoint", "/bin/sqlite3", h.services["backup"].Image, "-batch", "-bail", "/data/db.sqlite3", sql)
 }
-func (h *e2eHarness) sqliteReadOnly(root, sql string) string {
-	h.t.Helper()
-	return h.mustDocker("run", "--rm", "--pull", "never", "--user", h.identity(), "--read-only", "--mount", "type=bind,source="+root+",target=/restore,readonly", "--entrypoint", "/bin/sqlite3", h.services["backup"].Image, "-batch", "-bail", "-readonly", "file:/restore/db.sqlite3?immutable=1", sql)
-}
 func (h *e2eHarness) startRestored(root, name string) {
 	h.t.Helper()
 	port := unusedLoopbackPort(h.t)
@@ -193,10 +101,8 @@ func (h *e2eHarness) startRestored(root, name string) {
 	command := []string{"run", "--detach", "--pull", "never", "--name", container, "--label", "vaultwarden-less.e2e.project=" + h.project,
 		"--user", h.identity(), "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
 		"--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777", "--mount", "type=bind,source=" + root + ",target=/data",
-		"--mount", "type=bind,source=" + filepath.Join(h.deploymentRoot, "config/vaultwarden-runtime.json") + ",target=/config/vaultwarden-runtime.json,readonly",
 		"--publish", fmt.Sprintf("127.0.0.1:%d:80", port)}
 	// Use the rendered product configuration before any test-only overrides.
-	// Sends stay disabled here: existing Sends must still be readable on restore.
 	for key, value := range h.services["vaultwarden"].Environment {
 		command = append(command, "--env", key+"="+value)
 	}

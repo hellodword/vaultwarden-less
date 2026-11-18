@@ -43,14 +43,13 @@ in
       {
         nativeBuildInputs = [
           pkgs.python3
+          pkgs.sqlite
           pkgs.just
         ];
       }
       ''
         cd ${source}
         python3 -m unittest discover -s tests/scripts -p 'test_*.py'
-        python3 scripts/routes.py ${pkgs.vaultwarden.src} --output "$TMPDIR/catalog.txt"
-        cmp internal/routes/catalog.txt "$TMPDIR/catalog.txt"
         touch "$out"
       '';
 }

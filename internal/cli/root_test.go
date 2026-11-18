@@ -15,18 +15,7 @@ import (
 )
 
 func TestCommandsExitCodesAndLocalValidation(t *testing.T) {
-	var force bool
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/backups" {
-			var body struct {
-				Force bool `json:"force"`
-			}
-			json.NewDecoder(r.Body).Decode(&body)
-			force = body.Force
-			w.WriteHeader(202)
-			io.WriteString(w, `{"id":"0123456789abcdef0123456789abcdef","state":"succeeded","targets":[]}`)
-			return
-		}
 		if r.URL.Path == "/healthz" {
 			w.WriteHeader(204)
 			return
@@ -35,15 +24,15 @@ func TestCommandsExitCodesAndLocalValidation(t *testing.T) {
 	}))
 	defer server.Close()
 	served := false
-	env := environment{endpoint: server.URL, client: server.Client(), serve: func(context.Context, string, io.Writer) error { served = true; return nil }}
-	for _, args := range [][]string{{"version"}, {"healthcheck"}, {"status"}, {"backup", "--force"}, {"serve"}} {
+	env := environment{rulesDir: "../../rules", endpoint: server.URL, client: server.Client(), serve: func(context.Context, string, io.Writer) error { served = true; return nil }}
+	for _, args := range [][]string{{"version"}, {"healthcheck"}, {"status"}, {"serve"}} {
 		var out, diagnostic bytes.Buffer
 		if err := execute(t.Context(), args, &out, &diagnostic, env); err != nil {
 			t.Fatalf("%v: %v", args, err)
 		}
 	}
-	if !force || !served {
-		t.Fatal("commands were gated or lost force flag")
+	if !served {
+		t.Fatal("serve did not run")
 	}
 	for _, args := range [][]string{{}, {"unknown"}, {"backup", "extra"}, {"backup", "--unknown"}, {"backup", "--force=invalid"}, {"serve", "--config"}, {"status", "--config=x"}, {"help", "unknown"}, {"help", "backup", "extra"}, {"version", "--", "extra"}} {
 		var out, diagnostic bytes.Buffer
@@ -70,7 +59,7 @@ func TestCommandsExitCodesAndLocalValidation(t *testing.T) {
 }
 
 func TestHelpDoesNotRunCommands(t *testing.T) {
-	for _, args := range [][]string{{"help"}, {"-h"}, {"--help"}, {"help", "serve"}, {"validate", "--help"}, {"backup", "-h"}, {"status", "--help"}, {"healthcheck", "--help"}, {"version", "--help"}} {
+	for _, args := range [][]string{{"help"}, {"-h"}, {"--help"}, {"help", "serve"}, {"validate", "--help"}, {"status", "--help"}, {"healthcheck", "--help"}, {"version", "--help"}} {
 		var out, diagnostic bytes.Buffer
 		if err := execute(t.Context(), args, &out, &diagnostic, environment{}); err != nil {
 			t.Fatalf("%v: %v", args, err)
@@ -98,81 +87,5 @@ func TestServePreservesContextPathAndDiagnostics(t *testing.T) {
 	WriteError(&diagnostic, err)
 	if diagnostic.String() != "{\"error\":{\"code\":\"operation_failed\",\"message\":\"The operation failed\"}}\n" {
 		t.Fatalf("unexpected diagnostic: %q", &diagnostic)
-	}
-}
-
-func TestCheckBooleanFormsAndCancellation(t *testing.T) {
-	var received []bool
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var body struct{ Force bool }
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			t.Error(err)
-		}
-		received = append(received, body.Force)
-		w.WriteHeader(http.StatusAccepted)
-		io.WriteString(w, `{"id":"0123456789abcdef0123456789abcdef","state":"succeeded","targets":[]}`)
-	}))
-	defer server.Close()
-	env := environment{endpoint: server.URL, client: server.Client()}
-	for _, args := range [][]string{{"backup"}, {"backup", "--force"}, {"backup", "--force=false"}, {"backup", "--force=true"}} {
-		if err := execute(t.Context(), args, io.Discard, io.Discard, env); err != nil {
-			t.Fatal(err)
-		}
-	}
-	ctx, cancel := context.WithCancel(t.Context())
-	cancel()
-	if err := execute(ctx, []string{"backup"}, io.Discard, io.Discard, env); ExitCode(err) != 130 {
-		t.Fatalf("cancelled request: %v", err)
-	}
-	if len(received) != 4 || received[0] || !received[1] || received[2] || !received[3] {
-		t.Fatalf("requests: %v", received)
-	}
-}
-
-func TestWaitForActualOperationFailureAndMissingReceipt(t *testing.T) {
-	for _, missing := range []bool{false, true} {
-		t.Run(map[bool]string{false: "failed", true: "lost"}[missing], func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.Method == http.MethodPost {
-					w.WriteHeader(http.StatusAccepted)
-					io.WriteString(w, `{"id":"0123456789abcdef0123456789abcdef","state":"queued"}`)
-					return
-				}
-				if missing {
-					w.WriteHeader(http.StatusNotFound)
-					io.WriteString(w, `{"error":{"code":"operation_unknown"}}`)
-					return
-				}
-				io.WriteString(w, `{"id":"0123456789abcdef0123456789abcdef","state":"failed","targets":[{"name":"one","state":"deferred","retry_at":"2026-10-29T00:00:00Z"}]}`)
-			}))
-			defer server.Close()
-			var stdout, stderr bytes.Buffer
-			err := execute(t.Context(), []string{"backup"}, &stdout, &stderr, environment{endpoint: server.URL, client: server.Client()})
-			if ExitCode(err) != 1 {
-				t.Fatal("acceptance was treated as completion")
-			}
-			if missing {
-				if stdout.Len() != 0 || !strings.Contains(err.Error(), "cannot be confirmed") {
-					t.Fatal("lost receipt was not explicit")
-				}
-			} else if !json.Valid(stdout.Bytes()) || !strings.Contains(stdout.String(), "deferred") {
-				t.Fatal("target outcomes not on stdout")
-			}
-		})
-	}
-}
-func TestInterruptOnlyStopsWaiting(t *testing.T) {
-	accepted := make(chan struct{})
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusAccepted)
-		io.WriteString(w, `{"id":"0123456789abcdef0123456789abcdef","state":"running"}`)
-		close(accepted)
-	}))
-	defer server.Close()
-	go func() { <-accepted; cancel() }()
-	if code := ExitCode(execute(ctx, []string{"backup"}, io.Discard, io.Discard, environment{endpoint: server.URL, client: server.Client()})); code != 130 {
-		t.Fatalf("interrupted wait exit %d", code)
 	}
 }

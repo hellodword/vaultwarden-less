@@ -52,28 +52,20 @@ const notificationConfiguration = `notifications:
 `
 
 type stubChannel struct {
-	Attempts       int
-	Successes      int
-	Failures       int
-	Invalid        int
-	HTTP2          int
-	Markdown       int
-	FirstAttempt   time.Time
-	FirstSuccess   time.Time
-	UnknownSummary bool
+	Attempts     int
+	Successes    int
+	Failures     int
+	Invalid      int
+	HTTP2        int
+	Markdown     int
+	FirstAttempt time.Time
+	FirstSuccess time.Time
 }
 
 // This test-only process is packaged inside the runner. Docker DNS supplies
 // Apple's production hostname, and the backup process trusts only the mounted
 // test CA for this peer. No production endpoint override is involved.
 func TestMain(m *testing.M) {
-	if os.Getenv("VWLESS_E2E_REJECTOR") == "1" {
-		server := &http.Server{Addr: ":5000", ReadHeaderTimeout: 5 * time.Second, Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusForbidden) })}
-		if err := server.ListenAndServe(); err != nil {
-			os.Exit(1)
-		}
-		os.Exit(0)
-	}
 	if root := os.Getenv("VWLESS_E2E_STUB"); root != "" {
 		if err := runNotificationStub(root); err != nil {
 			fmt.Fprintln(os.Stderr, "notification stub failed")
@@ -190,14 +182,14 @@ func runNotificationStub(root string) error {
 			content, _ = doc["markdown"].(string)
 			fallback, _ := alert["body"].(string)
 			title, _ := alert["title"].(string)
-			valid = valid && strings.HasPrefix(title, "vaultwarden-less · ") && strings.HasPrefix(fallback, "Source: ") && !strings.Contains(fallback, "**")
+			valid = valid && strings.HasPrefix(title, "vaultwarden-less · ") && strings.HasPrefix(fallback, "SQLite ") && !strings.Contains(fallback, "**")
 			valid = valid && r.ProtoMajor == 2 && r.Header.Get("apns-topic") == "me.fin.bark" && r.Header.Get("apns-push-type") == "alert" && len(raw) <= 4096
 			valid = valid && aps["sound"] == "1107" && aps["category"] == "myNotificationCategory" && aps["mutable-content"] == float64(1) && aps["thread-id"] == "vaultwarden-less" && doc["isarchive"] == "1" && doc["group"] == "vaultwarden-less" && doc["badge"] == "1"
 			valid = valid && validStubJWT(r.Header.Get("authorization"), &auth.PublicKey)
 		default:
 			valid = false
 		}
-		valid = valid && strings.HasPrefix(content, "**Vaultwarden backup — ") && strings.Contains(content, "Source: ") && strings.Contains(content, "Time: ") && strings.Contains(content, "Source checks:") && !strings.Contains(content, "e2e-private-path")
+		valid = valid && strings.HasPrefix(content, "**Vaultwarden backup — ") && strings.Contains(content, "Repositories protected:") && !strings.Contains(content, "e2e-private-path")
 		mu.Lock()
 		defer mu.Unlock()
 		state := stats[channel]
@@ -210,11 +202,7 @@ func runNotificationStub(root string) error {
 		}
 		if valid {
 			state.Markdown++
-			for _, paragraph := range strings.Split(content, "\n\n") {
-				if paragraph == "> Unknown GET: started 8, finished 8" {
-					state.UnknownSummary = true
-				}
-			}
+
 		}
 		w.Header().Set("Content-Type", "application/json")
 		if !valid {

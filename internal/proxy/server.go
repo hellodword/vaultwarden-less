@@ -35,18 +35,19 @@ const (
 
 type Server struct {
 	upstream *url.URL
-	record   func(string, string, bool)
+	rules    routes.Rules
+	record   func()
 	log      *slog.Logger
 	proxy    *httputil.ReverseProxy
 	http     *http.Server
 	health   *http.Server
 }
 
-func NewServer(record func(string, string, bool), log *slog.Logger) *Server {
-	return newServer(mustURL(UpstreamURL), record, log)
+func NewServer(rules routes.Rules, record func(), log *slog.Logger) *Server {
+	return newServer(mustURL(UpstreamURL), rules, record, log)
 }
 
-func newServer(upstream *url.URL, record func(string, string, bool), log *slog.Logger) *Server {
+func newServer(upstream *url.URL, rules routes.Rules, record func(), log *slog.Logger) *Server {
 	transport := &http.Transport{
 		Proxy:                 nil,
 		DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
@@ -59,7 +60,7 @@ func newServer(upstream *url.URL, record func(string, string, bool), log *slog.L
 		ResponseHeaderTimeout: UpstreamResponseHeaderTimeout,
 	}
 	rp := &httputil.ReverseProxy{Transport: transport}
-	s := &Server{upstream: upstream, record: record, log: log, proxy: rp}
+	s := &Server{upstream: upstream, rules: rules, record: record, log: log, proxy: rp}
 	rp.Rewrite = s.rewrite
 	rp.ErrorHandler = s.proxyError
 	s.http = &http.Server{
@@ -82,10 +83,10 @@ func newServer(upstream *url.URL, record func(string, string, bool), log *slog.L
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	trigger := routes.Trigger(r.Method, r.URL.EscapedPath())
+	trigger := s.rules.Trigger(r.Method, r.URL.EscapedPath())
 	if s.record != nil && trigger {
-		s.record(r.Method, r.URL.EscapedPath(), true)
-		defer s.record(r.Method, r.URL.EscapedPath(), false)
+		s.record()
+		defer s.record()
 	}
 	response := &responseStatus{ResponseWriter: w}
 	completed := false
@@ -93,8 +94,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// Errors and interrupted responses remain conservative clues, including
 		// handlers normally excluded as reads or temporary authentication work.
 		if s.record != nil && !trigger && (!completed || response.code >= 400 || r.Context().Err() != nil) {
-			s.record(r.Method, r.URL.EscapedPath(), true)
-			s.record(r.Method, r.URL.EscapedPath(), false)
+			s.record()
 		}
 	}()
 	s.proxy.ServeHTTP(response, r)

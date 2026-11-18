@@ -12,7 +12,6 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"math"
 	"math/big"
 	"net"
 	"net/http"
@@ -25,7 +24,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/hellodword/vaultwarden-less/internal/config"
-	"github.com/hellodword/vaultwarden-less/internal/routes"
 	"github.com/hellodword/vaultwarden-less/internal/state"
 	"github.com/hellodword/vaultwarden-less/internal/testutil"
 )
@@ -112,9 +110,9 @@ func webhookMarkdown(t *testing.T, kind string, doc map[string]any) string {
 }
 
 func TestWebhookEncodedBodyLimitsAndHTTPRetry(t *testing.T) {
-	event := Event{Checks: 1, Count: 1, Source: "incomplete", Routes: map[string]routes.Counts{}}
+	event := Event{Kind: "Fault", Count: 1, Source: "failed"}
 	for i := range 1000 {
-		event.Routes[strconv.Itoa(i)+strings.Repeat("<界&", 20)] = routes.Counts{Started: 1, Finished: 1}
+		event.Targets = append(event.Targets, TargetStatus{Name: strconv.Itoa(i) + strings.Repeat("<界&", 20), State: "failed"})
 	}
 	now := time.Unix(1800000000, 0)
 	for _, kind := range []string{"wecom", "feishu", "dingtalk"} {
@@ -134,7 +132,7 @@ func TestWebhookEncodedBodyLimitsAndHTTPRetry(t *testing.T) {
 					t.Fatal("invalid body")
 				}
 				content := webhookMarkdown(t, kind, doc)
-				if !utf8.ValidString(content) || !strings.Contains(content, "Source: Incomplete") || !strings.Contains(content, "Source checks: 1; effective changes: 0") {
+				if !utf8.ValidString(content) || !strings.Contains(content, "SQLite failed") {
 					t.Error("truncation lost essential summary or UTF-8")
 				}
 				if kind == "wecom" && (len(content) > 4096 || len(content) <= 2048) {
@@ -168,7 +166,7 @@ func TestWebhooksSignaturesAndExplicitSuccess(t *testing.T) {
 						t.Error("Feishu signature or payload invalid")
 					}
 				}
-				if content := webhookMarkdown(t, kind, payload); !strings.Contains(content, "Source: Complete") {
+				if content := webhookMarkdown(t, kind, payload); !strings.Contains(content, "SQLite ready") {
 					t.Error("shared English Markdown report missing")
 				}
 				if kind == "dingtalk" {
@@ -187,13 +185,13 @@ func TestWebhooksSignaturesAndExplicitSuccess(t *testing.T) {
 			}
 			for _, raw := range []string{"", `{}`, `null`, `{"` + key + `":null}`, `{"` + key + `":"0"}`, `{"` + key + `":1}`, `{"` + key + `":1e-9999}`, `invalid`} {
 				response = raw
-				if sender.Send(context.Background(), Event{Count: 1, Source: "complete"}) == nil {
+				if sender.Send(context.Background(), Event{Count: 1, Source: "ready"}) == nil {
 					t.Errorf("accepted %q", raw)
 				}
 			}
 			for _, zero := range []string{"0", "-0", "0.0", "0e20"} {
 				response = `{"` + key + `":` + zero + `,"future":true}`
-				if err := sender.Send(context.Background(), Event{Count: 1, Source: "complete"}); err != nil {
+				if err := sender.Send(context.Background(), Event{Count: 1, Source: "ready"}); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -248,10 +246,10 @@ func TestBarkRealHTTP2JWTAndPayload(t *testing.T) {
 		markdown, _ := value["markdown"].(string)
 		alert, _ := aps["alert"].(map[string]any)
 		fallback, _ := alert["body"].(string)
-		if alert["title"] != "vaultwarden-less · Vaultwarden backup — Daily" || !strings.HasPrefix(fallback, "Source: Complete.") || strings.Contains(fallback, "**") {
+		if alert["title"] != "vaultwarden-less · Vaultwarden backup — Daily" || !strings.HasPrefix(fallback, "SQLite ready.") || strings.Contains(fallback, "**") {
 			t.Error("APNs plain fallback or result title missing")
 		}
-		if !utf8.ValidString(markdown) || !strings.Contains(markdown, "Source checks: 1; effective changes: 0") || !strings.Contains(markdown, "Omitted details:") || !strings.Contains(markdown, "Unknown GET: started 1, finished 1") {
+		if !utf8.ValidString(markdown) || !strings.Contains(markdown, "SQLite ready") || !strings.Contains(markdown, "Omitted details:") {
 			t.Error("Bark top-level Markdown missing or invalid")
 		}
 		w.WriteHeader(http.StatusOK)
@@ -268,9 +266,9 @@ func TestBarkRealHTTP2JWTAndPayload(t *testing.T) {
 	// The test transport trusts only the local TLS server. Production has no
 	// configurable APNs endpoint and always addresses the Apple hostname.
 	sender := &barkSender{cfg: config.Notifier{Name: "bark", Key: key, KeyID: "key", TeamID: "team", Topic: "topic", DeviceToken: "variable-token", Sound: ""}, client: &http.Client{Transport: transport}, now: func() time.Time { return now }}
-	event := Event{Checks: 1, Count: 4, Source: "complete", Targets: []TargetStatus{{Name: "primary", State: "unchanged"}}, Unknown: map[string]routes.Counts{"GET": {Started: 1, Finished: 1}}, Routes: map[string]routes.Counts{strings.Repeat("\"<&界", 5000): {Started: 1}}}
+	event := Event{Kind: "Daily", Count: 4, Source: "ready"}
 	for i := range 100 {
-		event.Routes[strconv.Itoa(i)+strings.Repeat("<界&", 20)] = routes.Counts{Started: 1, Finished: 1}
+		event.Targets = append(event.Targets, TargetStatus{Name: strconv.Itoa(i) + strings.Repeat("<界&", 20), State: "protected"})
 	}
 	if err := sender.Send(context.Background(), event); err != nil {
 		t.Fatal(err)
@@ -326,10 +324,10 @@ func TestMergedRetriesIsolationAndRecovery(t *testing.T) {
 	defer cancel()
 	done := make(chan struct{})
 	go func() { m.Run(ctx); close(done) }()
-	m.Enqueue(Event{Checks: 1, Source: "incomplete", Issues: map[string]int{"capture_timeout": 1}, Unknown: map[string]routes.Counts{"GET": {Started: 1}}})
-	eventually(t, func() bool { return bad.count() == 1 && good.count() == 1 && !m.Status()[0].NextAttempt.IsZero() })
+	m.Enqueue(Event{Kind: "Fault", Source: "failed"})
+	eventually(t, func() bool { return bad.count() == 1 && good.count() == 1 && m.Status()[0].Error != "" })
 	for range 100 {
-		m.Enqueue(Event{Checks: 1, Source: "complete"})
+		m.Enqueue(Event{Kind: "Daily", Source: "ready"})
 	}
 	clock.Advance(10 * time.Second)
 	eventually(t, func() bool { return good.count() == 2 })
@@ -337,7 +335,7 @@ func TestMergedRetriesIsolationAndRecovery(t *testing.T) {
 		t.Fatal("new checks reset failed channel backoff")
 	}
 	clock.Advance(50 * time.Second)
-	eventually(t, func() bool { return bad.count() == 2 })
+	eventually(t, func() bool { return bad.count() == 2 && clock.HasTimer(clock.Now().Add(5*time.Minute)) })
 	clock.Advance(5 * time.Minute)
 	eventually(t, func() bool { return bad.count() == 3 && m.Status()[0].Exhausted })
 	clock.Advance(24 * time.Hour)
@@ -347,70 +345,19 @@ func TestMergedRetriesIsolationAndRecovery(t *testing.T) {
 	bad.mu.Lock()
 	bad.failure = nil
 	bad.mu.Unlock()
-	m.Enqueue(Event{Checks: 1, Source: "complete", Unknown: map[string]routes.Counts{"GET": {Finished: 1}}})
+	m.Enqueue(Event{Kind: "Recovery", Source: "ready"})
 	eventually(t, func() bool { return bad.count() == 4 && m.Status()[0].Pending == 0 })
 	bad.mu.Lock()
 	recovery := bad.events[3]
 	bad.mu.Unlock()
-	if recovery.Checks != 102 || recovery.Undelivered == 0 {
+	if recovery.Count != 102 || recovery.Undelivered == 0 {
 		t.Fatal("undelivered state was lost")
 	}
-	if recovery.Unknown["GET"] != (routes.Counts{Started: 1, Finished: 1}) || len(recovery.Issues) != 0 || recovery.Source != "complete" {
-		t.Fatal("retry merged request phases or kept stale source diagnostics")
+	if recovery.Source != "ready" {
+		t.Fatal("stale diagnostics")
 	}
 	cancel()
 	<-done
-}
-
-func TestReportTitlesAndTargetState(t *testing.T) {
-	for _, kind := range []string{"Fault", "Recovery", "Reminder", "Daily"} {
-		now := time.Date(2026, 10, 29, 12, 0, 0, 0, time.UTC)
-		event := Event{Kind: kind, At: now, Timezone: "Asia/Shanghai", Source: "incomplete", Count: 1, Checks: 3, Changes: 2, Targets: []TargetStatus{{Name: "primary", State: "failed", Failed: true}}}
-		message := event.Message(4096)
-		for _, want := range []string{"Vaultwarden backup — " + kind, "2026-10-29 20:00:00 +08:00", "Source: Incomplete; retry pending", "Targets: 1 configured; 1 failed", "Verification:", "Source checks: 3; effective changes: 2"} {
-			if !strings.Contains(message, want) {
-				t.Fatalf("missing %q: %s", want, message)
-			}
-		}
-	}
-}
-
-func TestReportMergeKeepsRequestPhasesAndLatestDiagnostics(t *testing.T) {
-	event := Event{}
-	event.Merge(Event{Checks: 1, Count: 1, Undelivered: 1, Source: "incomplete", Issues: map[string]int{"capture_timeout": 1}, Warnings: []string{"file_reference_diagnostics_unavailable"}, Routes: map[string]routes.Counts{"POST /api/ciphers": {Started: 1}}, Unknown: map[string]routes.Counts{"GET": {Started: 1}}, Targets: []TargetStatus{{Name: "primary", State: "failed"}}})
-	event.Merge(Event{Checks: 1, Count: 2, Source: "complete", Routes: map[string]routes.Counts{"POST /api/ciphers": {Finished: 1}}, Unknown: map[string]routes.Counts{"GET": {Finished: 1}}, Targets: []TargetStatus{{Name: "primary", State: "uploaded"}}})
-	message := event.Message(4096)
-	for _, want := range []string{"Unknown GET: started 1, finished 1", "POST /api/ciphers: started 1, finished 1", "Previously undelivered reports: 1"} {
-		if !strings.Contains(message, want) {
-			t.Fatalf("missing %q in %s", want, message)
-		}
-	}
-	if len(event.Issues) != 0 || len(event.Warnings) != 0 || event.Title() != "Vaultwarden backup — Daily" {
-		t.Fatal("recovered source still reported old problems")
-	}
-	copy := event.clone()
-	copy.Unknown["GET"] = routes.Counts{Started: math.MaxUint64, Finished: 7}
-	copy.Merge(Event{Unknown: map[string]routes.Counts{"GET": {Started: 1, Finished: 2}}})
-	if copy.Unknown["GET"] != (routes.Counts{Started: math.MaxUint64, Finished: 9}) || event.Unknown["GET"] != (routes.Counts{Started: 1, Finished: 1}) {
-		t.Fatal("phase counter overflow or aliased delivery snapshot")
-	}
-}
-
-func TestMarkdownEscapingAndWholeDetailOmission(t *testing.T) {
-	event := Event{Checks: 1, Count: 2, Source: "complete", Targets: []TargetStatus{
-		{Name: "- ~~primary**\n> [link](https://example.test) <at id=all>", State: "unchanged"},
-		{Name: strings.Repeat("界", 5000), State: "failed"},
-	}, Unknown: map[string]routes.Counts{"GET": {Started: 1, Finished: 1}}}
-	message := event.Message(700)
-	if !utf8.ValidString(message) || len(message) > 700 || !strings.Contains(message, "Omitted details:") || !strings.Contains(message, "Targets: 2 configured; 1 failed; 0 pending") {
-		t.Fatalf("unsafe detail omission: %s", message)
-	}
-	if !strings.Contains(message, `\- \~\~primary\*\* &gt; \[link\]\(https://example\.test\) &lt;at id=all&gt;`) || strings.Contains(message, "\n> [link]") || strings.Contains(message, "<at") {
-		t.Fatal("dynamic target name changed Markdown structure")
-	}
-	if !strings.Contains(message, "Unknown GET: started 1, finished 1") || strings.Contains(message, "界") {
-		t.Fatal("oversized detail hid later small details or was partially included")
-	}
 }
 
 func TestNotifierStatusOmitsUnsetTimes(t *testing.T) {
@@ -437,22 +384,22 @@ func TestAPNsMinimumRetryAndPermanentFailure(t *testing.T) {
 	defer cancel()
 	done := make(chan struct{})
 	go func() { m.Run(ctx); close(done) }()
-	m.Enqueue(Event{Checks: 1})
+	m.Enqueue(Event{Kind: "Daily"})
 	eventually(t, func() bool { return s.count() == 1 && m.Status()[0].Error != "" })
 	clock.Advance(14 * time.Minute)
-	m.Enqueue(Event{Checks: 1})
+	m.Enqueue(Event{Kind: "Daily"})
 	if s.count() != 1 {
 		t.Fatal("APNs 5xx retried early")
 	}
 	clock.Advance(time.Minute)
-	eventually(t, func() bool { return s.count() == 2 })
+	eventually(t, func() bool { return s.count() == 2 && clock.HasTimer(clock.Now().Add(15*time.Minute)) })
 	s.mu.Lock()
 	s.failure = &DeliveryError{Code: "bad_device", Permanent: true}
 	s.mu.Unlock()
 	clock.Advance(15 * time.Minute)
 	eventually(t, func() bool { return m.Status()[0].Permanent })
 	clock.Advance(time.Hour)
-	m.Enqueue(Event{Checks: 1})
+	m.Enqueue(Event{Kind: "Daily"})
 	if s.count() != 3 {
 		t.Fatal("invalid device retried")
 	}
@@ -465,7 +412,7 @@ func TestDurableBudgetAndRecoveryBeforeDelivery(t *testing.T) {
 	store := state.Store{Directory: t.TempDir()}
 	sender := &fakeSender{name: "persistent", failure: &DeliveryError{Code: "unavailable"}}
 	makeManager := func() *Manager {
-		m := &Manager{clock: clock, channels: []*channel{{sender: sender, wake: make(chan struct{}, 1), status: Status{Name: sender.name}, identity: "same"}}}
+		m := &Manager{clock: clock, channels: []*channel{{sender: sender, wake: make(chan struct{}, 1), status: Status{Name: sender.name}}}}
 		if err := m.Restore(store); err != nil {
 			t.Fatal(err)
 		}
@@ -480,7 +427,7 @@ func TestDurableBudgetAndRecoveryBeforeDelivery(t *testing.T) {
 	m := makeManager()
 	cancel, done := start(m)
 	first := clock.Now()
-	if err := m.Enqueue(Event{Kind: "Fault", At: first, Faults: map[string]Fault{"source": {Object: "Source", Code: "incomplete", First: first}}, Source: "incomplete"}); err != nil {
+	if err := m.Enqueue(Event{Kind: "Fault", At: first, Faults: map[string]Fault{"source": {Object: "Source", Code: "capture failed", First: first}}, Source: "failed"}); err != nil {
 		t.Fatal(err)
 	}
 	eventually(t, func() bool { return m.Status()[0].Error != "" })
@@ -494,7 +441,8 @@ func TestDurableBudgetAndRecoveryBeforeDelivery(t *testing.T) {
 	}
 	cancel, done = start(m)
 	clock.Advance(time.Minute)
-	eventually(t, func() bool { return sender.count() == 2 && m.Status()[0].Attempts == 2 })
+	retryAt := clock.Now().Add(5 * time.Minute)
+	eventually(t, func() bool { return sender.count() == 2 && m.Status()[0].Attempts == 2 && clock.HasTimer(retryAt) })
 	clock.Advance(5 * time.Minute)
 	eventually(t, func() bool { return m.Status()[0].Exhausted })
 	cancel()
@@ -512,12 +460,12 @@ func TestDurableBudgetAndRecoveryBeforeDelivery(t *testing.T) {
 	sender.failure = nil
 	sender.mu.Unlock()
 	recovered := clock.Now()
-	m.Enqueue(Event{Kind: "Recovery", At: recovered, Source: "complete", Faults: map[string]Fault{"source": {Object: "Source", Code: "incomplete", First: first, Recovered: recovered}}})
+	m.Enqueue(Event{Kind: "Recovery", At: recovered, Source: "ready", Faults: map[string]Fault{"source": {Object: "Source", Code: "capture failed", First: first, Recovered: recovered}}})
 	eventually(t, func() bool { return m.Status()[0].Pending == 0 })
 	sender.mu.Lock()
 	last := sender.events[len(sender.events)-1]
 	sender.mu.Unlock()
-	if last.Faults["source"].First != first || last.Faults["source"].Recovered != recovered || !strings.Contains(last.Message(4096), "occurred then recovered") {
+	if last.Faults["source"].First != first || last.Faults["source"].Recovered != recovered || !strings.Contains(last.Message(4096), "recovered") {
 		t.Fatal("undelivered incident lost")
 	}
 	cancel()

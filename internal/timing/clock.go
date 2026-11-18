@@ -8,12 +8,12 @@ type Timer interface {
 }
 type Clock interface {
 	Now() time.Time
-	NewTimer(time.Duration) Timer
+	NewTimerAt(time.Time) Timer
 }
 type Real struct{}
 
-func (Real) Now() time.Time                 { return time.Now().UTC() }
-func (Real) NewTimer(d time.Duration) Timer { return realTimer{time.NewTimer(d)} }
+func (Real) Now() time.Time                { return time.Now().UTC() }
+func (Real) NewTimerAt(at time.Time) Timer { return realTimer{time.NewTimer(time.Until(at))} }
 
 type realTimer struct{ *time.Timer }
 
