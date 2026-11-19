@@ -20,3 +20,4 @@ AGENTS.md
 .vscode/
 .codex
 
+*.env
