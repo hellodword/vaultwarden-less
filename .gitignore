@@ -1,9 +1,7 @@
 /.env
 /config/backup.yaml
 /config/vaultwarden.env
-/credentials/backup/
-/credentials/maintenance/
-/credentials/restic/*
+/credentials/
 /data/
 /state/
 /staging/
@@ -12,7 +10,6 @@
 /dist/
 /tmp/
 /result
-/compose.env
 
 AGENTS.md
 .agents/

@@ -21,6 +21,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/hellodword/vaultwarden-less/internal/worker"
 )
 
 const (
@@ -40,21 +42,21 @@ var (
 )
 
 type e2eHarness struct {
-	t                                                    *testing.T
-	ctx                                                  context.Context
-	testRoot, deploymentRoot, project, releaseRoot       string
-	dockerPath, dockerConfig                             string
-	dockerEnv                                            []string
-	composeFile, overrideFile, environmentFile, imageTag string
-	runtimeOverrideFile                                  string
-	proxyPort                                            int
-	publicTLS, tlsCAFile                                 string
-	tlsServer                                            *httptest.Server
-	backendMu                                            sync.RWMutex
-	backend                                              *url.URL
-	services                                             map[string]composeService
-	vaultwardenOverrides                                 map[string]string
-	cleanupFailed                                        bool
+	t                                              *testing.T
+	ctx                                            context.Context
+	testRoot, deploymentRoot, project, releaseRoot string
+	dockerPath, dockerConfig                       string
+	dockerEnv                                      []string
+	composeFile, overrideFile                      string
+	runtimeOverrideFile                            string
+	proxyPort                                      int
+	publicTLS, tlsCAFile                           string
+	tlsServer                                      *httptest.Server
+	backendMu                                      sync.RWMutex
+	backend                                        *url.URL
+	services                                       map[string]composeService
+	vaultwardenOverrides                           map[string]string
+	cleanupFailed                                  bool
 }
 
 type composeService struct {
@@ -90,7 +92,7 @@ func newE2EHarness(t *testing.T, ctx context.Context) *e2eHarness {
 		project: fmt.Sprintf("vwless-%d", time.Now().UnixNano()), dockerPath: dockerPath, dockerConfig: filepath.Join(root, "docker-config"),
 		proxyPort: unusedLoopbackPort(t)}
 	t.Cleanup(h.cleanup)
-	for _, relative := range []string{"config", "credentials/backup", "credentials/maintenance", "credentials/restic", "data", "state", "cache", "restore", "maintenance-cache"} {
+	for _, relative := range []string{"config", "credentials/backup", "credentials/maintenance", "data", "state", "cache", "restore", "maintenance-cache"} {
 		if err := os.MkdirAll(filepath.Join(h.deploymentRoot, relative), 0700); err != nil {
 			t.Fatal(err)
 		}
@@ -103,19 +105,6 @@ func newE2EHarness(t *testing.T, ctx context.Context) *e2eHarness {
 	h.composeFile = filepath.Join(h.deploymentRoot, "compose.yml")
 	h.runtimeOverrideFile = filepath.Join(root, "compose.runtime.yml")
 	h.overrideFile = filepath.Join(root, "compose.e2e.json")
-	h.environmentFile = filepath.Join(h.deploymentRoot, "compose.env")
-	data, err := os.ReadFile(filepath.Join(h.releaseRoot, "templates", "compose.env"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		if strings.HasPrefix(line, "VWLESS_IMAGE_TAG=") {
-			h.imageTag = strings.TrimPrefix(line, "VWLESS_IMAGE_TAG=")
-		}
-	}
-	if h.imageTag == "" {
-		t.Fatal("bundle does not declare its product image tag")
-	}
 	h.mustDocker("info", "--format", "{{.ServerVersion}}")
 	h.mustDocker("load", "--input", *motoArchive)
 	canary := filepath.Join(root, "bind-canary")
@@ -155,7 +144,6 @@ func (h *e2eHarness) prepareDeployment() {
 		h.t.Fatal(err)
 	}
 	writePrivateFile(h.t, h.composeFile, string(data))
-	writePrivateFile(h.t, h.environmentFile, fmt.Sprintf("VWLESS_IMAGE_TAG=%s\n", h.imageTag))
 	data, err = os.ReadFile(filepath.Join(h.releaseRoot, "templates/config/vaultwarden.env"))
 	if err != nil {
 		h.t.Fatal(err)
@@ -164,17 +152,27 @@ func (h *e2eHarness) prepareDeployment() {
 	if err := os.CopyFS(filepath.Join(h.deploymentRoot, "rules"), os.DirFS(filepath.Join(h.releaseRoot, "rules"))); err != nil {
 		h.t.Fatal(err)
 	}
-	configuration := "targets:\n"
-	for _, name := range []string{"primary", "secondary"} {
-		configuration += fmt.Sprintf("  - name: %s\n    env_file: /run/credentials/backup/%s.env\n    options: [s3.bucket-lookup=path, s3.region=us-east-1]\n", name, name)
-		writePrivateFile(h.t, filepath.Join(h.deploymentRoot, "credentials/restic", name), "e2e-"+name+"-restic-password\n")
-		for _, role := range []string{"backup", "maintenance"} {
-			writePrivateFile(h.t, filepath.Join(h.deploymentRoot, "credentials", role, name+".env"), fmt.Sprintf("RESTIC_REPOSITORY=s3:http://moto-%s:5000/vaultwarden-less-%s/repository\nRESTIC_PASSWORD_FILE=/run/credentials/restic/%s\nAWS_ACCESS_KEY_ID=e2e-%s-%s\nAWS_SECRET_ACCESS_KEY=e2e-%s-secret\n", name, name, name, name, role, name))
-		}
+	data, err = os.ReadFile(filepath.Join(h.releaseRoot, "templates/config/backup.yaml"))
+	if err != nil {
+		h.t.Fatal(err)
 	}
+	writePrivateFile(h.t, filepath.Join(h.deploymentRoot, "config/backup.yaml"), string(data))
 	h.prepareNotificationStub()
-	configuration += notificationConfiguration
-	writePrivateFile(h.t, filepath.Join(h.deploymentRoot, "config/backup.yaml"), configuration)
+}
+
+func (h *e2eHarness) writeRepositoryEnv(role, name, password string) {
+	h.t.Helper()
+	sample, err := os.ReadFile(filepath.Join(h.releaseRoot, "templates/credentials/backup/s3.env.example"))
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	env := strings.NewReplacer(
+		"s3:https://<endpoint>/<bucket>/<prefix>", fmt.Sprintf("s3:http://moto-%s:5000/vaultwarden-less-%s/repository", name, name),
+		"RESTIC_PASSWORD=\n", "RESTIC_PASSWORD="+password+"\n",
+		"AWS_ACCESS_KEY_ID=\n", "AWS_ACCESS_KEY_ID=e2e-"+name+"-"+role+"\n",
+		"AWS_SECRET_ACCESS_KEY=\n", "AWS_SECRET_ACCESS_KEY=e2e-"+name+"-secret\n",
+	).Replace(string(sample))
+	writePrivateFile(h.t, filepath.Join(h.deploymentRoot, "credentials", role, name+".env"), env)
 }
 func (h *e2eHarness) writeOverride() {
 	// Compose normally merges ports. Replace the shipped mapping so acceptance
@@ -219,19 +217,27 @@ func (h *e2eHarness) overrideVaultwarden(values map[string]string) {
 	h.waitHTTP(h.publicTLS+"/alive", http.StatusOK, time.Minute)
 }
 func (h *e2eHarness) start() {
-	h.compose("up", "--detach", "moto-primary", "moto-secondary", "notify-stub", "vaultwarden")
-	h.waitHealthy("vaultwarden", 3*time.Minute)
-	for _, name := range []string{"primary", "secondary"} {
+	h.compose("run", "--rm", "--no-deps", "backup", "validate")
+	h.compose("up", "--detach", "--wait", "vaultwarden", "backup", "proxy")
+	h.waitStatus(time.Minute, func(s worker.Status) bool { return s.Source == "unconfigured" && len(s.Targets) == 0 })
+	h.compose("up", "--detach", "moto-primary", "moto-secondary", "notify-stub")
+	configuration := "targets:\n"
+	for i, name := range []string{"primary", "secondary"} {
 		h.wait(90*time.Second, "Moto readiness", func() bool {
 			_, err := h.docker("exec", h.containerID("moto-"+name), "/bin/python3", "-c", `import boto3; boto3.client('s3',endpoint_url='http://127.0.0.1:5000',aws_access_key_id='test',aws_secret_access_key='test',region_name='us-east-1').create_bucket(Bucket='vaultwarden-less-`+name+`')`)
 			return err == nil
 		})
-		h.nativeRestic(name, nil, "init")
-	}
-	h.compose("run", "--rm", "--no-deps", "backup", "validate")
-	h.compose("up", "--detach", "backup", "proxy")
-	for _, name := range []string{"backup", "proxy"} {
-		h.waitHealthy(name, 3*time.Minute)
+		for _, role := range []string{"backup", "maintenance"} {
+			h.writeRepositoryEnv(role, name, "e2e-"+name+"-restic-password")
+		}
+		h.nativeRestic(name, "init")
+		configuration += fmt.Sprintf("  - name: %s\n    env_file: /run/credentials/backup/%s.env\n    options: [s3.bucket-lookup=path, s3.region=us-east-1]\n", name, name)
+		writePrivateFile(h.t, filepath.Join(h.deploymentRoot, "config/backup.yaml"), configuration+notificationConfiguration)
+		h.compose("run", "--rm", "--no-deps", "backup", "validate")
+		h.compose("up", "--detach", "--no-deps", "--force-recreate", "--wait", "backup")
+		h.waitStatus(3*time.Minute, func(s worker.Status) bool {
+			return s.Source == "ready" && len(s.Targets) == i+1 && s.Targets[i].State == "protected"
+		})
 	}
 	h.setBackend(loopbackEndpoint(h.proxyPort))
 	h.waitHTTP(h.publicTLS+"/alive", http.StatusOK, time.Minute)
@@ -328,7 +334,7 @@ func (h *e2eHarness) compose(arguments ...string) string {
 	return output
 }
 func (h *e2eHarness) tryCompose(ctx context.Context, arguments ...string) (string, error) {
-	base := []string{"compose", "--env-file", h.environmentFile, "--project-directory", h.deploymentRoot, "--project-name", h.project, "--file", h.composeFile, "--file", h.runtimeOverrideFile, "--file", h.overrideFile}
+	base := []string{"compose", "--project-directory", h.deploymentRoot, "--project-name", h.project, "--file", h.composeFile, "--file", h.runtimeOverrideFile, "--file", h.overrideFile}
 	return h.dockerContext(ctx, append(base, arguments...)...)
 }
 func (h *e2eHarness) containerID(service string) string {

@@ -1,6 +1,4 @@
-# Copy this file beside compose.env, config/, credentials/, data/, state/ and cache/.
-# Host paths are relative to this file. Create the bind sources before startup;
-# Compose must not create missing directories in place of configuration files.
+# Run docker compose in the deployment directory. Bind paths are relative to this file.
 name: vaultwarden-less
 
 x-service-defaults: &service-defaults
@@ -52,7 +50,7 @@ services:
 
   backup:
     <<: *service-defaults
-    image: "vaultwarden-less-backup:${VWLESS_IMAGE_TAG:?VWLESS_IMAGE_TAG is required}"
+    image: "vaultwarden-less-backup:development"
     pull_policy: never
     hostname: backup
     command: [serve]
@@ -83,12 +81,6 @@ services:
         bind:
           create_host_path: false
       - type: bind
-        source: ./credentials/restic
-        target: /run/credentials/restic
-        read_only: true
-        bind:
-          create_host_path: false
-      - type: bind
         source: ./state
         target: /state
         bind:
@@ -112,7 +104,7 @@ services:
 
   proxy:
     <<: *service-defaults
-    image: "vaultwarden-less-proxy:${VWLESS_IMAGE_TAG:?VWLESS_IMAGE_TAG is required}"
+    image: "vaultwarden-less-proxy:development"
     pull_policy: never
     hostname: proxy
     command: [serve]

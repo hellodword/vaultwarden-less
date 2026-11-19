@@ -1,11 +1,6 @@
 package config
 
 import (
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
-	"crypto/x509"
-	"encoding/pem"
 	"os"
 	"path/filepath"
 	"strings"
@@ -41,8 +36,9 @@ notifications:
 			t.Fatal("accepted invalid document")
 		}
 	}
-	if cfg, err := DecodeBackup([]byte("targets: []\nnotifications: {channels: []}\n")); err != nil || !cfg.Valid() {
-		t.Fatal("empty configuration invalid")
+	cfg, err = LoadBackup(filepath.Join("..", "..", "templates", "config", "backup.yaml"))
+	if err != nil || !cfg.Valid() || len(cfg.Targets) != 0 || len(cfg.Notifications.Channels) != 0 {
+		t.Fatalf("default backup configuration: %v", err)
 	}
 }
 
@@ -112,74 +108,6 @@ notifications:
 	}
 	if cfg.Notifications.Channels[0].Error != "" || cfg.Notifications.Channels[0].Sound != "" {
 		t.Fatal("explicit sound or varying token length changed")
-	}
-}
-
-func TestShippedBackupTemplatesUseConsumerSyntax(t *testing.T) {
-	root, err := filepath.Abs(filepath.Join("..", "..", "templates"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	document, err := os.ReadFile(filepath.Join(root, "config", "backup.yaml"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	// The operator supplies this key; the templates must not ship a private key.
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	der, err := x509.MarshalPKCS8PrivateKey(key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	keyPath := filepath.Join(t.TempDir(), "bark-apns-auth-key.p8")
-	if err := os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	regions := map[string]string{
-		"aws-s3":       "us-east-1",
-		"backblaze-b2": "us-west-002",
-	}
-	data := strings.ReplaceAll(string(document), "/run/credentials/backup/bark-apns-auth-key.p8", keyPath)
-	for name := range regions {
-		original := filepath.Join(root, "credentials", "backup", name+"-backup.env")
-		contents, err := os.ReadFile(original)
-		if err != nil {
-			t.Fatal(err)
-		}
-		passwordPath := filepath.Join(t.TempDir(), name+"-repository-password.txt")
-		os.WriteFile(passwordPath, []byte("synthetic-only"), 0o600)
-		envPath := filepath.Join(t.TempDir(), name+"-backup.env")
-		os.WriteFile(envPath, []byte(strings.ReplaceAll(string(contents), "/run/credentials/restic/"+name+"-repository-password.txt", passwordPath)), 0o600)
-		data = strings.ReplaceAll(data, "/run/credentials/backup/"+name+"-backup.env", envPath)
-	}
-	path := filepath.Join(t.TempDir(), "backup.yaml")
-	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	cfg, err := LoadBackup(path)
-	if err != nil || !cfg.Valid() || len(cfg.Targets) != len(regions) || len(cfg.Notifications.Channels) != 0 {
-		t.Fatalf("invalid backup template: %v", err)
-	}
-	for _, target := range cfg.Targets {
-		env := make(map[string]string)
-		for _, entry := range target.Environment {
-			name, value, _ := strings.Cut(entry, "=")
-			env[name] = value
-		}
-		region, ok := regions[target.Name]
-		passwordFile := target.Name + "-repository-password.txt"
-		if !ok || len(env) != 5 || env["AWS_DEFAULT_REGION"] != region ||
-			!strings.HasSuffix(env["RESTIC_PASSWORD_FILE"], "/"+passwordFile) ||
-			!strings.HasPrefix(env["RESTIC_REPOSITORY"], "s3:https://") ||
-			env["AWS_ACCESS_KEY_ID"] == "" || env["AWS_SECRET_ACCESS_KEY"] == "" {
-			t.Fatalf("incorrect native restic inputs for %s", target.Name)
-		}
-		password, err := os.ReadFile(filepath.Join(root, "credentials", "restic", passwordFile))
-		if err != nil || len(password) != 0 {
-			t.Fatalf("%s must be an empty raw password placeholder", passwordFile)
-		}
 	}
 }
 

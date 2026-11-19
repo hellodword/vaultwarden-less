@@ -1,125 +1,143 @@
 # 部署与首次备份
 
-## 选择三个存放位置
+## 安装
 
-保留 VPS 上的工作库，在两家提供 SLA 的对象存储分别开通 bucket，选取不同地理区域、独立账号或访问主体，为每处生成独立的 restic 仓库密码。模板给出 AWS S3 和 Backblaze B2 的 S3 接口。按所选区域、存储类别和账户条款核对 SLA。供应商的可用性承诺与能恢复出哪一个时间点是两件事，恢复时间点以各仓库实际快照为准。[Amazon S3 SLA](https://aws.amazon.com/s3/sla/) · [Backblaze SLA](https://www.backblaze.com/company/policy/sla)
+准备一台 Linux amd64 主机，安装 Docker 和带 `--wait` 的 Docker Compose。把发布包的实际内容放在 `/srv/releases/vaultwarden-less`，保留其中的镜像、文档和模板。自行构建可在构建机运行 `just release`，复制 `result/` 指向的目录内容。
 
-每个仓库独占一个空前缀。在线备份主体需要列举、读取、写入仓库对象并创建和删除 restic 锁。按供应商能力限制删除快照和数据包的权限。维护主体单独保管，可执行保留和清理。管理员在 VPS 之外保管 bucket、区域、端点、仓库密码和维护访问凭据。每位使用者自行保管主密码及已启用的账号验证恢复手段。
-
-## 离线安装
-
-在构建机运行 `just release`，把 `result/` 的实际内容复制到 VPS 上的只读发布目录。VPS 需要 Linux amd64、Docker 和 Compose v2。以下 Bash 命令需要 Docker 访问权和设置文件属主的权限。三项服务及维护容器都以 `1000:1000` 运行。
+下面用有 Docker 和文件属主设置权限的账号操作。`/srv/vaultwarden-less` 是本次新建的部署目录，后续在有 `compose.yml` 的目录运行 `docker compose`。发布包里的 Compose 和手册命令已写入对应镜像的标签。
 
 ```sh
-set -euo pipefail
-export BUNDLE=/srv/releases/vaultwarden-less
-export DEPLOY_DIR=/srv/vaultwarden-less
-umask 077
-mkdir -m 0700 "$DEPLOY_DIR"
-cd "$DEPLOY_DIR"
-cp "$BUNDLE/compose.yml" "$BUNDLE/templates/compose.env" .
-cp -R "$BUNDLE/templates/config" "$BUNDLE/templates/credentials" "$BUNDLE/rules" .
-chmod -R u+rwX,go-rwx config credentials rules
-chmod u+rw compose.yml compose.env
-install -d -m 0700 -o 1000 -g 1000 data cache state
-mkdir -m 0700 credentials/maintenance
-for image in vaultwarden backup proxy; do docker load -i "$BUNDLE/images/$image.tar.gz"; done
-docker image inspect --format '{{.Os}}/{{.Architecture}} {{index .Config.Labels "org.opencontainers.image.version"}}' vaultwarden/server:1.37.5
+(
+  set -eu
+  umask 077
+  bundle=/srv/releases/vaultwarden-less
+  mkdir -m 0700 /srv/vaultwarden-less
+  cd /srv/vaultwarden-less
+  install -m 0600 "$bundle/compose.yml" .
+  install -d -m 0700 credentials
+  install -d -o 1000 -g 1000 -m 0700 config rules credentials/backup data cache state
+  install -o 1000 -g 1000 -m 0600 "$bundle"/templates/config/* config/
+  install -o 1000 -g 1000 -m 0600 "$bundle"/rules/* rules/
+  docker load -i "$bundle/images/vaultwarden.tar.gz"
+  docker load -i "$bundle/images/backup.tar.gz"
+  docker load -i "$bundle/images/proxy.tar.gz"
+)
+cd /srv/vaultwarden-less
 ```
 
-最后一条命令应输出 `linux/amd64 1.37.5`。构建时使用的官方平台 manifest 摘要固定在 `nix/packages.nix`。[升级手册](maintenance.md#更新上游)说明如何用上游配置摘要复核发布包。
+三项服务以 `1000:1000` 运行。Vaultwarden 写入 `data/`，backup 只读数据库，工作副本放在 `cache/`，通知记录放在 `state/`。外部反代把 HTTPS 请求交给 `127.0.0.1:8080`，并覆盖来自客户端的转发头。域名按需填写。[配置说明](configuration.md)
 
-填写 `config/vaultwarden.env` 的外部 HTTPS `DOMAIN`、所需邮件设置、两个目标的在线凭据及仓库密码。为两个目标分别准备 `credentials/maintenance/<目标名>-maintenance.env`，使用同一仓库地址、区域和容器内密码路径，填入独立的维护访问密钥。填写后设置服务需要读取的文件权限。
+## 导入已有 SQLite
+
+新建空 vault 可直接启动。导入已有 vault 时，先停止原实例的写入和 Vaultwarden 进程，保留它的数据目录和配置。下面假定原库在部署目录旁边的 `../previous/data/`。把 `source` 改成实际目录，确认新部署尚未启动，`data/` 为空。
+
+SQLite 有时把已提交的修改留在 `db.sqlite3-wal`。把同一次停机留下的主库和旁文件复制到可写的临时目录，再用发布镜像里的 SQLite 合成一份独立数据库。看到 `ok` 后，命令才会把它放进新实例。源文件保持原样。
+
+<!-- sqlite-import -->
+```sh
+(
+  set -eu
+  source=../previous/data
+  test -s "$source/db.sqlite3"
+  test -d data && test -z "$(ls -A data)" || { echo '请使用新部署的空 data/ 目录' >&2; exit 1; }
+  work=$(mktemp -d "$PWD/cache/import.XXXXXXXX")
+  chown 1000:1000 "$work"
+  install -o 1000 -g 1000 -m 0600 "$source/db.sqlite3" "$work/"
+  for file in db.sqlite3-wal db.sqlite3-shm; do
+    if test -f "$source/$file"; then
+      install -o 1000 -g 1000 -m 0600 "$source/$file" "$work/"
+    fi
+  done
+  docker run --rm --pull=never --read-only \
+    --mount "type=bind,source=$work,target=/work" \
+    --entrypoint /bin/sqlite3 vaultwarden-less-backup:development \
+    -batch -bail /work/db.sqlite3 '.backup /work/standalone.sqlite3'
+  check=$(docker run --rm --pull=never --read-only \
+    --mount "type=bind,source=$work,target=/work,readonly" \
+    --entrypoint /bin/sqlite3 vaultwarden-less-backup:development \
+    -batch -bail -readonly 'file:/work/standalone.sqlite3?immutable=1' 'PRAGMA integrity_check;')
+  echo "$check"
+  test "$check" = ok
+  install -o 1000 -g 1000 -m 0600 "$work/standalone.sqlite3" data/db.sqlite3
+  rm -r -- "$work"
+)
+```
+
+组织共享条目、条目附件和文件型 Send 如需继续使用，请保留原数据并单独安排迁移。验收个人 vault 时，用官方客户端在隔离的 HTTPS 入口登录、解锁，核对一个已知条目。[备份范围](contracts.md#什么算个人-vault-变化)
+
+## 启动与开通账号
+
+默认 `targets: []`、`channels: []`，可以先验收个人 vault，再申请对象存储。在部署目录校验配置并启动服务。
 
 ```sh
-chown -R 1000:1000 -- rules config credentials/backup credentials/restic
-chmod -R u=rwX,go= -- rules config credentials/backup credentials/restic
-chmod 0600 -- credentials/maintenance/*.env
+docker compose config --quiet
+docker compose run --rm --no-deps backup validate
+docker compose up -d --wait
+docker compose exec -T backup /bin/vaultwarden-less-backup status
 ```
 
-Vaultwarden 可写 `data/`。backup 只读源库并可写 `cache/`、`state/`，proxy 只挂载规则。TLS 入口向 `127.0.0.1:8080` 转发并覆盖客户端传来的转发头。Docker 重启后原本运行的服务自动启动，手工停止的服务保持停机。
+零仓库时 `status` 显示 `source: "unconfigured"`。此时 vault 只在本机。已启用的通知渠道会报告 `no_usable_targets`。
 
-## 接管已有 SQLite
-
-已有实例先停写，保留原数据和配置。令 `SOURCE_DATA` 指向已停止的数据库目录。若来源是可信的一致归档，先在私有目录提取同一批数据库文件。以下示例中，从 `tar -tf "$ARCHIVE"` 中找到主库成员名，设为 `DB_MEMBER`，例如 `export DB_MEMBER=data/db.sqlite3`。
-
-<!-- native-archive-example -->
-```sh
-set -euo pipefail
-umask 077
-unpack=$(mktemp -d)
-tar -tf "$ARCHIVE" > "$unpack/members"
-member=${DB_MEMBER:?}
-members=("$member")
-for suffix in -wal -shm; do
-  if grep -Fxq -- "$member$suffix" "$unpack/members"; then members+=("$member$suffix"); fi
-done
-tar -xf "$ARCHIVE" -C "$unpack" --no-same-owner --no-same-permissions -- "${members[@]}"
-export SOURCE_DATA="$unpack/$(dirname -- "$member")"
-```
-
-将 `IMPORT_STAGE` 设为私有工作区里尚未创建的绝对路径，`DEPLOY_DIR/data` 是新部署的空目录。下面的命令使用 SQLite CLI，将 WAL 中已提交的事务纳入可独立打开的数据库。
-
-<!-- native-import-example -->
-```sh
-set -euo pipefail
-umask 077
-: "${SOURCE_DATA:?}" "${IMPORT_STAGE:?}" "${DEPLOY_DIR:?}"
-[[ $SOURCE_DATA = /* && $IMPORT_STAGE = /* && $DEPLOY_DIR = /* ]]
-test -d "$DEPLOY_DIR/data" && test ! -L "$DEPLOY_DIR/data" || exit 1
-contents=$(find "$DEPLOY_DIR/data" -mindepth 1 -maxdepth 1 -print -quit)
-test -z "$contents"
-mkdir -m 0700 -- "$IMPORT_STAGE"
-cd "$IMPORT_STAGE"
-for file in db.sqlite3 db.sqlite3-wal db.sqlite3-shm; do
-  src="$SOURCE_DATA/$file"
-  if [[ $file != db.sqlite3 && ! -e $src && ! -L $src ]]; then continue; fi
-  test -f "$src" && test ! -L "$src" || exit 1
-  cp -- "$src" "$file"
-done
-test -s db.sqlite3
-sqlite3 -batch -bail db.sqlite3 '.backup standalone.sqlite3'
-test "$(sqlite3 -batch -bail standalone.sqlite3 'PRAGMA integrity_check;')" = ok
-install -m 0600 -- standalone.sqlite3 "$DEPLOY_DIR/data/db.sqlite3"
-chown 1000:1000 -- "$DEPLOY_DIR/data/db.sqlite3"
-```
-
-核对 `sqlite3 -readonly standalone.sqlite3 'SELECT count(*) FROM organizations;'`。已有共享条目按所有者需要转为个人条目或另行备份。需要保留的附件和文件型 Send 连同原数据目录一起保管。在隔离地址启动工作副本，用官方客户端解密已知条目，再从两个仓库分别恢复和核对，最后切换正式入口。接管正在使用的本项目部署时，保留两个仓库的地址、密码以及已停机的 `state/` 工作副本，为通知记录设置 `1000:1000` 和 `0600`。
-
-## 初始化与验收
-
-在部署目录定义以下函数。模板的两个示例直接使用环境变量，若配置额外的 restic 后端选项，手工命令也要传入对应的 `-o key=value`。
+已有账号可以直接使用。开通新账号时，先将 HTTPS 入口限制给准备注册的人，在 `config/vaultwarden.env` 中设 `SIGNUPS_ALLOWED=true`，再执行下面的命令。每人用自己的邮箱和主密码注册。注册完成后，设回 `SIGNUPS_ALLOWED=false`，保持 `SIGNUPS_DOMAINS_WHITELIST=` 为空，再执行一次同一命令。
 
 ```sh
-dc() { docker compose --env-file "$DEPLOY_DIR/compose.env" -f "$DEPLOY_DIR/compose.yml" "$@"; }
-dc config --quiet
-dc run --rm --no-deps backup validate
-RESTIC_IMAGE=$(dc config --images | grep '^vaultwarden-less-backup:')
-export RESTIC_IMAGE
-native() {
-  docker run --rm --read-only --tmpfs /tmp:rw,nosuid,nodev,mode=1777 \
-    --env-file "$RESTIC_ENV_FILE" \
-    --mount "type=bind,source=$DEPLOY_DIR/credentials/restic,target=/run/credentials/restic,readonly" \
-    --entrypoint /bin/restic "$RESTIC_IMAGE" --no-cache "$@"
-}
+docker compose up -d --no-deps --force-recreate --wait vaultwarden
 ```
 
-逐仓核对地址。对全新的空前缀运行一次 `native init`。已有仓库直接使用原密码执行 `native cat config`。例如，初始化两个全新仓库时执行以下命令。
+## 接入一个仓库
+
+每处存储单独准备 bucket 或专用前缀、访问密钥和 restic 仓库密码。按你购买的存储类别、地区和服务条款确认 SLA。把仓库地址、密码和可用于恢复的访问密钥在 VPS 之外保管一份。下面用 `primary` 举例。按 R2、B2、AWS S3 接入时，可以依次取名 `r2`、`b2`、`aws`，每次做完一个再做下一个。[S3 接口与凭据](configuration.md#对象存储凭据)
+
+在部署目录为新目标复制一份模板，用编辑器填写其中四项。已有凭据文件直接沿用，接入已有仓库时填写原来的仓库密码。
 
 ```sh
-for target in aws-s3 backblaze-b2; do
-  export RESTIC_ENV_FILE="$DEPLOY_DIR/credentials/maintenance/$target-maintenance.env"
-  native init
-  native cat config
-done
-dc up -d
-dc exec -T backup /bin/vaultwarden-less-backup status
+test ! -e credentials/backup/primary.env && install -o 1000 -g 1000 -m 0600 \
+  /srv/releases/vaultwarden-less/templates/credentials/backup/s3.env.example \
+  credentials/backup/primary.env
 ```
 
-从两次 `native cat config` 的输出记录两个不同的仓库 ID。首次上传期间，`status` 会显示 `checking`。再次运行 `dc exec -T backup /bin/vaultwarden-less-backup status`，等两个目标都显示 `protected` 后，分别记录完整快照 ID。
+将 `config/backup.yaml` 中的 `targets` 写成下面这样。接入下一处时，在同一列表追加一项，保留已有仓库和 `notifications`。
 
-## 开通个人账号
+```yaml
+targets:
+  - name: primary
+    env_file: /run/credentials/backup/primary.env
+```
 
-开户期间，仅向需要注册的人开放入口。在部署目录的 `config/vaultwarden.env` 中临时设置 `SIGNUPS_ALLOWED=true`，执行 `dc up -d --force-recreate vaultwarden`。每人用自己的邮箱注册并设置主密码。注册完成后，将 `SIGNUPS_ALLOWED` 设回 `false`，保持 `SIGNUPS_DOMAINS_WHITELIST` 为空，再执行同一条命令。以后开通账号可以重复此流程。
+```sh
+docker compose run --rm --no-deps backup validate
+```
 
-每人在自己的 vault 中创建一个能识别的条目。等两个仓库各有一份包含此次写入的快照，再按[恢复步骤](operations.md)逐仓核对。
+`validate` 检查本地配置能否读取。接下来用 restic 验证远端地址和密码。**只有确认是新仓库的空前缀时，才执行一次 `init`**。接入已有仓库直接从 `cat config` 开始。如果为目标配置了额外的 `options`，手工执行 restic 时也要逐个传入 `-o key=value`。
+
+```sh
+docker run --rm --pull=never --read-only --tmpfs /tmp:mode=1777 \
+  --env-file ./credentials/backup/primary.env \
+  --entrypoint /bin/restic vaultwarden-less-backup:development --no-cache init
+```
+
+```sh
+docker run --rm --pull=never --read-only --tmpfs /tmp:mode=1777 \
+  --env-file ./credentials/backup/primary.env \
+  --entrypoint /bin/restic vaultwarden-less-backup:development --no-cache cat config
+```
+
+记下输出里的仓库 `id`。已有仓库与异地保存的记录核对，不同仓库应有不同的 ID。然后让 backup 读取新的目标列表。
+
+```sh
+docker compose up -d --no-deps --force-recreate --wait backup
+docker compose exec -T backup /bin/vaultwarden-less-backup status
+```
+
+等 `source` 为 `ready`，新目标的 `state` 为 `protected`，再看仓库中的快照。第一条命令列出时间和 ID，第二条应列出 `/db.sqlite3`。
+
+```sh
+docker run --rm --pull=never --read-only --tmpfs /tmp:mode=1777 \
+  --env-file ./credentials/backup/primary.env \
+  --entrypoint /bin/restic vaultwarden-less-backup:development --no-cache snapshots
+docker run --rm --pull=never --read-only --tmpfs /tmp:mode=1777 \
+  --env-file ./credentials/backup/primary.env \
+  --entrypoint /bin/restic vaultwarden-less-backup:development --no-cache ls latest
+```
+
+用客户端保存一个能认出的个人条目，等新快照写入。从这个仓库恢复一次并解锁核对，再接入下一处。[从快照恢复](recovery.md)

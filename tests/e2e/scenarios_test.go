@@ -18,6 +18,7 @@ func TestNativeReleaseAcceptance(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 24*time.Minute)
 	defer cancel()
 	h := newE2EHarness(t, ctx)
+	h.checkDatabaseCopies()
 	started := time.Now()
 	h.start()
 	baseline := h.waitPass(started)
@@ -50,8 +51,13 @@ func TestNativeReleaseAcceptance(t *testing.T) {
 
 	t.Log("one repository rejects credentials while its peer protects edited content")
 	beforeOutage := len(h.snapshots("secondary"))
-	passwordPath := filepath.Join(h.deploymentRoot, "credentials/restic/secondary")
-	writePrivateFile(t, passwordPath, "synthetic incorrect password\n")
+	rotateSecondaryPassword := func(password string) {
+		t.Helper()
+		writePrivateFile(t, filepath.Join(h.deploymentRoot, "maintenance-cache/new-password"), password+"\n")
+		h.nativeRestic("secondary", "key", "passwd", "--new-password-file", "/cache/new-password")
+		h.writeRepositoryEnv("maintenance", "secondary", password)
+	}
+	rotateSecondaryPassword("e2e-temporary-password")
 	item := client.getItem(ctx, id)
 	item["favorite"] = true
 	setItemPassword(t, item, "updated content")
@@ -83,7 +89,7 @@ func TestNativeReleaseAcceptance(t *testing.T) {
 	h.waitStatus(3*time.Minute, func(s worker.Status) bool {
 		return s.Targets[0].CheckedAt.After(edit) && s.Targets[0].State == "protected"
 	})
-	writePrivateFile(t, passwordPath, "e2e-secondary-restic-password\n")
+	rotateSecondaryPassword("e2e-secondary-restic-password")
 	h.waitNotificationError("state_write_failed")
 	latest := h.waitStatus(7*time.Minute, func(s worker.Status) bool {
 		return s.Targets[1].State == "protected" && s.Targets[1].Snapshot != saved.Targets[1].Snapshot
@@ -145,7 +151,7 @@ func TestNativeReleaseAcceptance(t *testing.T) {
 	t.Log("recover and decrypt the same personal item independently from each repository")
 	h.compose("stop", "proxy", "backup", "vaultwarden")
 	for _, s := range cold.Targets {
-		h.nativeRestic(s.Name, nil, "check", "--read-data")
+		h.nativeRestic(s.Name, "check", "--read-data")
 		root := h.restore(s.Name, s.Snapshot, "restore-"+s.Name)
 		h.startRestored(root, "restore-"+s.Name)
 		recovered := newBitwardenCLI(t, filepath.Join(h.testRoot, "bw-"+s.Name), h.publicTLS, h.tlsCAFile, email)

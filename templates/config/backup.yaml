@@ -1,9 +1,7 @@
-# Separate initialized repositories at independent providers and regions.
-targets:
-  - name: aws-s3
-    env_file: /run/credentials/backup/aws-s3-backup.env
-  - name: backblaze-b2
-    env_file: /run/credentials/backup/backblaze-b2-backup.env
+targets: []
+# targets:
+#   - name: primary
+#     env_file: /run/credentials/backup/primary.env
 
 notifications:
   timezone: Asia/Shanghai

@@ -43,7 +43,6 @@ in
       {
         nativeBuildInputs = [
           pkgs.python3
-          pkgs.sqlite
           pkgs.just
         ];
       }

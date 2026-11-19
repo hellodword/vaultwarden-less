@@ -93,7 +93,10 @@ let
     cp -R ${source}/templates/. "$out/templates/"
     cp -R ${source}/rules "$out/rules"
     cp -R ${source}/docs/. "$out/docs/"
-    substituteInPlace "$out/templates/compose.env" --replace-fail 'VWLESS_IMAGE_TAG=development' 'VWLESS_IMAGE_TAG=${identity.release}'
+    for image in vaultwarden-less-backup vaultwarden-less-proxy; do
+      substituteInPlace "$out/compose.yml" --replace-fail "$image:development" "$image:${identity.release}"
+      substituteInPlace "$out"/docs/*.md --replace-quiet "$image:development" "$image:${identity.release}"
+    done
   '';
   motoPython = pkgs.python3.withPackages (p: [ p.moto ] ++ p.moto.optional-dependencies.server);
   motoImage = pkgs.dockerTools.buildLayeredImage {

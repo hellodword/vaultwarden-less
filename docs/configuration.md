@@ -1,35 +1,54 @@
 # 配置
 
-| 部署文件 | 内容 | 应用方式 |
+在部署目录操作。服务以 `1000:1000` 运行，读取的配置和在线凭据用 `0600`，其所在目录用 `0700`。
+
+| 文件 | 用途 | 修改后生效 |
 | --- | --- | --- |
-| `compose.yml`、`compose.env` | 镜像、回环端口和挂载路径 | `docker compose --env-file compose.env up -d` |
-| `config/vaultwarden.env` | Vaultwarden 的环境变量，含外部 HTTPS DOMAIN、注册及邮件设置 | `docker compose --env-file compose.env up -d --force-recreate vaultwarden` |
-| `config/backup.yaml` | 目标名称、凭据路径、后端选项、通知 | 重建 backup，确保文件替换后重新绑定 |
-| `credentials/backup/*.env` | 每个目标单独的 restic 运行环境 | 重启 backup |
-| `credentials/restic/*-repository-password.txt` | 各仓库的原始密码 | 下次 restic 命令读取；换密钥使用原生 `restic key` |
-| `rules/routes.txt`、`rules/personal-vault.sql` | 请求筛选和个人数据范围 | 分别重启 proxy、backup。规则目录整体只读挂载 |
+| `compose.yml` | 镜像、挂载、宿主机监听端口 | `docker compose up -d --wait` |
+| `config/vaultwarden.env` | 域名、注册和邮件等 Vaultwarden 设置 | `docker compose up -d --no-deps --force-recreate --wait vaultwarden` |
+| `config/backup.yaml` | 仓库列表、restic 后端选项、通知 | `docker compose up -d --no-deps --force-recreate --wait backup` |
+| `credentials/backup/` | 每仓一份在线凭据，可另放 Bark 的 `.p8` 文件 | `docker compose restart backup` |
+| `credentials/maintenance/` | 可选的维护凭据，只交给手动运行的 restic 容器 | 下次手工命令读取 |
+| `rules/routes.txt`、`rules/personal-vault.sql` | 请求筛选、个人库内容比较 | 分别执行 `docker compose restart proxy`、`docker compose restart backup` |
 
-Vaultwarden 读取 `config/vaultwarden.env`，网页 vault 和管理面板默认关闭。Compose 固定数据路径，并将 `CONFIG_FILE` 指向只读根文件系统上一个不存在的文件。接管旧目录时先审查旧 `data/config.json`，把需要的配置转换为环境变量，从工作数据目录移走该 JSON。官方健康检查会单独读取这里的 DOMAIN。[Vaultwarden 配置模板](https://github.com/dani-garcia/vaultwarden/blob/1.37.5/.env.template)
+`backup.yaml` 是单文件挂载。重建容器可以读到编辑器通过重命名保存的新文件。凭据和规则按目录挂载，重启相应进程即可重新读取。检查配置用 `docker compose run --rm --no-deps backup validate`，首次备份还会在真实数据库的一致副本上执行 SQL 规则。[仓库接入步骤](deployment.md#接入一个仓库)
 
-## 个人账号与使用权限
+## 对象存储凭据
 
-| 模板设置 | Vaultwarden 1.37.5 的行为 |
+`templates/credentials/backup/s3.env.example` 适用于 S3 接口，每个仓库填一份。`RESTIC_REPOSITORY` 写成 `s3:https://端点/bucket/前缀`，`RESTIC_PASSWORD` 用于解密仓库，`AWS_ACCESS_KEY_ID` 和 `AWS_SECRET_ACCESS_KEY` 用于访问对象存储。恢复数据库后，每个人仍用自己的主密码解锁个人 vault。
+
+> **Docker `--env-file` 会把引号当成值的一部分。** 写 `RESTIC_REPOSITORY=s3:https://…`。如果写成 `RESTIC_REPOSITORY="s3:https://…"`，restic 读到的第一个字符就是双引号，可能报 `invalid backend`。密码和访问密钥同样按字面填写，`$` 也会原样保留。backup 读取目标的 `env_file` 时使用相同的解析规则。[Docker env-file 语法](https://pkg.go.dev/github.com/docker/cli/pkg/kvfile)
+
+| 存储 | 端点从哪里取 |
 | --- | --- |
-| `SIGNUPS_ALLOWED=false`、`SIGNUPS_DOMAINS_WHITELIST=` | 关闭公开注册，已开通的个人账号照常登录。 |
-| `ORG_CREATION_USERS=none`、`INVITATIONS_ALLOWED=false` | 禁止创建组织，也禁止通过组织邀请新建账号。已有组织及成员关系继续有效，组织管理员仍可邀请本实例已注册的用户。 |
-| `USER_ATTACHMENT_LIMIT=0`、`ORG_ATTACHMENT_LIMIT=0` | 拒绝向个人条目和组织条目上传附件。原有附件文件仍在时，有权限的用户可以下载。 |
-| `SENDS_ALLOWED=false` | 拒绝新建或编辑文本型和文件型 Send。已有分享链接按原有条件生效，所有者可以删除对应的 Send。 |
+| Cloudflare R2 | 在账户中复制 bucket 的 S3 API 端点。通常为 `<account-id>.r2.cloudflarestorage.com`。使用该 bucket 的 S3 访问密钥。[R2 S3 API](https://developers.cloudflare.com/r2/api/s3/api/) |
+| Backblaze B2 | 使用 bucket 所在区域显示的 S3 端点，如 `s3.us-west-002.backblazeb2.com`。keyID 和 applicationKey 分别填入两个 AWS 凭据字段。[B2 端点和访问密钥](https://www.backblaze.com/docs/en/cloud-storage-get-started-with-a-backblaze-integration) |
+| Amazon S3 | 使用 bucket 所在区域的 S3 端点，如 `s3.us-east-1.amazonaws.com`，为备份主体配置该前缀的权限。[S3 区域端点](https://docs.aws.amazon.com/general/latest/gr/s3.html) |
 
-这些设置由 Vaultwarden 在服务端执行。账号开通步骤见[部署指南](deployment.md#开通个人账号)。[组织邀请](https://github.com/dani-garcia/vaultwarden/blob/1.37.5/src/api/core/organizations.rs#L1033-L1069) · [附件限额](https://github.com/dani-garcia/vaultwarden/blob/1.37.5/src/api/core/ciphers.rs#L1241-L1258) · [Send 权限](https://github.com/dani-garcia/vaultwarden/blob/1.37.5/src/api/core/sends.rs#L93-L109)
+服务商要求显式指定签名区域时，可在凭据文件增加 `AWS_DEFAULT_REGION`。每个目标也可以在 `backup.yaml` 中设 `options`，例如 `options: [s3.bucket-lookup=path]`。手工命令使用同一份 env 文件，并带上对应的 `-o` 选项。[restic S3 配置](https://restic.readthedocs.io/en/stable/030_preparing_a_new_repo.html#s3-compatible-storage)
 
-## 备份目标与凭据
+在线凭据需要列举、读取和写入仓库，还要能创建和删除 restic 锁。可按供应商的权限模型限制对快照和数据包的删除。要单独保管清理权限时，在部署目录创建私有的 `credentials/maintenance/`，把对应文件命名为 `primary.env` 等。仓库地址和密码与在线文件相同，访问密钥换成维护主体的。管理员保管这个目录，只有手工运行的 restic 才会读它。仓库密码、端点、区域以及可用于恢复的对象存储凭据要另存一份到 VPS 之外。
 
-每个目标的 `env_file` 使用 Docker env-file 格式，逐行写入字面量 `NAME=value`。仓库密码文件只放密码本身。维护凭据位于 `credentials/maintenance/`，单独提供给手工运行的 restic 容器。Compose 使用另一套插值规则，含美元符号的字面值可用单引号包住。配置、凭据和缓存应置于私有目录，真实值只存放在部署端。
+## 个人账号和外部地址
 
-`backup.yaml` 根键为 `targets`、`notifications`。每个目标需要唯一的 `name`、容器内的 `env_file`，可带字符串列表 `options`，每项传给 restic 的 `--option`。一个目标的配置错误单独显示，其他有效目标继续备份。`validate` 在本地检查配置、凭据文件、路由格式和 SQL 规则可读性。启动后的第一次一致副本检查 SQL 与数据库的实际兼容性。
+`config/vaultwarden.env` 是 Compose 服务的 `env_file`。Compose 会处理引号和插值，例如可用单引号包住含 `$` 的 SMTP 密码。`DOMAIN` 可留空。需要 Vaultwarden 生成固定的外部链接时，填客户端实际使用的 HTTPS 地址。使用子路径时，公开 URL、反代转发的路径和 Vaultwarden 的挂载路径要一致。宿主机默认只在 `127.0.0.1:8080` 接收反代的连接。[Vaultwarden 配置模板](https://github.com/dani-garcia/vaultwarden/blob/1.37.5/.env.template)
 
-## 直接通知
+| 默认设置 | 对个人实例的影响 |
+| --- | --- |
+| `SIGNUPS_ALLOWED=false`、`SIGNUPS_DOMAINS_WHITELIST=` | 仅已开通的账号能登录。需要开户时临时开放注册。[开通账号](deployment.md#启动与开通账号) |
+| `ORG_CREATION_USERS=none`、`INVITATIONS_ALLOWED=false` | 禁止创建组织和通过组织邀请开新账号。已有组织仍可邀请已注册的用户。[组织邀请](https://github.com/dani-garcia/vaultwarden/blob/1.37.5/src/api/core/organizations.rs#L1033-L1069) |
+| `USER_ATTACHMENT_LIMIT=0`、`ORG_ATTACHMENT_LIMIT=0` | 拒绝上传个人、组织条目附件。已有文件仍在时，有权限的人可以下载。[附件限额](https://github.com/dani-garcia/vaultwarden/blob/1.37.5/src/api/core/ciphers.rs#L1241-L1258) |
+| `SENDS_ALLOWED=false` | 拒绝创建和编辑 Send。已有链接仍按各自的访问条件生效。[Send 权限](https://github.com/dani-garcia/vaultwarden/blob/1.37.5/src/api/core/sends.rs#L93-L109) |
 
-在 `backup.yaml` 的 `notifications.channels` 中启用模板所示的渠道。企业微信使用 webhook，钉钉和飞书支持签名密钥，Bark 使用 APNs 设备 token、P-256 PKCS#8 密钥、Key ID、Team ID 和 topic 发往 Apple。所有通道默认关闭。每个通道只接收目标名称、结果、时间和错误类别。
+网页 vault 和管理面板默认关闭。Compose 通过 `CONFIG_FILE` 固定服务配置来源。官方镜像的健康检查还会读取 `data/config.json` 中的域名。接管旧数据时，把仍需使用的设置写入环境文件，将旧 JSON 留在原数据副本。
 
-首次故障发送 Fault，确认恢复发送 Recovery。未恢复的问题默认每 6 小时发送 Reminder，每日当地时间 21:00 发送 Daily，默认时区 Asia/Shanghai。每个目标分别显示最近比较时间与快照时间，长期未更改的个人库可以持续受保护。每个通道独立合并待发消息，一轮最多三次尝试，遵循服务商的重试时间。`state/reports.json` 记录故障与下次提醒时间，`state/notifications.json` 记录待发消息和投递进度。重启后续发。两份记录任一读写失败时，通知暂停，备份继续，处理步骤见[日常与恢复](operations.md)。整个 VPS 停机时，机内进程无法发送通知；缺失日报可以从接收端发现。
+## 通知
+
+在 `config/backup.yaml` 中按 `channels: []` 下的注释填写所用渠道。每个渠道起一个独立名称。企业微信填写机器人 webhook，钉钉和飞书可填签名密钥。Bark 直接向 Apple APNs 投递，需要设备 token、P-256 PKCS#8 格式的 `.p8`、Key ID、Team ID 和 topic。容器内的 `/run/credentials/backup/bark-apns-auth-key.p8` 对应部署目录的 `credentials/backup/bark-apns-auth-key.p8`，属主 `1000:1000`、权限 `0600`。
+
+```sh
+docker compose run --rm --no-deps backup validate &&
+docker compose up -d --no-deps --force-recreate --wait backup
+```
+
+首次故障发 Fault，故障解除发 Recovery。默认按 Asia/Shanghai 时区在 21:00 发 Daily，未恢复的故障每 6 小时发 Reminder。可在同一文件调整 `timezone`、`daily_at` 和 `reminder_interval`。报告包含目标、结果、时间和错误类别。每个渠道分别记录投递进度，重启后续发。整台 VPS 离线期间收不到日报。[查看状态和处理故障](operations.md#查看保护状态)
